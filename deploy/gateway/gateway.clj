@@ -38,7 +38,7 @@
          '[clojure.string :as str]
          '[clojure.java.io :as io]
          '[lodestar.gatepolicy :as gp])   ; the security DECISIONS, real-typed in Beagle (not Any)
-(import '[java.net Socket InetSocketAddress]
+(import '[java.net Socket InetSocketAddress InetAddress]
         '[java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter InputStream])
 
 (def listen-port (Integer/parseInt (or (System/getenv "GATEWAY_PORT") "8088")))
@@ -47,6 +47,12 @@
 (def rate-per-s   (Double/parseDouble (or (System/getenv "GATEWAY_RATE")  "20")))
 (def burst        (Double/parseDouble (or (System/getenv "GATEWAY_BURST") "40")))
 (def max-body     (Integer/parseInt   (or (System/getenv "GATEWAY_MAX_BODY") "65536")))
+;; Optional allowlist of coordinator hosts the gateway may forward to (comma-sep).
+;; Defense-in-depth against a registry row pointing :coordinator-host at an internal
+;; service (SSRF). If unset, any host EXCEPT link-local/any-local/multicast is allowed.
+(def coord-allowlist
+  (when-let [s (System/getenv "GATEWAY_ALLOWED_COORD_HOSTS")]
+    (set (remove str/blank? (map str/trim (str/split s #","))))))
 
 ;; Token hashing, tenant resolution, rate-limit accounting, and request validation
 ;; are the gateway's security DECISIONS — they live in lodestar.gatepolicy with REAL
@@ -62,23 +68,42 @@
         (spit audit-path (str line "\n") :append true)
         (binding [*out* *err*] (println line))))))
 
-;; --- tenant registry: reload on mtime change, index every active token-hash ----
-(def registry (atom {:mtime -1 :by-token {} :tenants 0}))
+;; --- tenant registry: reload on (mtime,size) change, index every active token-hash --
+;; Cache key is [mtime size], not mtime alone: a same-second rewrite (1s mtime
+;; resolution) that changes the file size still triggers a reload, so a revoke/rotate
+;; can't be silently cached away.
+(def registry (atom {:sig nil :by-token {} :tenants 0}))
 
 (defn- active-hashes [t]
   (into (set (:tokens t)) (when-let [h (:token-sha256 t)] [h])))   ; :tokens set + legacy single
 
+;; Build the hash->Tenant index, FAILING CLOSED on a token hash shared across two
+;; different tenants: a collision would otherwise route one party's token to an
+;; arbitrary tenant (map-order dependent). The colliding hash authenticates to NOBODY.
+(defn- index-by-token [tenants]
+  (let [pairs (for [[tid t] tenants h (active-hashes t)] [h tid t])
+        marked (reduce (fn [acc [h tid t]]
+                         (let [prior (get acc h)]
+                           (cond
+                             (nil? prior)                      (assoc acc h (gp/parse-tenant tid t))
+                             (= ::collision prior)             acc
+                             (= tid (:tid prior))              acc          ; same tenant, fine
+                             :else                             (assoc acc h ::collision))))
+                       {} pairs)
+        dups (keep (fn [[h v]] (when (= ::collision v) h)) marked)]
+    (when (seq dups)
+      (audit! {:event :registry :status :duplicate-token-hash :count (count dups)})
+      (binding [*out* *err*]
+        (println (str "WARNING: " (count dups) " token hash(es) shared across tenants — rejecting them (fail-closed)"))))
+    (into {} (remove (fn [[_ v]] (= ::collision v)) marked))))
+
 (defn load-registry! []
   (let [f (io/file tenants-path)]
     (when (.exists f)
-      (let [mt (.lastModified f)]
-        (when (not= mt (:mtime @registry))
-          (let [tenants (edn/read-string (slurp f))
-                ;; raw EDN entry -> validated, typed gp/Tenant (the by-hash index)
-                by-token (into {} (for [[tid t] tenants
-                                        h (active-hashes t)]
-                                    [h (gp/parse-tenant tid t)]))]
-            (reset! registry {:mtime mt :by-token by-token :tenants (count tenants)})))))
+      (let [sig [(.lastModified f) (.length f)]]
+        (when (not= sig (:sig @registry))
+          (let [tenants (edn/read-string (slurp f))]
+            (reset! registry {:sig sig :by-token (index-by-token tenants) :tenants (count tenants)})))))
     @registry))
 
 (defn tenant-for-token [token]
@@ -118,6 +143,28 @@
       (.write w (pr-str req-map)) (.newLine w) (.flush w)   ; pr-str => guaranteed single line
       (.readLine r))))
 
+;; SSRF guard: the coordinator host comes from the registry. RESOLVE it to an IP
+;; (so a hostname pointing at the metadata endpoint is caught too) and refuse
+;; link-local (incl. 169.254.169.254 cloud metadata), any-local (0.0.0.0), and
+;; multicast; honor an explicit allowlist if configured. Loopback/private are fine
+;; (the normal co-located / per-tenant-container topologies). NB: we use
+;; .getHostAddress + string checks rather than .isLinkLocalAddress etc. because
+;; babashka's reflection can't call those boolean InetAddress predicates.
+(defn- ip-blocked? [ip]
+  (or (str/starts-with? ip "169.254.")     ; IPv4 link-local incl. 169.254.169.254 metadata
+      (str/starts-with? ip "fe80:")         ; IPv6 link-local
+      (= ip "0.0.0.0") (= ip "::") (= ip "0:0:0:0:0:0:0:0")
+      (let [oct (first (str/split ip #"\."))                 ; IPv4 multicast 224.0.0.0–239.x
+            n   (try (Integer/parseInt oct) (catch Exception _ -1))]
+        (<= 224 n 239))))
+
+(defn coord-host-ok? [host]
+  (try
+    (let [ip (.getHostAddress (InetAddress/getByName host))]
+      (and (not (ip-blocked? ip))
+           (or (nil? coord-allowlist) (contains? coord-allowlist host))))
+    (catch Exception _ false)))                              ; unresolvable => refuse
+
 (defn- coord-result [resp]                                  ; coarse status for the audit line
   (cond (nil? resp) :no-response
         (str/includes? resp ":error")    :error
@@ -153,6 +200,10 @@
               (do (audit! {:event :rpc :tenant (:tid t) :status :bad-request :remote remote})
                   (txt-resp 400 "bad request — body must be an EDN map with a keyword :op"))
 
+              (not (coord-host-ok? (:host t)))   ; SSRF guard on the registry-supplied host
+              (do (audit! {:event :rpc :tenant (:tid t) :status :forbidden-coord-host :host (:host t) :remote remote})
+                  (txt-resp 502 "coordinator host not permitted"))
+
               :else
               (try
                 (let [resp (coord-rpc (:host t) (:port t) parsed)]
@@ -165,8 +216,9 @@
                   (audit! {:event :rpc :tenant (:tid t) :op (:op parsed) :status :coordinator-down :remote remote})
                   (txt-resp 502 (str "coordinator down for tenant " (:tid t))))
                 (catch Exception e
-                  (audit! {:event :rpc :tenant (:tid t) :status :gateway-error :remote remote})
-                  (txt-resp 500 (str "gateway error: " (.getMessage e))))))))))))
+                  ;; audit captures the class/message internally; never echo it to the client
+                  (audit! {:event :rpc :tenant (:tid t) :status :gateway-error :err (.getMessage e) :remote remote})
+                  (txt-resp 500 "gateway error"))))))))))
 
 (defn handler [req]
   (case [(:request-method req) (:uri req)]
