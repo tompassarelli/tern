@@ -23,9 +23,11 @@ cleanup() { [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
 trap cleanup EXIT
 
 echo "starting coordinator on :$CPORT ..."
-( cd "$FRAM" && exec bb -cp out cnf_coord_daemon.clj serve-flat "$CPORT" "$LOG" ) >"$TMP/coord.log" 2>&1 &
+# Launch the REAL production daemon (JVM via bin/fram-daemon), not a bb stand-in —
+# the test backend should be the same process operators run.
+"$FRAM/bin/fram-daemon" "$CPORT" "$LOG" >"$TMP/coord.log" 2>&1 &
 COORD_PID=$!
-for _ in $(seq 40); do
+for _ in $(seq 160); do   # JVM boot is slower than bb; allow up to ~40s on a cold runner
   bb -e "(import '[java.net Socket InetSocketAddress])
          (try (with-open [s (Socket.)] (.connect s (InetSocketAddress. \"127.0.0.1\" $CPORT) 500)
                 (let [o (.getOutputStream s)] (.write o (.getBytes \"{:op :version}\n\")) (.flush o)) (System/exit 0))

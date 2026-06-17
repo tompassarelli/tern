@@ -23,7 +23,7 @@ trap cleanup EXIT
 echo "coordinator FRAM_BIND=0.0.0.0 on :$CPORT ; gateway routes :coordinator-host=$IP"
 FRAM_BIND=0.0.0.0 "$FRAM/bin/fram-daemon" "$CPORT" "$LOG" >"$TMP/coord.log" 2>&1 &
 CPID=$!
-for _ in $(seq 40); do ss -tlnH "sport = :$CPORT" 2>/dev/null | grep -q . && break; sleep 0.25; done
+for _ in $(seq 160); do ss -tlnH "sport = :$CPORT" 2>/dev/null | grep -q . && break; sleep 0.25; done  # JVM boot ~40s budget
 
 GATEWAY_PORT="$GPORT" GATEWAY_TENANTS="$REG" bb "$HERE/gateway.clj" >"$TMP/gw.log" 2>&1 &
 GPID=$!

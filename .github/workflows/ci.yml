@@ -29,6 +29,23 @@ jobs:
       - name: Install babashka
         run: curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
 
+      # Fram's coordinator daemon (bin/fram-daemon) runs on the JVM via `clojure -M`,
+      # NOT babashka — bb's native image lacks javax.net.ssl.SSLServerSocket (engine
+      # mTLS). The gateway tests stand up a real coordinator, so the runner needs the
+      # Clojure CLI + a JDK (ubuntu-latest ships a JDK; rlwrap isn't needed for `clojure`).
+      - name: Install Clojure CLI (Fram's coordinator daemon is JVM, not bb)
+        run: |
+          curl -L -O https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+          chmod +x linux-install.sh
+          sudo ./linux-install.sh
+          clojure --version
+
+      # Pre-download Fram's JVM deps (cheshire) so the daemon boots within the test
+      # poll window instead of racing a cold Maven fetch on first launch.
+      - name: Warm Fram JVM deps
+        working-directory: fram
+        run: clojure -P
+
       - name: Domain tests (run on the committed out/, no Beagle build needed)
         working-directory: lodestar
         run: |
