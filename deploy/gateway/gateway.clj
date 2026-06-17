@@ -36,10 +36,10 @@
 (require '[org.httpkit.server :as http]
          '[clojure.edn :as edn]
          '[clojure.string :as str]
-         '[clojure.java.io :as io])
+         '[clojure.java.io :as io]
+         '[lodestar.gatepolicy :as gp])   ; the security DECISIONS, real-typed in Beagle (not Any)
 (import '[java.net Socket InetSocketAddress]
-        '[java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter InputStream]
-        '[java.security MessageDigest])
+        '[java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter InputStream])
 
 (def listen-port (Integer/parseInt (or (System/getenv "GATEWAY_PORT") "8088")))
 (def tenants-path (or (System/getenv "GATEWAY_TENANTS") "tenants.edn"))
@@ -48,11 +48,10 @@
 (def burst        (Double/parseDouble (or (System/getenv "GATEWAY_BURST") "40")))
 (def max-body     (Integer/parseInt   (or (System/getenv "GATEWAY_MAX_BODY") "65536")))
 
-(defn sha256-hex [^String s]
-  (let [md (MessageDigest/getInstance "SHA-256")]
-    (->> (.digest md (.getBytes s "UTF-8"))
-         (map #(format "%02x" (bit-and % 0xff)))
-         (apply str))))
+;; Token hashing, tenant resolution, rate-limit accounting, and request validation
+;; are the gateway's security DECISIONS — they live in lodestar.gatepolicy with REAL
+;; types (Tenant/Bucket records, Map String Tenant, Float). This file is the effects
+;; shell: HTTP, sockets, the registry file, the buckets atom, the audit log.
 
 ;; --- audit log: one EDN line per request; never logs the object VALUE (:r) -----
 (def audit-lock (Object.))
@@ -75,33 +74,27 @@
       (let [mt (.lastModified f)]
         (when (not= mt (:mtime @registry))
           (let [tenants (edn/read-string (slurp f))
+                ;; raw EDN entry -> validated, typed gp/Tenant (the by-hash index)
                 by-token (into {} (for [[tid t] tenants
                                         h (active-hashes t)]
-                                    [h (assoc t :tenant tid)]))]
+                                    [h (gp/parse-tenant tid t)]))]
             (reset! registry {:mtime mt :by-token by-token :tenants (count tenants)})))))
     @registry))
 
 (defn tenant-for-token [token]
-  (when (seq token)
-    (get (:by-token (load-registry!)) (sha256-hex token))))
+  (gp/token->tenant (:by-token (load-registry!)) token))   ; hashes + looks up; nil on miss/empty
 
 (defn bearer [req]
-  (when-let [h (get-in req [:headers "authorization"])]
-    (when (str/starts-with? h "Bearer ") (subs h 7))))
+  (gp/bearer-token (get-in req [:headers "authorization"])))
 
 ;; --- per-tenant token-bucket rate limit ---------------------------------------
 (def buckets (atom {}))
 (defn allow? [tenant]
-  (let [now (System/nanoTime)
-        upd (swap! buckets update tenant
-              (fn [b]
-                (let [b (or b {:tokens burst :ts now})
-                      elapsed (max 0.0 (/ (double (- now (:ts b))) 1.0e9))
-                      refilled (min burst (+ (:tokens b) (* elapsed rate-per-s)))]
-                  (if (>= refilled 1.0)
-                    {:tokens (- refilled 1.0) :ts now :ok true}
-                    {:tokens refilled :ts now :ok false}))))]
-    (:ok (get upd tenant))))
+  ;; the pure token-bucket STEP (state in -> new state + verdict) is gp/bucket-step;
+  ;; the atom + clock are the effects we keep here.
+  (:ok (get (swap! buckets update tenant
+              (fn [b] (gp/bucket-step b (double (System/nanoTime)) rate-per-s burst)))
+            tenant)))
 
 ;; --- bounded body read: caps bytes regardless of a lying Content-Length -------
 (defn read-body [^InputStream is limit]
@@ -142,37 +135,37 @@
       (do (audit! {:event :rpc :tenant nil :status :unauthorized :remote remote})
           (txt-resp 401 "unauthorized"))
 
-      (not (allow? (:tenant t)))
-      (do (audit! {:event :rpc :tenant (:tenant t) :status :rate-limited :remote remote})
+      (not (allow? (:tid t)))
+      (do (audit! {:event :rpc :tenant (:tid t) :status :rate-limited :remote remote})
           (txt-resp 429 "rate limited"))
 
       :else
       (let [raw (read-body (:body req) max-body)]
         (cond
           (= raw ::too-big)
-          (do (audit! {:event :rpc :tenant (:tenant t) :status :too-large :remote remote})
+          (do (audit! {:event :rpc :tenant (:tid t) :status :too-large :remote remote})
               (txt-resp 413 (str "request body exceeds " max-body " bytes")))
 
           :else
           (let [parsed (try (edn/read-string raw) (catch Exception _ ::bad))]
             (cond
-              (or (= parsed ::bad) (not (map? parsed)) (not (keyword? (:op parsed))))
-              (do (audit! {:event :rpc :tenant (:tenant t) :status :bad-request :remote remote})
+              (not (gp/valid-op? parsed))   ; map with a keyword :op; ::bad fails (not a map)
+              (do (audit! {:event :rpc :tenant (:tid t) :status :bad-request :remote remote})
                   (txt-resp 400 "bad request — body must be an EDN map with a keyword :op"))
 
               :else
               (try
-                (let [resp (coord-rpc (:coordinator-host t "127.0.0.1") (:coordinator-port t) parsed)]
+                (let [resp (coord-rpc (:host t) (:port t) parsed)]
                   ;; audit op + subject + predicate + coarse result — NEVER the object value
-                  (audit! {:event :rpc :tenant (:tenant t) :op (:op parsed)
+                  (audit! {:event :rpc :tenant (:tid t) :op (:op parsed)
                            :te (:te parsed) :p (:p parsed)
                            :status (coord-result resp) :remote remote})
                   (edn-resp 200 resp))
                 (catch java.net.ConnectException _
-                  (audit! {:event :rpc :tenant (:tenant t) :op (:op parsed) :status :coordinator-down :remote remote})
-                  (txt-resp 502 (str "coordinator down for tenant " (:tenant t))))
+                  (audit! {:event :rpc :tenant (:tid t) :op (:op parsed) :status :coordinator-down :remote remote})
+                  (txt-resp 502 (str "coordinator down for tenant " (:tid t))))
                 (catch Exception e
-                  (audit! {:event :rpc :tenant (:tenant t) :status :gateway-error :remote remote})
+                  (audit! {:event :rpc :tenant (:tid t) :status :gateway-error :remote remote})
                   (txt-resp 500 (str "gateway error: " (.getMessage e))))))))))))
 
 (defn handler [req]

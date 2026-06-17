@@ -15,7 +15,7 @@ Group=lodestar
 Environment=FRAM_HOME=/opt/fram
 EnvironmentFile=/etc/lodestar/gateway.env
 # adjust if babashka is elsewhere (`command -v bb`)
-ExecStart=/usr/local/bin/bb /opt/lodestar/deploy/gateway/gateway.clj
+ExecStart=/usr/local/bin/bb -cp /opt/lodestar/out /opt/lodestar/deploy/gateway/gateway.clj
 Restart=on-failure
 RestartSec=2
 

@@ -39,7 +39,7 @@ services:
 
   gateway:
     image: lodestar:latest
-    command: ["bash","-lc","exec bb /opt/lodestar/deploy/gateway/gateway.clj"]
+    command: ["bash","-lc","exec bb -cp /opt/lodestar/out /opt/lodestar/deploy/gateway/gateway.clj"]
     environment:
       GATEWAY_PORT: "8088"
       GATEWAY_TENANTS: /srv/lodestar/tenants.edn

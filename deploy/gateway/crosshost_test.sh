@@ -25,7 +25,7 @@ FRAM_BIND=0.0.0.0 "$FRAM/bin/fram-daemon" "$CPORT" "$LOG" >"$TMP/coord.log" 2>&1
 CPID=$!
 for _ in $(seq 160); do ss -tlnH "sport = :$CPORT" 2>/dev/null | grep -q . && break; sleep 0.25; done  # JVM boot ~40s budget
 
-GATEWAY_PORT="$GPORT" GATEWAY_TENANTS="$REG" bb "$HERE/gateway.clj" >"$TMP/gw.log" 2>&1 &
+GATEWAY_PORT="$GPORT" GATEWAY_TENANTS="$REG" bb -cp "$HERE/../../out" "$HERE/gateway.clj" >"$TMP/gw.log" 2>&1 &
 GPID=$!
 for _ in $(seq 40); do [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$GPORT/healthz)" = 200 ] && break; sleep 0.25; done
 

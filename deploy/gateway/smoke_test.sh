@@ -37,7 +37,7 @@ done
 
 echo "starting gateway on :$GPORT ..."
 GATEWAY_PORT="$GPORT" GATEWAY_TENANTS="$REG" GATEWAY_AUDIT_LOG="$AUDIT" GATEWAY_MAX_BODY=64 \
-  bb "$HERE/gateway.clj" >"$TMP/gw.log" 2>&1 &
+  bb -cp "$HERE/../../out" "$HERE/gateway.clj" >"$TMP/gw.log" 2>&1 &
 GW_PID=$!
 for _ in $(seq 40); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$GPORT/healthz" 2>/dev/null)" = "200" ] && break
