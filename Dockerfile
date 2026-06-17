@@ -22,9 +22,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # babashka is the only runtime dependency — the compiled Clojure is committed.
 RUN curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | bash
 
-ARG FRAM_REF=main
+# Pinned to the Fram commit Lodestar is built against — keep in sync with
+# FRAM_VERSION (override at build with --build-arg FRAM_REF=<sha>).
+ARG FRAM_REF=e6978b5b2959e4cd3ad9d209d94400e3e5e0d153
 WORKDIR /opt
-RUN git clone --depth 1 --branch "${FRAM_REF}" https://github.com/tompassarelli/fram
+RUN git clone https://github.com/tompassarelli/fram \
+ && git -C fram checkout --quiet "${FRAM_REF}"
 COPY . /opt/lodestar
 
 ENV FRAM_HOME=/opt/fram \
