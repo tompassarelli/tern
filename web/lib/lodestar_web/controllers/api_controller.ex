@@ -4,6 +4,10 @@ defmodule LodestarWeb.ApiController do
   # Cytoscape-ready thread DAG from the board daemon (:7977).
   def dag(conn, _params), do: json(conn, Lodestar.Threads.graph())
 
+  # Claim-derived list view: threads grouped by lifecycle (in-progress/ready/
+  # blocked/backlog/draft), ready ordered by do_on so the top row is "next".
+  def list(conn, _params), do: json(conn, Lodestar.Threads.list())
+
   # Generic claims read for wake's `persist :feed`: flat entity rows (id = the
   # claim ref, so writes target the right subject) for a graph. Board for now.
   def entities(conn, params) do
@@ -123,5 +127,26 @@ defmodule LodestarWeb.ApiController do
 
   def wake_board(conn, _params) do
     conn |> put_resp_content_type("text/html") |> send_resp(200, @board_shell)
+  end
+
+  # Claims-native list view — threads grouped by derived lifecycle, live.
+  @list_shell """
+  <!doctype html>
+  <html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lodestar · list</title>
+    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}</style>
+  </head>
+  <body>
+    <div id="list"></div>
+    <script src="/js/lodestar-list.js"></script>
+  </body>
+  </html>
+  """
+
+  def list_view(conn, _params) do
+    conn |> put_resp_content_type("text/html") |> send_resp(200, @list_shell)
   end
 end

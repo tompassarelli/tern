@@ -43,6 +43,70 @@ defmodule Lodestar.Threads do
     %{lanes: lanes}
   end
 
+  # List view — threads grouped by DERIVED lifecycle, claim-native. The ontology
+  # (Tom): in-progress = a live driver; ready = committed AND has a do_on (queued
+  # for a period); backlog = committed but NO do_on (orthogonal "ready"-type work,
+  # not scheduled); blocked = an open depends_on; draft = uncommitted. done/
+  # abandoned are excluded. Ready is ordered by do_on (soonest first) so the top
+  # ready row is literally "next"; other groups newest-first.
+  @list_groups [
+    {"in-progress", "In Progress"},
+    {"ready", "Ready"},
+    {"blocked", "Blocked"},
+    {"backlog", "Backlog"},
+    {"draft", "Draft"}
+  ]
+
+  def list(port \\ nil) do
+    port = port || Fram.board_port()
+    {node_attrs, edges} = fold(Fram.all_triples(port))
+    titled = for {id, attrs} <- node_attrs, Map.get(attrs, "title", "") != "", into: %{}, do: {id, attrs}
+    by_from = Enum.group_by(edges, & &1.from)
+    online = Lodestar.Presence.online_refs()
+
+    rows =
+      for {id, attrs} <- titled,
+          status = derive_status(attrs, Map.get(by_from, id, []), node_attrs, online),
+          group = list_group(status, attrs),
+          not is_nil(group) do
+        %{
+          id: id,
+          title: Map.get(attrs, "title", id),
+          group: group,
+          status: status,
+          do_on: Map.get(attrs, "do_on", ""),
+          driver: driver_of(by_from, id)
+        }
+      end
+
+    by_group = Enum.group_by(rows, & &1.group)
+
+    groups =
+      for {key, label} <- @list_groups do
+        items = Map.get(by_group, key, [])
+
+        ordered =
+          if key == "ready",
+            do: Enum.sort_by(items, &{&1.do_on == "", &1.do_on}),
+            else: Enum.sort_by(items, & &1.id, :desc)
+
+        %{key: key, label: label, count: length(ordered), items: ordered}
+      end
+
+    %{groups: groups}
+  end
+
+  defp list_group(status, attrs) do
+    cond do
+      status in ["done", "abandoned"] -> nil
+      status == "active" -> "in-progress"
+      status == "blocked" -> "blocked"
+      Map.has_key?(attrs, "committed") and Map.get(attrs, "do_on", "") != "" -> "ready"
+      Map.has_key?(attrs, "committed") -> "backlog"
+      true -> "draft"
+    end
+  end
+
   # Shared "compute scoped threads" core for graph/0 + board/0 — no logic drift.
   # Returns the scoped cards (graph nodes), the surviving dag edges, and the keep set.
   defp scoped(port) do

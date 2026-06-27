@@ -18,6 +18,7 @@ defmodule LodestarWeb.Router do
     pipe_through :api
 
     get "/dag", ApiController, :dag
+    get "/list", ApiController, :list
     get "/presence", ApiController, :presence
     get "/entities", ApiController, :entities
     # wake derives the feed's WS as a sibling of the feed URL (/api/entities → /api/live)
@@ -36,5 +37,6 @@ defmodule LodestarWeb.Router do
     get "/live", ApiController, :live
     get "/wake", ApiController, :wake_shell
     get "/wb", ApiController, :wake_board
+    get "/list", ApiController, :list_view
   end
 end
