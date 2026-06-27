@@ -13,13 +13,13 @@
 ;; derived head collapse a worker that reports twice — the barrier counts WORKERS, not claims.
 ;;
 ;; usage:
-;;   bb fleet-map.clj <port> map    <role-template> <N> <task> [K]   — register batch + fan out N workers
-;;   bb fleet-map.clj <port> done   <batch-id> <worker> <payload>    — a worker reports DONE (carries payload)
-;;   bb fleet-map.clj <port> status <batch-id>                       — barrier state + aggregated payloads
-;;   bb fleet-map.clj <port> barrier <batch-id>                      — just the derived fired? + done set
-;;   bb fleet-map.clj <port> list                                    — known batches
-;; env: FLEET_MAP_SPAWN=0 registers the batch + records worker handles but skips the real
-;;      spawn-agent/msg ping (deterministic test path; DONEs then simulated via the `done` verb).
+;;   bb lodestar-map.clj <port> map    <role-template> <N> <task> [K]   — register batch + fan out N workers
+;;   bb lodestar-map.clj <port> done   <batch-id> <worker> <payload>    — a worker reports DONE (carries payload)
+;;   bb lodestar-map.clj <port> status <batch-id>                       — barrier state + aggregated payloads
+;;   bb lodestar-map.clj <port> barrier <batch-id>                      — just the derived fired? + done set
+;;   bb lodestar-map.clj <port> list                                    — known batches
+;; env: MAP_SPAWN=0 registers the batch + records worker handles but skips the real
+;;      SDK spawn (deterministic test path; DONEs then simulated via the `done` verb).
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
          '[clojure.java.shell :refer [sh]])
 
@@ -77,7 +77,6 @@
 (let [[port verb & args] *command-line-args*
       port (Integer/parseInt port)
       home (System/getenv "HOME")
-      agent-data (str home "/code/agent-data")
       scratch (str home "/code/lodestar/cli")]
   (case verb
 
@@ -90,7 +89,7 @@
                            (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss"))
                   "-" (format "%04x" (rand-int 0x10000)))
           e (batch-ent id)
-          spawn? (not= "0" (System/getenv "FLEET_MAP_SPAWN"))]
+          spawn? (not= "0" (System/getenv "MAP_SPAWN"))]
       (assert! port e "batch_kind"     "fan-out")
       (assert! port e "expected_count" n)
       (assert! port e "barrier_k"      k)
@@ -102,26 +101,23 @@
         (let [slug (str tmpl "-" id "-" i)]
           (assert! port e "worker" slug)            ; membership claim (tagged with batch id)
           (when spawn?
-            ;; define the per-worker role, spawn an ephemeral holder, ping it with the
-            ;; batch-tagged task + the exact DONE-report line it must run on completion.
             (sh "bb" (str scratch "/presence-cli.clj") (str port) "define-role" slug "exclusive"
                 (str "fan-out worker " i "/" n " of " id))
-            (sh "bash" (str agent-data "/spawn-agent.sh") slug
-                :env (assoc (into {} (System/getenv))
-                            "AGENT_LIFECYCLE" "ephemeral" "FLEET_PORT" (str port)))
-            (sh "bb" (str scratch "/msg-cli.clj") (str port) "send" "fleet-map" slug
-                (str task "\n\n[batch " e " worker " slug "]\n"
-                     (when has-schema
-                       (str "Your result payload MUST be JSON conforming to this schema:\n  " schema "\n"))
-                     "On completion you MUST run:\n"
-                     "  bb " scratch "/fleet-map.clj " port " done " id " " slug " \"<your result>\""
-                     (when has-schema
-                       (str "\nThe payload is schema-validated on acceptance; a non-conforming payload is "
-                            "REJECTED (nonzero exit) and you must re-run the line with a conforming result.")))
-                (or schema "")))))
+            (let [full-prompt (str task "\n\n[batch " e " worker " slug "]\n"
+                                   (when has-schema
+                                     (str "Your result payload MUST be JSON conforming to this schema:\n  " schema "\n"))
+                                   "On completion you MUST run:\n"
+                                   "  bb " scratch "/lodestar-map.clj " port " done " id " " slug " \"<your result>\""
+                                   (when has-schema
+                                     (str "\nThe payload is schema-validated on acceptance; a non-conforming payload is "
+                                          "REJECTED (nonzero exit) and you must re-run the line with a conforming result.")))]
+              (sh "/run/current-system/sw/bin/bun" "run" (str home "/code/lodestar/sdk/src/spawn.ts") full-prompt
+                  :env (assoc (into {} (System/getenv))
+                              "AGENT_ID" slug
+                              "AGENT_LIFECYCLE" "ephemeral"))))))
       (println (str "batch " e "  N=" n " K=" k " role=" tmpl
                     (when has-schema "  +schema")
-                    (if spawn? "  (spawned + pinged)" "  (registered only, FLEET_MAP_SPAWN=0)"))))
+                    (if spawn? "  (spawned via SDK)" "  (registered only, MAP_SPAWN=0)"))))
 
     "done"         ; <batch-id> <worker> <payload>  — a worker reports DONE against the batch
     (let [[id worker payload] args
@@ -132,12 +128,12 @@
           ;; malformed output — exit 3 + retry instruction is the agent's signal to re-run with a fix.
           ;; No schema => validate-json returns valid (:no-schema), identical to pre-rec4 behavior.
           schema (one port be "done_schema")
-          vr (fleet.schema-validate/validate-json payload schema)]
+          vr (lodestar.schema-validate/validate-json payload schema)]
       (when-not (:valid vr)
         (println (str "REJECTED  " worker " DONE -> " be "  (payload failed schema validation)"))
         (doseq [er (:errors vr)] (println (str "  - " er)))
         (println (str "  ↳ DONE not recorded; barrier unchanged. Fix the payload to satisfy the schema and "
-                      "re-run:\n     bb <fleet-map.clj> " port " done " id " " worker " \"<conforming-json>\""))
+                      "re-run:\n     bb <lodestar-map.clj> " port " done " id " " worker " \"<conforming-json>\""))
         (System/exit 3))
       (assert! port de "done_batch"   be)
       (assert! port de "done_worker"  worker)
@@ -214,4 +210,4 @@
             :else
             (do (Thread/sleep 1000) (recur))))))
 
-    (do (println "usage: fleet-map.clj <port> {map|done|status|barrier|wait|list}\n  map adds optional [K] [<json-schema>]; done is schema-gated when the batch carries one; wait blocks with a reaper timeout") (System/exit 2))))
+    (do (println "usage: lodestar-map.clj <port> {map|done|status|barrier|wait|list}\n  map adds optional [K] [<json-schema>]; done is schema-gated when the batch carries one; wait blocks with a reaper timeout") (System/exit 2))))

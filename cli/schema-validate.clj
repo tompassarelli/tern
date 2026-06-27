@@ -1,10 +1,10 @@
 ;; schema-validate.clj — JSON-Schema (practical subset) validator for structured DONE payloads
-;; (Lodestar fleet primitive 5). Matches Anthropic Workflow's agent({schema}) gate: a sender attaches
-;; a schema to a message/batch (msg-cli / fleet-map), and the receiving side validates a worker's DONE
+;; (Lodestar primitive 5). Matches Anthropic Workflow's agent({schema}) gate: a sender attaches
+;; a schema to a message/batch (msg-cli / lodestar-map), and the receiving side validates a worker's DONE
 ;; payload against it BEFORE accepting — invalid => reject + ask retry; absent => accept unchanged.
 ;;
 ;; DUAL MODE — this file is both a library and a CLI:
-;;   * load-file'd by msg-cli.clj / fleet-map.clj -> call (fleet.schema-validate/validate-json p s)
+;;   * load-file'd by msg-cli.clj / lodestar-map.clj -> call (lodestar.schema-validate/validate-json p s)
 ;;   * run directly for the test loop:  bb schema-validate.clj '<payload-json>' '<schema-json>'
 ;;     prints VALID / INVALID+errors, exit 0/1. The `(when (= *file* babashka.file) ...)` guard keeps
 ;;     the CLI from firing when another script loads us.
@@ -13,7 +13,7 @@
 ;; enum, const, required, properties, additionalProperties:false, items, minItems/maxItems,
 ;; minLength/maxLength, pattern, minimum/maximum. Unknown keywords are ignored (permissive, like a
 ;; real validator on an unsupported draft). A blank/absent schema => valid (the backward-compat path).
-(ns fleet.schema-validate
+(ns lodestar.schema-validate
   (:require [cheshire.core :as json]
             [clojure.string :as str]))
 

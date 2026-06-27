@@ -73,7 +73,7 @@
                   ; against the schema this message carries. No schema => accepts (no-constraint).
     (let [[id payload] args, e (str "@msg:" id)
           schema (one port e "schema")
-          {:keys [valid errors no-schema]} (fleet.schema-validate/validate-json payload schema)]
+          {:keys [valid errors no-schema]} (lodestar.schema-validate/validate-json payload schema)]
       (if valid
         (println (str "VALID" (when no-schema " (message carries no schema)") " — payload accepted"))
         (do (println (str "INVALID — payload rejected for " e ", retry with a conforming reply:"))
