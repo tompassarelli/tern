@@ -20,4 +20,11 @@ defmodule LodestarWeb.Router do
     get "/dag", ApiController, :dag
     get "/presence", ApiController, :presence
   end
+
+  # wake frontend feed: flat /presence snapshot + /live WebSocket (raw, no
+  # pipeline — /live is a WS upgrade, /presence answers any Accept).
+  scope "/", LodestarWeb do
+    get "/presence", ApiController, :wake_presence
+    get "/live", ApiController, :live
+  end
 end
