@@ -49,11 +49,12 @@
    "tell @ui emoji_<condition> \"<glyph>\" (conditions: active/ready/blocked/draft).\n\n"
    "Prefer capture for new work and tell/untell for changes; the system serializes "
    "and rule-checks every write, so just state facts and let it enforce integrity.\n\n"
-   "DRIVING AGENTS (multi-agent work): SDK dispatch (`~/code/lodestar/sdk/src/dispatch.ts`) "
-   "reads thread claims, derives posture (unplanned/atomic/composite), and dispatches via "
-   "`@anthropic-ai/claude-agent-sdk`. Work queue on :7977 (ready/next/leverage; claim with "
-   "`driver @agent`); lodestar web (:8088) watches + steers live. Consult the AGENT PLAYBOOK "
-   "(lodestar thread 2026-06-22-232740) before reaching for tools."))
+   "DRIVING AGENTS (multi-agent work): use `dispatch` to spawn an agent for a thread — "
+   "it reads thread claims, derives posture (unplanned/atomic/composite), and dispatches via "
+   "Claude Agent SDK. For ad-hoc tasks without a thread, use `spawn`. The canonical flow is: "
+   "capture a thread → tell it claims (model, dependencies) → dispatch it. "
+   "Work queue on :7977 (ready/next/leverage; claim with `driver @agent`); "
+   "lodestar web (:8088) watches + steers live."))
 
 ;; tool name -> {desc, schema, argv}. argv maps the JSON arguments map (string
 ;; keys) to the engine argument vector.
@@ -106,19 +107,81 @@
    {:name "presentation" :desc "The effective emoji map (condition -> glyph), engine defaults + user overrides. Returns JSON {active,ready,blocked,draft}."
     :schema {:type "object" :properties {}} :argv (fn [_] ["json" "presentation"])}])
 
+;; --- SDK agent tools (dispatch/spawn) — shell out to bun, not the engine ----
+(def sdk-dir (str (.getParent (io/file (str here))) "/sdk/src"))
+(def bun "/run/current-system/sw/bin/bun")
+
+(def sdk-tools
+  [{:name "dispatch"
+    :desc "Dispatch an agent for a thread. Reads thread claims to derive posture (unplanned/atomic/composite), then spawns via Claude Agent SDK. The thread must exist (use capture first). Returns the agent ID."
+    :schema {:type "object"
+             :properties {:id {:type "string" :description "Thread ID to dispatch (e.g. 2026-06-27-193317)"}
+                          :model {:type "string" :description "Model tier: opus, sonnet, haiku (default: sonnet)"}
+                          :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}}
+             :required ["id"]}}
+   {:name "spawn"
+    :desc "Spawn an ad-hoc agent with a prompt (no pre-existing thread needed). For thread-driven work, prefer capture + dispatch instead. Returns the agent ID."
+    :schema {:type "object"
+             :properties {:prompt {:type "string" :description "The task prompt for the agent"}
+                          :model {:type "string" :description "Model tier: opus, sonnet, haiku (default: sonnet)"}
+                          :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}}
+             :required ["prompt"]}}])
+
+(defn call-sdk [nm args]
+  (let [env (into {} (System/getenv))]
+    (case nm
+      "dispatch"
+      (let [id (get args "id")
+            model (get args "model")
+            effort (get args "effort")
+            agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
+            cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
+                      model  (assoc "AGENT_MODEL" model)
+                      effort (assoc "AGENT_EFFORT" effort))]
+        (let [log (io/file (str (System/getenv "HOME") "/.local/state/lodestar/agents/" agent-id ".log"))]
+          (.mkdirs (.getParentFile log))
+          (proc/process {:env cmd-env :out log :err log}
+                        bun "run" (str sdk-dir "/dispatch.ts") id))
+        {:content [{:type "text" :text (str "dispatched @agent:" agent-id " for thread @" id
+                                            (when model (str " model=" model))
+                                            "\nAgent is running in the background. "
+                                            "Watch via lodestar web (:8088) or `show` the thread.")}]})
+
+      "spawn"
+      (let [prompt (get args "prompt")
+            model (get args "model")
+            effort (get args "effort")
+            agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
+            cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
+                      model  (assoc "AGENT_MODEL" model)
+                      effort (assoc "AGENT_EFFORT" effort))]
+        (let [log (io/file (str (System/getenv "HOME") "/.local/state/lodestar/agents/" agent-id ".log"))]
+          (.mkdirs (.getParentFile log))
+          (proc/process {:env cmd-env :out log :err log}
+                        bun "run" (str sdk-dir "/spawn.ts") prompt))
+        {:content [{:type "text" :text (str "spawned @agent:" agent-id
+                                            (when model (str " model=" model))
+                                            "\nAgent is running in the background. "
+                                            "Watch via lodestar web (:8088).")}]}))))
+
 (defn find-tool [nm] (first (filter #(= (:name %) nm) tools)))
+(defn find-sdk-tool [nm] (first (filter #(= (:name %) nm) sdk-tools)))
 
 (defn call-tool [nm args]
-  (if-let [t (find-tool nm)]
-    (let [argv (mapv str ((:argv t) (or args {})))
-          {:keys [out err exit]} (apply proc/sh engine argv)
-          errs (str/trim (or err ""))
-          text (str/trim (str out (when (seq errs) (str "\n[stderr] " errs))))]
-      {:content [{:type "text" :text (if (str/blank? text) (str "(done; exit " exit ")") text)}]
-       :isError (not (zero? exit))})
-    {:content [{:type "text" :text (str "unknown tool: " nm)}] :isError true}))
+  (if-let [st (find-sdk-tool nm)]
+    (call-sdk nm (or args {}))
+    (if-let [t (find-tool nm)]
+      (let [argv (mapv str ((:argv t) (or args {})))
+            {:keys [out err exit]} (apply proc/sh engine argv)
+            errs (str/trim (or err ""))
+            text (str/trim (str out (when (seq errs) (str "\n[stderr] " errs))))]
+        {:content [{:type "text" :text (if (str/blank? text) (str "(done; exit " exit ")") text)}]
+         :isError (not (zero? exit))})
+      {:content [{:type "text" :text (str "unknown tool: " nm)}] :isError true})))
 
-(defn tools-list [] {:tools (mapv (fn [t] {:name (:name t) :description (:desc t) :inputSchema (:schema t)}) tools)})
+(defn tools-list []
+  {:tools (into (mapv (fn [t] {:name (:name t) :description (:desc t) :inputSchema (:schema t)}) tools)
+                (mapv (fn [t] {:name (:name t) :description (:desc t) :inputSchema (:schema t)}) sdk-tools))})
 
 (defn on-initialize [params]
   {:protocolVersion (get params "protocolVersion" "2025-06-18")
