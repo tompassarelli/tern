@@ -195,10 +195,21 @@ function applyAgentFilter() {
   document.querySelectorAll('#agent-list .agent').forEach(li => {
     const hay = (li.textContent + ' ' + (li.dataset.uuid || '')).toLowerCase();
     const hitSearch = !omniQuery || hay.includes(omniQuery);
-    const hitStatus = statusFilter === 'all' || li.dataset.status === statusFilter;
+    const hitStatus = statusFilter === 'all'
+      || (statusFilter === 'pinned' ? li.dataset.pinned === 'true' : li.dataset.status === statusFilter);
     li.classList.toggle('hide-search', !(hitSearch && hitStatus));
   });
 }
+function fmtAge(iso) {
+  if (!iso) return null;
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 0) return 'just now';
+  const h = ms / 3600000;
+  if (h < 1) return Math.round(h * 60) + 'm ago';
+  if (h < 24) return Math.round(h) + 'h ago';
+  return Math.round(h / 24) + 'd ago';
+}
+const STALE_COLORS = { GREEN: '#4a4', YELLOW: '#ca0', RED: '#c44', PINNED: '#58f' };
 $('#omni').addEventListener('input', e => {
   omniQuery = e.target.value.trim().toLowerCase();
   Graph.search(omniQuery);
@@ -245,16 +256,25 @@ function renderAgents(agents) {
     const li = el('li', 'agent' + (a.online ? '' : ' offline') + (a.uuid === selected ? ' sel' : ''));
     li.dataset.uuid = a.uuid;
     li.dataset.status = statusOf(a);   // for the All/Working/Dormant/Offline filter
+    li.dataset.pinned = a.pinned ? 'true' : 'false';
     if (working) li.classList.add('working');
-    li.title = 'watch this agent — open live stream';   // the card IS the watch action (click → openStream)
+    if (a.pinned) li.classList.add('pinned');
+    li.title = 'watch this agent — open live stream';
 
-    // row1: status badge · primary label (role) · uuid · NEEDS-YOU hook
+    // row1: staleness dot · status badge · primary label (role) · pin · gen · age
     const row1 = el('div', 'row1');
+    const bucket = a.staleness_bucket || 'GREEN';
+    const dot = el('span', 'stale-dot');
+    dot.style.background = STALE_COLORS[bucket] || '#888';
+    dot.title = bucket + ' (' + (a.staleness_score != null ? a.staleness_score.toFixed(2) : '?') + ')';
     const status = el('span', 'status ' + (working ? 'work' : a.online ? 'idle' : 'off'),
       working ? '● working' : a.online ? '○ dormant' : '· offline');
     const name = el('span', 'aname', a.roles[0] || a.uuid.slice(0, 8));
-    row1.append(status, name);
-    // NEEDS-YOU: placeholder hook for the coming decision/blocker schema.
+    row1.append(dot, status, name);
+    if (a.pinned) row1.append(el('span', 'pin-badge', '📌'));
+    if (a.generation > 0) row1.append(el('span', 'gen-badge', 'G' + a.generation));
+    const age = fmtAge(a.spawned_at);
+    if (age) row1.append(el('span', 'age-chip', age));
     if (a.needs_you) row1.append(el('span', 'needs-you', '⚑ needs you'));
     li.append(row1);
 

@@ -64,7 +64,7 @@
 
 (defn lease-epoch [r] (:epoch r))
 
-^{:line 52 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (defrecord PresenceRow [uuid online expires_s roles model effort lifecycle current_thread active_workflow task cost_usd stream_age_s has_stream])
+^{:line 52 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (defrecord PresenceRow [uuid online expires_s roles model effort lifecycle current_thread active_workflow task cost_usd stream_age_s has_stream pinned spawned_at generation staleness_score staleness_bucket])
 
 (defn presencerow-uuid [r] (:uuid r))
 
@@ -275,8 +275,32 @@
    live? ^{:line 247 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (and ^{:line 247 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (some? ld) ^{:line 247 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (> ^{:line 247 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (:exp ld) now))
    expires ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (if ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (and ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (some? ld) ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (> ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (:exp ld) now)) ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (int ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (/ ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (- ^{:line 248 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (:exp ld) now) 1000)) nil)
    ae ^{:line 249 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (str "@agent:" h)
-   c ^{:line 250 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (get costs h)]
-  ^{:line 251 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (->PresenceRow h ^{:line 252 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (boolean live?) expires ^{:line 253 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (sorted-roles ^{:line 253 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved-many port ae "holds")) ^{:line 254 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved port ae "model") ^{:line 255 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved port ae "effort") ^{:line 256 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved port ae "lifecycle") ^{:line 257 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved port se "current_thread") ^{:line 258 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved port se "active_workflow") ^{:line 259 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/resolved port se "task") ^{:line 260 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (if ^{:line 260 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (some? c) c 0.0) ^{:line 261 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/stream-age-s h) ^{:line 262 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (rt/stream-exists? h))))
+   c ^{:line 250 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (get costs h)
+   pinned (= "true" (rt/resolved port ae "pinned"))
+   spawned-at (rt/resolved port ae "spawned_at")
+   gen-s (rt/resolved port ae "generation")
+   gen (or (when gen-s (parse-long gen-s)) 0)
+   last-run (rt/resolved port ae "last_run_at")
+   idle-h (when last-run
+            (try (/ (- now (.toEpochMilli (java.time.Instant/parse last-run))) 3600000.0)
+                 (catch Exception _ nil)))
+   idle-score (if idle-h (min 1.0 (/ idle-h 24.0)) 0.5)
+   gen-score (min 1.0 (/ (double gen) 5.0))
+   score (+ (* 0.53 idle-score) (* 0.47 gen-score))
+   bucket (cond pinned "PINNED" (< score 0.3) "GREEN" (< score 0.7) "YELLOW" :else "RED")]
+  (->PresenceRow h (boolean live?) expires
+    (sorted-roles (rt/resolved-many port ae "holds"))
+    (rt/resolved port ae "model")
+    (rt/resolved port ae "effort")
+    (rt/resolved port ae "lifecycle")
+    (rt/resolved port se "current_thread")
+    (rt/resolved port se "active_workflow")
+    (rt/resolved port se "task")
+    (if (some? c) c 0.0)
+    (rt/stream-age-s h)
+    (rt/stream-exists? h)
+    pinned spawned-at gen (double score) bucket)))
+
 
 ^{:line 266 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (defn ^Boolean focus? [^PresenceRow r]
   ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (or ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (some? ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (:active_workflow r)) ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (or ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (some? ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (:current_thread r)) ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (some? ^{:line 267 :file "/home/tom/code/framescope/bridge/bridge.bclj"} (:task r)))))

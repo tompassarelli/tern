@@ -16,7 +16,7 @@
 ;;   bb presence-cli.clj <port> presence                             ; projection (replaces ls presence/ + age math)
 ;;   bb presence-cli.clj <port> slackers [minutes]                   ; derived: online + holds no work-lease
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
-         '[cheshire.core :as json])
+         '[cheshire.core :as json] '[clojure.java.shell])
 
 (def TTL 600000)          ; 10min lease; renew every ~3min
 (def LEASE-PRED "lease")
@@ -189,36 +189,85 @@
       (retract! port ae "pinned" "true")
       (prn {:unpinned ae}))
 
-    "stale"                                 ; [threshold-hours=24]  — agents whose last run exceeds threshold
-    (let [thresh-h (if (seq args) (parse-long (first args)) 24)
-          thresh-ms (* thresh-h 3600000)
-          ss (or (sessions port) [])
-          runs-by-agent (reduce (fn [m [e h]]
-                                  (let [at (resolved port (str "@agent:" h) "last_run_at")]
-                                    (if at (assoc m h at) m)))
-                                {} ss)
-          spawns (reduce (fn [m [e h]]
-                           (let [at (resolved port (str "@agent:" h) "spawned_at")]
-                             (if at (assoc m h at) m)))
-                         {} ss)]
-      (println (format "%-14s %-8s %-20s %-20s %s" "AGENT" "STALE?" "SPAWNED" "LAST_RUN" "ROLES"))
+    "stale"                                 ; composite staleness: idle time + generation + playbook drift
+    (let [;; playbook learning count (from :7977) — how many learnings exist now
+          playbook-count (try (count (:values (send-op 7977 {:op :resolved :te "@2026-06-22-232740" :p "learning"})))
+                              (catch Exception _ 0))
+          ss (or (sessions port) [])]
+      (println (format "%-14s %-5s %5s %4s %4s %-7s %-4s %s"
+                       "AGENT" "SCORE" "IDLE" "GEN" "PBOK" "BUCKET" "PIN" "ROLES"))
       (doseq [[_e h] (sort-by second ss)]
         (let [ae (str "@agent:" h)
-              spawn-at (get spawns h)
-              last-run (get runs-by-agent h)
-              rs (:values (send-op port {:op :resolved :te ae :p "holds"}))
-              resp (if (seq rs) (str/join "," (map #(subs % 6) (sort rs))) "-")
-              age-ms (when last-run
-                       (try (- now (.toEpochMilli (java.time.Instant/parse last-run)))
+              pinned (= "true" (resolved port ae "pinned"))
+              last-run (resolved port ae "last_run_at")
+              gen-s (resolved port ae "generation")
+              gen (or (when gen-s (parse-long gen-s)) 0)
+              boot-playbook-s (resolved port ae "playbook_count_at_boot")
+              boot-playbook (or (when boot-playbook-s (parse-long boot-playbook-s)) 0)
+              playbook-drift (if (pos? playbook-count)
+                               (/ (double (- playbook-count boot-playbook)) playbook-count)
+                               0.0)
+              idle-h (when last-run
+                       (try (/ (- now (.toEpochMilli (java.time.Instant/parse last-run))) 3600000.0)
                             (catch Exception _ nil)))
-              stale? (cond
-                       (nil? last-run) "no-data"
-                       (nil? age-ms)   "parse-err"
-                       (> age-ms thresh-ms) (str "YES (" (int (/ age-ms 3600000)) "h)")
-                       :else "no")
-              spawn-short (when spawn-at (subs spawn-at 0 (min 19 (count spawn-at))))
-              run-short (when last-run (subs last-run 0 (min 19 (count last-run))))]
-          (println (format "%-14s %-8s %-20s %-20s %s" h (or stale? "?") (or spawn-short "-") (or run-short "-") resp)))))
+              idle-score (if idle-h (min 1.0 (/ idle-h 24.0)) 0.5)
+              gen-score (min 1.0 (/ (double gen) 5.0))
+              score (+ (* 0.4 idle-score) (* 0.35 gen-score) (* 0.25 playbook-drift))
+              bucket (cond pinned "PINNED" (< score 0.3) "GREEN" (< score 0.7) "YELLOW" :else "RED")
+              rs (:values (send-op port {:op :resolved :te ae :p "holds"}))
+              resp (if (seq rs) (str/join "," (map #(subs % 6) (sort rs))) "-")]
+          (println (format "%-14s %5.2f %5s %4d %4d %-7s %-4s %s"
+                           h score
+                           (if idle-h (format "%.0fh" idle-h) "?")
+                           gen
+                           (- playbook-count boot-playbook)
+                           bucket
+                           (if pinned "*" "")
+                           resp)))))
+
+    "staleness"                             ; <uuid>  — single agent staleness detail + dispatch recommendation
+    (let [[h] args
+          ae (str "@agent:" h)
+          pinned (= "true" (resolved port ae "pinned"))
+          last-run (resolved port ae "last_run_at")
+          gen-s (resolved port ae "generation")
+          gen (or (when gen-s (parse-long gen-s)) 0)
+          spawn-at (resolved port ae "spawned_at")
+          model (resolved port ae "model")
+          lifecycle (resolved port ae "lifecycle")
+          prev-input (resolved port ae "prev_input_tokens")
+          playbook-count (try (count (:values (send-op 7977 {:op :resolved :te "@2026-06-22-232740" :p "learning"})))
+                              (catch Exception _ 0))
+          boot-playbook-s (resolved port ae "playbook_count_at_boot")
+          boot-playbook (or (when boot-playbook-s (parse-long boot-playbook-s)) 0)
+          playbook-drift (- playbook-count boot-playbook)
+          idle-h (when last-run
+                   (try (/ (- now (.toEpochMilli (java.time.Instant/parse last-run))) 3600000.0)
+                        (catch Exception _ nil)))
+          idle-score (if idle-h (min 1.0 (/ idle-h 24.0)) 0.5)
+          gen-score (min 1.0 (/ (double gen) 5.0))
+          pb-score (if (pos? playbook-count) (/ (double playbook-drift) playbook-count) 0.0)
+          score (+ (* 0.4 idle-score) (* 0.35 gen-score) (* 0.25 pb-score))
+          bucket (cond pinned "PINNED" (< score 0.3) "GREEN" (< score 0.7) "YELLOW" :else "RED")]
+      (println (format "%-18s %s" "agent" ae))
+      (println (format "%-18s %s" "pinned" (if pinned "YES" "no")))
+      (println (format "%-18s %s" "lifecycle" (or lifecycle "?")))
+      (println (format "%-18s %s" "model" (or model "?")))
+      (println (format "%-18s %s" "spawned_at" (or spawn-at "?")))
+      (println (format "%-18s %s" "last_run_at" (or last-run "?")))
+      (println (format "%-18s %s" "idle" (if idle-h (format "%.1f hours" idle-h) "unknown")))
+      (println (format "%-18s %d" "generation" gen))
+      (println (format "%-18s %s" "prev_input_tokens" (or prev-input "?")))
+      (println (format "%-18s %d new since boot" "playbook_drift" playbook-drift))
+      (println (format "%-18s %.2f" "staleness_score" score))
+      (println (format "%-18s %s" "BUCKET" bucket))
+      (println)
+      (case bucket
+        "PINNED" (println "DISPATCH: reuse (pinned — user trusts this context)")
+        "GREEN"  (println "DISPATCH: reuse (fresh context)")
+        "YELLOW" (println "DISPATCH: reuse with caution — inject rehydration hint")
+        "RED"    (println (str "DISPATCH: consider MIGRATE_FROM — spawn fresh with\n"
+                               "  MIGRATE_FROM=" h " to inherit roles + drain inbox"))))
 
     "forget"                                ; deregister: retract session claims + release the lease
     (let [[h] args, se (str "@session:" h)]
@@ -260,9 +309,24 @@
                     (str/join ", " (map #(subs % 6) (sort rs))) ", *}  (uuid ∪ held-roles)"))
       (doseq [t (sort ws)] (println (str "  watches " t))))
 
+    "compact"                               ; <uuid> — trigger fleet-aware rotation for an agent
+    (let [[h] args
+          ae (str "@agent:" h)
+          roles (:values (send-op port {:op :resolved :te ae :p "holds"}))]
+      (if (empty? roles)
+        (do (println (str "no roles for " h " — nothing to rotate")) (System/exit 1))
+        (do (println (str "triggering compact for " h " roles=" (pr-str (map #(subs % 6) roles))))
+            (assert! port ae "needs_rotation" "true")
+            (let [r (clojure.java.shell/sh "bash"
+                      (str (System/getenv "HOME") "/code/fleet-data/fleet-compact.sh") h)]
+              (println (:out r))
+              (when (seq (:err r)) (binding [*out* *err*] (println (:err r))))
+              (System/exit (:exit r))))))
+
     (do (println "usage: presence-cli.clj <port> {register|renew|task|focus|cost|forget  (session)")
         (println "                                |identify|card  (agent card)")
         (println "                                |define-role|assign|unassign|roles|holders  (roles)")
         (println "                                |watch|unwatch|subscriptions  (thread subs)")
+        (println "                                |compact  (fleet-aware context rotation)")
         (println "                                |presence|slackers}  (projections)")
         (System/exit 2))))

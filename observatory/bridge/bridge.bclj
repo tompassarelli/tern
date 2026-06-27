@@ -53,7 +53,9 @@
   [uuid :- String online :- Bool expires_s :- (U Int Nil) roles :- (Vec String)
    model :- (U String Nil) effort :- (U String Nil) lifecycle :- (U String Nil)
    current_thread :- (U String Nil) active_workflow :- (U String Nil) task :- (U String Nil)
-   cost_usd :- Float stream_age_s :- (U Int Nil) has_stream :- Bool])
+   cost_usd :- Float stream_age_s :- (U Int Nil) has_stream :- Bool
+   pinned :- Bool spawned_at :- (U String Nil) generation :- Int
+   staleness_score :- Float staleness_bucket :- String])
 (defrecord TapeEvent
   [t :- Int kind :- String id :- String from :- (U String Nil) to :- (U String Nil)
    label :- (U String Nil) agent :- (U String Nil) cost :- (U Float Nil)])
@@ -247,7 +249,19 @@
         live? (and (some? ld) (> (:exp ld) now))
         expires (if (and (some? ld) (> (:exp ld) now)) (int (/ (- (:exp ld) now) 1000)) nil)
         ae (str "@agent:" h)
-        c (get costs h)]
+        c (get costs h)
+        pinned (= "true" (rt/resolved port ae "pinned"))
+        spawned-at (rt/resolved port ae "spawned_at")
+        gen-s (rt/resolved port ae "generation")
+        gen (or (when gen-s (parse-long gen-s)) 0)
+        last-run (rt/resolved port ae "last_run_at")
+        idle-h (when last-run
+                 (try (/ (- now (.toEpochMilli (java.time.Instant/parse last-run))) 3600000.0)
+                      (catch Exception _ nil)))
+        idle-score (if idle-h (min 1.0 (/ idle-h 24.0)) 0.5)
+        gen-score (min 1.0 (/ (double gen) 5.0))
+        score (+ (* 0.53 idle-score) (* 0.47 gen-score))
+        bucket (cond pinned "PINNED" (< score 0.3) "GREEN" (< score 0.7) "YELLOW" :else "RED")]
     (->PresenceRow
       h (boolean live?) expires
       (sorted-roles (rt/resolved-many port ae "holds"))
@@ -259,7 +273,8 @@
       (rt/resolved port se "task")
       (if (some? c) c 0.0)
       (rt/stream-age-s h)
-      (rt/stream-exists? h))))
+      (rt/stream-exists? h)
+      pinned spawned-at gen (double score) bucket)))
 
 ;; dedup to ONE cockpit card per handle, keeping the richest row
 ;; (online > has-focus > fresher stream).
