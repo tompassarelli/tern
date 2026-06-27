@@ -18,6 +18,19 @@
         "type": "github"
       }
     },
+    "fram": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782604458,
+        "narHash": "sha256-WhCGYVn4WLtqlTlUVyHpkNROBfwr9dQmJgL8IbwXlRE=",
+        "path": "/home/tom/code/fram",
+        "type": "path"
+      },
+      "original": {
+        "path": "/home/tom/code/fram",
+        "type": "path"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782467914,
@@ -37,6 +50,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "fram": "fram",
         "nixpkgs": "nixpkgs"
       }
     },
