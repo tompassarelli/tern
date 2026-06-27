@@ -14,14 +14,10 @@ defmodule LodestarWeb.Router do
     plug :accepts, ["json"]
   end
 
-  scope "/", LodestarWeb do
-    pipe_through :browser
+  scope "/api", LodestarWeb do
+    pipe_through :api
 
-    get "/", PageController, :home
+    get "/dag", ApiController, :dag
+    get "/presence", ApiController, :presence
   end
-
-  # Other scopes may use custom stacks.
-  # scope "/api", LodestarWeb do
-  #   pipe_through :api
-  # end
 end

@@ -117,7 +117,7 @@ body {
 }
 
 /* ── agent roster (right pane content) ── */
-.agent-list { display: flex; flex-direction: column; gap: 2px; }
+.agent-list { display: flex; flex-direction: column; gap: 2px; height: 100%; overflow-y: auto; }
 .agent-row {
   display: flex;
   align-items: flex-start;
@@ -161,3 +161,7 @@ body {
 }
 .agent-model { font-size: 10px; color: var(--muted); }
 .agent-ctx { font-size: 11px; color: var(--star); font-family: ui-monospace, monospace; }
+
+/* ── thread DAG (left pane) — Cytoscape owns #cy; seamless pan/zoom, no scrollbars ── */
+.pane-content { overflow: hidden; }
+#cy.cy { width: 100%; height: 100%; }
