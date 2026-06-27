@@ -30,36 +30,134 @@ body {
   height: 100vh;
 }
 
+/* panel = Claude-Code shape: title · content · CLI box · status line */
 .panel {
-  background: var(--panel);
   border: 1px solid var(--panel-edge);
   border-radius: 16px;
-  padding: 20px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
 
-.panel-label {
+.pane-title {
   color: var(--muted);
   font-size: 13px;
   letter-spacing: 0.04em;
   text-transform: lowercase;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
-.panel-body {
+.pane-content {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.placeholder {
+  height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--muted);
 }
 
-.panel-cli {
-  border-top: 1px solid var(--panel-edge);
-  padding-top: 10px;
-  color: var(--muted);
+/* ── CLI input box (the > prompt, mode tag breaks the top border) ── */
+.cli-box {
+  position: relative;
+  margin-top: 12px;
+  border: 1px solid var(--panel-edge);
+  border-radius: 10px;
+  padding: 10px 12px;
   font-family: ui-monospace, monospace;
   font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
+.cli-tag {
+  position: absolute;
+  top: -8px;
+  right: 14px;
+  background: var(--panel);
+  padding: 0 8px;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  color: var(--accent-alt);
+}
+.cli-prompt { color: var(--accent); }
+.cli-ph { color: var(--muted); }
+
+/* ── status line (badge · message · toggles · token usage) ── */
+.statusline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+.badge {
+  background: var(--star);
+  color: var(--bg);
+  padding: 1px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.status-tok { margin-left: auto; color: var(--star); }
+.toggle {
+  border: 1px solid var(--panel-edge);
+  border-radius: 6px;
+  padding: 2px 8px;
+  color: var(--ink);
+  font-size: 11px;
+}
+
+/* ── agent roster (right pane content) ── */
+.agent-list { display: flex; flex-direction: column; gap: 2px; }
+.agent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+.agent-row:hover { background: rgba(255, 255, 255, 0.03); }
+.agent-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex: 0 0 auto;
+}
+.agent-dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.agent-dot.off { background: var(--muted); opacity: 0.4; }
+.agent-main { flex: 1; min-width: 0; }
+.agent-id {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-focus {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.agent-model { font-size: 10px; color: var(--muted); }
+.agent-ctx { font-size: 11px; color: var(--star); font-family: ui-monospace, monospace; }
