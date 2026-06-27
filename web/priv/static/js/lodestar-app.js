@@ -43,13 +43,25 @@
 
   // a frame: header (optional) + flex content + "›" CLI + bottom badge
   function frame(badgeLabel, headerEl, cli) {
-    const f = el("div", "display:flex;flex-direction:column;min-width:0;height:100%;");
+    const f = el("div", "display:flex;flex-direction:column;min-width:0;height:100%;overflow:hidden;");
     if (headerEl) f.append(headerEl);
-    const content = el("div", "flex:1 1 auto;min-height:0;overflow:hidden;position:relative;");
+    // flex:1 1 0 (not auto) so the surface is sized purely by the flex track and
+    // CANNOT grow the frame past 100vh — keeps every panel's "›" at the same bottom.
+    const content = el("div", "flex:1 1 0;min-height:0;overflow:hidden;position:relative;");
     f.append(content);
     if (cli) f.append(cliBar(cli.placeholder, cli.onSubmit));
     f.append(badge(badgeLabel));
     return { f, content };
+  }
+
+  // Mount a renderer into an INNER wrapper, not the frame content itself — the
+  // mount fns overwrite root.style.cssText (height:100%), which would clobber the
+  // content box's flex:1 1 0/overflow and let the surface grow the frame.
+  function mountInto(container, fn) {
+    container.textContent = "";
+    const inner = el("div", "height:100%;width:100%;overflow:hidden;");
+    container.append(inner);
+    if (typeof fn === "function") { try { fn({ el: inner }); } catch (e) { console.error("mount failed:", e); } }
   }
 
   async function post(url, body) {
@@ -67,7 +79,7 @@
   function boot() {
     const app = document.getElementById("app");
     if (!app) return;
-    app.style.cssText = `display:flex;height:100vh;background:${EF.bg};color:${EF.ink};`;
+    app.style.cssText = `display:flex;height:100vh;overflow:hidden;background:${EF.bg};color:${EF.ink};`;
 
     // LEFT — workbench with a view toggle in its header
     const toggle = el("div",
@@ -76,7 +88,7 @@
       placeholder: "capture a thread…",
       onSubmit: (v) => post("/api/capture", { graph: "board", title: v }),
     });
-    const left = el("div", `flex:1 1 58%;border-right:1px solid ${EF.edge};min-width:0;`);
+    const left = el("div", `flex:1 1 58%;border-right:1px solid ${EF.edge};min-width:0;overflow:hidden;`);
     left.append(wb.f);
 
     // RIGHT — agents; its "›" steers the currently-selected agent
@@ -87,7 +99,7 @@
         if (handle) return post("/api/steer", { handle, text: v });
       },
     });
-    const right = el("div", "flex:1 1 42%;min-width:0;");
+    const right = el("div", "flex:1 1 42%;min-width:0;overflow:hidden;");
     right.append(ag.f);
 
     app.append(left, right);
@@ -95,11 +107,7 @@
     let current = null;
     function show(key) {
       const v = VIEWS.find((x) => x[0] === key);
-      const mount = window.lodestar && window.lodestar[v[2]];
-      wb.content.textContent = "";
-      if (typeof mount === "function") {
-        try { mount({ el: wb.content }); } catch (err) { console.error("mount " + key + " failed:", err); }
-      }
+      mountInto(wb.content, window.lodestar && window.lodestar[v[2]]);
       current = key;
       paintToggle();
     }
@@ -116,12 +124,7 @@
     }
 
     show("list"); // default surface
-    const ma = window.lodestar && window.lodestar.mountAgents;
-    if (typeof ma === "function") {
-      try { ma({ el: ag.content }); } catch (err) { console.error("mountAgents failed:", err); }
-    } else {
-      ag.content.append(el("div", `padding:14px;color:${EF.muted};font-size:13px;`, "agents panel loading…"));
-    }
+    mountInto(ag.content, window.lodestar && window.lodestar.mountAgents);
   }
 
   document.addEventListener("DOMContentLoaded", boot);
