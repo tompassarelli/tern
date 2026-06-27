@@ -18,6 +18,8 @@
 (require lodestar.clockify :as cf)
 (require clojure.string :as str)
 (require fram.rt)
+(import java.util.Random)   ; non-java.lang classes need an explicit import
+(import java.util.UUID)
 
 (declare-extern fram.rt/read-log [String -> (Vec fold/Assertion)])
 ;; NOTE: NO write-log extern. Lodestar is a CLIENT — it mutates state ONLY through
@@ -38,8 +40,6 @@
 (declare-extern fram.rt/time-dir [-> String])
 (declare-extern fram.rt/ensure-dir [String -> Nil])
 (declare-extern fram.rt/spit-file [String String -> Nil])
-(declare-extern fram.rt/reserve-id [String -> String])
-(declare-extern fram.rt/release-id [String String -> Nil])
 (declare-extern fram.rt/slugify [String -> String])
 (declare-extern fram.rt/getenv-or [String String -> String])
 (declare-extern fram.rt/coord-version [Int -> Int])
@@ -48,6 +48,19 @@
 (declare-extern fram.rt/coord-port [-> Int])
 (declare-extern fram.rt/coord-status [Int -> String])
 
+;; --- thread id: lodestar-owned UUIDv7 minter --------------------------------
+;; A UUIDv7 packs a 48-bit ms timestamp in the high bits, so ids are both
+;; collision-proof and k-sortable (lexicographic order ~ chronological). This is
+;; lodestar-owned ON PURPOSE: fram.rt/now-id (the @timestamp scheme) has other
+;; callers and stays untouched. created_at — not the id's internal bits — is the
+;; app's ordering/display key; the id carries only identity.
+(defn uuidv7 [] :- String
+  (let [ts (System/currentTimeMillis)
+        r (Random.)
+        msb (bit-or (bit-shift-left ts 16) 0x7000 (bit-and (.nextInt r) 0xFFF))
+        lsb (bit-or (bit-shift-left 2 62) (bit-and (.nextLong r) 0x3FFFFFFFFFFFFFFF))]
+    (str (UUID. msb lsb))))
+
 ;; --- display helpers --------------------------------------------------------
 
 (defn- title-of [idx :- k/Index te :- String] :- String
@@ -55,6 +68,30 @@
 
 (defn- short-id [te :- String] :- String
   (if (str/starts-with? te "@") (subs te 1) te))
+
+;; --- ref resolution: @id OR @handle -> canonical @id ------------------------
+;; The view/boundary concern. An id is an opaque immutable key; a handle is an
+;; optional mutable human alias. fram NEVER sees a handle — capture/tell/CLI hand
+;; it a ref, this maps it to the canonical id first. Passthrough when the ref
+;; already names a thread (has a title); else find a thread whose `handle` claim
+;; equals the ref (sans @), latest created_at winning ties; else ref unchanged.
+(defn resolve-ref [idx :- k/Index ref :- String] :- String
+  (if (some? (k/one-i idx ref "title"))
+    ref
+    (let [bare (short-id ref)
+          matches (filterv (fn [te :- String] :- Bool
+                             (let [h (k/one-i idx te "handle")]
+                               (and (some? h) (= h bare))))
+                           (k/thread-ids-i idx))]
+      (if (empty? matches)
+        ref
+        (reduce (fn [best :- String te :- String] :- String
+                  (if (str/blank? best)
+                    te
+                    (let [bc (let [c (k/one-i idx best "created_at")] (if (some? c) c ""))
+                          tc (let [c (k/one-i idx te "created_at")] (if (some? c) c ""))]
+                      (if (fram.rt/str-lt? bc tc) te best))))
+                "" matches)))))
 
 (defn- trunc [s :- String n :- Int] :- String
   (if (> (count s) n) (str (subs s 0 (- n 1)) "…") s))
@@ -97,7 +134,7 @@
 
 (defn- capture-claims [te :- String title :- String owner :- String source :- String
                        author :- String lead :- String proposed :- String
-                       today :- String] :- (Vec k/Claim)
+                       created-at :- String today :- String] :- (Vec k/Claim)
   ;; NO `driver` at birth (operating-manual): making a thread active is a deliberate
   ;; pickup (`tell <id> driver @x`), never a capture default — a driver cell here is
   ;; exactly the "stray driver" pollution the-model warns about.
@@ -109,7 +146,9 @@
         c (add-claim c te "created_by" (ref-or-blank author))
         c (add-claim c te "lead" (ref-or-blank lead))
         c (add-claim c te "proposed_by" (ref-or-blank proposed))
-        c (add-claim c te "created_at" today)
+        ;; created_at is an explicit full-ISO claim (now-iso), asserted at capture —
+        ;; the id is opaque now (UUIDv7), so ordering/display read THIS, not the id.
+        c (add-claim c te "created_at" created-at)
         c (add-claim c te "updated_at" today)
         c (add-claim c te "committed" today)]
     c))
@@ -129,9 +168,10 @@
     [:else
      (do
        (fram.rt/ensure-dir threads-dir)
-       (let [id (fram.rt/reserve-id threads-dir)
+       (let [id (uuidv7)
              slug (fram.rt/slugify title)
              today (fram.rt/today-iso)
+             created-at (fram.rt/now-iso)
              te (str "@" id)
              path (str threads-dir "/" id "-" slug ".md")
              port (fram.rt/coord-port)]
@@ -141,15 +181,15 @@
          ;; capture can never strand title/provenance in a file. (The old file-first
          ;; path did exactly that whenever the log had pending coordinator writes,
          ;; i.e. routinely under a live fleet — the recurring two-way divergence.)
+         ;; UUIDv7 is collision-proof, so capture no longer reserves a file-lock id
+         ;; (the old now-id/reserve-id dance guarded same-second timestamp clashes).
          (if (< (fram.rt/coord-version port) 0)
-           (do (fram.rt/release-id threads-dir id)
-               (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `lodestar up`."))
-           (let [claims (capture-claims te title owner source author lead proposed today)
+           (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `lodestar up`.")
+           (let [claims (capture-claims te title owner source author lead proposed created-at today)
                  results (mapv (fn [c :- k/Claim] :- String
                                  (tell-retry port "assert" (:l c) (:p c) (:r c) 5))
                                claims)
                  oks (count (filterv (fn [r :- String] :- Bool (str/starts-with? r "ok:")) results))]
-             (fram.rt/release-id threads-dir id)
              (if (= oks (count claims))
                (do
                  (fram.rt/spit-file path (exp/thread-md (:claims (fold/fold (fram.rt/read-log log))) te))
@@ -158,6 +198,14 @@
                                "  committed: " oks " claims via coordinator. Next: lodestar tell " id " <pred> <value>")))
                (println (str "capture PARTIAL: only " oks "/" (count claims)
                              " claim(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files.")))))))])))
+
+;; Resolve a thread ref (@id OR @handle) to its canonical @id and print it. The
+;; bin/lodestar wrapper calls this before routing tell/untell to fram, so a
+;; handle ref (`lodestar tell @perf ...`) lands on the right thread — fram itself
+;; is handle-blind and only ever sees the canonical id.
+(defn cmd-resolve [log :- String ref :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))]
+    (println (resolve-ref idx ref))))
 
 ;; Entity-drift audit: repo path-form collisions (tags retired with relates_to).
 (defn cmd-audit [log :- String] :- Nil
@@ -553,6 +601,10 @@
       [(= cmd "plate")    (cmd-plate log)]
       [(= cmd "needs-review") (cmd-needs-review log)]
       [(= cmd "audit")    (cmd-audit log)]
+      [(= cmd "resolve")
+       (if (>= (count args) 2)
+         (cmd-resolve log (nth args 1))
+         (println "usage: resolve <@handle|@id>"))]
       [(= cmd "validate") (cmd-validate log)]
       [(= cmd "doctor")   (cmd-doctor threads-dir log)]
       [(= cmd "json")
@@ -578,7 +630,7 @@
            [(= sub "projects")   (cf/cmd-projects)]
            [(= sub "workspaces") (cf/cmd-workspaces)]
            [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
-      [:else (println "lodestar usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | plate | needs-review | audit | validate | doctor | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
+      [:else (println "lodestar usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | plate | needs-review | audit | resolve <@handle|@id> | validate | doctor | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
 
 (defn -main [& args] :- Nil
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

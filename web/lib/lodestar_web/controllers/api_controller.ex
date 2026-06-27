@@ -76,20 +76,30 @@ defmodule LodestarWeb.ApiController do
   end
 
   # Higher-level claim-native verb (lodestar `tell`): one fact about an entity.
-  # Normalizes the @ on the subject; the engine decides assert-vs-supersede.
+  # Resolve the subject (id OR handle) to its canonical id; resolve the object too
+  # when it's a thread ref (`@…`) so `tell @perf depends_on @other-handle` works.
+  # Literal objects (estimate_hours 4, do_on …, outcome …) pass through untouched.
   def tell(conn, %{"graph" => g, "id" => id, "pred" => pred, "obj" => obj}) do
-    te = if String.starts_with?(id, "@"), do: id, else: "@" <> id
-    write_resp(conn, Lodestar.Fram.assert!(Lodestar.Fram.port_for(g), te, pred, obj))
+    te = Lodestar.Threads.resolve(at(id))
+    r = if String.starts_with?(obj, "@"), do: Lodestar.Threads.resolve(obj), else: obj
+    write_resp(conn, Lodestar.Fram.assert!(Lodestar.Fram.port_for(g), te, pred, r))
   end
 
-  # Capture a new thread (lodestar `capture`): mint a timestamp id + assert its
-  # title. A thread IS any id with a title; it derives as "draft" until committed.
+  # Capture a new thread (lodestar `capture`): mint a UUIDv7 id + assert its title
+  # and an explicit created_at claim. A thread IS any id with a title; it derives
+  # as "draft" until committed. Optional `handle` = a mutable alias; optional
+  # `part_of` = a parent ref (id OR handle), resolved to its canonical id.
   def capture(conn, %{"title" => title} = params) when is_binary(title) and title != "" do
-    graph = Map.get(params, "graph", "board")
-    id = "@" <> Calendar.strftime(DateTime.utc_now(), "%Y-%m-%d-%H%M%S")
+    port = Lodestar.Fram.port_for(Map.get(params, "graph", "board"))
+    id = "@" <> Lodestar.Id.uuid7()
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
 
-    case Lodestar.Fram.assert!(Lodestar.Fram.port_for(graph), id, "title", title) do
-      {:ok, v} -> json(conn, %{ok: v, id: id})
+    with {:ok, _} <- Lodestar.Fram.assert!(port, id, "title", title),
+         {:ok, v} <- Lodestar.Fram.assert!(port, id, "created_at", now),
+         {:ok, _} <- assert_optional(port, id, "handle", Map.get(params, "handle")),
+         {:ok, _} <- assert_optional_ref(port, id, "part_of", Map.get(params, "part_of")) do
+      json(conn, %{ok: v, id: id})
+    else
       other -> write_resp(conn, other)
     end
   end
@@ -97,9 +107,11 @@ defmodule LodestarWeb.ApiController do
   def capture(conn, _), do: conn |> put_status(400) |> json(%{error: "title required"})
 
   # Steer an agent from the agents-panel "›": write a steer claim on the agent's
-  # session (agents daemon). The agent's loop can pick it up.
+  # session (agents daemon). Resolve the incoming ref so a thread handle works;
+  # an ordinary agent handle passes through unchanged.
   def steer(conn, %{"handle" => h, "text" => text}) when is_binary(h) and is_binary(text) and text != "" do
-    write_resp(conn, Lodestar.Fram.assert!(Lodestar.Fram.agents_port(), "@session:" <> h, "steer", text))
+    handle = h |> at() |> Lodestar.Threads.resolve() |> String.replace_prefix("@", "")
+    write_resp(conn, Lodestar.Fram.assert!(Lodestar.Fram.agents_port(), "@session:" <> handle, "steer", text))
   end
 
   def steer(conn, _), do: conn |> put_status(400) |> json(%{error: "handle + text required"})
@@ -107,6 +119,21 @@ defmodule LodestarWeb.ApiController do
   defp write_resp(conn, {:ok, v}), do: json(conn, %{ok: v})
   defp write_resp(conn, {:conflict, _}), do: conn |> put_status(409) |> json(%{conflict: true})
   defp write_resp(conn, {:error, reason}), do: conn |> put_status(502) |> json(%{error: to_string(reason)})
+
+  # Ensure a leading @ on a ref so resolve/1 sees the canonical `@…` form.
+  defp at("@" <> _ = ref), do: ref
+  defp at(ref) when is_binary(ref), do: "@" <> ref
+
+  # Optional LITERAL claim: assert only when present + non-blank, else a benign ok.
+  defp assert_optional(_port, _id, _pred, v) when v in [nil, ""], do: {:ok, nil}
+  defp assert_optional(port, id, pred, v) when is_binary(v), do: Lodestar.Fram.assert!(port, id, pred, v)
+
+  # Optional REFERENCE claim (e.g. a parent): resolve the ref to a canonical id
+  # before writing so a handle works as the target. Absent → benign ok.
+  defp assert_optional_ref(_port, _id, _pred, v) when v in [nil, ""], do: {:ok, nil}
+
+  defp assert_optional_ref(port, id, pred, v) when is_binary(v),
+    do: Lodestar.Fram.assert!(port, id, pred, Lodestar.Threads.resolve(at(v)))
 
   # wake's sibling /live WebSocket — upgrade + hand off to LiveFeed (PubSub-fed).
   def live(conn, _params) do

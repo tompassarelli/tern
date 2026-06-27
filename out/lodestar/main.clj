@@ -11,7 +11,16 @@
             [lodestar.audit :as audit]
             [lodestar.clockify :as cf]
             [clojure.string :as str]
-            [fram.rt :as rt]))
+            [fram.rt :as rt])
+  (:import [java.util Random]
+           [java.util UUID]))
+
+(defn ^String uuidv7 []
+  (let [ts (System/currentTimeMillis)
+   r (Random.)
+   msb (bit-or (bit-shift-left ts 16) 0x7000 (bit-and (.nextInt r) 0xFFF))
+   lsb (bit-or (bit-shift-left 2 62) (bit-and (.nextLong r) 0x3FFFFFFFFFFFFFFF))]
+  (str (UUID. msb lsb))))
 
 (defn- ^String title-of [idx ^String te]
   (let [t (k/one-i idx te "title")]
@@ -19,6 +28,16 @@
 
 (defn- ^String short-id [^String te]
   (if (str/starts-with? te "@") (subs te 1) te))
+
+(defn ^String resolve-ref [idx ^String ref]
+  (if (some? (k/one-i idx ref "title")) ref (let [bare (short-id ref)
+   matches (filterv (fn [te] (let [h (k/one-i idx te "handle")]
+  (and (some? h) (= h bare)))) (k/thread-ids-i idx))]
+  (if (empty? matches) ref (reduce (fn [best te] (if (str/blank? best) te (let [bc (let [c (k/one-i idx best "created_at")]
+  (if (some? c) c ""))
+   tc (let [c (k/one-i idx te "created_at")]
+  (if (some? c) c ""))]
+  (if (fram.rt/str-lt? bc tc) te best)))) "" matches)))))
 
 (defn- ^String trunc [^String s n]
   (if (> (count s) n) (str (subs s 0 (- n 1)) "…") s))
@@ -64,14 +83,14 @@
 (defn- ^String ref-or-blank [^String v]
   (if (str/blank? v) "" (str "@" v)))
 
-(defn- capture-claims [^String te ^String title ^String owner ^String source ^String author ^String lead ^String proposed ^String today]
+(defn- capture-claims [^String te ^String title ^String owner ^String source ^String author ^String lead ^String proposed ^String created-at ^String today]
   (let [c (add-claim [] te "title" title)
    c (if (= owner "personal") c (add-claim c te "owner" owner))
    c (add-claim c te "source" source)
    c (add-claim c te "created_by" (ref-or-blank author))
    c (add-claim c te "lead" (ref-or-blank lead))
    c (add-claim c te "proposed_by" (ref-or-blank proposed))
-   c (add-claim c te "created_at" today)
+   c (add-claim c te "created_at" created-at)
    c (add-claim c te "updated_at" today)
    c (add-claim c te "committed" today)]
   c))
@@ -87,21 +106,23 @@
   (or (ctrl? source) (ctrl? author) (ctrl? lead) (ctrl? proposed)) (println "capture: LODESTAR_SOURCE/AUTHOR/LEAD/PROPOSED_BY must each be a single line")
   :else (do
   (fram.rt/ensure-dir threads-dir)
-  (let [id (fram.rt/reserve-id threads-dir)
+  (let [id (uuidv7)
    slug (fram.rt/slugify title)
    today (fram.rt/today-iso)
+   created-at (fram.rt/now-iso)
    te (str "@" id)
    path (str threads-dir "/" id "-" slug ".md")
    port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (do
-  (fram.rt/release-id threads-dir id)
-  (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `lodestar up`.")) (let [claims (capture-claims te title owner source author lead proposed today)
+  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `lodestar up`.") (let [claims (capture-claims te title owner source author lead proposed created-at today)
    results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) claims)
    oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
-  (fram.rt/release-id threads-dir id)
   (if (= oks (count claims)) (do
   (fram.rt/spit-file path (exp/thread-md (:claims (fold/fold (fram.rt/read-log log))) te))
   (println (str "captured -> " te "  " title "  [owner: " owner "]\n" "  file:      " path "\n" "  committed: " oks " claims via coordinator. Next: lodestar tell " id " <pred> <value>"))) (println (str "capture PARTIAL: only " oks "/" (count claims) " claim(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files."))))))))))
+
+(defn cmd-resolve [^String log ^String ref]
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))]
+  (println (resolve-ref idx ref))))
 
 (defn cmd-audit [^String log]
   (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
@@ -439,6 +460,7 @@
   (= cmd "plate") (cmd-plate log)
   (= cmd "needs-review") (cmd-needs-review log)
   (= cmd "audit") (cmd-audit log)
+  (= cmd "resolve") (if (>= (count args) 2) (cmd-resolve log (nth args 1)) (println "usage: resolve <@handle|@id>"))
   (= cmd "validate") (cmd-validate log)
   (= cmd "doctor") (cmd-doctor threads-dir log)
   (= cmd "json") (cmd-json log (if (> (count args) 1) (nth args 1) "") (if (> (count args) 2) (nth args 2) ""))
@@ -455,7 +477,7 @@
   (= sub "projects") (cf/cmd-projects)
   (= sub "workspaces") (cf/cmd-workspaces)
   :else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
-  :else (println "lodestar usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | plate | needs-review | audit | validate | doctor | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)"))))
+  :else (println "lodestar usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | plate | needs-review | audit | resolve <@handle|@id> | validate | doctor | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)"))))
 
 (defn -main [& args]
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

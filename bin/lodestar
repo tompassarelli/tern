@@ -25,13 +25,25 @@ FRAM="${FRAM_HOME:-$HOME/code/fram}"
 LODESTAR="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
-  ready|blocked|leverage|next|agenda|plate|capture|json|needs-review|audit|validate|doctor|clock)
+  ready|blocked|leverage|next|agenda|plate|capture|json|needs-review|audit|resolve|validate|doctor|clock)
     # `validate` runs lodestar's FULL check (engine-generic ++ lodestar work rules,
     # lodestar.validate) — the fram CLI `validate` is generic-only since the work
     # rules moved out of the kernel. The MCP validate tool shells through here too.
     exec bb -cp "$LODESTAR/out:$FRAM/out" -m lodestar.main "$@" ;;
   up)
     exec "$FRAM/bin/fram-up" "${@:2}" ;;
-  *)  # engine verbs: import/export/show/set/merge/tell/untell/watch
+  tell|untell)
+    # Handles (and @ids) are a LODESTAR concern: fram is handle-blind and re-adds
+    # the leading @ to the bare subject it's handed. So resolve the SUBJECT ref to
+    # its canonical id here first — that's what makes `lodestar tell @perf ...`
+    # land on the right thread — then pass fram the bare canonical id. Only rewrite
+    # when the full `tell <id> <pred> <value>` shape is present; otherwise pass
+    # through untouched so fram's own usage/arg checks are unchanged.
+    if [ "$#" -ge 4 ]; then
+      canon="$(bb -cp "$LODESTAR/out:$FRAM/out" -m lodestar.main resolve "$2" 2>/dev/null)"
+      [ -n "$canon" ] && set -- "$1" "${canon#@}" "${@:3}"
+    fi
+    exec "$FRAM/bin/fram" "$@" ;;
+  *)  # engine verbs: import/export/show/set/merge/watch
     exec "$FRAM/bin/fram" "$@" ;;
 esac

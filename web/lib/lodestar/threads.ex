@@ -75,6 +75,40 @@ defmodule Lodestar.Threads do
     %{nodes: nodes, edges: kedges}
   end
 
+  @doc """
+  Resolve a ref — an `@id` OR an `@handle` — to a canonical thread id, off the
+  cached board fold. An id and a handle are separate owners: the id is the opaque
+  immutable key, the handle is an optional mutable alias.
+
+  - `ref` is already a titled node → it IS an id; pass it through.
+  - else treat `ref` minus its leading `@` as a handle, and return the id of the
+    node whose `handle` attr matches. On duplicate handles, the latest `created_at`
+    wins (ISO-8601 sorts chronologically).
+  - no match → `ref` unchanged.
+
+  This is the view/boundary concern: fram only ever sees the canonical id this
+  returns, never a handle.
+  """
+  def resolve(ref) when is_binary(ref) do
+    {node_attrs, _edges} = Lodestar.GraphCache.fold()
+
+    cond do
+      titled?(Map.get(node_attrs, ref)) ->
+        ref
+
+      true ->
+        handle = String.replace_prefix(ref, "@", "")
+
+        case Enum.filter(node_attrs, fn {_id, a} -> Map.get(a, "handle") == handle end) do
+          [] -> ref
+          matches -> matches |> Enum.max_by(fn {_id, a} -> Map.get(a, "created_at", "") end) |> elem(0)
+        end
+    end
+  end
+
+  defp titled?(%{} = attrs), do: Map.get(attrs, "title", "") != ""
+  defp titled?(_), do: false
+
   # Undirected BFS over the dag edges from `start` — both edge directions are
   # walked so we collect ancestors AND descendants. Returns the connected node set.
   defp reachable(start, dedges) do
@@ -161,6 +195,9 @@ defmodule Lodestar.Threads do
         %{
           id: id,
           title: Map.get(attrs, "title", id),
+          # mutable human alias (separate owner from the immutable id) + birth time
+          handle: Map.get(attrs, "handle"),
+          created_at: Map.get(attrs, "created_at", ""),
           do_on: Map.get(attrs, "do_on", ""),
           priority: Map.get(attrs, "priority", ""),
           driver: driver_of(by_from, id),

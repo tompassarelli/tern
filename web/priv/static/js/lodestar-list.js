@@ -50,6 +50,14 @@
     { key: "c", label: "Commit spec", run: (it) => tell(it.id, "committed", "true") },
     { key: "s", label: "Schedule today", run: (it) => tell(it.id, "do_on", today()) },
     { key: "u", label: "Unschedule", run: (it) => tell(it.id, "do_on", "") },
+    { key: "h", label: "Set handle…", run: (it) => {
+      // handle is a mutable human alias; identity (the id) is untouched. Store the
+      // bare slug — resolve() re-adds the leading @ at the boundary.
+      const slug = window.prompt("Set handle (short slug):", it.handle || "");
+      if (slug == null) return;                  // cancelled
+      const v = slug.trim().replace(/^@+/, "");
+      if (v) tell(it.id, "handle", v);
+    } },
     { key: "g", label: "View DAG", run: (it) => focusGraph(it.id) },
   ];
 
@@ -85,6 +93,16 @@
     if (a) { e.preventDefault(); a.run(hoverItem); }
   });
 
+  // The human alias (a mutable claim, separate owner from identity). Subtle,
+  // monospace, leads the title. Absent handle → null (additive, never breaks).
+  function handleChip(item) {
+    if (!item.handle) return null;
+    return el("span",
+      `flex:0 0 auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;` +
+      `color:${EF.muted};border:1px solid ${EF.muted}55;border-radius:3px;padding:0 4px;white-space:nowrap;`,
+      "@" + item.handle);
+  }
+
   // one chip per ACTIVE axis — makes the orthogonal axes explicit on every row.
   function facetBadges(item) {
     const wrap = el("span", "flex:0 0 auto;display:flex;gap:5px;align-items:center;");
@@ -118,8 +136,11 @@
     r.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, item); });
 
     const dot = el("span", `flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:${HUE[item.lens] || EF.muted};`);
+    const handle = handleChip(item);
     const title = el("span", "flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", item.title);
-    r.append(dot, title, facetBadges(item));
+    r.append(dot);
+    if (handle) r.append(handle);
+    r.append(title, facetBadges(item));
     return r;
   }
 

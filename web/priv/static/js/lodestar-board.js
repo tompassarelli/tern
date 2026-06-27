@@ -50,6 +50,16 @@
     } catch (_) {}
   }
 
+  // The human alias (a mutable claim, separate owner from identity). Subtle,
+  // monospace, leads the title — matches lodestar-list.js's handleChip exactly.
+  function handleChip(item) {
+    if (!item.handle) return null;
+    return el("span",
+      `flex:0 0 auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;` +
+      `color:${EF.muted};border:1px solid ${EF.muted}55;border-radius:3px;padding:0 4px;white-space:nowrap;`,
+      "@" + item.handle);
+  }
+
   // one chip per ACTIVE axis — identical to the list's facetBadges so attention
   // reads the same on both surfaces. Attention (an agent on it now) leads.
   function facetBadges(item) {
@@ -99,8 +109,11 @@
     k.onmouseleave = () => { k.style.borderColor = EF.edge; k.style.borderLeftColor = accent; };
 
     const dot = el("span", `flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:${accent};`);
+    const handle = handleChip(it);
     const title = el("span", "flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", it.title);
-    k.append(dot, title, facetBadges(it));
+    k.append(dot);
+    if (handle) k.append(handle);
+    k.append(title, facetBadges(it));
     return k;
   }
 
