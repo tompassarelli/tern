@@ -180,8 +180,8 @@
       return nodes.get(id);
     }
     function touch(id, t) { const n = nodes.get(id); if (n && t > n.data.lastActive) n.data.lastActive = t; }
-    // a non-fleet graph's nodes must SURVIVE the fleet-specific collapse: the backbone
-    // de-blobs FLEET traffic, but the code program / board live in the same union. Keep
+    // a non-agent graph's nodes must SURVIVE the agent-specific collapse: the backbone
+    // de-blobs agent traffic, but the code program / board live in the same union. Keep
     // a code module (the program) so an agent's working_on line lands somewhere visible.
     const isModule = n => n.id.endsWith('#root') || (n.attrs && n.attrs.file) || typeOf(n) === 'module';
     // a beam needs both ends: keep every node an `attending` edge points at, even a bare
@@ -191,16 +191,16 @@
     const attnTargets = new Set();
     snapshot.edges.forEach(e => { if (e.pred === 'attending') attnTargets.add(e.to); });
     // 1) structural nodes + program nodes (seed lastActive; traffic bumps it below).
-    // attention CURSORS survive the fleet de-blob too: they are the live light-show, not
+    // attention CURSORS survive the agent de-blob too: they are the live light-show, not
     // collapsible firehose — keep the @attention:<uuid> node so its attending→module beam
     // lands somewhere visible (mirrors how a code module passes through, msg 7980).
     snapshot.nodes.forEach(n => {
       const t = typeOf(n);
-      const fromFleet = (n.graph || 'fleet') === 'fleet';
+      const fromAgents = (n.graph || 'agents') === 'agents';
       if (STRUCTURAL.has(t)) { ensure(n.id, t, n.attrs || {}); touch(n.id, nodeTime(n.attrs)); }
       else if (t === 'attention') { ensure(n.id, t, n.attrs || {}); touch(n.id, nodeTime(n.attrs)); }
       else if (attnTargets.has(n.id)) { ensure(n.id, isModule(n) ? 'module' : t, n.attrs || {}); touch(n.id, nodeTime(n.attrs)); }
-      else if (!fromFleet && (isModule(n) || t === 'thread')) {
+      else if (!fromAgents && (isModule(n) || t === 'thread')) {
         ensure(n.id, isModule(n) ? 'module' : t, n.attrs || {}); touch(n.id, nodeTime(n.attrs));
       }
     });
@@ -251,12 +251,12 @@
       edges.push({ data: { id: 'talk:' + k, source: t.src, target: t.dst, pred: '×' + t.w,
                            weight: t.w, kind: 'talk' } }));
 
-    // re-label parties + stamp graph membership (synth parties default to fleet).
-    const graphOf = {}; snapshot.nodes.forEach(n => { graphOf[n.id] = n.graph || 'fleet'; });
+    // re-label parties + stamp graph membership (synth parties default to agents).
+    const graphOf = {}; snapshot.nodes.forEach(n => { graphOf[n.id] = n.graph || 'agents'; });
     nodes.forEach(node => {
       const d = node.data;
       d.label = labelFor(d.id, d.type, d.attrs, ctx[d.id]);
-      d.graph = graphOf[d.id] || 'fleet';
+      d.graph = graphOf[d.id] || 'agents';
     });
 
     const typeSet = new Set([...nodes.values()].map(n => n.data.type));
@@ -265,11 +265,11 @@
   }
 
   // ---- CODE view: a beagle program materializing as an AST graph -------------
-  // The fleet typing keys on the id PREFIX (@agent: → agent). Code ids are uniform
+  // Agent typing keys on the id PREFIX (@agent: → agent). Code ids are uniform
   // (@<mod>#<n>), so code typing keys on the `kind` claim + a 1-hop head walk, per
   // fram-engine's CODE-RENDER-SCHEMA. This is the code analogue of nodeType/labelFor
   // above — same pure contract, different axis. Collapse is by AST depth, not party
-  // aggregation (backbone is fleet-specific, so code bypasses it entirely).
+  // aggregation (backbone is agent-specific, so code bypasses it entirely).
   const DEF_HEADS = new Set(['define', 'def', 'defn', 'defn-', 'defmacro', 'define-target',
     'define-mode', 'define-syntax', 'define-type', 'deftype', 'defrecord',
     'define-record-type', 'definterface', 'default-main']);
@@ -281,7 +281,7 @@
 
   function basename(p) { p = String(p); const i = p.lastIndexOf('/'); return i >= 0 ? p.slice(i + 1) : p; }
 
-  // a code snapshot has @<mod>#<n|root> node ids OR `kind` attrs — fleet ids never do.
+  // a code snapshot has @<mod>#<n|root> node ids OR `kind` attrs — agent ids never do.
   function isCodeSnapshot(snapshot) {
     return !!snapshot && Array.isArray(snapshot.nodes) && snapshot.nodes.some(
       n => /#(\d+|root)$/.test(n.id) || (n.attrs && n.attrs.kind != null));

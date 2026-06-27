@@ -1,8 +1,7 @@
-// timetape.js — a scrubbable last-N-min activity ribbon. Answers "what is my fleet
-// DOING right now" as a temporal view: three lanes (msg / session / run) positioned
-// by time, a cumulative-cost sparkline behind them, a live now-line, and a scrubber
-// that reads out the events under the cursor. Data: GET /timetape (sent_at/started_at/
-// ended_at from the graph) + live commit ticks stamped on arrival. (fleet-commander #2.)
+// timetape.js — scrubbable last-N-min activity ribbon. Temporal view of agent
+// activity: three lanes (msg / session / run) positioned by time, cumulative-cost
+// sparkline, live now-line, scrubber with event readout. Data: GET /timetape
+// (sent_at/started_at/ended_at from the graph) + live commit ticks.
 'use strict';
 
 const TimeTape = (function () {
