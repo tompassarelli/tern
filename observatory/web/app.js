@@ -502,6 +502,16 @@ function openLive() {
   ws.onclose = () => setTimeout(openLive, 2000);
 }
 
+// ---------- collapse toggles ----------
+const agentsToggle = $('#agents-toggle');
+if (agentsToggle) agentsToggle.onclick = () => {
+  document.getElementById('agents').classList.toggle('collapsed');
+  agentsToggle.textContent = document.getElementById('agents').classList.contains('collapsed') ? '›' : '‹';
+};
+const timetapeToggle = $('#timetape-toggle');
+if (timetapeToggle) timetapeToggle.onclick = () =>
+  document.getElementById('timetape').classList.toggle('collapsed');
+
 // ---------- boot ----------
 if (ctxEl) ctxEl.onchange = () => { refreshPresence(); openLive(); Graph.reset(); TimeTape.refresh(); };
 refreshPresence();

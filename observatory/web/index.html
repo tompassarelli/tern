@@ -37,7 +37,7 @@
 <main id="observatory" class="view active">
   <div class="obs-main">
     <aside id="agents">
-      <div class="pane-head">Agents <span id="agent-count" class="count">0</span></div>
+      <div class="pane-head"><span class="pane-label">Agents</span> <span id="agent-count" class="count">0</span><button id="agents-toggle" class="pane-toggle" title="collapse sidebar">‹</button></div>
       <!-- STATUS FILTER: narrow the list to All / Working / Dormant / Offline. -->
       <div class="seg agent-filter" id="agent-filter" style="margin:6px 6px 0;">
         <button data-status="all" class="on">All</button><button data-status="working">Working</button><button data-status="dormant">Dormant</button><button data-status="offline">Offline</button><button data-status="pinned">Pinned</button>
@@ -68,6 +68,7 @@
   <!-- ---- TIME TAPE: scrubbable last-N-min activity ribbon ---- -->
   <div id="timetape">
     <div class="tt-head">
+      <button id="timetape-toggle" class="pane-toggle" title="collapse timetape">▲</button>
       <span class="tt-title">Time Tape</span>
       <div class="tt-range" id="tt-range">
         <button data-mins="15">15m</button><button data-mins="30" class="on">30m</button><button data-mins="60">60m</button>
