@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# framescope — start the bridge (DETACHED) + serve the observatory. Prints a URL.
+# lodestar-web — start the bridge (DETACHED) + serve the lodestar web. Prints a URL.
 #
-#   bin/framescope [http-port]            (default 8088)   start/ensure the bridge
-#   bin/framescope [http-port] --restart  force a fresh bridge (after bridge.clj edits)
-#   bin/framescope [http-port] --fg       run in the foreground (dev)
+#   bin/lodestar-web [http-port]            (default 8088)   start/ensure the bridge
+#   bin/lodestar-web [http-port] --restart  force a fresh bridge (after bridge.clj edits)
+#   bin/lodestar-web [http-port] --fg       run in the foreground (dev)
 #
 # The bridge is daemonized (setsid, detached, output → logfile) so it OUTLIVES the
 # shell — a human (or agent) running this never leaves a process tied to their session
-# that dies on exit. That was the bug that kept killing Tom's bridge. The observatory
+# that dies on exit. That was the bug that kept killing Tom's bridge. The lodestar web
 # targets the fram fleet coordinator on :7978 by default; switch the target daemon live
 # from the UI port box — and web/ edits are served from disk, so no restart is needed
 # for those (only a bridge.clj change needs --restart).
@@ -19,18 +19,18 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # bridge.clj is now compiled from bridge.bclj (beagle) and (require [bridge.rt]).
 # Run from REPO so bb picks up ./bb.edn (classpath ".") to resolve bridge.rt.
 cd "$REPO"
-LOG="${TMPDIR:-/tmp}/framescope-bridge-${HTTP_PORT}.log"
+LOG="${TMPDIR:-/tmp}/lodestar-web-bridge-${HTTP_PORT}.log"
 URL="http://localhost:${HTTP_PORT}"
 
 if ! command -v bb >/dev/null 2>&1; then
-  echo "framescope: babashka (bb) is required but not on PATH." >&2
+  echo "lodestar-web: babashka (bb) is required but not on PATH." >&2
   exit 1
 fi
 
 running() { curl -fsS --max-time 1 "${URL}/presence?port=7978" >/dev/null 2>&1; }
 
 if [[ "${MODE}" == "--fg" ]]; then
-  echo "framescope (foreground) → ${URL}"
+  echo "lodestar-web (foreground) → ${URL}"
   exec bb "${REPO}/bridge/bridge.clj" "${HTTP_PORT}"
 fi
 
@@ -38,7 +38,7 @@ if [[ "${MODE}" == "--restart" ]]; then
   pkill -f "bridge/bridge.clj ${HTTP_PORT}" 2>/dev/null || true
   sleep 1
 elif running; then
-  echo "framescope already up → ${URL}  (web/ edits are live on hard-refresh; use --restart after editing bridge.clj)"
+  echo "lodestar-web already up → ${URL}  (web/ edits are live on hard-refresh; use --restart after editing bridge.clj)"
   exit 0
 fi
 
@@ -48,8 +48,8 @@ disown 2>/dev/null || true
 
 for _ in $(seq 1 20); do running && break; sleep .25; done
 if running; then
-  echo "framescope → ${URL}   (detached; log: ${LOG})"
+  echo "lodestar-web → ${URL}   (detached; log: ${LOG})"
 else
-  echo "framescope: bridge did not come up — see ${LOG}" >&2
+  echo "lodestar-web: bridge did not come up — see ${LOG}" >&2
   exit 1
 fi
