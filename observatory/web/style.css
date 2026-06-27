@@ -51,7 +51,7 @@ body {
 }
 .omni input:focus { outline: none; border-color: var(--accent); }
 .agent.hide-search { display: none; }
-.conn { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 13px; }
+.conn { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 13px; flex-shrink: 0; }
 .conn input { width: 72px; background: var(--bg2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-family: var(--mono); }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
@@ -67,8 +67,16 @@ body {
 }
 .count { background: var(--panel2); color: var(--accent); border-radius: 10px; padding: 0 7px; font-size: 11px; }
 
-/* observatory = column: the agents+stream row, then the time-tape ribbon */
-#observatory.view.active { flex-direction: column; }
+/* agents view = column: the agents+stream row, then the time-tape ribbon */
+#agents-view.view.active { flex-direction: column; }
+/* thread subtabs: small pills next to the primary tabs */
+.subtabs { display: inline-flex; gap: 2px; margin-left: 6px; padding-left: 8px; border-left: 1px solid var(--line); }
+.subtab {
+  background: transparent; color: var(--faint); border: 1px solid transparent;
+  padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
+}
+.subtab:hover { color: var(--dim); }
+.subtab.active { color: var(--dim); background: var(--panel); border-color: var(--line); }
 .obs-main { flex: 1; display: flex; min-height: 0; }
 
 /* ---- agent mission-control cards ---- */
@@ -427,19 +435,119 @@ body.linking #cy { cursor: crosshair; }
 #timetape.collapsed .tt-head { padding: 3px 14px; }
 #timetape.collapsed #timetape-toggle { transform: rotate(180deg); }
 
-/* ---- responsive: single-column at ≤800px ---- */
-@media (max-width: 800px) {
-  .obs-main { flex-direction: column; }
-  #agents {
-    width: 100% !important; max-height: 120px; border-right: none;
-    border-bottom: 1px solid var(--line); flex-direction: row;
+/* ---- half-width primary viewport (tiled with terminal, ~720px at 2880×1920 scale 2) ---- */
+@media (max-width: 1100px) {
+  /* topbar: compact, one row */
+  #topbar { gap: 8px; padding: 6px 10px; }
+  .brand { font-size: 13px; }
+  .brand .sub { display: none; }
+  .tabs { gap: 1px; }
+  .tab { padding: 4px 8px; font-size: 12px; }
+  .subtabs { margin-left: 2px; padding-left: 5px; }
+  .subtab { padding: 2px 7px; font-size: 11px; }
+  .omni { max-width: 120px; min-width: 60px; }
+  .omni input { padding: 3px 7px; font-size: 12px; }
+  .cmdk-hint { padding: 2px 6px; font-size: 11px; }
+  .conn { gap: 4px; font-size: 11px; }
+  .ctx-pick { font-size: 10px; }
+  .ctx-pick select { padding: 1px 3px; font-size: 11px; }
+
+  /* agents sidebar: narrow, dense, scannable */
+  #agents { width: 190px; }
+  .pane-head { padding: 5px 8px; font-size: 10px; letter-spacing: .5px; }
+  #agent-list { padding: 3px; }
+  .agent { padding: 5px 7px; margin-bottom: 1px; border-radius: 6px; }
+  .agent.working { border-left-width: 2px; }
+  .agent.pinned { border-left-width: 2px; }
+  .agent .row1 { gap: 4px; }
+  .agent .aname { font-size: 11px; }
+  .agent .status { font-size: 8px; padding: 0 3px; border-radius: 3px; letter-spacing: .2px; }
+  .agent .meta { margin-top: 2px; gap: 3px; }
+  .agent .uuid { font-size: 9px; }
+  .agent .mchip { font-size: 8px; padding: 0 3px; border-radius: 3px; }
+  .agent .cost-chip { font-size: 9px; }
+  .agent .roles { margin-top: 2px; gap: 2px; }
+  .chip { font-size: 9px; padding: 0 4px; border-radius: 3px; }
+  .agent .focus { margin-top: 2px; font-size: 10px; gap: 3px; }
+  .agent .stale-dot { width: 5px; height: 5px; }
+  .agent .gen-badge { font-size: 7px; padding: 0 3px; }
+  .agent .age-chip { font-size: 8px; }
+  .needs-you { font-size: 8px; padding: 0 4px; }
+  .agent .pin-badge { font-size: 10px; }
+  .seg.agent-filter { margin: 2px 3px 0; }
+  .seg.agent-filter button { padding: 2px 5px; font-size: 9px; }
+
+  /* stream: tighter, more content per screen */
+  #stream-head { padding: 5px 8px; }
+  #stream-title { font-size: 12px; }
+  .cost { font-size: 11px; }
+  .stream { padding: 6px 8px; gap: 5px; }
+  .ev { padding: 6px 8px; border-radius: 6px; max-width: none; }
+  .ev .label { font-size: 9px; margin-bottom: 2px; letter-spacing: .4px; }
+  .ev.tool .name { font-size: 11px; }
+  .ev.tool pre { font-size: 11px; max-height: 100px; }
+  .ev.result pre { font-size: 11px; max-height: 80px; }
+  .ev.text .body { font-size: 13px; }
+  .ev.thinking .body { font-size: 12px; }
+  .detail-view button { font-size: 10px; padding: 2px 6px; }
+
+  /* steer */
+  .steer { padding: 5px 7px; gap: 4px; }
+  .steer input { padding: 5px 6px; font-size: 12px; border-radius: 6px; }
+  .steer #steer-to { width: 90px; }
+  .steer button { padding: 0 10px; font-size: 12px; border-radius: 6px; }
+
+  /* timetape: shorter ribbon */
+  .tt-head { padding: 3px 8px; gap: 6px; font-size: 10px; }
+  .tt-title { font-size: 9px; }
+  .tt-track { height: 40px; margin: 0 8px 4px; border-radius: 6px; }
+  .tt-range button { padding: 0 5px; font-size: 9px; border-radius: 4px; }
+  .tt-readout { font-size: 10px; }
+  .tt-cost { font-size: 10px; }
+
+  /* graph controls: compact rows */
+  .graph-controls { padding: 4px 8px; gap: 3px; }
+  .gc-toolbar { gap: 3px; }
+  .seg button { padding: 3px 6px; font-size: 10px; }
+  .ctl-btn { padding: 3px 6px; font-size: 10px; }
+  #graph-edit button { font-size: 9px; padding: 3px 5px; }
+  .gc-drawer { gap: 4px; }
+  .gc-row { padding: 3px 8px; }
+  .gc-sel { padding: 3px 8px; font-size: 11px; }
+  .gc-lbl { font-size: 10px; }
+
+  /* graph canvas */
+  #graph-view.active:has(#node-panel:not(.hidden)) {
+    grid-template-columns: minmax(0, 1fr) clamp(180px, 30vw, 260px);
   }
-  #agents .pane-head { display: none; }
-  #agent-list {
-    overflow-x: auto; overflow-y: hidden;
-    display: flex; flex-direction: row; flex: 1; padding: 4px;
-  }
-  .agent { flex-shrink: 0; min-width: 160px; margin-bottom: 0; margin-right: 4px; }
-  #agents .agent-filter { display: none; }
-  #stream-col { flex: 1; min-height: 0; }
+
+  /* properties panel */
+  .node-panel .pane-head { padding: 5px 8px; }
+  #node-claims { padding: 5px 8px; }
+  .claim { padding: 4px 0; }
+  .claim .p { font-size: 11px; }
+  .claim .o { font-size: 12px; }
+  .node-action { padding: 5px; font-size: 11px; margin-bottom: 5px; border-radius: 6px; }
+  .claim-sec { margin: 6px 0 2px; font-size: 10px; }
+
+  /* legend */
+  .legend { padding: 5px 8px; border-radius: 6px; font-size: 10px; bottom: 8px; left: 8px; }
+  .legend h4 { font-size: 9px; margin: 0 0 4px; }
+  .legend .sw { width: 9px; height: 9px; border-radius: 2px; }
+
+  /* command palette */
+  .cmd-box { width: min(480px, 94vw); }
+  .cmd-input { font-size: 14px; }
+  .cmd-item { padding: 6px 9px; }
+  .cmd-lbl { font-size: 13px; }
+}
+
+/* ---- narrow half-width (720px and below — 2880 display halved at 2× scale) ---- */
+@media (max-width: 780px) {
+  #agents { width: 160px; }
+  .ctx-pick { display: none; }
+  .omni { max-width: 80px; }
+  .agent .age-chip { display: none; }
+  .agent .gen-badge { display: none; }
+  .agent .pin-badge { display: none; }
 }

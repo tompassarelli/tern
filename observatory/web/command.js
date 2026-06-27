@@ -13,7 +13,7 @@
   const G = () => window.Graph;
   // link gestures live on the canvas — hop to the Graph tab first so the armed
   // source→target click flow has something to draw on.
-  const toGraph = () => { const t = document.querySelector('.tab[data-view="graph"]'); if (t && !t.classList.contains('active')) t.click(); };
+  const toGraph = () => showTab('graph');
   const steer = (to, body) => fetch('/steer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ to, body }) }).then(r => r.json()).catch(() => ({ ok: false }));
 

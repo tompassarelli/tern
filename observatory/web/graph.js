@@ -5,7 +5,7 @@
 const Graph = (function () {
   let cy = null;
   let loadedPort = null;                 // sentinel: non-null once the union has loaded
-  let graphVisible = { fleet: true, code: true, board: true, work: true, attention: true };  // membership facet
+  let graphVisible = { agents: true, code: true, board: true, work: true, attention: true };  // membership facet
   let typeColors = {};
   let mode = 'backbone';                 // 'backbone' (de-blobbed) | 'raw' (firehose)
   let drill = { byNode: {}, byEdge: {} };  // backbone drill-down: party/edge → messages
@@ -65,7 +65,7 @@ const Graph = (function () {
       default:        return Number(d.weight) || 0;
     }
   }
-  // size every fleet node off the active channel, normalized to the current max so the
+  // size every agents node off the active channel, normalized to the current max so the
   // spread is legible regardless of the channel's units. sqrt → perceptual area scaling.
   function applySizes() {
     if (!cy || codeMode) return;          // code keeps its own depth/mass curve in style()
@@ -284,7 +284,7 @@ const Graph = (function () {
   // ---- node visibility = recency filter AND graph-membership facet ----------------
   // recencyMax >= RECENCY_MAX means "show everything". A node with no activity
   // timestamp (lastActive 0) is scaffold (a never-busy role/thread) — kept, not hidden.
-  // graph-membership (fleet/code/board/work) is a FILTER over the one union, not a port.
+  // graph-membership (agents/code/board/work) is a FILTER over the one union, not a port.
   function applyRecency() {  // kept name — callers across the file expect it
     if (!cy) return;
     const showAll = recencyMax >= RECENCY_MAX;
@@ -292,7 +292,7 @@ const Graph = (function () {
     cy.batch(() => cy.nodes().forEach(n => {
       const la = n.data('lastActive') || 0;
       const stale = !showAll && la > 0 && (now - la) / 60000 > recencyMax;
-      const offGraph = graphVisible[n.data('graph') || 'fleet'] === false;
+      const offGraph = graphVisible[n.data('graph') || 'agents'] === false;
       const isolate = hideIsolates && n.connectedEdges().length === 0;
       n.style('display', (stale || offGraph || isolate) ? 'none' : 'element');
     }));
@@ -301,12 +301,9 @@ const Graph = (function () {
     min = parseInt(min, 10); if (isNaN(min)) return;
     recencyMax = Math.max(0, min); applyRecency(); applySizes();   // recency also feeds size-by:recency
   }
-  // the view is SCOPED to code iff code is the only structural graph showing (work may tag
-  // along) — that's when the deep-AST/depth transform is the right render. Any of fleet /
-  // attention / board in view means we're in the federated union → render that instead.
   function codeScoped() {
     return graphVisible.code !== false &&
-           graphVisible.fleet === false && graphVisible.board === false && graphVisible.attention === false;
+           graphVisible.agents === false && graphVisible.board === false && graphVisible.attention === false;
   }
   // graph-membership facet: toggle a source daemon's nodes in/out of the union view. Toggling
   // code in/out can flip codeScoped (AST ⇄ union), so re-pull the snapshot, not just re-filter.
@@ -455,7 +452,7 @@ const Graph = (function () {
   // viewport; only freshly-arrived nodes get seated. relayout=true is for explicit
   // view changes (first paint, mode/depth switch, port change, manual Re-layout).
   // the graph is now the UNIFIED FEDERATED union of all live daemons — the bridge
-  // unions :7978 (fleet) + :7979 (code) + :7977 (board) into one node/edge set, so the
+  // unions :7978 (agents) + :7979 (code) + :7977 (board) into one node/edge set, so the
   // graph has no port: membership is a client-side filter facet. (`port` arg is vestigial
   // — ignored for the fetch; kept so the many existing call sites don't all change.)
   async function load(port, opts) {
@@ -465,8 +462,8 @@ const Graph = (function () {
     const snap = await r.json();
     // The deep-AST transform (typed by `kind`, collapsed by depth) is a SCOPED view, only
     // when the filter is narrowed to code (Code preset). In the federated union — where
-    // fleet/attention/board are also in view — render the union via backbone/raw so code
-    // passes through as module nodes and the attention beams + fleet spine aren't hijacked
+    // agents/attention/board are also in view — render the union via backbone/raw so code
+    // passes through as module nodes and the attention beams + agents spine aren't hijacked
     // into a code-only AST render. (codeMode was snapshot-sniffed; gate it on the filter.)
     codeMode = GraphDomain.isCodeSnapshot(snap) && codeScoped();
     let built;
@@ -513,7 +510,7 @@ const Graph = (function () {
     lastBuilt.nodes.forEach(n => {
       const d = n.data, la = d.lastActive || 0;
       const stale = !showAll && la > 0 && (now - la) / 60000 > recencyMax;
-      const off = graphVisible[d.graph || 'fleet'] === false;
+      const off = graphVisible[d.graph || 'agents'] === false;
       const isolate = hideIsolates && !connected.has(d.id);
       if (stale || off || isolate) return;
       vis.add(d.id);
@@ -844,7 +841,7 @@ const Graph = (function () {
       const id = res.id;
       if (cy.getElementById(id).length === 0) {
         cy.add({ data: { id, label: title, type: 'work', attrs: { title }, weight: 0,
-                         lastActive: Date.now(), graph: 'fleet' } });
+                         lastActive: Date.now(), graph: 'agents' } });
         const c = viewCenter(); cy.getElementById(id).position({ x: c.x, y: c.y });
       }
       if (!typeColors.work) { typeColors.work = GraphDomain.colorForType('work'); cy.style(style()); }
@@ -891,7 +888,7 @@ const Graph = (function () {
       if (!typeColors.team) typeColors.team = GraphDomain.colorForType('team');
       if (cy.getElementById(teamId).length === 0) {
         cy.add({ data: { id: teamId, label: '⬡ ' + title, type: 'team',
-          attrs: { title, operational_requirements: reqs || '' }, weight: 0, lastActive: Date.now(), graph: 'fleet' } });
+          attrs: { title, operational_requirements: reqs || '' }, weight: 0, lastActive: Date.now(), graph: 'agents' } });
         cy.getElementById(teamId).position(cen);
       }
       for (const m of members) {
@@ -979,23 +976,23 @@ const Graph = (function () {
   }
 
   // ---- presets (9d7d): a view = a saved {filter × layout × edge-layers × size} ------
-  // The existing fleet/code views are just BUILT-IN presets; user presets persist in
+  // The existing agents/code views are just BUILT-IN presets; user presets persist in
   // localStorage. Applying a preset is the one knob that drives the whole engine.
   // Built-in views = filter × layout × color × edge-layers, now including GRAPH-MEMBERSHIP
   // (which daemons are in view). "Everything" is the federated default; the rest are just
   // membership/layout filters over the same union — NOT separate per-port screens.
-  const ALL_GRAPHS = { fleet: true, code: true, board: true, work: true, attention: true };
+  const ALL_GRAPHS = { agents: true, code: true, board: true, work: true, attention: true };
   const BUILTIN_PRESETS = {
     Everything: { mode: 'backbone', layout: 'force', size: 'messages', graphVisible: ALL_GRAPHS },
     // the light-show as a saved view: dark-room on, cursors+code in focus, beams the only
     // bright layer. "A view = filter × layout × color × edge-layers" — dark-room is a facet.
     'Light Show': { mode: 'backbone', layout: 'force', size: 'recency', lightShow: true,
-      graphVisible: { attention: true, code: true, fleet: true, work: true },
+      graphVisible: { attention: true, code: true, agents: true, work: true },
       edgeLayers: { struct: false, talk: false, child: false, working: false, attending: true } },
-    Fleet:      { mode: 'backbone', layout: 'force', size: 'messages', graphVisible: { fleet: true, work: true } },
+    Agents:     { mode: 'backbone', layout: 'force', size: 'messages', graphVisible: { agents: true, work: true } },
     Code:       { mode: 'raw',      layout: 'dag',   size: 'messages', graphVisible: { code: true, work: true }, edgeLayers: { struct: false, talk: false, child: true, working: true } },
     Board:      { mode: 'backbone', layout: 'dag',   size: 'messages', graphVisible: { board: true } },
-    'Agents+Code': { mode: 'backbone', layout: 'force', size: 'messages', graphVisible: { fleet: true, code: true, work: true } },
+    'Agents+Code': { mode: 'backbone', layout: 'force', size: 'messages', graphVisible: { agents: true, code: true, work: true } },
     Raw:        { mode: 'raw',       layout: 'force', size: 'messages', graphVisible: ALL_GRAPHS },
     Timeline:   { mode: 'backbone',  layout: 'time',  size: 'recency',  edgeLayers: { struct: true, talk: true, child: false, working: true } },
   };
@@ -1021,9 +1018,9 @@ const Graph = (function () {
     if (p.hideIsolates != null) hideIsolates = p.hideIsolates;
     if (p.edgeLayers) edgeLayers = Object.assign({ struct: true, talk: true, child: true, working: true, attending: true }, p.edgeLayers);
     // a preset's graphVisible is the COMPLETE membership map (replace, not merge): default
-    // every graph OFF, then turn on what the preset lists — so "Code"/"Fleet"/"Light Show"
+    // every graph OFF, then turn on what the preset lists — so "Code"/"Agents"/"Light Show"
     // actually SCOPE the union instead of leaking the unlisted graphs back in.
-    if (p.graphVisible) graphVisible = Object.assign({ fleet: false, code: false, board: false, work: false, attention: false }, p.graphVisible);
+    if (p.graphVisible) graphVisible = Object.assign({ agents: false, code: false, board: false, work: false, attention: false }, p.graphVisible);
     // dark-room is a view facet: a preset either lights the room or leaves it on. Toggle the
     // CSS class now; the load() below re-paints the overlay. (lightFocus resets on exit.)
     setLightShow(!!p.lightShow);
@@ -1119,7 +1116,7 @@ const Graph = (function () {
     pruneIfCruft(m.l);
   }
   // a node that has lost all its edges AND all its attrs is cruft — clear it live
-  // (fleet-commander's prune flow). Structural backbone nodes are kept regardless.
+  // (agents-commander's prune flow). Structural backbone nodes are kept regardless.
   function pruneIfCruft(id) {
     const n = cy.getElementById(id);
     if (!n.length || isStructuralType(n.data('type'))) return;
