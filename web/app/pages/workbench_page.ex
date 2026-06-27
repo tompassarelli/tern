@@ -30,20 +30,31 @@ defmodule LodestarWeb.WorkbenchPage do
   defp dot_cls(true), do: "w-[7px] h-[7px] rounded-full shrink-0 bg-ok"
   defp dot_cls(false), do: "w-[7px] h-[7px] rounded-full shrink-0 bg-muted opacity-40"
 
-  def init(_params, component, _server) do
+  def init(_params, component, server) do
     roster = Lodestar.Presence.roster()
     selected = roster |> List.first() |> then(&(&1 && &1.uuid))
 
-    put_state(component,
-      agents: roster,
-      fleet: Lodestar.Presence.fleet_tokens(roster),
-      selected: selected,
-      messages: if(selected, do: Lodestar.Stream.messages(selected), else: []),
-      active: active_info(roster, selected),
-      tip: Enum.random(@tips),
-      view: "board",
-      board: Lodestar.Threads.board()
-    )
+    component =
+      put_state(component,
+        agents: roster,
+        fleet: Lodestar.Presence.fleet_tokens(roster),
+        selected: selected,
+        messages: if(selected, do: Lodestar.Stream.messages(selected), else: []),
+        active: active_info(roster, selected),
+        tip: Enum.random(@tips),
+        view: "board",
+        board: Lodestar.Threads.board(),
+        synced: 0
+      )
+
+    # Live push: subscribe to each daemon's commit channel. The DaemonSubscriber
+    # GenServers broadcast :daemon_changed on every commit → no polling.
+    server =
+      server
+      |> put_subscription({:graph, "agents"})
+      |> put_subscription({:graph, "board"})
+
+    {component, server}
   end
 
   # thinking-indicator info for the selected agent (only when it's live + working)
@@ -77,6 +88,35 @@ defmodule LodestarWeb.WorkbenchPage do
 
   def action(:apply_stream, params, component),
     do: put_state(component, :messages, params.messages)
+
+  # ── live push from the daemon subscribers (no polling) ──
+  def action(:daemon_changed, params, component) do
+    case params.graph do
+      "agents" -> put_command(component, :reload_agents)
+      "board" -> put_command(component, :reload_board)
+      _ -> component
+    end
+  end
+
+  def command(:reload_agents, _params, server) do
+    roster = Lodestar.Presence.roster()
+    put_action(server, :apply_agents, agents: roster, fleet: Lodestar.Presence.fleet_tokens(roster))
+  end
+
+  def command(:reload_board, _params, server),
+    do: put_action(server, :apply_board, board: Lodestar.Threads.board())
+
+  def action(:apply_agents, params, component) do
+    component
+    |> put_state(agents: params.agents, fleet: params.fleet)
+    |> put_state(:active, active_info(params.agents, component.state.selected))
+    |> put_state(:synced, component.state.synced + 1)
+  end
+
+  def action(:apply_board, params, component) do
+    component = put_state(component, board: params.board, synced: component.state.synced + 1)
+    if component.state.view == "graph", do: put_action(component, :mount_graph), else: component
+  end
 
   defp select(component, nil), do: component
 
@@ -179,6 +219,7 @@ defmodule LodestarWeb.WorkbenchPage do
         <div class={status_cls()}>
           <span class="bg-star text-bg px-1.5 py-px rounded text-[11px] font-semibold">auto</span>
           <span>auto mode on · {length(@agents)} agents</span>
+          <span class="text-ok" data-testid="synced" title="live pushes received">●&nbsp;{@synced}</span>
           <span class="ml-auto text-star">{@fleet.context} ctx · {@fleet.total} all-time</span>
         </div>
       </section>

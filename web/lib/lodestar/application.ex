@@ -11,8 +11,9 @@ defmodule Lodestar.Application do
       LodestarWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:lodestar, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Lodestar.PubSub},
-      # Start a worker by calling: Lodestar.Worker.start_link(arg)
-      # {Lodestar.Worker, arg},
+      # One supervised subscriber per fram daemon — the live commit→push spine.
+      Supervisor.child_spec({Lodestar.DaemonSubscriber, name: :sub_agents, graph: "agents", port: 7978}, id: :sub_agents),
+      Supervisor.child_spec({Lodestar.DaemonSubscriber, name: :sub_board, graph: "board", port: 7977}, id: :sub_board),
       # Start to serve requests, typically the last entry
       LodestarWeb.Endpoint
     ]
