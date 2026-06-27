@@ -43,17 +43,21 @@ defmodule Lodestar.Threads do
     %{lanes: lanes}
   end
 
-  # List view — threads grouped by DERIVED lifecycle, claim-native. The ontology
-  # (Tom): in-progress = a live driver; ready = committed AND has a do_on (queued
-  # for a period); backlog = committed but NO do_on (orthogonal "ready"-type work,
-  # not scheduled); blocked = an open depends_on; draft = uncommitted. done/
-  # abandoned are excluded. Ready is ordered by do_on (soonest first) so the top
-  # ready row is literally "next"; other groups newest-first.
-  @list_groups [
-    {"in-progress", "In Progress"},
-    {"ready", "Ready"},
+  # List view — ORTHOGONAL AXES, not a linear status (Tom's model). Every thread
+  # carries an independent value on each axis, all DERIVED from claims:
+  #   committed  — a `committed` claim: spec frozen / planning resolved / "execute next"
+  #   scheduled  — a `do_on`: queued for a period (else unscheduled)
+  #   active     — a live driver (an agent on it now)
+  #   blocked    — an open depends_on
+  # "backlog" was never a state — it was just committed+unscheduled. Removed.
+  # The default DEFAULT lens groups by one urgency axis (no duplicate rows); each
+  # row also ships its full facet set so the UI shows badges + can build compound
+  # views (saved queries over the axes) without re-deriving.
+  @list_lenses [
+    {"active", "Active"},
     {"blocked", "Blocked"},
-    {"backlog", "Backlog"},
+    {"scheduled", "Scheduled"},
+    {"unscheduled", "Unscheduled"},
     {"draft", "Draft"}
   ]
 
@@ -67,29 +71,37 @@ defmodule Lodestar.Threads do
     rows =
       for {id, attrs} <- titled,
           status = derive_status(attrs, Map.get(by_from, id, []), node_attrs, online),
-          group = list_group(status, attrs),
-          not is_nil(group) do
+          status not in ["done", "abandoned"] do
+        committed = Map.has_key?(attrs, "committed")
+        scheduled = Map.get(attrs, "do_on", "") != ""
+        active = status == "active"
+        blocked = status == "blocked"
+
         %{
           id: id,
           title: Map.get(attrs, "title", id),
-          group: group,
-          status: status,
           do_on: Map.get(attrs, "do_on", ""),
           priority: Map.get(attrs, "priority", ""),
-          driver: driver_of(by_from, id)
+          driver: driver_of(by_from, id),
+          # the orthogonal axes, explicit (the UI renders these as badges)
+          committed: committed,
+          scheduled: scheduled,
+          active: active,
+          blocked: blocked,
+          lens: lens(active, blocked, committed, scheduled)
         }
       end
 
-    by_group = Enum.group_by(rows, & &1.group)
+    by_lens = Enum.group_by(rows, & &1.lens)
 
     groups =
-      for {key, label} <- @list_groups do
-        items = Map.get(by_group, key, [])
+      for {key, label} <- @list_lenses do
+        items = Map.get(by_lens, key, [])
 
         ordered =
-          if key == "ready",
-            # manual order wins (a `priority` claim, drag-set), then do_on, so the
-            # top ready row is "next". Items without priority sort after by do_on.
+          if key == "scheduled",
+            # the execute queue: manual order (drag-set `priority`) wins, then do_on,
+            # so the top row is literally "next". Unprioritized sort after by do_on.
             do: Enum.sort_by(items, &{prio_key(&1.priority), &1.do_on == "", &1.do_on}),
             else: Enum.sort_by(items, & &1.id, :desc)
 
@@ -99,23 +111,24 @@ defmodule Lodestar.Threads do
     %{groups: groups}
   end
 
+  # Default mutually-exclusive lens (urgency order). Axes stay independent on the
+  # row; this is only the grouping the default view collapses them to.
+  defp lens(active, blocked, committed, scheduled) do
+    cond do
+      active -> "active"
+      blocked -> "blocked"
+      committed and scheduled -> "scheduled"
+      committed -> "unscheduled"
+      true -> "draft"
+    end
+  end
+
   # sort key for a drag-set priority claim: {0, n} for a parseable rank (ordered
   # ascending), {1, 0} for none (sorts after, falls back to do_on).
   defp prio_key(p) do
     case Float.parse(to_string(p)) do
       {f, _} -> {0, f}
       :error -> {1, 0.0}
-    end
-  end
-
-  defp list_group(status, attrs) do
-    cond do
-      status in ["done", "abandoned"] -> nil
-      status == "active" -> "in-progress"
-      status == "blocked" -> "blocked"
-      Map.has_key?(attrs, "committed") and Map.get(attrs, "do_on", "") != "" -> "ready"
-      Map.has_key?(attrs, "committed") -> "backlog"
-      true -> "draft"
     end
   end
 

@@ -211,10 +211,34 @@
   window.lodestar = window.lodestar || {};
   window.lodestar.mountAgents = function ({ el: root }) {
     if (!root) return;
+    // CLAUDE-CODE shape, top→bottom: the selected agent's CHAT (dominant) → the
+    // steer INPUT → the agent PICKER beneath the input (the spawned agents show
+    // up here; navigate via /resume + spawn, switch by clicking).
     root.style.cssText = "height:100%;display:flex;flex-direction:column;";
-    rosterEl = el("div", `flex:0 0 auto;max-height:45vh;overflow:auto;border-bottom:1px solid ${EF.edge};`);
-    chatEl = el("div", "flex:1 1 auto;overflow:auto;");
-    root.append(rosterEl, chatEl);
+    chatEl = el("div", "flex:1 1 auto;min-height:0;overflow:auto;");
+
+    const cli = el("div",
+      `flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:9px 12px;border-top:1px solid ${EF.edge};`);
+    cli.append(el("span", `color:${EF.accent};font-size:14px;`, "›"));
+    const input = el("input",
+      `flex:1 1 auto;background:transparent;border:none;outline:none;color:${EF.ink};font-size:13px;font-family:inherit;`);
+    input.placeholder = "message the selected agent…";
+    input.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter" && input.value.trim() && selected) {
+        const v = input.value.trim(); input.value = "";
+        try {
+          await fetch("/api/steer", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ handle: selected, text: v }),
+          });
+        } catch (_) {}
+      }
+    });
+    cli.append(input);
+
+    rosterEl = el("div", `flex:0 0 auto;max-height:30vh;overflow:auto;border-top:1px solid ${EF.edge};`);
+
+    root.append(chatEl, cli, rosterEl);
     render(rosterEl);
     liveRefresh(rosterEl);
   };

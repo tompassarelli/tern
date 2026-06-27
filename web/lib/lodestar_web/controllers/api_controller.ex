@@ -110,6 +110,16 @@ defmodule LodestarWeb.ApiController do
     |> halt()
   end
 
+  # Thin everforest scrollbars EVERYWHERE — no native chunky/arrow scrollbars.
+  # Injected into every shell's <style>; unscoped so it catches every scroll box.
+  @scrollbar_css "*{scrollbar-width:thin;scrollbar-color:#414b50 transparent}" <>
+                   "::-webkit-scrollbar{width:8px;height:8px}" <>
+                   "::-webkit-scrollbar-track{background:transparent}" <>
+                   "::-webkit-scrollbar-thumb{background:#414b50;border-radius:4px}" <>
+                   "::-webkit-scrollbar-thumb:hover{background:#859289}" <>
+                   "::-webkit-scrollbar-button{display:none;height:0;width:0}" <>
+                   "::-webkit-scrollbar-corner{background:transparent}"
+
   # The wake frontend shell: mounts the compiled wake bundle into #app, with
   # Cytoscape + the escape-hatch mounts. The wake app self-feeds via /presence
   # + /live. (Lives at /wake while we prove the stack; flips to / when ready.)
@@ -121,7 +131,7 @@ defmodule LodestarWeb.ApiController do
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>lodestar</title>
     <link rel="stylesheet" href="/assets/css/app.css" />
-    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}#app{height:100vh;overflow:auto}</style>
+    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}#app{height:100vh;overflow:auto}#{@scrollbar_css}</style>
     <script src="/js/cytoscape.min.js"></script>
   </head>
   <body>
@@ -146,7 +156,7 @@ defmodule LodestarWeb.ApiController do
   <head>
     <meta charset="utf-8" />
     <title>lodestar · board write</title>
-    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}#app{height:100vh;overflow:auto}.border-border{border-color:#414b50}.text-foreground{color:#d3c6aa}.text-muted-foreground{color:#859289}</style>
+    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}#app{height:100vh;overflow:auto}.border-border{border-color:#414b50}.text-foreground{color:#d3c6aa}.text-muted-foreground{color:#859289}#{@scrollbar_css}</style>
     <script>window.WAKE_GRAPH = "board";</script>
   </head>
   <body>
@@ -168,7 +178,7 @@ defmodule LodestarWeb.ApiController do
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>lodestar · list</title>
-    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}</style>
+    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}#{@scrollbar_css}</style>
   </head>
   <body>
     <div id="list"></div>
@@ -189,7 +199,7 @@ defmodule LodestarWeb.ApiController do
     <html lang="en"><head><meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>lodestar · #{title}</title>
-    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}</style>
+    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}#{@scrollbar_css}</style>
     </head><body><div id="#{root_id}"></div><script src="#{js}"></script></body></html>
     """
   end
@@ -210,7 +220,7 @@ defmodule LodestarWeb.ApiController do
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>lodestar</title>
     <script>window.WAKE_GRAPH = "board";</script>
-    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}*{box-sizing:border-box}</style>
+    <style>html,body{margin:0;height:100%;background:#272e33;color:#d3c6aa;font-family:ui-sans-serif,system-ui,sans-serif}*{box-sizing:border-box}#{@scrollbar_css}</style>
     <script src="/js/cytoscape.min.js"></script>
   </head>
   <body>

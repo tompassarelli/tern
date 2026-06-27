@@ -9,10 +9,11 @@
     muted: "#859289", accent: "#7fbbb3", star: "#dbbc7f", ok: "#a7c080",
     warn: "#e67e80", purple: "#d699b6",
   };
-  // group key -> accent (the status dot + count chip)
+  // lens key -> accent (the dot + count chip). Lenses are the default grouping
+  // of the orthogonal axes; per-row badges show the axes themselves.
   const HUE = {
-    "in-progress": EF.star, ready: EF.ok, blocked: EF.warn,
-    backlog: EF.muted, draft: EF.purple,
+    active: EF.star, blocked: EF.warn, scheduled: EF.ok,
+    unscheduled: EF.accent, draft: EF.purple,
   };
 
   function el(tag, style, text) {
@@ -32,31 +33,79 @@
     } catch (_) {}
   }
 
+  // Linear-style row actions — NO static buttons. Hover a row to target it, press
+  // a hotkey; or right-click for the menu. Each action writes a claim (/api/tell).
+  let hoverItem = null;
+  const today = () => new Date().toISOString().slice(0, 10);
+  const ACTIONS = [
+    { key: "d", label: "Mark done", run: (it) => tell(it.id, "outcome", "done") },
+    { key: "c", label: "Commit spec", run: (it) => tell(it.id, "committed", "true") },
+    { key: "s", label: "Schedule today", run: (it) => tell(it.id, "do_on", today()) },
+    { key: "u", label: "Unschedule", run: (it) => tell(it.id, "do_on", "") },
+  ];
+
+  let menuEl = null;
+  function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
+  function showMenu(x, y, item) {
+    closeMenu();
+    menuEl = el("div",
+      `position:fixed;left:${x}px;top:${y}px;z-index:1000;background:${EF.panel};border:1px solid ${EF.edge};` +
+      `border-radius:6px;padding:4px;min-width:180px;box-shadow:0 6px 20px #0007;`);
+    ACTIONS.forEach((a) => {
+      const mi = el("div",
+        `display:flex;justify-content:space-between;gap:18px;padding:6px 10px;border-radius:4px;font-size:12px;color:${EF.ink};cursor:pointer;`);
+      mi.append(el("span", null, a.label), el("span", `color:${EF.muted};text-transform:uppercase;`, a.key));
+      mi.onmouseenter = () => (mi.style.background = EF.bg);
+      mi.onmouseleave = () => (mi.style.background = "transparent");
+      mi.onclick = () => { a.run(item); closeMenu(); };
+      menuEl.append(mi);
+    });
+    document.body.append(menuEl);
+    const rb = menuEl.getBoundingClientRect();
+    if (rb.right > innerWidth) menuEl.style.left = innerWidth - rb.width - 8 + "px";
+    if (rb.bottom > innerHeight) menuEl.style.top = innerHeight - rb.height - 8 + "px";
+  }
+
+  document.addEventListener("click", closeMenu);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { closeMenu(); return; }
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return; // never hijack the CLI
+    if (!hoverItem) return;
+    const a = ACTIONS.find((x) => x.key === e.key.toLowerCase());
+    if (a) { e.preventDefault(); a.run(hoverItem); }
+  });
+
+  // one chip per ACTIVE axis — makes the orthogonal axes explicit on every row.
+  function facetBadges(item) {
+    const wrap = el("span", "flex:0 0 auto;display:flex;gap:5px;align-items:center;");
+    const chip = (txt, color, title) => {
+      const c = el("span",
+        `font-size:10px;color:${color};border:1px solid ${color}55;border-radius:3px;padding:0 5px;white-space:nowrap;`, txt);
+      c.title = title; return c;
+    };
+    if (item.committed) wrap.append(chip("spec", EF.accent, "committed — plan resolved, ready to execute"));
+    if (item.scheduled) wrap.append(chip(item.do_on || "scheduled", EF.ok, "scheduled (do_on)"));
+    if (item.active && item.driver) wrap.append(chip(item.driver.replace(/^@/, ""), EF.star, "active — agent driving now"));
+    if (item.blocked) wrap.append(chip("blocked", EF.warn, "blocked — open dependency"));
+    return wrap;
+  }
+
   function row(item) {
-    const draggable = item.group === "ready"; // only the next-up queue reorders
+    const draggable = item.lens === "scheduled"; // only the next-up queue reorders
     const r = el("div",
       `display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid ${EF.edge};` +
       `cursor:${draggable ? "grab" : "default"};font-size:13px;color:${EF.ink};`);
     if (draggable) { r.draggable = true; r.dataset.id = item.id; }
-    r.onmouseenter = () => (r.style.background = EF.panel);
-    r.onmouseleave = () => (r.style.background = "transparent");
+    // Linear-style: hover targets the row for hotkeys; right-click opens actions.
+    // No static per-row button — actions live in the context menu + keyboard.
+    r.onmouseenter = () => { r.style.background = EF.panel; hoverItem = item; };
+    r.onmouseleave = () => { r.style.background = "transparent"; if (hoverItem === item) hoverItem = null; };
+    r.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, item); });
 
-    const dot = el("span", `flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:${HUE[item.group] || EF.muted};`);
+    const dot = el("span", `flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:${HUE[item.lens] || EF.muted};`);
     const title = el("span", "flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", item.title);
-
-    const meta = el("span", `flex:0 0 auto;font-size:11px;color:${EF.muted};`,
-      item.group === "ready" && item.do_on ? item.do_on
-        : item.group === "in-progress" && item.driver ? item.driver.replace(/^@/, "") : "");
-
-    // claims-native action: mark done -> writes outcome=done -> /live -> refetch
-    const done = el("button",
-      `flex:0 0 auto;font-size:11px;padding:2px 8px;border:1px solid ${EF.edge};border-radius:4px;` +
-      `background:transparent;color:${EF.muted};cursor:pointer;`, "done");
-    done.onmouseenter = () => { done.style.color = EF.ok; done.style.borderColor = EF.ok; };
-    done.onmouseleave = () => { done.style.color = EF.muted; done.style.borderColor = EF.edge; };
-    done.onclick = (e) => { e.stopPropagation(); tell(item.id, "outcome", "done"); };
-
-    r.append(dot, title, meta, done);
+    r.append(dot, title, facetBadges(item));
     return r;
   }
 
@@ -74,25 +123,41 @@
     return best;
   }
 
+  // collapsed group keys, persisted so folds survive reload + live re-render.
+  const collapsed = new Set((() => { try { return JSON.parse(localStorage.getItem("ls-collapsed") || "[]"); } catch (_) { return []; } })());
+  const saveCollapsed = () => { try { localStorage.setItem("ls-collapsed", JSON.stringify([...collapsed])); } catch (_) {} };
+
   function group(g, listEl) {
     const sec = el("div", "margin-bottom:2px;");
+    const folded = collapsed.has(g.key);
     const head = el("div",
-      `display:flex;align-items:center;gap:8px;padding:6px 14px;position:sticky;top:0;background:${EF.bg};` +
-      `font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${EF.muted};`);
+      `display:flex;align-items:center;gap:8px;padding:6px 14px;position:sticky;top:0;z-index:1;background:${EF.bg};` +
+      `font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${EF.muted};` +
+      `cursor:pointer;user-select:none;`);
+    const caret = el("span", `width:9px;font-size:9px;color:${EF.muted};`, folded ? "▸" : "▾");
     const chip = el("span",
       `min-width:18px;text-align:center;font-size:10px;padding:0 5px;border-radius:8px;` +
       `background:${EF.panel};color:${HUE[g.key] || EF.muted};`, String(g.count));
-    head.append(el("span", null, g.label), chip);
+    head.append(caret, el("span", null, g.label), chip);
     sec.append(head);
 
     const body = el("div");
+    if (folded) body.style.display = "none";
     g.items.forEach((it) => body.append(row(it)));
     if (!g.items.length) body.append(el("div", `padding:6px 14px;font-size:12px;color:${EF.edge};`, "—"));
     sec.append(body);
 
-    // DRAG-RESEQUENCE (ready queue only): reorder rows, then persist the new
-    // order as `priority` claims (10,20,30…) — claims-native, survives reload.
-    if (g.key === "ready" && g.items.length > 1) {
+    head.onclick = () => {
+      const nowFolded = !collapsed.has(g.key);
+      if (nowFolded) collapsed.add(g.key); else collapsed.delete(g.key);
+      saveCollapsed();
+      body.style.display = nowFolded ? "none" : "";
+      caret.textContent = nowFolded ? "▸" : "▾";
+    };
+
+    // DRAG-RESEQUENCE (scheduled/next queue only): reorder rows, then persist the
+    // new order as `priority` claims (10,20,30…) — claims-native, survives reload.
+    if (g.key === "scheduled" && g.items.length > 1) {
       body.addEventListener("dragstart", (e) => {
         dragEl = e.target.closest("[data-id]");
         if (dragEl) dragEl.style.opacity = "0.4";

@@ -91,14 +91,9 @@
     const left = el("div", `flex:1 1 58%;border-right:1px solid ${EF.edge};min-width:0;overflow:hidden;`);
     left.append(wb.f);
 
-    // RIGHT — agents; its "›" steers the currently-selected agent
-    const ag = frame("frame: agents", null, {
-      placeholder: "message the selected agent…",
-      onSubmit: (v) => {
-        const handle = window.lodestar && window.lodestar.agentSelection;
-        if (handle) return post("/api/steer", { handle, text: v });
-      },
-    });
+    // RIGHT — agents. Claude-Code-shaped: the panel owns its OWN layout (chat →
+    // steer input → agent picker), so the frame adds no CLI here.
+    const ag = frame("frame: agents", null);
     const right = el("div", "flex:1 1 42%;min-width:0;overflow:hidden;");
     right.append(ag.f);
 
