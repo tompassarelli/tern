@@ -8,9 +8,11 @@
 ;;                created_at=..  worker=<handle>          (one `worker` claim per spawned worker)
 ;;   @done:<id>:<worker>  done_batch=@batch:<id>  done_worker=<handle>  done_payload=..  done_at=..
 ;;
-;; The BARRIER is a Datalog join over the claim graph (scan engine): distinct workers that emitted a
-;; DONE against the batch. complete? := (count distinct-done-workers) >= K. Set semantics in the
-;; derived head collapse a worker that reports twice — the barrier counts WORKERS, not claims.
+;; The BARRIER is the count-distinct QUORUM — coord.clj's first-class incremental
+;; aggregate (the completion DUAL of mutual exclusion). distinct workers that emitted a
+;; DONE against the batch. complete? := (count distinct-done-workers) >= K. Set semantics
+;; collapse a worker that reports twice — the barrier counts WORKERS, not claims. Budget
+;; (Sigma) is the SAME primitive with the sum reducer instead of count-distinct.
 ;;
 ;; usage:
 ;;   bb lodestar-map.clj <port> map    <role-template> <N> <task> [K]   — register batch + fan out N workers
@@ -32,23 +34,26 @@
 ;; shared coord substrate: cardinality-typed write verbs (move-C) live once in
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op lodestar.coord/send-op)
-(def append! lodestar.coord/append!)
-(def put!    lodestar.coord/put!)
-(def one     lodestar.coord/resolved)
-(def many    lodestar.coord/many)
+(def send-op    lodestar.coord/send-op)
+(def append!    lodestar.coord/append!)
+(def put!       lodestar.coord/put!)
+(def one        lodestar.coord/resolved)
+(def many       lodestar.coord/many)
+(def distinct-of lodestar.coord/distinct-of)   ; count-distinct quorum, set form
 
 (defn q [port query] (:ok (send-op port {:op :query :query query})))
 
-;; --- BARRIER: distinct workers that emitted DONE against this batch (2-literal Datalog join).
-;; A multi-literal body routes to the scan engine (q/run); set-semantics on the derived head
-;; `done/1` dedups a worker that reported more than once. THIS is the complete-when-K-DONE query.
+;; --- BARRIER = the count-distinct QUORUM (coord.clj's `distinct-of`), the
+;; completion DUAL of mutual exclusion. The body binds every @done:* worker for
+;; this batch; the shared aggregate folds them set-wise — a worker that reports
+;; more than once counts ONCE. complete? := (count distinct-workers) >= K, i.e.
+;; coord/quorum-met?; reusing the already-folded set below avoids a 2nd query.
+(defn done-body [batch-e]
+  [{:rel "triple" :args [{:var "d"} "done_batch"  batch-e]}
+   {:rel "triple" :args [{:var "d"} "done_worker" {:var "w"}]}])
+
 (defn done-workers [port batch-e]
-  (->> (q port {:find "done"
-                :rules [{:head {:rel "done" :args [{:var "w"}]}
-                         :body [{:rel "triple" :args [{:var "d"} "done_batch" batch-e]}
-                                {:rel "triple" :args [{:var "d"} "done_worker" {:var "w"}]}]}]})
-       (map first) set))
+  (distinct-of port ["w"] (done-body batch-e)))
 
 ;; aggregated DONE payloads: [worker payload] per reporting worker (for the synthesis step).
 (defn done-payloads [port batch-e]
