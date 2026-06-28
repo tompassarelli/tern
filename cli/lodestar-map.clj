@@ -29,11 +29,12 @@
 ;; the validator's own CLI dormant (main-guard).
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/schema-validate.clj"))
 
-;; shared coord substrate (Foundation Part B): wire helpers live once in cli/coord.clj
-;; (one/many = the single/multi resolved variants — semantics unchanged).
+;; shared coord substrate: cardinality-typed write verbs (move-C) live once in
+;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op lodestar.coord/send-op)
-(def assert! lodestar.coord/assert!)
+(def append! lodestar.coord/append!)
+(def put!    lodestar.coord/put!)
 (def one     lodestar.coord/resolved)
 (def many    lodestar.coord/many)
 
@@ -83,16 +84,16 @@
                   "-" (format "%04x" (rand-int 0x10000)))
           e (batch-ent id)
           spawn? (not= "0" (System/getenv "MAP_SPAWN"))]
-      (assert! port e "batch_kind"     "fan-out")
-      (assert! port e "expected_count" n)
-      (assert! port e "barrier_k"      k)
-      (assert! port e "role_template"  tmpl)
-      (assert! port e "task"           task)
-      (assert! port e "created_at"     (str (java.time.Instant/now)))
-      (when has-schema (assert! port e "done_schema" schema))   ; rec4: payload contract for every DONE
+      (put! port e "batch_kind"     "fan-out")    ; single (batch metadata, write-once)
+      (put! port e "expected_count" n)
+      (put! port e "barrier_k"      k)
+      (put! port e "role_template"  tmpl)
+      (put! port e "task"           task)
+      (put! port e "created_at"     (str (java.time.Instant/now)))
+      (when has-schema (put! port e "done_schema" schema))   ; rec4: payload contract for every DONE
       (doseq [i (range 1 (inc n))]
         (let [slug (str tmpl "-" id "-" i)]
-          (assert! port e "worker" slug)            ; membership claim (tagged with batch id)
+          (append! port e "worker" slug)            ; multi — membership claim (one per spawned worker)
           (when spawn?
             (sh "bb" (str scratch "/presence-cli.clj") (str port) "define-role" slug "exclusive"
                 (str "fan-out worker " i "/" n " of " id))
@@ -128,10 +129,14 @@
         (println (str "  ↳ DONE not recorded; barrier unchanged. Fix the payload to satisfy the schema and "
                       "re-run:\n     bb <lodestar-map.clj> " port " done " id " " worker " \"<conforming-json>\""))
         (System/exit 3))
-      (assert! port de "done_batch"   be)
-      (assert! port de "done_worker"  worker)
-      (assert! port de "done_payload" (or payload ""))
-      (assert! port de "done_at"      (str (java.time.Instant/now)))
+      ;; @done:<batch>:<worker> is a per-(batch,worker) subject — these are single ON
+      ;; THAT subject (write-once). The barrier's multi-ness is the AGGREGATE over many
+      ;; @done:* entities (count-distinct done_worker), a read-side join — not a multi
+      ;; group on one subject.
+      (put! port de "done_batch"   be)            ; single
+      (put! port de "done_worker"  worker)        ; single (per @done subject)
+      (put! port de "done_payload" (or payload "")) ; single
+      (put! port de "done_at"      (str (java.time.Instant/now)))  ; single
       (let [done (done-workers port be)
             {:keys [k expected]} (batch-meta port be)
             kk (or k expected)]
@@ -193,7 +198,7 @@
 
             (>= (System/currentTimeMillis) deadline)
             (let [missing (remove (set done) (or workers []))]
-              (assert! port be "barrier_status" "timed_out")
+              (put! port be "barrier_status" "timed_out")   ; single
               (binding [*out* *err*]
                 (println (format "BARRIER TIMED OUT after %ss — %d/%s done; missing: %s"
                                  (quot timeout-ms 1000) (count done) (or kk "?")

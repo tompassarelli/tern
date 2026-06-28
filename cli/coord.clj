@@ -5,9 +5,19 @@
 ;; ~11 single/multi resolved variants. One drift in any copy and the fleet's
 ;; coordination silently diverges. This is the single definition they all load.
 ;;
-;; SEMANTICS UNCHANGED — this is pure de-duplication. The OCC verb redesign
-;; (append!/put!/swap!) is a LATER thread (C); here assert!/retract! keep the
-;; existing read-:version-then-CAS-with-retry behavior byte-for-byte.
+;; WRITE VERBS — cardinality-typed (move-C). The one global-version CAS ritual that
+;; every assert! cargo-culted (read GLOBAL :version, pass it as the per-claim base,
+;; retry) is GONE. It is replaced by three verbs whose choice is the predicate's
+;; cardinality, NOT a base dance:
+;;   append!  MULTI            one op, NO base, NO retry  — rival/disjoint writes
+;;                             coexist (engine appends; identical is idempotent).
+;;   put!     SINGLE  LWW      one op, NO base            — engine supersedes a
+;;                             declared-single pred (last writer wins).
+;;   swap!    SINGLE  CAS      base + retry  — the ONLY base+retry verb; opt-IN
+;;                             conflict-detection for a genuine read-modify-write.
+;; append!/put! pass NO :base, so the (now base-OPTIONAL) engine never staleness-
+;; rejects them; only swap! threads a base. assert! survives as a thin alias to swap!
+;; (byte-for-byte the old CAS behavior) for any un-migrated straggler.
 ;;
 ;; DUAL MODE (the schema-validate.clj precedent): load-file'd by a sibling CLI as a
 ;; library, OR run directly as a connectivity smoke. The main-guard keeps the CLI
@@ -31,17 +41,34 @@
       (.write w (.getBytes (str (pr-str op) "\n"))) (.flush w)
       (edn/read-string (.readLine r)))))
 
-;; the daemon's current global version (the OCC base read).
+;; the daemon's current global version (only swap!/retract! read it now — the base).
 (defn cur-ver [port] (:version (send-op port {:op :version})))
 
-;; OCC assert at the current :version; retry on reject (a concurrent write moved
-;; the base). (str r) coerces — every caller already passes a string, so it is a
-;; no-op for them, kept defensive. 4 tries (the dominant copy; concern was 3 —
-;; strictly-more retries, identical success semantics).
-(defn assert! [port te p r]
+;; append! — MULTI cardinality: one wire op, NO base, NO retry. The engine appends
+;; (rival/disjoint values coexist; an identical (te,p,r) is idempotent). The safe
+;; coexist default. (str r) coerces defensively (callers already pass strings).
+(defn append! [port te p r]
+  (send-op port {:op :assert :te te :p p :r (str r)}))
+
+;; put! — SINGLE last-writer-wins: one wire op, NO base. For a pred the engine has
+;; declared single this SUPERSEDES the prior live value (LWW). Wire-identical to
+;; append!; the cardinality CLAIM (engine-side) — not this verb — decides append-vs-
+;; supersede, so the verb names the call site's INTENT. A no-base write is never
+;; staleness-rejected (base-optional engine), which IS the LWW contract.
+(defn put! [port te p r]
+  (send-op port {:op :assert :te te :p p :r (str r)}))
+
+;; swap! — SINGLE compare-and-swap: the ONLY base+retry verb. Reads the base, writes
+;; under it, retries on :reject (a concurrent write moved the base). Reserve for a
+;; genuine read-modify-write race; near-zero production callers after move-C. 4 tries.
+(defn swap! [port te p r]
   (loop [tries 4]
     (let [res (send-op port {:op :assert :te te :p p :r (str r) :base (cur-ver port)})]
       (if (and (:reject res) (pos? tries)) (recur (dec tries)) res))))
+
+;; thin migration alias — old assert! WAS the swap! CAS ritual; keep it pointing
+;; there so any un-migrated caller is byte-for-byte unchanged.
+(def assert! swap!)
 
 (defn retract! [port te p r]
   (loop [tries 4]

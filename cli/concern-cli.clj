@@ -16,11 +16,12 @@
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
          '[clojure.set :as set])
 
-;; shared coord substrate (Foundation Part B): send-op/assert!/retract!/resolved
-;; live once in cli/coord.clj (OCC assert-with-retry — semantics unchanged).
+;; shared coord substrate: the cardinality-typed write verbs (move-C) live once in
+;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op  lodestar.coord/send-op)
-(def assert!  lodestar.coord/assert!)
+(def append!  lodestar.coord/append!)
+(def put!     lodestar.coord/put!)
 (def retract! lodestar.coord/retract!)
 (def resolved lodestar.coord/resolved)
 
@@ -31,12 +32,14 @@
                                    :rules [{:head {:rel "e" :args [{:var "e"}]} :body body}]}}))
        (map first)))
 
-;; single-valued supersede: retract every current value of p, then assert v.
-;; (status is not a schema-known single-valued predicate, so a bare assert appends.)
+;; LWW for a semantically-single but engine-MULTI predicate (status): the engine
+;; would APPEND a bare write, so supersede EXPLICITLY — clear every current value,
+;; then put! the new one. (Once status is folded into the engine's cardinality CLAIM
+;; — thread B — a bare put! supersedes natively and this retract loop drops out.)
 (defn set-single! [port c p v]
   (doseq [old (q-col port [{:rel "triple" :args [c p {:var "e"}]}])]
     (retract! port c p old))
-  (assert! port c p v))
+  (put! port c p v))
 
 (defn all-concerns [port]
   (distinct (q-col port [{:rel "triple" :args [{:var "e"} "kind" "concern"]}])))
@@ -78,14 +81,14 @@
     (let [[agent repo intent files] args
           fs (->> (str/split (or files "") #",") (map str/trim) (remove str/blank?))
           id (str "concern-" (System/currentTimeMillis) "-" (subs (str (java.util.UUID/randomUUID)) 0 4))]
-      (assert! port id "title"  (str "[" repo "] " intent))
-      (assert! port id "kind"   "concern")
-      (assert! port id "agent"  (str "@" agent))
-      (assert! port id "driver" (str "@" agent))      ; board visibility: shows as active work
-      (assert! port id "repo"   repo)
-      (assert! port id "intent" intent)
+      (put! port id "title"  (str "[" repo "] " intent))   ; single
+      (put! port id "kind"   "concern")                    ; single
+      (put! port id "agent"  (str "@" agent))              ; single
+      (put! port id "driver" (str "@" agent))              ; single (engine) — board visibility: active work
+      (put! port id "repo"   repo)                         ; single
+      (put! port id "intent" intent)                       ; single
       (set-single! port id "status" "building")
-      (doseq [f fs] (assert! port id "touches" f))
+      (doseq [f fs] (append! port id "touches" f))         ; multi
       (println (str "✓ concern " id))
       (println (str "  @" agent "  building  [" repo "]  touches {" (str/join " " fs) "}"))
       (println "\nOverlapping concerns — coordinate, you are NOT blocked:")

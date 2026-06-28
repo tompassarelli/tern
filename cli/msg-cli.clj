@@ -9,11 +9,12 @@
 ;; resolves no matter the cwd; the validator's own CLI stays dormant when load-file'd (main-guard).
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/schema-validate.clj"))
 
-;; shared coord substrate (Foundation Part B): wire helpers live once in cli/coord.clj
-;; (one/many = the single/multi resolved variants — semantics unchanged).
+;; shared coord substrate: cardinality-typed write verbs (move-C) live once in
+;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op lodestar.coord/send-op)
-(def assert! lodestar.coord/assert!)
+(def append! lodestar.coord/append!)
+(def put!    lodestar.coord/put!)
 (def one     lodestar.coord/resolved)
 (def many    lodestar.coord/many)
 
@@ -56,15 +57,15 @@
                            (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")) "-" from
                   "-" (format "%04x" (rand-int 0x10000)))
           e (str "@msg:" id)]
-      (assert! port e "from" from)
-      (assert! port e "to" to)
-      (assert! port e "subject" (or subj ""))
-      (assert! port e "body" (or body ""))
-      (assert! port e "sent_at" (str (java.time.Instant/now)))
+      (put! port e "from" from)              ; single — all message fields are write-once on a fresh @msg
+      (put! port e "to" to)
+      (put! port e "subject" (or subj ""))
+      (put! port e "body" (or body ""))
+      (put! port e "sent_at" (str (java.time.Instant/now)))
       ;; rec4: optional JSON schema the recipient's structured reply must satisfy. Absent => no claim,
       ;; identical to pre-rec4 behavior.
       (let [has-schema (and schema (seq (str/trim schema)))]
-        (when has-schema (assert! port e "schema" schema))
+        (when has-schema (put! port e "schema" schema))
         (println (str "sent " e " -> " to (when has-schema "  [+schema]")))))
 
     "inbox"       ; <me>  — DERIVED: to∈{me,"*"} AND not acked_by me
@@ -94,8 +95,8 @@
 
     "ack"         ; <me> <msg-id>  — replaces mv mbox/<msg> mbox/done/
     (let [[me id] args, e (str "@msg:" id)]
-      (assert! port e "acked_by" me)
-      (assert! port e "acked_at" (str (java.time.Instant/now)))
+      (append! port e "acked_by" me)                       ; multi (many ackers)
+      (put!    port e "acked_at" (str (java.time.Instant/now))) ; single
       (println (str me " acked " e)))
 
     "send-cmd"    ; <from> <to> <op> "<args-edn>" — send a structured command envelope as the body
@@ -108,11 +109,11 @@
                                (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")) "-" from
                       "-" (format "%04x" (rand-int 0x10000)))
               e (str "@msg:" id)]
-          (assert! port e "from" from)
-          (assert! port e "to" to)
-          (assert! port e "subject" (str "cmd:" op))
-          (assert! port e "body" (pr-str env))
-          (assert! port e "sent_at" (str (java.time.Instant/now)))
+          (put! port e "from" from)              ; single — write-once on a fresh @msg
+          (put! port e "to" to)
+          (put! port e "subject" (str "cmd:" op))
+          (put! port e "body" (pr-str env))
+          (put! port e "sent_at" (str (java.time.Instant/now)))
           (println (str "sent cmd " e " -> " to "  " (pr-str env))))))
 
     "parse"       ; "<body>" — show how the reactor (Phase 1) would parse this body (dogfood/validate)

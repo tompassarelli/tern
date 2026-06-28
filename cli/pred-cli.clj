@@ -25,7 +25,8 @@
 ;; shared coord substrate (Foundation Part B): the wire helpers live once in cli/coord.clj.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op  lodestar.coord/send-op)
-(def assert!  lodestar.coord/assert!)
+(def append!  lodestar.coord/append!)
+(def put!     lodestar.coord/put!)
 (def retract! lodestar.coord/retract!)
 (def resolved lodestar.coord/resolved)
 (def many     lodestar.coord/many)
@@ -34,13 +35,13 @@
 (defn pred-ent  [nm]  (str PRED-NS nm))
 (defn pred-name [ent] (let [s (str ent)] (if (str/starts-with? s PRED-NS) (subs s (count PRED-NS)) s)))
 
-;; single-valued registry field = clear current values, then assert (LWW). doc/
-;; minted_* aren't engine-single so a bare assert would ACCUMULATE; cardinality/
-;; value_kind ARE engine-single (schema setup!), so this is a correct superset for
-;; them — uniform regardless of engine cardinality. same_as is multi (plain assert!).
+;; single-valued registry field = clear current values, then put! (LWW). The
+;; pred_cardinality / pred_value_kind / doc / minted_* fields aren't in the engine's
+;; single set, so a bare write would ACCUMULATE — supersede EXPLICITLY (retract loop),
+;; uniform regardless of engine cardinality. same_as is multi (plain append!).
 (defn set-1! [port te p v]
   (doseq [old (many port te p)] (retract! port te p old))
-  (assert! port te p (str v)))
+  (put! port te p (str v)))
 
 ;; ============================================================================
 ;; VOCAB — the authoritative registry definition, seeded ONCE. [name card kind doc]
@@ -182,7 +183,7 @@
 ;; literals: the 3rd arg of a wire helper, a :p map key, and the middle of a
 ;; datalog `triple` arg-vector. Returns {predicate -> #{files}}.
 ;; ============================================================================
-(def pred-fns '#{assert! retract! resolved one many rf rmany set-single! set-1!})
+(def pred-fns '#{append! put! swap! assert! retract! resolved one many rf rmany set-single! set-1!})
 
 (defn read-forms [path]
   (with-open [rdr (java.io.PushbackReader. (io/reader path))]
@@ -192,7 +193,7 @@
           (if (= f eof) acc (recur (conj acc f))))))))
 
 (def pred-fn-names (set (map name pred-fns)))   ; match on simple name so a fully-qualified
-                                                ; lodestar.coord/assert! is caught like a bare assert!
+                                                ; lodestar.coord/append! is caught like a bare append!
 (defn preds-in-form [form]
   (let [found (atom #{})]
     (walk/postwalk
@@ -241,7 +242,7 @@
     (let [[old new] args]
       (when-not (and old new)
         (println "usage: pred-cli.clj <port> alias <old-name> <new-name>") (System/exit 2))
-      (assert! port (pred-ent old) "same_as" (pred-ent new))
+      (append! port (pred-ent old) "same_as" (pred-ent new))   ; multi (alias edges accumulate)
       (println (str "✓ " (pred-ent old) " same_as " (pred-ent new) "  (reads of '" old "' now resolve to '" new "')")))
 
     "ls"

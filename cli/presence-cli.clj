@@ -21,11 +21,12 @@
 (def TTL 600000)          ; 10min lease; renew every ~3min
 (def LEASE-PRED "lease")
 
-;; shared coord substrate (Foundation Part B): the wire helpers live once in
-;; cli/coord.clj; rebind the local names this CLI uses (semantics unchanged).
+;; shared coord substrate: the cardinality-typed write verbs (move-C) live once in
+;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op  lodestar.coord/send-op)
-(def assert!  lodestar.coord/assert!)
+(def append!  lodestar.coord/append!)
+(def put!     lodestar.coord/put!)
 (def retract! lodestar.coord/retract!)
 (def resolved lodestar.coord/resolved)
 
@@ -57,17 +58,17 @@
   (case verb
     "register"
     (let [[h dir sid] args, se (str "@session:" h)]
-      (assert! port se "agent" h)
-      (assert! port se "dir" (or dir "?"))
-      (assert! port se "session_id" (or sid "?"))
-      (assert! port se "started_at" (str (java.time.Instant/now)))
+      (put! port se "agent" h)                     ; single
+      (put! port se "dir" (or dir "?"))            ; single
+      (put! port se "session_id" (or sid "?"))     ; single
+      (put! port se "started_at" (str (java.time.Instant/now)))  ; single
       (prn (send-op port {:op :acquire-lease :res (str "session:" h) :holder h :ttl-ms TTL})))
 
     "renew"
     (let [[h] args] (prn (send-op port {:op :acquire-lease :res (str "session:" h) :holder h :ttl-ms TTL})))
 
     "task"
-    (let [[h t] args] (prn (assert! port (str "@session:" h) "task" t)))
+    (let [[h t] args] (prn (put! port (str "@session:" h) "task" t)))   ; single
 
     ;; ===========================================================================
     ;; AGENT REGISTRY. Handle is an opaque uuid (an ADDRESS, never a name). Identity is a
@@ -76,12 +77,17 @@
     ;; holder) or a uuid; the uuid is just the non-colliding instance id.
     ;; ===========================================================================
     "identify"                              ; <uuid> [model] [effort] [context_tokens] [lifecycle] [supervisor]
+    ;; NOTE: these agent-card fields are registry-single (one value per agent) and the
+    ;; intended semantics is last-writer-wins, hence put!. They are not yet in the
+    ;; engine's FRAM_SINGLE_VALUED set, so the engine still treats them as multi — put!
+    ;; here is presently wire-identical to a bare append; the LWW becomes native once
+    ;; thread B folds these into the engine cardinality CLAIM. Verb names the intent.
     (let [[h model effort ctx life sup] args, ae (str "@agent:" h)]
-      (when (and model  (seq model))  (assert! port ae "model" model))
-      (when (and effort (seq effort)) (assert! port ae "effort" effort))
-      (when (and ctx    (seq ctx))    (assert! port ae "context_tokens" ctx))
-      (assert! port ae "lifecycle" (or life "standing"))
-      (when (and sup (seq sup)) (assert! port ae "supervisor" sup))
+      (when (and model  (seq model))  (put! port ae "model" model))           ; single
+      (when (and effort (seq effort)) (put! port ae "effort" effort))         ; single
+      (when (and ctx    (seq ctx))    (put! port ae "context_tokens" ctx))    ; single
+      (put! port ae "lifecycle" (or life "standing"))                         ; single
+      (when (and sup (seq sup)) (put! port ae "supervisor" sup))              ; single
       (prn {:agent ae :model model :effort effort :lifecycle (or life "standing")}))
 
     "card"                                  ; <uuid>  — the agent card + held roles
@@ -95,8 +101,8 @@
 
     "define-role"                           ; <slug> <exclusive|inclusive> "<title>"  — register a role
     (let [[slug excl title] args, re (str "@role:" slug)]
-      (assert! port re "title" (or title slug))
-      (assert! port re "exclusivity" (or excl "inclusive"))
+      (put! port re "title" (or title slug))             ; single
+      (put! port re "exclusivity" (or excl "inclusive")) ; single
       (prn {:role re :exclusivity (or excl "inclusive")}))
 
     "assign"                                ; <uuid> <slug>  — agent takes a role (exclusive => lease-gated)
@@ -105,9 +111,9 @@
       (if (= excl "exclusive")
         (let [r (send-op port {:op :acquire-lease :res (str "role:" slug) :holder h :ttl-ms TTL})]
           (if (:ok r)
-            (do (assert! port ae "holds" re) (prn {:assigned re :to h :exclusive true}))
+            (do (append! port ae "holds" re) (prn {:assigned re :to h :exclusive true}))
             (prn {:refused re :reason :exclusive-held :by (:holder r)})))
-        (do (assert! port ae "holds" re) (prn {:assigned re :to h :exclusive false}))))
+        (do (append! port ae "holds" re) (prn {:assigned re :to h :exclusive false}))))
 
     "unassign"                              ; <uuid> <slug>
     (let [[h slug] args, ae (str "@agent:" h), re (str "@role:" slug)]
@@ -132,8 +138,8 @@
 
     "focus"                                 ; <uuid> <current_thread> [active_workflow] — VOLATILE, on the session
     (let [[h ct wf] args, se (str "@session:" h)]
-      (assert! port se "current_thread" (or ct "-"))
-      (when wf (assert! port se "active_workflow" wf))
+      (put! port se "current_thread" (or ct "-"))   ; single (LWW intent; see identify note)
+      (when wf (put! port se "active_workflow" wf))  ; single
       (prn {:focus se :current_thread ct :active_workflow wf}))
 
     "presence"                              ; THE PROJECTION — agents + held roles + focus. Pinned first, then online, then rest.
@@ -168,8 +174,8 @@
 
     "pin"                                   ; <uuid> [reason]  — mark agent as important (surfaces first in roster)
     (let [[h & reason-parts] args, ae (str "@agent:" h)]
-      (assert! port ae "pinned" "true")
-      (when (seq reason-parts) (assert! port ae "pin_reason" (str/join " " reason-parts)))
+      (put! port ae "pinned" "true")    ; single (flag; LWW intent)
+      (when (seq reason-parts) (put! port ae "pin_reason" (str/join " " reason-parts)))  ; single
       (prn {:pinned ae}))
 
     "unpin"                                 ; <uuid>  — remove pin
@@ -265,26 +271,26 @@
 
     "cost"                                  ; per-run real $ cost -> claim on the agent graph (per-task token tracking)
     (let [[h sid c] args re (str "@run:" sid)]
-      (assert! port re "agent" h)
-      (assert! port re "cost_usd" (or c "0"))
-      (assert! port re "ended_at" (str (java.time.Instant/now)))
+      (put! port re "agent" h)                     ; single (write-once on a fresh @run)
+      (put! port re "cost_usd" (or c "0"))         ; single
+      (put! port re "ended_at" (str (java.time.Instant/now)))  ; single
       (prn {:recorded re :agent h :cost_usd c}))
 
     "runmeta"                               ; <uuid> <session_id> <json>  — full per-run telemetry tuple
     (let [[h sid json-str] args
           re (str "@run:" sid)
           m (json/parse-string json-str true)]
-      (assert! port re "agent" h)
-      (assert! port re "ended_at" (str (java.time.Instant/now)))
+      (put! port re "agent" h)                     ; single (write-once on a fresh @run)
+      (put! port re "ended_at" (str (java.time.Instant/now)))  ; single
       (doseq [[k v] m :when (some? v)]
-        (assert! port re (name k) (str v)))
+        (append! port re (name k) (str v)))        ; DYNAMIC pred -> append! (safe default)
       (prn {:recorded re :agent h :fields (count m)}))
 
     ;; --- subscriptions: thread-watches as claims (consumed by lodestar-listen.clj) ---
     ;; subject = the agent's self node @<handle> (its self-reference channel is implicit; this
     ;; ADDS threads beyond it). multi-valued: an agent watches many threads.
     "watch"                                 ; <uuid> <thread-ref>  — subscribe to a thread
-    (let [[h t] args] (prn (assert! port (str "@agent:" h) "watches" t)))
+    (let [[h t] args] (prn (append! port (str "@agent:" h) "watches" t)))   ; multi (watches many threads)
 
     "unwatch"                               ; <uuid> <thread-ref>  — drop a subscription
     (let [[h t] args] (prn (retract! port (str "@agent:" h) "watches" t)))
@@ -304,7 +310,7 @@
       (if (empty? roles)
         (do (println (str "no roles for " h " — nothing to rotate")) (System/exit 1))
         (do (println (str "triggering compact for " h " roles=" (pr-str (map #(subs % 6) roles))))
-            (assert! port ae "needs_rotation" "true")
+            (put! port ae "needs_rotation" "true")   ; single (flag; LWW intent)
             (let [r (clojure.java.shell/sh "bash"
                       (str (System/getenv "HOME") "/code/lodestar/sdk/src/compact.sh") h)]
               (println (:out r))

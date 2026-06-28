@@ -3,14 +3,15 @@
 ;; Find unacked messages for <agent-id> (to∈{id,"*"} AND id NOT in acked_by), print each
 ;; readable, then ACK each (acked_by + acked_at) so it's delivered exactly once and never
 ;; re-surfaces. No unacked mail => print NOTHING, exit 0. Standalone: helper fns copied
-;; verbatim from msg-cli.clj (send-op/assert!/one/many/messages/for-me?).
+;; verbatim from msg-cli.clj (send-op/append!/put!/one/many/messages/for-me?).
 (require '[clojure.edn :as edn] '[clojure.java.io :as io])
 
-;; shared coord substrate (Foundation Part B): wire helpers live once in cli/coord.clj
-;; (one/many = the single/multi resolved variants — semantics unchanged).
+;; shared coord substrate: cardinality-typed write verbs (move-C) live once in
+;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op lodestar.coord/send-op)
-(def assert! lodestar.coord/assert!)
+(def append! lodestar.coord/append!)
+(def put!    lodestar.coord/put!)
 (def one     lodestar.coord/resolved)
 (def many    lodestar.coord/many)
 
@@ -32,5 +33,5 @@
         (println (str "✉ from " from " — " subj))
         (println (str "  " body))
         ;; ack last: print delivers, then mark so it never re-surfaces (exactly-once on success)
-        (assert! port e "acked_by" me)
-        (assert! port e "acked_at" (str (java.time.Instant/now)))))))
+        (append! port e "acked_by" me)                            ; multi (many ackers)
+        (put!    port e "acked_at" (str (java.time.Instant/now))))))) ; single
