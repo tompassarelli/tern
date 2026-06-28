@@ -26,44 +26,60 @@
   (let [v (:version (send-op port {:op :version}))]
     (send-op port {:op :assert :te id :p "acked_by" :r me :base v})))
 
-;; --- swarm token budget + fork-bomb backstop -------------------------------
-;; The REAL resource is token spend, not concurrency: N agents looping forever
-;; still burn infinite credits. So the binding limit is a declarative TOKEN BUDGET
-;; (@swarm budget_total set once; budget_spent accumulated atomically via the :bump
-;; coord op as sdk executors charge usage). The reactor GATES on remaining()>0 before
-;; it shells a real agent — fan out freely until the budget's spent, then stop.
-;; The @swarm-slot:1..N pool stays as a non-binding fork-bomb backstop (default HIGH);
-;; a crashed holder's slot self-frees via the lease TTL (lazy expiry, no sweeper).
-(def swarm-max (Integer/parseInt (or (System/getenv "LODESTAR_SWARM_MAX") "64")))
-;; MUST match sdk/src/budget.ts SUBJECT (same env var + default) so the reactor reads the
-;; exact entity the executors charge — else the gate reads a budget nobody is spending.
+;; --- swarm cost budget + derived concurrency ceiling -----------------------
+;; The REAL resource is spend, not concurrency: N agents looping forever still burn
+;; infinite credits. The binding limit is a declarative COST BUDGET: @swarm
+;; budget_total (a USD ceiling) set once. Spend is a DERIVED SUM — Σ(@run:* cost_usd),
+;; folded from the immutable per-run cost claims presence-cli already writes — never a
+;; mutated budget_spent cell or a :bump op (that counter duplicated derivable state and
+;; had to stay in sync with budget.ts). The reactor GATES on remaining()>0 before it
+;; shells a real agent. No budget_total set => unbounded.
+;; The fork-bomb backstop is likewise DERIVED, not a @swarm-slot counting semaphore:
+;; any concurrency ceiling = count(live drivers) vs LODESTAR_SWARM_MAX.
+(def driver-max (Integer/parseInt (or (System/getenv "LODESTAR_SWARM_MAX") "64")))
+;; MUST match sdk/src/budget.ts SUBJECT (same env var + default) so the gate reads the
+;; same budget the executors' costs roll up to.
 (def budget-subj (or (System/getenv "LODESTAR_BUDGET") "@swarm"))
-(defn budget-remaining
-  "total - spent for the budget subject, or nil if no budget_total set (= unbounded)."
+(defn spent-sum
+  "Σ(@run:* cost_usd) — live spend folded from immutable per-run cost claims. The find
+   returns (run,cost) PAIRS so equal-cost runs stay distinct (a cost-only find would
+   dedup them under set semantics and under-count)."
   [port]
-  (when-let [total (parse-long (str (or (rf port budget-subj "budget_total") "")))]
-    (- total (or (parse-long (str (or (rf port budget-subj "budget_spent") "0"))) 0))))
-(defn acquire-slot! [port holder]
-  (some (fn [i]                                   ; first free slot key, or nil if all N held
-          (let [res (str "@swarm-slot:" i)]
-            (when-not (:reject (send-op port {:op :acquire-lease :holder holder :res res :ttl-ms 600000}))
-              res)))
-        (range 1 (inc swarm-max))))
-(defn release-slot! [port holder slot]
-  (send-op port {:op :release-lease :holder holder :res slot}))
+  (->> (:ok (send-op port {:op :query
+                           :query {:find "c"
+                                   :rules [{:head {:rel "c" :args [{:var "e"} {:var "v"}]}
+                                            :body [{:rel "triple" :args [{:var "e"} "cost_usd" {:var "v"}]}]}]}}))
+       (filter #(str/starts-with? (str (first %)) "@run:"))
+       (keep #(parse-double (str (second %))))
+       (reduce + 0.0)))
+(defn budget-remaining
+  "budget_total − Σ(@run cost_usd), or nil if no budget_total set (= unbounded)."
+  [port]
+  (when-let [total (parse-double (str (or (rf port budget-subj "budget_total") "")))]
+    (- total (spent-sum port))))
+(defn live-drivers
+  "count of distinct subjects carrying a live `driver` claim — the derived
+   concurrency, replacing the @swarm-slot semaphore."
+  [port]
+  (->> (:ok (send-op port {:op :query
+                           :query {:find "d"
+                                   :rules [{:head {:rel "d" :args [{:var "s"} {:var "a"}]}
+                                            :body [{:rel "triple" :args [{:var "s"} "driver" {:var "a"}]}]}]}}))
+       (map first) distinct count))
 (defn with-guard
-  "Gate a blocking agent shell: skip if the token budget is spent; else hold a backstop
-   slot for the run. Budget is the real limit; the slot pool is the fork-bomb ceiling."
+  "Gate a blocking agent shell: skip if the cost budget is spent OR live drivers are at
+   the derived ceiling; else run. No slots, no semaphore — both limits are read-time folds."
   [port self label thunk]
-  (let [rem (budget-remaining port)]
+  (let [rem  (budget-remaining port)
+        live (live-drivers port)]
     (cond
       (and rem (<= rem 0))
-      (println (str "   ⏸ BUDGET SPENT (remaining " rem ") — backing off, not spawning " label))
+      (println (str "   ⏸ BUDGET SPENT (remaining $" rem ") — backing off, not spawning " label))
+      (>= live driver-max)
+      (println (str "   ⏸ driver ceiling (" live "/" driver-max " live) — backing off " label))
       :else
-      (if-let [slot (acquire-slot! port self)]
-        (try (println (str "   ⛓ slot " slot (when rem (str ", budget ~" rem " left")))) (flush) (thunk)
-             (finally (release-slot! port self slot) (println (str "   ⛓ slot " slot " freed")) (flush)))
-        (println (str "   ⏸ fork-bomb backstop (" swarm-max " slots held) — backing off " label))))))
+      (do (println (str "   ⚙ run " label (when rem (str ", budget ~$" rem " left")) " (" live " live drivers)")) (flush)
+          (thunk)))))
 
 ;; --- Phase 1: the reactor ---------------------------------------------------
 ;; Parse a mail body as the Phase-0 command envelope (must stay in sync with
