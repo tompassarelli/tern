@@ -71,55 +71,70 @@
       once?   (boolean (some #{"--once"} flags))
       ack?    (boolean (some #{"--ack"} flags))
       react?  (boolean (some #{"--react"} flags))   ; Phase 1: execute command-envelope mail (spawn/dispatch) + ack
+      scoped? (boolean (some #{"--scoped"} flags))  ; P5: server-side scoped subscribe (daemon pushes only my commits)
       addrs   (atom (into #{uuid "*"} (keep role-slug (rmany port node "holds"))))  ; uuid ∪ held roles
       watched (atom (set (rmany port node "watches")))]
-  (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
-    (let [w (.getOutputStream s) r (io/reader (.getInputStream s))]
-      (.write w (.getBytes (str (pr-str {:op :subscribe}) "\n"))) (.flush w)
-      (.readLine r)                                              ; consume {:subscribed N}
-      (println (format "● @agent:%s listening — addrs %s + %d watched thread(s)%s"
-                       uuid (pr-str (sort @addrs)) (count @watched) (if once? "  [--once]" "")))
-      (flush)
-      (loop []
-        (when-let [line (.readLine r)]
-          (let [ev (try (edn/read-string line) (catch Exception _ nil))]
-            (when (and (map? ev) (= :commit (:event ev)))
-              (let [{:keys [op l p r]} ev]
-                (cond
-                  ;; (a) role (un)assigned to me -> my address set changes live
-                  (and (= l node) (= p "holds"))
-                  (do (when-let [sl (role-slug r)]
-                        (swap! addrs (if (= op "assert") conj disj) sl)
-                        (println (format "  ↳ addrs: %s %s (now %s)"
-                                         (if (= op "assert") "+role" "-role") sl (pr-str (sort @addrs)))) (flush)))
+  ;; outer loop: with --scoped, RECONNECT when my addr/watch set changes so the daemon re-scopes
+  ;; the push filter (the daemon's subscribe loop ignores mid-stream re-subscribe, so a fresh
+  ;; connection is how we re-scope). Without --scoped, reconnect? never fires -> one pass, identical
+  ;; to the firehose listener (full backward-compat).
+  (loop []
+    (let [reconnect? (atom false)]
+      (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
+        (let [w (.getOutputStream s) r (io/reader (.getInputStream s))
+              sub (cond-> {:op :subscribe}
+                    scoped? (assoc :filter {:addrs @addrs :watch @watched :node node}))]
+          (.write w (.getBytes (str (pr-str sub) "\n"))) (.flush w)
+          (.readLine r)                                              ; consume {:subscribed N}
+          (println (format "● @agent:%s listening%s — addrs %s + %d watched thread(s)%s"
+                           uuid (if scoped? " [scoped]" "") (pr-str (sort @addrs)) (count @watched) (if once? "  [--once]" "")))
+          (flush)
+          (loop []
+            (when-let [line (.readLine r)]
+              (let [ev (try (edn/read-string line) (catch Exception _ nil))]
+                (when (and (map? ev) (= :commit (:event ev)))
+                  (let [{:keys [op l p r]} ev]
+                    (cond
+                      ;; (a) role (un)assigned to me -> address set changes; re-scope if --scoped
+                      (and (= l node) (= p "holds"))
+                      (do (when-let [sl (role-slug r)]
+                            (swap! addrs (if (= op "assert") conj disj) sl)
+                            (println (format "  ↳ addrs: %s %s (now %s)"
+                                             (if (= op "assert") "+role" "-role") sl (pr-str (sort @addrs)))) (flush)
+                            (when scoped? (reset! reconnect? true))))
 
-                  ;; (b) thread watch/unwatch
-                  (and (= l node) (= p "watches"))
-                  (do (swap! watched (if (= op "assert") conj disj) r)
-                      (println (format "  ↳ scope: %s %s (now %d watched)"
-                                       (if (= op "assert") "watch" "unwatch") r (count @watched))) (flush))
+                      ;; (b) thread watch/unwatch -> re-scope if --scoped
+                      (and (= l node) (= p "watches"))
+                      (do (swap! watched (if (= op "assert") conj disj) r)
+                          (println (format "  ↳ scope: %s %s (now %d watched)"
+                                           (if (= op "assert") "watch" "unwatch") r (count @watched))) (flush)
+                          (when scoped? (reset! reconnect? true)))
 
-                  ;; (c) self-channel: a message to my uuid OR a role I hold
-                  (and (= op "assert") (= p "to") (contains? @addrs r))
-                  (do (Thread/sleep 150)   ; let from/subject/body settle — routing-key "to" lands first
-                      (let [body (rf port l "body"), env (parse-envelope body)]
-                        (if (and react? env (:op env))
-                          ;; REACTOR (--react): a command envelope -> EXECUTE + ack. The closed loop.
-                          (do (println (format "⚙  REACT %s  op=%s args=%s  (from %s)"
-                                               l (:op env) (pr-str (:args env)) (rf port l "from"))) (flush)
-                              (react! port uuid (:op env) (:args env))
-                              (ack! port uuid l)
-                              (println (str "   ↳ executed + acked_by " uuid)) (flush))
-                          ;; LISTENER: print (flag a malformed command body if present)
-                          (do (when (:error env) (println (str "   ⚠ command body malformed: " (:error env))))
-                              (println (format "✉  MAIL %s  (to %s)\n   from:    %s\n   subject: %s\n   body:    %s"
-                                               l r (rf port l "from") (rf port l "subject") body))
-                              (when ack? (ack! port uuid l) (println (str "   ↳ acked_by " uuid)))
-                              (flush))))
-                      (when once? (System/exit 0)))
+                      ;; (c) self-channel: a message to my uuid OR a role I hold
+                      (and (= op "assert") (= p "to") (contains? @addrs r))
+                      (do (Thread/sleep 150)   ; let from/subject/body settle — routing-key "to" lands first
+                          (let [body (rf port l "body"), env (parse-envelope body)]
+                            (if (and react? env (:op env))
+                              ;; REACTOR (--react): a command envelope -> EXECUTE + ack. The closed loop.
+                              (do (println (format "⚙  REACT %s  op=%s args=%s  (from %s)"
+                                                   l (:op env) (pr-str (:args env)) (rf port l "from"))) (flush)
+                                  (react! port uuid (:op env) (:args env))
+                                  (ack! port uuid l)
+                                  (println (str "   ↳ executed + acked_by " uuid)) (flush))
+                              ;; LISTENER: print (flag a malformed command body if present)
+                              (do (when (:error env) (println (str "   ⚠ command body malformed: " (:error env))))
+                                  (println (format "✉  MAIL %s  (to %s)\n   from:    %s\n   subject: %s\n   body:    %s"
+                                                   l r (rf port l "from") (rf port l "subject") body))
+                                  (when ack? (ack! port uuid l) (println (str "   ↳ acked_by " uuid)))
+                                  (flush))))
+                          (when once? (System/exit 0)))
 
-                  ;; (d) watched-thread activity
-                  (and (= op "assert") (contains? @watched l))
-                  (do (println (format "◆  THREAD %s  %s = %s" l p r)) (flush)
-                      (when once? (System/exit 0)))))))
-          (recur))))))
+                      ;; (d) watched-thread activity
+                      (and (= op "assert") (contains? @watched l))
+                      (do (println (format "◆  THREAD %s  %s = %s" l p r)) (flush)
+                          (when once? (System/exit 0)))))))
+              ;; --scoped re-scope: break the inner read-loop so the outer reconnects with the new filter
+              (if @reconnect?
+                (do (println "  ↳ re-scoping subscription (addr/watch changed)…") (flush))
+                (recur))))))
+      (when @reconnect? (recur)))))
