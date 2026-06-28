@@ -10,9 +10,11 @@
     # shells $FRAM/bin/fram for engine verbs. Fram ships its compiled Clojure
     # in out/ (committed, runs on bare bb — no Beagle at runtime), so we consume
     # it as a plain source tree (flake = false) and wrap it the same way.
-    # Tracks the local checkout; bump deliberately alongside FRAM_VERSION.
+    # Pinned via this flake's lock; bump with `nix flake update fram`. (Must be a
+    # fetchable URL, never a local path — a path: leaks the author's machine into
+    # the published flake and breaks every other consumer + CI.)
     fram = {
-      url = "path:/home/tom/code/fram";
+      url = "github:tompassarelli/fram";
       flake = false;
     };
   };

@@ -21,14 +21,17 @@
     "fram": {
       "flake": false,
       "locked": {
-        "lastModified": 1782604458,
-        "narHash": "sha256-WhCGYVn4WLtqlTlUVyHpkNROBfwr9dQmJgL8IbwXlRE=",
-        "path": "/home/tom/code/fram",
-        "type": "path"
+        "lastModified": 1782670428,
+        "narHash": "sha256-W8WoiIiO9Q4MWtK4/3TcaM3kNrS83lbR5JJggJKdX/I=",
+        "owner": "tompassarelli",
+        "repo": "fram",
+        "rev": "650e27604b4100b50d9c49a4d7ea82147fef0cb6",
+        "type": "github"
       },
       "original": {
-        "path": "/home/tom/code/fram",
-        "type": "path"
+        "owner": "tompassarelli",
+        "repo": "fram",
+        "type": "github"
       }
     },
     "nixpkgs": {
