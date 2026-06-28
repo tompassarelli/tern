@@ -28,6 +28,29 @@
   (let [v (:version (send-op port {:op :version}))]
     (send-op port {:op :assert :te id :p "acked_by" :r me :base v})))
 
+;; --- swarm spawn-cap (shared pool with sdk/src/slots.ts) --------------------
+;; The reactor MUST hold a slot before it shells a real agent, else commanded
+;; fan-out bypasses the cap discover.ts gates on. Same pool @swarm-slot:1..N, same
+;; exclusive-lease primitive (P3) -> global concurrent agents can't exceed N. A
+;; crashed holder's slot self-frees: the lease has a TTL and lazily expires (the
+;; next acquirer reclaims it — cnf_coord acquire-lease!, no sweeper needed).
+(def swarm-max (Integer/parseInt (or (System/getenv "LODESTAR_SWARM_MAX") "4")))
+(defn acquire-slot! [port holder]
+  (some (fn [i]                                   ; first free slot key, or nil if all N held (= at cap)
+          (let [res (str "@swarm-slot:" i)]
+            (when-not (:reject (send-op port {:op :acquire-lease :holder holder :res res :ttl-ms 600000}))
+              res)))
+        (range 1 (inc swarm-max))))
+(defn release-slot! [port holder slot]
+  (send-op port {:op :release-lease :holder holder :res slot}))
+(defn with-slot
+  "Hold a swarm slot for the duration of thunk (a blocking agent shell); back off if at cap."
+  [port self label thunk]
+  (if-let [slot (acquire-slot! port self)]
+    (try (println (str "   ⛓ slot " slot " held (cap " swarm-max ")")) (flush) (thunk)
+         (finally (release-slot! port self slot) (println (str "   ⛓ slot " slot " freed")) (flush)))
+    (println (str "   ⏸ AT CAP (" swarm-max " slots held) — backing off, not spawning " label))))
+
 ;; --- Phase 1: the reactor ---------------------------------------------------
 ;; Parse a mail body as the Phase-0 command envelope (must stay in sync with
 ;; cli/msg-cli.clj parse-envelope — same contract). Plain bodies -> nil.
@@ -49,13 +72,15 @@
 ;; sdk-* id) — required for multi-hop routing/acks (per nixos-config-1's P2 harness).
 (defn react! [port self op args]
   (case op
-    :spawn    (do (println (str "   ⚙ spawn: " (pr-str (:prompt args))))
+    :spawn    (with-slot port self "spawn"
+                (fn [] (println (str "   ⚙ spawn: " (pr-str (:prompt args))))
                   (proc/shell {:dir sdk :continue true
                                :extra-env (cond-> {"AGENT_ID" self} (:model args) (assoc "AGENT_MODEL" (str (:model args))))}
-                              "bun" "src/spawn.ts" (str (:prompt args))))
-    :dispatch (do (println (str "   ⚙ dispatch thread " (:thread args)))
+                              "bun" "src/spawn.ts" (str (:prompt args)))))
+    :dispatch (with-slot port self "dispatch"
+                (fn [] (println (str "   ⚙ dispatch thread " (:thread args)))
                   (proc/shell {:dir sdk :continue true :extra-env {"AGENT_ID" self}}
-                              "bun" "src/dispatch.ts" (str (:thread args))))
+                              "bun" "src/dispatch.ts" (str (:thread args)))))
     ;; Phase 3: atomic work-claim via the exclusive-lease (mutual exclusion in the coordinator).
     :claim    (let [h (or (:holder args) "reactor")
                     r (send-op port {:op :acquire-lease :holder h :res (str "@lease:" (:thread args))
