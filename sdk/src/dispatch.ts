@@ -3,6 +3,7 @@ import { getThreadClaims, getChildren } from "./lodestar-client";
 import { derivePosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
 import { harnessOptions, DEFAULT_SYSTEM_PROMPT, type Effort } from "./harness";
+import { inputChannel, subscribeFeed } from "./coordination";
 import { charge, tokensOf } from "./budget";
 import { recordRun } from "./telemetry";
 
@@ -54,8 +55,13 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   let result = "";
   let resultMsg: any = null;
 
+  // Real-time coordination: run the prompt in streaming-input mode so peers can inject
+  // pings into THIS run (no re-arm — subscribeFeed re-spawns host-side, invisibly).
+  const ch = inputChannel(prompt);
+  const stopFeed = subscribeFeed(agentId, (m) => ch.push(m));
+
   for await (const message of query({
-    prompt,
+    prompt: ch.stream(),
     options: harnessOptions({
       self: agentId,
       extraTools: tools,
@@ -70,6 +76,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
     if ("result" in msg) {
       result = msg.result;
       resultMsg = msg;
+      if (ch.pending() === 0) { ch.end(); break; } // task done + no pending peer ping -> finish
     }
 
     if (msg.type === "assistant" && msg.message?.content) {
@@ -80,6 +87,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
       }
     }
   }
+  stopFeed();
 
   await charge(tokensOf(resultMsg)); // bill this run's tokens to the shared budget (atomic :bump)
   recordRun({ thread: threadId, agent: agentId, tokens: tokensOf(resultMsg),

@@ -25,6 +25,7 @@ export function inputChannel(initial: string) {
   return {
     push(text: string) { queue.push(userMsg(text)); wake?.(); wake = null; },
     end() { closed = true; wake?.(); wake = null; },
+    pending() { return queue.length; }, // unconsumed injected pings — lets a task agent end when idle
     async *stream(): AsyncGenerator<SDKUserMessage> {
       while (true) {
         while (queue.length) yield queue.shift()!;
