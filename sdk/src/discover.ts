@@ -10,6 +10,7 @@
 import { execSync, execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { dispatch } from "./dispatch";
+import { acquireSlot, releaseSlot, SWARM_MAX } from "./slots";
 
 const REPO = resolve(import.meta.dir, "../..");
 const CLAIM_CLI = `${REPO}/cli/claim-cli.clj`;
@@ -60,31 +61,44 @@ export async function discover(self: string, opts: DiscoverOpts = {}): Promise<s
   const done: string[] = [];
   let empty = 0;
 
+  const backoff = async (why: string) => {
+    empty++;
+    const base = Math.min(30_000, 1_000 * 2 ** empty);
+    const ms = Math.round(base * (0.5 + Math.random())); // jitter desyncs the swarm
+    console.log(`[discover] ${self} ${why} (${empty}/${maxEmpty}) — backoff ${ms}ms`);
+    await new Promise((r) => setTimeout(r, ms));
+  };
+
   while (done.length < maxTasks && empty < maxEmpty) {
+    // Budget gate: hold one of N swarm slots before running ANY agent. No free
+    // slot = at cap → back off. This is what stops a fan-out from fork-bombing.
+    const slot = await acquireSlot(self);
+    if (!slot) {
+      await backoff(`at cap (${SWARM_MAX} slots full)`);
+      continue;
+    }
     let claimed = false;
-    for (const t of readyThreads()) {
-      if (!claimDriver(t.id, self)) continue; // peer got it — try the next ready thread
-      claimed = true;
-      empty = 0;
-      console.log(`[discover] ${self} claimed ${t.id} — ${t.title}`);
-      try {
-        await dispatch(t.id);
-        done.push(t.id);
-        console.log(`[discover] ${self} finished ${t.id} (${done.length} total)`);
-      } catch (e) {
-        console.error(`[discover] ${self} dispatch of ${t.id} failed:`, e);
-      } finally {
-        releaseDriver(t.id, self);
+    try {
+      for (const t of readyThreads()) {
+        if (!claimDriver(t.id, self)) continue; // peer got it — try the next ready thread
+        claimed = true;
+        empty = 0;
+        console.log(`[discover] ${self} claimed ${t.id} — ${t.title}`);
+        try {
+          await dispatch(t.id);
+          done.push(t.id);
+          console.log(`[discover] ${self} finished ${t.id} (${done.length} total)`);
+        } catch (e) {
+          console.error(`[discover] ${self} dispatch of ${t.id} failed:`, e);
+        } finally {
+          releaseDriver(t.id, self);
+        }
+        break; // re-poll fresh — the graph moved
       }
-      break; // re-poll fresh — the graph moved
+    } finally {
+      await releaseSlot(self, slot); // free the budget slot whether or not we found work
     }
-    if (!claimed) {
-      empty++;
-      const base = Math.min(30_000, 1_000 * 2 ** empty);
-      const backoff = Math.round(base * (0.5 + Math.random())); // jitter desyncs the swarm
-      console.log(`[discover] ${self} no claimable work (${empty}/${maxEmpty}) — backoff ${backoff}ms`);
-      await new Promise((r) => setTimeout(r, backoff));
-    }
+    if (!claimed) await backoff("no claimable work");
   }
   console.log(`[discover] ${self} exiting — drove ${done.length} thread(s)`);
   return done;
