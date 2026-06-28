@@ -111,8 +111,13 @@
   {:init #{} :step (fn [s row] (conj s (first row))) :final identity})
 
 (def sum-reducer
-  "Budget reducer: Σ the numeric projection of each row (non-numeric -> 0)."
-  {:init 0 :step (fn [n row] (+ n (or (parse-double (str (first row))) 0))) :final identity})
+  "Budget reducer: Σ the numeric SECOND projection of each row (non-numeric -> 0).
+   Rows MUST carry a distinct key in the FIRST position (the @run/@charge subject):
+   the engine's derived head is a SET of tuples, so a value-only projection would
+   collapse two equal-valued addends (two equal-cost runs) and UNDER-count. The key
+   keeps equal values distinct — the exact dual of count-distinct, which WANTS the
+   collapse. This asymmetry is why Σ projects [key val] and count-distinct [key]."
+  {:init 0 :step (fn [n row] (+ n (or (parse-double (str (second row))) 0))) :final identity})
 
 ;; The rows a Datalog BODY binds, projected onto PROJECT (the head vars). One
 ;; scan-engine query; a 1- or 2-literal body routes to the join engine (q/run).
@@ -135,7 +140,9 @@
   "K-of-N quorum's left side: how many DISTINCT keys BODY binds."
   [port project body] (count (distinct-of port project body)))
 (defn sum-of
-  "Σ of a numeric projection over BODY — the budget/spend fold."
+  "Σ of a numeric projection over BODY. PROJECT must be [key-var val-var]: the key
+   (the @run/@charge subject) keeps equal values distinct so they are not deduped
+   away; the val is summed. The budget/spend fold."
   [port project body] (aggregate port project body sum-reducer))
 
 ;; --- gates (a gate is just a threshold predicate over a fold) ---------------

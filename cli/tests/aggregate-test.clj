@@ -34,14 +34,16 @@
            (co/put! port (str b ":d2c") "agg_done_worker" "w2")
            (= 3 (co/count-distinct port ["w"] done-body))))
 
-  ;; --- Σ (budget). Append-only charges; spend is the fold, never a cell. ------
-  (doseq [[c n] [["r1" 100] ["r2" 250] ["r3" 50.5]]]
+  ;; --- Σ (budget). Append-only charges; spend is the fold, never a cell. r4 has
+  ;; the SAME value as r1 (100) — the dedup trap: a value-only projection would
+  ;; collapse them and under-count. [key val] keeps them distinct. -------------
+  (doseq [[c n] [["r1" 100] ["r2" 250] ["r3" 50.5] ["r4" 100]]]
     (let [ce (str b ":charge:" c)]
       (co/put! port ce "agg_charged_to" b)
       (co/put! port ce "agg_charge_tokens" n)))
-  (chk "sum-of Σ's the numeric projection (100+250+50.5)"
-       (== 400.5 (co/sum-of port ["n"] charge-body)))
-  (let [total 500 spent (co/sum-of port ["n"] charge-body)]
+  (chk "sum-of Σ's [key val] rows (100+250+50.5+100), equal-valued addends NOT deduped"
+       (== 500.5 (co/sum-of port ["c" "n"] charge-body)))
+  (let [total 600 spent (co/sum-of port ["c" "n"] charge-body)]
     (chk "budget gate: remaining = cap - Σ(charges), still under"
          (and (> (- total spent) 0) (== 99.5 (- total spent)))))
 
