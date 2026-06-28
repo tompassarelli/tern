@@ -80,7 +80,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
     }
   }
 
-  charge(tokensOf(resultMsg)); // bill this run's tokens to the shared budget
+  await charge(tokensOf(resultMsg)); // bill this run's tokens to the shared budget (atomic :bump)
   console.log(`\n[dispatch] @${threadId} complete`);
   return { threadId, posture: postureLabel, result };
 }
