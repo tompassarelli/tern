@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# agent-coord — ONE command so parallel agents stop colliding.
+#
+#   agent-coord join  <name> [dir]   declare presence + atomically claim the repo you're in
+#   agent-coord leave <name> [dir]   release the claim
+#   agent-coord roster               who's online, where, and on what
+#
+# Built on the already-running coordinators (no new daemon, no new concepts).
+# A claim is a REAL mutual-exclusion lease: if another agent already holds your
+# repo, you are told to back off. That — not etiquette — is what stops collisions.
+set -uo pipefail
+CLI="$HOME/code/lodestar/cli"
+BOARD=7977      # work-claims: the lease + driver visibility on the board the app reads
+AGENT=7978      # presence: who / where
+TTL=28800000    # 8h lease; re-run `join` to renew
+
+here() { git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || pwd; }
+unit() { echo "repo:$(basename "$1")"; }
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+  join)
+    name="${1:?usage: agent-coord join <name> [dir]}"
+    dir="${2:-$(here)}"; u="$(unit "$dir")"
+    bb "$CLI/presence-cli.clj" "$AGENT" register "$name" "$dir" "$name" >/dev/null 2>&1 || true
+    out=$(bb "$CLI/claim-cli.clj" "$BOARD" claim "$u" "$name" "$TTL" 2>&1)
+    if echo "$out" | grep -q '^DENIED'; then
+      echo "✋ $out"
+      echo "   → Another agent owns $u. Do NOT edit here — coordinate, or take other work."
+      exit 1
+    fi
+    bb "$CLI/presence-cli.clj" "$AGENT" task "$name" "$u" >/dev/null 2>&1 || true  # focus = what you actually hold
+    echo "✓ $out"
+    echo "   → You own $u (8h). Edit freely. Run 'agent-coord leave $name' when done (else it lapses)."
+    ;;
+  leave)
+    name="${1:?usage: agent-coord leave <name> [dir]}"
+    dir="${2:-$(here)}"; u="$(unit "$dir")"
+    bb "$CLI/claim-cli.clj" "$BOARD" release "$u" "$name" 2>&1
+    ;;
+  roster)
+    bb "$CLI/presence-cli.clj" "$AGENT" presence 2>&1
+    ;;
+  *)
+    echo "usage: agent-coord {join <name> [dir] | leave <name> [dir] | roster}"; exit 2;;
+esac
