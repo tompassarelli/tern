@@ -146,7 +146,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     effort: o.effort, // the reasoning knob spawn.ts used to drop on the floor
     permissionMode: "acceptEdits",
     systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT),
-    maxTurns: o.maxTurns ?? 50,
+    maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
   } as Options;
 }
 
