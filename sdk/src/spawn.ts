@@ -43,7 +43,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     }
   }
 
-  charge(tokensOf(resultMsg)); // bill this run's tokens to the shared budget
+  await charge(tokensOf(resultMsg)); // bill this run's tokens to the shared budget (atomic :bump)
   console.log(`[spawn] @agent:${agentId} complete`);
   return result;
 }

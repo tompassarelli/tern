@@ -1,30 +1,51 @@
 // Token budget — the declarative spend cap (replaces the concurrency cap). Set it
-// once: `lodestar tell swarm-budget budget_total 500000`. Every agent run charges
-// its token usage to `swarm-budget budget_spent`; executors stop dispatching once
-// spent >= total. This bounds the REAL resource — spend — regardless of how the
-// swarm fans out. (A concurrency cap bounds count, not cost, and fights the
-// parallelism we actually want.) No budget_total set => unbounded (opt-in).
-import { execSync } from "node:child_process";
+// once: `lodestar tell @swarm budget_total 500000`. Every agent run charges its
+// token usage to @swarm/budget_spent via the coordinator's ATOMIC :bump op (fram-1,
+// e3e9adf) — read-add-write under the lock, so N executors charging at once never
+// lose an update. Executors stop dispatching once spent >= total. Bounds the real
+// resource (spend) regardless of fan-out. No budget_total set => unbounded (opt-in).
+import { createConnection } from "node:net";
 
-const SUBJECT = process.env.LODESTAR_BUDGET ?? "swarm-budget";
+const PORT = Number(process.env.LODESTAR_PORT ?? 7977);
+const SUBJECT = process.env.LODESTAR_BUDGET ?? "@swarm";
 
-function readNum(pred: string): number | null {
+// One line-delimited EDN request/response against the coordinator socket.
+function coordOp(op: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection({ host: "127.0.0.1", port: PORT }, () => sock.write(op + "\n"));
+    let buf = "";
+    sock.on("data", (d) => {
+      buf += d.toString();
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) {
+        sock.end();
+        resolve(buf.slice(0, nl));
+      }
+    });
+    sock.on("error", reject);
+    sock.setTimeout(4000, () => {
+      sock.destroy();
+      reject(new Error("coordinator timeout"));
+    });
+  });
+}
+
+// Resolve a single-valued claim to a number, or null if unset/unreadable.
+async function readNum(pred: string): Promise<number | null> {
   try {
-    const claims = JSON.parse(
-      execSync(`lodestar json show ${SUBJECT}`, { encoding: "utf8", timeout: 5000 }).trim()
-    ) as { predicate: string; value: string }[];
-    const c = claims.find((x) => x.predicate === pred);
-    return c && c.value !== "" ? Number(c.value) : null;
+    const r = await coordOp(`{:op :resolved :te ${JSON.stringify(SUBJECT)} :p ${JSON.stringify(pred)}}`);
+    const m = r.match(/:value\s+"?(-?\d+(?:\.\d+)?)"?/);
+    return m ? Number(m[1]) : null;
   } catch {
     return null;
   }
 }
 
 // Tokens left, or Infinity if no budget is set (the unbounded, opt-in default).
-export function remaining(): number {
-  const total = readNum("budget_total");
+export async function remaining(): Promise<number> {
+  const total = await readNum("budget_total");
   if (total == null || Number.isNaN(total)) return Infinity;
-  return total - (readNum("budget_spent") ?? 0);
+  return total - ((await readNum("budget_spent")) ?? 0);
 }
 
 // Total tokens for one agent run (input + output + cache) from the SDK result msg.
@@ -38,14 +59,13 @@ export function tokensOf(resultMsg: any): number {
   );
 }
 
-// Add `tokens` to budget_spent. Read-modify-write — approximate under concurrent
-// finishes; fram-1's atomic coord add-verb makes it exact. The budget is a guard,
-// not accounting, so minor drift is fine. No-op when no budget is set.
-export function charge(tokens: number): void {
+// Atomically add `tokens` to @swarm/budget_spent via the coordinator :bump op —
+// race-proof under concurrent charges (read-add-write inside the lock). No-op when
+// no budget is set, so unbudgeted runs stay untracked.
+export async function charge(tokens: number): Promise<void> {
   if (tokens <= 0) return;
-  if (readNum("budget_total") == null) return; // no budget => don't track
-  const spent = readNum("budget_spent") ?? 0;
+  if ((await readNum("budget_total")) == null) return; // no budget => don't track
   try {
-    execSync(`lodestar tell ${SUBJECT} budget_spent ${spent + tokens}`, { encoding: "utf8", timeout: 5000 });
+    await coordOp(`{:op :bump :te ${JSON.stringify(SUBJECT)} :p "budget_spent" :n ${Math.round(tokens)}}`);
   } catch {}
 }

@@ -73,7 +73,7 @@ export async function discover(self: string, opts: DiscoverOpts = {}): Promise<s
     // Budget gate: stop pulling work once the token budget is spent. Bounds spend,
     // not concurrency — fan out freely, cost is the only ceiling. No budget set =>
     // remaining() is Infinity (unbounded, opt-in).
-    if (remaining() <= 0) {
+    if ((await remaining()) <= 0) {
       await backoff("token budget spent");
       continue;
     }
