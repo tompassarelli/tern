@@ -129,6 +129,9 @@ function withCoordination(self: string, base: string): string {
     `  ${REPO}/bin/concern declare ${self} ${repo} "<what you're building>" <file1,file2,...>`,
     `  ${REPO}/bin/concern shape <id>   # likely-to-land work in your footprint — build against it`,
     `  ${REPO}/bin/concern status <id> likely-to-land · done <id> · ls [repo]`,
+    ``,
+    `Internal notes / status / scratch / handoffs -> docs/private/ (gitignored), NEVER public docs/.`,
+    `Run \`${REPO}/bin/ensure-private-docs\` to set up the ignore in a repo before writing there.`,
   ].join("\n");
   return `${base}\n${proto}`;
 }

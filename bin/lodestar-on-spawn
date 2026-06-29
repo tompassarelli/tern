@@ -30,6 +30,9 @@ feature against what is likely to land before it is in main.
   ~/code/lodestar/bin/concern status <id> likely-to-land · done <id> · ls [repo]
 Declare a concern before editing code for a feature, so others can see + shape around your work.
 
+Internal notes / status / scratch / handoffs -> docs/private/ (gitignored), NEVER public docs/.
+Run \`~/code/lodestar/bin/ensure-private-docs\` to set up the ignore in a repo before writing there.
+
 To be reachable in REAL TIME, arm your interrupt listener as a BACKGROUND task now:
   ~/code/lodestar/bin/lodestar-arm $ID
 Dormant (no tokens) until a peer addresses you; when it returns you have mail — read it, act, re-arm.
