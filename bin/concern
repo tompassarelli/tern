@@ -2,4 +2,44 @@
 # concern — concern-level coordination for parallel agents (NOT locks).
 # Declare a feature + its footprint; concerns coexist; overlap and likely-to-land
 # work are surfaced so agents shape around each other. See cli/concern-cli.clj.
-exec bb "$HOME/code/lodestar/cli/concern-cli.clj" 7977 "$@"
+#
+# FOOTPRINT = CODE-GRAPH BLAST JOINS (thread 019f1010-2705): on a FLIPPED Beagle repo
+# (a warm fram code daemon is up) footprint rides code-node IDENTITY via the per-repo
+# code store — scope-correct, rename-stable. We discover that repo's code-daemon port
+# here and hand it to the CLI as $LODESTAR_CODE_PORT (the :7977 board stays the spine).
+# No live code daemon -> the CLI degrades to path-string footprint.
+set -euo pipefail
+BOARD=7977
+
+# Best-effort repo for code-daemon discovery: `declare` carries it positionally
+# (`declare <agent> <repo> ...` => $3), other verbs read the concern's stored
+# code_port off the spine, so $PWD is a fine fallback for them.
+repo=""
+if [ "${1:-}" = "declare" ]; then repo="${3:-}"; fi
+[ -z "$repo" ] && repo="$PWD"
+repo="${repo/#\~/$HOME}"
+
+# port of the per-repo warm code daemon, IFF one is actually listening there.
+discover_code_port() {
+  local dir="$1" cand=""
+  [ -d "$dir" ] || return 0
+  # 1) .mcp.json FRAM_CODE_PORT (written by fram-code-on)
+  if [ -f "$dir/.mcp.json" ]; then
+    cand="$(grep -oE '"FRAM_CODE_PORT"[^0-9]*[0-9]+' "$dir/.mcp.json" 2>/dev/null | grep -oE '[0-9]+' | tail -1)"
+  fi
+  # 2) else a .fram/coord-<port>.log left by a boot
+  if [ -z "$cand" ] && [ -d "$dir/.fram" ]; then
+    local f
+    for f in "$dir"/.fram/coord-*.log; do
+      [ -e "$f" ] || continue
+      cand="$(basename "$f" | sed -E 's/coord-([0-9]+)\.log/\1/')"; [ -n "$cand" ] && break
+    done
+  fi
+  # only adopt it if a daemon is genuinely listening (a stale port would hang writes)
+  if [ -n "$cand" ] && ss -ltn 2>/dev/null | grep -q ":$cand "; then echo "$cand"; fi
+}
+
+CODE_PORT="$(discover_code_port "$repo" || true)"
+[ -n "${CODE_PORT:-}" ] && export LODESTAR_CODE_PORT="$CODE_PORT"
+
+exec bb "$HOME/code/lodestar/cli/concern-cli.clj" "$BOARD" "$@"
