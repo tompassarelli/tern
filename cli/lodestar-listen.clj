@@ -18,6 +18,8 @@
 ;; (rf/rmany = the single/multi resolved variants — semantics unchanged).
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op lodestar.coord/send-op)
+(def append! lodestar.coord/append!)
+(def put!    lodestar.coord/put!)
 (def rf      lodestar.coord/resolved)
 (def rmany   lodestar.coord/many)
 ;; shared incremental-aggregate (coord.clj): budget Σ and the driver ceiling are
@@ -27,9 +29,7 @@
 (def count-distinct lodestar.coord/count-distinct)
 (defn role-slug [r] (when (and (string? r) (>= (count r) 6) (= "@role:" (subs r 0 6))) (subs r 6)))
 
-(defn ack! [port me id]
-  (let [v (:version (send-op port {:op :version}))]
-    (send-op port {:op :assert :te id :p "acked_by" :r me :base v})))
+(defn ack! [port me id] (append! port id "acked_by" me))   ; acked_by is multi — append (coexist)
 
 ;; --- swarm cost budget + derived concurrency ceiling -----------------------
 ;; The REAL resource is spend, not concurrency: N agents looping forever still burn
@@ -80,44 +80,54 @@
       (do (println (str "   ⚙ run " label (when rem (str ", budget ~$" rem " left")) " (" live " live drivers)")) (flush)
           (thunk)))))
 
-;; --- Phase 1: the reactor ---------------------------------------------------
-;; Parse a mail body as the Phase-0 command envelope (must stay in sync with
-;; cli/msg-cli.clj parse-envelope — same contract). Plain bodies -> nil.
-(def known-ops #{:dispatch :spawn :tell :claim})
-(defn parse-envelope [body]
-  (when (and body (str/starts-with? (str/triml (str body)) "{"))
-    (let [m (try (edn/read-string body) (catch Exception _ ::bad))]
-      (cond (= m ::bad)               {:error "not valid EDN"}
-            (not (map? m))            {:error "not an EDN map"}
-            (not (known-ops (:op m))) {:error (str "unknown :op " (pr-str (:op m)))}
-            (not (map? (:args m)))    {:error ":args not a map"}
-            :else                     {:op (:op m) :args (:args m)}))))
-
+;; --- Phase 1: the reactor — a forward-chaining rule over claim-patterns ------
+;; The reactor NO LONGER string-parses a command envelope (the parse-envelope copy that
+;; "MUST stay in sync" with msg-cli is DELETED). A command is CLAIMS on @cmd:<id>; the
+;; reactor matches PENDING ones (op+target, NOT acked_by) via the shared Datalog rule
+;; (coord/pending-cmds) and reads each arg as a claim with rf — no parsing, no settle sleep.
 (def sdk (or (System/getenv "LODESTAR_SDK") (str (System/getenv "HOME") "/code/lodestar/sdk")))
-;; EXECUTE a command envelope: REUSE dispatch.ts/spawn.ts as the executor. Phase 1 wires
-;; :spawn + :dispatch (the keystone); :tell/:claim are Phase 2/3.
-;; `self` = the reactor's handle (its uuid). Passed as AGENT_ID into spawned/dispatched
-;; agents so any command_peer they emit is attributed to the real handle (not a generated
-;; sdk-* id) — required for multi-hop routing/acks (per nixos-config-1's P2 harness).
-(defn react! [port self op args]
+
+;; EXECUTE one command (cmd = @cmd:<id>): REUSE dispatch.ts/spawn.ts as the executor. Args are
+;; read off the command's claims, not an envelope map. `self` = the reactor's handle (its uuid),
+;; passed as AGENT_ID so any command_peer a spawned/dispatched agent emits is attributed to the
+;; real handle (not a generated sdk-* id) — required for multi-hop routing/acks.
+(defn react! [port self op cmd]
   (case op
-    :spawn    (with-guard port self "spawn"
-                (fn [] (println (str "   ⚙ spawn: " (pr-str (:prompt args))))
-                  (proc/shell {:dir sdk :continue true
-                               :extra-env (cond-> {"AGENT_ID" self} (:model args) (assoc "AGENT_MODEL" (str (:model args))))}
-                              "bun" "src/spawn.ts" (str (:prompt args)))))
-    :dispatch (with-guard port self "dispatch"
-                (fn [] (println (str "   ⚙ dispatch thread " (:thread args)))
-                  (proc/shell {:dir sdk :continue true :extra-env {"AGENT_ID" self}}
-                              "bun" "src/dispatch.ts" (str (:thread args)))))
-    ;; Phase 3: atomic work-claim via the exclusive-lease (mutual exclusion in the coordinator).
-    :claim    (let [h (or (:holder args) "reactor")
-                    r (send-op port {:op :acquire-lease :holder h :res (str "@lease:" (:thread args))
-                                     :ttl-ms (or (:ttl-ms args) 600000)})]
-                (if (:reject r)
-                  (println (str "   ⚠ claim DENIED " (:thread args) " — held by " (:holder r)))
-                  (println (str "   ✓ claimed " (:thread args) " by " h " (epoch " (:epoch r) ")"))))
-    (println (str "   ⚠ op " op " not yet wired in the reactor (e.g. :tell -> Phase 2)"))))
+    "spawn"    (with-guard port self "spawn"
+                 (fn [] (let [prompt (rf port cmd "prompt") model (rf port cmd "model")]
+                          (println (str "   ⚙ spawn: " (pr-str prompt)))
+                          (proc/shell {:dir sdk :continue true
+                                       :extra-env (cond-> {"AGENT_ID" self} model (assoc "AGENT_MODEL" (str model)))}
+                                      "bun" "src/spawn.ts" (str prompt)))))
+    "dispatch" (with-guard port self "dispatch"
+                 (fn [] (let [thread (rf port cmd "thread")]
+                          (println (str "   ⚙ dispatch thread " thread))
+                          (proc/shell {:dir sdk :continue true :extra-env {"AGENT_ID" self}}
+                                      "bun" "src/dispatch.ts" (str thread)))))
+    ;; tell — the most claim-native op: assert a single claim (id pred value). No executor.
+    "tell"     (let [id (rf port cmd "id") pred (rf port cmd "pred") value (rf port cmd "value")]
+                 (append! port id pred value)
+                 (println (str "   ✓ told " id " " pred " " value)))
+    ;; claim — work-claim WITHOUT a reactor lease (the @lease:<thread> acquire-lease is DELETED,
+    ;; roadmap tier I + §3.5). A `driver` claim on the resource IS the lock (declared-single,
+    ;; last-writer-wins): graph-internal mutual exclusion collapses onto a claim, no parallel lease.
+    "claim"    (let [res (rf port cmd "resource") holder (or (rf port cmd "holder") (rf port cmd "from") self)
+                     subj (if (str/starts-with? (str res) "@") res (str "@" res))]
+                 (put! port subj "driver" holder)
+                 (println (str "   ✓ claimed " subj " driver=" holder)))
+    (println (str "   ⚠ op " op " not wired in the reactor"))))
+
+;; The forward-chaining loop: every PENDING command targeting one of my addrs -> execute,
+;; ack (acked_by removes it from the pending set — exactly-once), and reply with a CLAIM
+;; (validated by the coordinator's existing commit rule-check, not a JSON-Schema sidecar).
+(defn react-pending! [port self addrs]
+  (doseq [[cmd op tgt] (sort (or (lodestar.coord/pending-cmds port) []))]
+    (when (contains? addrs tgt)
+      (println (format "⚙  REACT %s  op=%s  (target %s, from %s)" cmd op tgt (or (rf port cmd "from") "?"))) (flush)
+      (react! port self op cmd)
+      (ack! port self cmd)
+      (append! port cmd "reply" (str op " executed by " self))   ; reply = a claim
+      (println (str "   ↳ executed + acked_by " self)) (flush))))
 
 (let [[ps uuid & flags] *command-line-args*
       port    (Integer/parseInt ps)
@@ -164,23 +174,23 @@
                                            (if (= op "assert") "watch" "unwatch") r (count @watched))) (flush)
                           (when scoped? (reset! reconnect? true)))
 
-                      ;; (c) self-channel: a message to my uuid OR a role I hold
+                      ;; (c) self-channel: a human message to my uuid OR a role I hold. `to` lands
+                      ;; LAST now (msg-cli send writes it after the body), so from/subject/body are
+                      ;; already visible — no settle sleep, and no envelope parsing (commands are
+                      ;; @cmd: subjects handled in (c2), not mail bodies).
                       (and (= op "assert") (= p "to") (contains? @addrs r))
-                      (do (Thread/sleep 150)   ; let from/subject/body settle — routing-key "to" lands first
-                          (let [body (rf port l "body"), env (parse-envelope body)]
-                            (if (and react? env (:op env))
-                              ;; REACTOR (--react): a command envelope -> EXECUTE + ack. The closed loop.
-                              (do (println (format "⚙  REACT %s  op=%s args=%s  (from %s)"
-                                                   l (:op env) (pr-str (:args env)) (rf port l "from"))) (flush)
-                                  (react! port uuid (:op env) (:args env))
-                                  (ack! port uuid l)
-                                  (println (str "   ↳ executed + acked_by " uuid)) (flush))
-                              ;; LISTENER: print (flag a malformed command body if present)
-                              (do (when (:error env) (println (str "   ⚠ command body malformed: " (:error env))))
-                                  (println (format "✉  MAIL %s  (to %s)\n   from:    %s\n   subject: %s\n   body:    %s"
-                                                   l r (rf port l "from") (rf port l "subject") body))
-                                  (when ack? (ack! port uuid l) (println (str "   ↳ acked_by " uuid)))
-                                  (flush))))
+                      (do (println (format "✉  MAIL %s  (to %s)\n   from:    %s\n   subject: %s\n   body:    %s"
+                                           l r (rf port l "from") (rf port l "subject") (rf port l "body"))) (flush)
+                          (when ack? (ack! port uuid l) (println (str "   ↳ acked_by " uuid)) (flush))
+                          (when once? (System/exit 0)))
+
+                      ;; (c2) command landing: a @cmd:<id> whose routing `target` is one of my addrs.
+                      ;; `target` is asserted LAST, so op+args are present. Drive the forward-chaining
+                      ;; rule (coord/pending-cmds) — no string parse, no settle sleep.
+                      (and (= op "assert") (= p "target") (contains? @addrs r))
+                      (do (if react?
+                            (react-pending! port uuid @addrs)   ; --react: execute + ack + reply
+                            (println (format "⌘  COMMAND %s  op=%s  (target %s)" l (rf port l "op") r))) (flush)
                           (when once? (System/exit 0)))
 
                       ;; (d) watched-thread activity
