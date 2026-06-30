@@ -1,5 +1,5 @@
 // Escape-hatch mounts for the wake frontend. wake carves a container and calls
-// window.lodestar.mountGraph({el, wake}); we render the Cytoscape thread DAG
+// window.tern.mountGraph({el, wake}); we render the Cytoscape thread DAG
 // into it (data from /api/dag). Everforest palette. Uses the global `cytoscape`.
 
 (function () {
@@ -34,11 +34,11 @@
     ];
   }
 
-  window.lodestar = window.lodestar || {};
+  window.tern = window.tern || {};
 
   // focus (optional) = an @id; when set, fetch the focused subgraph around it and
   // accent that node. Absent → full DAG, identical to before.
-  window.lodestar.mountGraph = async function ({ el, focus }) {
+  window.tern.mountGraph = async function ({ el, focus }) {
     if (!el || typeof cytoscape === "undefined") return;
     el.style.width = "100%";
     el.style.height = el.style.height || "420px";

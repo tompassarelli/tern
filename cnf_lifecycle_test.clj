@@ -1,10 +1,10 @@
-;; cnf_lifecycle_test.clj — Stage 4 gate: the lodestar lifecycle derivations
+;; cnf_lifecycle_test.clj — Stage 4 gate: the tern lifecycle derivations
 ;; (terminal / work-thread / blocked / ready) expressed AS Datalog rules over the
 ;; reified store must produce the SAME results as the hand-coded flat projections.
 ;; Derivation replaces bespoke code — the CNF thesis, checked on the live corpus.
 ;;   FRAM_LOG=/path bb -cp out cnf_lifecycle_test.clj
 (require '[fram.cnf :as c] '[fram.schema :as s] '[fram.datalog :as d]
-         '[fram.kernel :as k] '[lodestar.projections :as proj] '[fram.fold :as fold]
+         '[fram.kernel :as k] '[tern.projections :as proj] '[fram.fold :as fold]
          '[fram.rt] '[clojure.string :as str] '[clojure.set :as set] '[clojure.java.io :as io])
 
 (def log (System/getenv "FRAM_LOG"))
@@ -44,7 +44,7 @@
   (let [subj (ent-for! (:l cl)) p (:p cl) r (:r cl)]
     (if (ref? r) (s/link! ctx subj p (ent-for! r) tx) (s/assert! ctx subj p r tx))))
 
-;; --- the lodestar lifecycle, AS RULES (lifecycle DERIVED from the explicit
+;; --- the tern lifecycle, AS RULES (lifecycle DERIVED from the explicit
 ;;     committed/outcome/abandoned claims — never a stored heuristic) -----------
 (def out-p (c/value-id ctx "outcome"))
 (def ab-p  (c/value-id ctx "abandoned"))

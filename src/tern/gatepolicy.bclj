@@ -1,0 +1,67 @@
+#lang beagle/clj
+(ns tern.gatepolicy
+  "Pure security/policy DECISIONS for the auth gateway, with REAL types (not Any —
+  Any would defeat the point; the checker must know the shapes). The effects (HTTP,
+  sockets, the registry file, the buckets atom, audit IO) stay in gateway.clj; this
+  module DECIDES, the shell ACTS. `Any` appears ONLY at the untrusted-input boundary
+  (the parsed wire body / raw registry EDN), where it is correct to validate dynamic
+  data INTO a typed shape — that is the one honest use of Any.")
+
+(require clojure.string :as str)
+(import java.security.MessageDigest)   ; non-java.lang classes need an explicit import
+
+;; A tenant the gateway routes to (the typed shape the registry EDN validates into).
+(defrecord Tenant [tid :- String host :- String port :- Int])
+;; A per-tenant token-bucket cell (rate limiting state).
+(defrecord Bucket [tokens :- Float ts :- Float ok :- Bool])
+
+;; --- token hashing: SHA-256 hex (Java interop) ------------------------------
+(defn- hex-byte [b :- Int] :- String
+  (let [v (bit-and b 255) h "0123456789abcdef"]
+    (str (subs h (quot v 16) (+ (quot v 16) 1))
+         (subs h (rem v 16) (+ (rem v 16) 1)))))
+
+(defn sha256-hex [s :- String] :- String
+  (let [md (MessageDigest/getInstance "SHA-256")
+        bs (.digest md (.getBytes s "UTF-8"))]
+    (reduce (fn [acc :- String b :- Int] :- String (str acc (hex-byte b))) "" (vec bs))))
+
+;; --- bearer header -> raw token ---------------------------------------------
+(defn bearer-token [auth :- String] :- String
+  (if (and (some? auth) (str/starts-with? auth "Bearer ")) (subs auth 7) ""))
+
+;; --- validate one untrusted registry entry INTO a typed Tenant (or nil) ------
+;; cfg is Any: it's raw EDN off disk. This is the boundary — dynamic in, typed out.
+(defn parse-tenant [tid :- String cfg :- Any] :- Any
+  (let [host (:coordinator-host cfg) port (:coordinator-port cfg)]
+    (if (and (some? port))
+      (->Tenant tid (if (some? host) host "127.0.0.1") port)
+      nil)))
+
+;; --- token -> Tenant: hash, look it up in the by-hash index ------------------
+(defn token->tenant [by-hash :- (Map String Tenant) token :- String] :- Any
+  (if (and (some? token) (not (= token "")))
+    (get by-hash (sha256-hex token))
+    nil))
+
+;; --- per-tenant token bucket: PURE step (state in, new state + verdict out) --
+(defn bucket-step [b :- Any now :- Float rate :- Float burst :- Float] :- Bucket
+  (let [bk (if (some? b) b (->Bucket burst now true))
+        elapsed (max 0.0 (/ (- now (:ts bk)) 1.0e9))
+        refilled (min burst (+ (:tokens bk) (* elapsed rate)))]
+    (if (>= refilled 1.0)
+      (->Bucket (- refilled 1.0) now true)
+      (->Bucket refilled now false))))
+
+;; --- request validation: body must be an EDN map with a keyword :op ----------
+;; parsed is Any: untrusted wire EDN. Validating Any -> Bool is the correct boundary.
+(defn valid-op? [parsed :- Any] :- Bool
+  (and (map? parsed) (keyword? (:op parsed))))
+
+;; --- coarse coordinator-result status for the audit line (never the value) ---
+(defn coord-status [resp :- String] :- String
+  (cond
+    [(nil? resp) "no-response"]
+    [(str/includes? resp ":error") "error"]
+    [(str/includes? resp ":conflict") "conflict"]
+    [:else "ok"]))

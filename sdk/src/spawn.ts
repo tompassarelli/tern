@@ -35,7 +35,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
 
   if (escalate && !Number.isFinite(await remaining())) {
     console.warn(`[spawn] @agent:${agentId} escalation ON but no budget_total — no spend floor; ` +
-      `it stops only at the ladder ceiling. Set: lodestar tell @swarm budget_total <usd>`);
+      `it stops only at the ladder ceiling. Set: tern tell @swarm budget_total <usd>`);
   }
   console.log(`[spawn] @agent:${agentId} starting${escalate ? ` (escalate @ tier ${tier} ${rung().model}/${rung().effort})` : ""}`);
 

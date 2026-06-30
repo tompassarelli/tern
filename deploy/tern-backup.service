@@ -1,0 +1,23 @@
+# systemd oneshot — snapshot every tenant's claims.log (run on a schedule by
+# tern-backup.timer; this unit does the work).
+#   sudo cp deploy/tern-backup.service /etc/systemd/system/
+#   sudo cp deploy/tern-backup.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tern-backup.timer
+[Unit]
+Description=Tern per-tenant claims.log backup
+
+[Service]
+Type=oneshot
+User=tern
+Group=tern
+Environment=TERN_TENANT_ROOT=/var/lib/tern/tenants
+Environment=TERN_BACKUP_DIR=/var/lib/tern/backups
+ExecStart=/opt/tern/deploy/backup.sh
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tern

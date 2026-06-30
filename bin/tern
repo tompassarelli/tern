@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Tern — the life app. Routes LIFE verbs to the Tern CLI (tern.main,
+# run against the Fram engine on the classpath) and ENGINE verbs to the Fram CLI.
+# Both operate on the same private XDG claim data. Supplies the life domain config
+# (cardinality vocab §1.1 + capture provenance).
+#
+#   engine: ~/code/fram   data: ~/code/tern-data (XDG ~/.local/state/tern)
+export FRAM_THREADS="${FRAM_THREADS:-$HOME/.local/state/tern/threads}"
+export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/tern/claims.log}"
+export FRAM_TIME_DIR="${FRAM_TIME_DIR:-$HOME/.local/state/tern/time}"
+export FRAM_SINGLE_VALUED="${FRAM_SINGLE_VALUED:-title owner lead driver source part_of do_on valid_until estimate_hours created_at updated_at name display_name body created_by committed outcome abandoned superseded_by merged_into session_of start_time end_time clockify_id}"
+# Tern DECLARES its lifecycle vocab to the (now genericized) Fram kernel —
+# value-identical to the kernel default, so this is the explicit-config form of
+# what was previously baked in (Fram >= ec7ef90: FRAM_TERMINAL_PREDS/WITHDRAWN_PREDS).
+export FRAM_TERMINAL_PREDS="${FRAM_TERMINAL_PREDS:-outcome abandoned superseded_by}"
+export FRAM_WITHDRAWN_PREDS="${FRAM_WITHDRAWN_PREDS:-abandoned}"
+export CLOCKIFY_SECRET_FILE="${CLOCKIFY_SECRET_FILE:-/run/secrets/clockify-api-key}"
+export TERN_SOURCE="${TERN_SOURCE:-tom}"
+export TERN_AUTHOR="${TERN_AUTHOR:-tom_passarelli}"
+export TERN_LEAD="${TERN_LEAD:-tom_passarelli}"
+export TERN_DRIVER="${TERN_DRIVER:-tom_passarelli}"
+export TERN_PROPOSED_BY="${TERN_PROPOSED_BY:-tom_passarelli}"
+
+FRAM="${FRAM_HOME:-$HOME/code/fram}"
+TERN="$(cd "$(dirname "$0")/.." && pwd)"
+
+case "${1:-}" in
+  ready|blocked|leverage|next|agenda|plate|capture|json|needs-review|audit|resolve|validate|doctor|clock)
+    # `validate` runs tern's FULL check (engine-generic ++ tern work rules,
+    # tern.validate) — the fram CLI `validate` is generic-only since the work
+    # rules moved out of the kernel. The MCP validate tool shells through here too.
+    exec bb -cp "$TERN/out:$FRAM/out" -m tern.main "$@" ;;
+  up)
+    exec "$FRAM/bin/fram-up" "${@:2}" ;;
+  tell|untell)
+    # Handles (and @ids) are a TERN concern: fram is handle-blind and re-adds
+    # the leading @ to the bare subject it's handed. So resolve the SUBJECT ref to
+    # its canonical id here first — that's what makes `tern tell @perf ...`
+    # land on the right thread — then pass fram the bare canonical id. Only rewrite
+    # when the full `tell <id> <pred> <value>` shape is present; otherwise pass
+    # through untouched so fram's own usage/arg checks are unchanged.
+    if [ "$#" -ge 4 ]; then
+      canon="$(bb -cp "$TERN/out:$FRAM/out" -m tern.main resolve "$2" 2>/dev/null)"
+      [ -n "$canon" ] && set -- "$1" "${canon#@}" "${@:3}"
+    fi
+    exec "$FRAM/bin/fram" "$@" ;;
+  *)  # engine verbs: import/export/show/set/merge/watch
+    exec "$FRAM/bin/fram" "$@" ;;
+esac

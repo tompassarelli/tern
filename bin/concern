@@ -6,7 +6,7 @@
 # FOOTPRINT = CODE-GRAPH BLAST JOINS (thread 019f1010-2705): on a FLIPPED Beagle repo
 # (a warm fram code daemon is up) footprint rides code-node IDENTITY via the per-repo
 # code store — scope-correct, rename-stable. We discover that repo's code-daemon port
-# here and hand it to the CLI as $LODESTAR_CODE_PORT (the :7977 board stays the spine).
+# here and hand it to the CLI as $TERN_CODE_PORT (the :7977 board stays the spine).
 # No live code daemon -> the CLI degrades to path-string footprint.
 set -euo pipefail
 BOARD=7977
@@ -40,6 +40,6 @@ discover_code_port() {
 }
 
 CODE_PORT="$(discover_code_port "$repo" || true)"
-[ -n "${CODE_PORT:-}" ] && export LODESTAR_CODE_PORT="$CODE_PORT"
+[ -n "${CODE_PORT:-}" ] && export TERN_CODE_PORT="$CODE_PORT"
 
-exec bb "$HOME/code/lodestar/cli/concern-cli.clj" "$BOARD" "$@"
+exec bb "$HOME/code/tern/cli/concern-cli.clj" "$BOARD" "$@"

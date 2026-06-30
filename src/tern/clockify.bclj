@@ -1,0 +1,96 @@
+#lang beagle/clj
+(ns tern.clockify
+  "Clockify integration — the BILLING projection of claim-native sessions.
+   The canonical time store is the claim graph (fram.clock sessions); this
+   module only pushes closed billable sessions outward to Clockify on demand and
+   lists workspaces/projects. The thread-owner -> Clockify-project mapping lives
+   in <time-dir>/projects.json (integration config, not time data). API key from
+   $CLOCKIFY_API_KEY or the file at $CLOCKIFY_SECRET_FILE; nothing baked in.")
+
+(require clojure.string :as str)
+(require fram.rt)
+(require fram.json :as json)
+
+(declare-extern fram.rt/error-exit [String -> Any])
+(declare-extern fram.rt/file-exists [String -> Bool])
+(declare-extern fram.rt/create-dirs [String -> Nil])
+(declare-extern fram.rt/getenv [String -> String?])
+(declare-extern fram.rt/http-get [String String -> String])
+(declare-extern fram.rt/http-post [String String String -> String])
+
+(declare-extern fram.json/parse [String -> Json])
+(declare-extern fram.json/to-string [Json -> String])
+(declare-extern fram.json/get [Json String -> String?])
+(declare-extern fram.json/put [Json String String? -> Json])
+(declare-extern fram.json/empty [-> Json])
+(declare-extern fram.json/sort-keys [Json -> Json])
+
+;; --- api key + http ---------------------------------------------------------
+(defn- clockify-key [] :- String
+  (let [env-key (fram.rt/getenv "CLOCKIFY_API_KEY")
+        secret-file (fram.rt/getenv "CLOCKIFY_SECRET_FILE")]
+    (cond
+      [(some? env-key) env-key]
+      [(and (some? secret-file) (fram.rt/file-exists secret-file)) (str/trim (slurp secret-file))]
+      [:else (fram.rt/error-exit
+              "no clockify key — set CLOCKIFY_API_KEY, or CLOCKIFY_SECRET_FILE to a key file")])))
+
+(defn- clockify-get [path :- String] :- Json
+  (let [body (fram.rt/http-get (str "https://api.clockify.me/api/v1" path) (clockify-key))]
+    (if (= body "") (fram.json/empty) (fram.json/parse body))))
+
+(defn- clockify-post [path :- String body-data :- Json] :- Json
+  (let [body (fram.rt/http-post (str "https://api.clockify.me/api/v1" path)
+                               (clockify-key) (fram.json/to-string body-data))]
+    (if (= body "") (fram.json/empty) (fram.json/parse body))))
+
+(defn default-workspace [] :- String
+  (let [env-ws (fram.rt/getenv "CLOCKIFY_WORKSPACE_ID")]
+    (if (some? env-ws)
+      env-ws
+      (let [user (clockify-get "/user")
+            ws (fram.json/get user "defaultWorkspace")]
+        (if (nil? ws) (fram.rt/error-exit "no defaultWorkspace in /user response") ws)))))
+
+;; --- thread-owner -> project mapping (integration config) -------------------
+(defn- projects-path [dir :- String] :- String (str dir "/projects.json"))
+
+(defn- load-projects [dir :- String] :- Json
+  (let [p (projects-path dir)]
+    (if (fram.rt/file-exists p) (fram.json/parse (slurp p)) (fram.json/empty))))
+
+(defn cmd-map [dir :- String owner :- String project-id :- String] :- Nil
+  (let [mapping (load-projects dir)]
+    (fram.rt/create-dirs dir)
+    (spit (projects-path dir)
+          (fram.json/to-string (fram.json/sort-keys (fram.json/put mapping owner project-id))))
+    (println (str "mapped owner " owner " → clockify project " project-id))))
+
+(defn project-for [dir :- String owner :- String] :- String?
+  (fram.json/get (load-projects dir) owner))
+
+;; --- listing ----------------------------------------------------------------
+(defn cmd-workspaces [] :- Nil
+  (doseq [w (cheshire.core/parse-string
+              (fram.rt/http-get "https://api.clockify.me/api/v1/workspaces" (clockify-key)) false)]
+    (println (str (get w "id" "") "  " (get w "name" "")))))
+
+(defn cmd-projects [] :- Nil
+  (let [ws (default-workspace)]
+    (doseq [p (cheshire.core/parse-string
+               (fram.rt/http-get (str "https://api.clockify.me/api/v1/workspaces/" ws "/projects?page-size=100") (clockify-key)) false)]
+      (println (str (get p "id" "") "  " (get p "name" ""))))))
+
+;; --- push one session as a Clockify time entry; returns the new entry id -----
+(defn create-entry [ws :- String proj :- String start :- String end :- String desc :- String] :- String
+  (let [resp (clockify-post
+              (str "/workspaces/" ws "/time-entries")
+              (fram.json/put
+               (fram.json/put
+                (fram.json/put
+                 (fram.json/put (fram.json/empty) "start" (str start "Z"))
+                 "end" (str end "Z"))
+                "description" desc)
+               "projectId" proj))
+        cid (fram.json/get resp "id")]
+    (if (nil? cid) "" cid)))

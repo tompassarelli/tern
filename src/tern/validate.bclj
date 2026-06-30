@@ -1,0 +1,51 @@
+#lang beagle/clj
+(ns tern.validate
+  "Tern's integrity check: the engine's GENERIC structural rules (cycles,
+  dangling refs — fram.kernel/violations-i) PLUS the WORK-semantics rules the
+  engine no longer owns. The work rules were lifted out of the fram kernel to
+  here: a depends_on edge to a withdrawn (abandoned) thread is suspect, and the
+  role refs lead/driver/proposed_by must point at a person node (one carrying a
+  `display_name`). The kernel stays domain-free — it knows cycles and dangling
+  refs, not lifecycle or person/role vocab.")
+
+(require fram.kernel :as k)
+(require tern.projections :as proj)
+
+;; WORK-semantics violations over the index (the rules lifted out of the kernel's
+;; violations-i). Lifecycle-aware (terminal/withdrawn) + person/role vocab —
+;; neither of which the generic engine knows.
+(defn work-violations-i [idx :- k/Index te :- String] :- (Vec String)
+  (let [term? (proj/terminal-i? idx te)
+        ;; a depends_on edge to a withdrawn (abandoned) target — only suspect for
+        ;; a still-open thread (a resolved thread's stale deps don't matter).
+        v-ab (reduce
+              (fn [acc :- (Vec String) d :- String] :- (Vec String)
+                (if (and (not term?) (proj/withdrawn-i? idx d))
+                  (conj acc (str "depends_on points at abandoned " d))
+                  acc))
+              []
+              (k/many-i idx te "depends_on"))
+        ;; person-ref integrity: lead/driver must point at a node carrying a
+        ;; display_name claim ('references unknown person', greppable apart from
+        ;; the thread-ref 'references missing entity'). `name` is a RESERVED
+        ;; engine/schema predicate, so persons use display_name.
+        v-p (reduce
+             (fn [acc :- (Vec String) p :- String] :- (Vec String)
+               (let [ref (k/one-i idx te p)]
+                 (if (and (some? ref) (nil? (k/one-i idx ref "display_name")))
+                   (conj acc (str p " references unknown person " ref))
+                   acc)))
+             v-ab
+             ["lead" "driver"])
+        v-pb (reduce
+              (fn [acc :- (Vec String) rt :- String] :- (Vec String)
+                (if (nil? (k/one-i idx rt "display_name"))
+                  (conj acc (str "proposed_by references unknown person " rt))
+                  acc))
+              v-p
+              (k/many-i idx te "proposed_by"))]
+    v-pb))
+
+;; Full tern validate over one thread = engine-generic ++ tern-work.
+(defn violations-i [idx :- k/Index te :- String] :- (Vec String)
+  (vec (concat (k/violations-i idx te) (work-violations-i idx te))))

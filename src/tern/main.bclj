@@ -1,0 +1,636 @@
+#lang beagle/clj
+(ns tern.main
+  "Tern life CLI: the lifecycle/projection verbs (ready, blocked, leverage,
+  next, agenda, plate, capture, clock, needs-review, audit, doctor, json). Runs on
+  the Fram engine (fram.*); engine verbs (tell/set/import/...) are routed to
+  the fram CLI by the bin/tern wrapper."
+  (:gen-class))
+
+(require fram.kernel :as k)
+(require fram.fold :as fold)
+(require fram.import :as imp)
+(require fram.export :as exp)
+(require tern.projections :as proj)
+(require tern.validate :as val)
+(require tern.staleness :as stale)
+(require tern.clock :as clk)
+(require tern.audit :as audit)
+(require tern.clockify :as cf)
+(require clojure.string :as str)
+(require fram.rt)
+(import java.util.Random)   ; non-java.lang classes need an explicit import
+(import java.util.UUID)
+
+(declare-extern fram.rt/read-log [String -> (Vec fold/Assertion)])
+;; NOTE: NO write-log extern. Tern is a CLIENT — it mutates state ONLY through
+;; the coordinator (tell-retry -> coord-assert/retract). The removed `write-log`
+;; was a direct log-file bypass; capture reached for it and stranded data in files
+;; (the 2026-06-23 divergence bug). Not declaring it makes the bypass impossible.
+(declare-extern fram.rt/today-iso [-> String])
+(declare-extern fram.rt/now-iso [-> String])
+(declare-extern fram.rt/now-id [-> String])
+(declare-extern fram.rt/bump-id [String -> String])
+(declare-extern fram.rt/iso-to-seconds [String -> Int])
+(declare-extern fram.rt/this-week-dates [-> (Vec String)])
+(declare-extern fram.rt/parse-int [String -> Int])
+(declare-extern fram.rt/str-lt? [String String -> Bool])
+(declare-extern fram.rt/to-json [Any -> String])
+(declare-extern fram.rt/threads-dir [-> String])
+(declare-extern fram.rt/log-path [-> String])
+(declare-extern fram.rt/time-dir [-> String])
+(declare-extern fram.rt/ensure-dir [String -> Nil])
+(declare-extern fram.rt/spit-file [String String -> Nil])
+(declare-extern fram.rt/slugify [String -> String])
+(declare-extern fram.rt/getenv-or [String String -> String])
+(declare-extern fram.rt/coord-version [Int -> Int])
+(declare-extern fram.rt/coord-assert [Int String String String Int -> String])
+(declare-extern fram.rt/coord-retract [Int String String String Int -> String])
+(declare-extern fram.rt/coord-port [-> Int])
+(declare-extern fram.rt/coord-status [Int -> String])
+
+;; --- thread id: tern-owned UUIDv7 minter --------------------------------
+;; A UUIDv7 packs a 48-bit ms timestamp in the high bits, so ids are both
+;; collision-proof and k-sortable (lexicographic order ~ chronological). This is
+;; tern-owned ON PURPOSE: fram.rt/now-id (the @timestamp scheme) has other
+;; callers and stays untouched. created_at — not the id's internal bits — is the
+;; app's ordering/display key; the id carries only identity.
+(defn uuidv7 [] :- String
+  (let [ts (System/currentTimeMillis)
+        r (Random.)
+        msb (bit-or (bit-shift-left ts 16) 0x7000 (bit-and (.nextInt r) 0xFFF))
+        lsb (bit-or (bit-shift-left 2 62) (bit-and (.nextLong r) 0x3FFFFFFFFFFFFFFF))]
+    (str (UUID. msb lsb))))
+
+;; --- display helpers --------------------------------------------------------
+
+(defn- title-of [idx :- k/Index te :- String] :- String
+  (let [t (k/one-i idx te "title")] (if (some? t) t "")))
+
+(defn- short-id [te :- String] :- String
+  (if (str/starts-with? te "@") (subs te 1) te))
+
+;; --- ref resolution: @id OR @handle -> canonical @id ------------------------
+;; The view/boundary concern. An id is an opaque immutable key; a handle is an
+;; optional mutable human alias. fram NEVER sees a handle — capture/tell/CLI hand
+;; it a ref, this maps it to the canonical id first. Passthrough when the ref
+;; already names a thread (has a title); else find a thread whose `handle` claim
+;; equals the ref (sans @), latest created_at winning ties; else ref unchanged.
+(defn resolve-ref [idx :- k/Index ref :- String] :- String
+  (if (some? (k/one-i idx ref "title"))
+    ref
+    (let [bare (short-id ref)
+          matches (filterv (fn [te :- String] :- Bool
+                             (let [h (k/one-i idx te "handle")]
+                               (and (some? h) (= h bare))))
+                           (k/thread-ids-i idx))]
+      (if (empty? matches)
+        ref
+        (reduce (fn [best :- String te :- String] :- String
+                  (if (str/blank? best)
+                    te
+                    (let [bc (let [c (k/one-i idx best "created_at")] (if (some? c) c ""))
+                          tc (let [c (k/one-i idx te "created_at")] (if (some? c) c ""))]
+                      (if (fram.rt/str-lt? bc tc) te best))))
+                "" matches)))))
+
+(defn- trunc [s :- String n :- Int] :- String
+  (if (> (count s) n) (str (subs s 0 (- n 1)) "…") s))
+
+(defrecord LevItem [te :- String score :- Int])
+(defrecord NextItem [te :- String score :- Int])
+(defrecord AgendaItem [te :- String do_on :- String])
+
+;; --- claim-set signatures (for capture's import guard) ----------------------
+(defn- claim-sig [c :- k/Claim] :- String (str (:l c) "|" (:p c) "|" (:r c)))
+(defn- sig-member-map [claims :- (Vec k/Claim)] :- (Map String Bool)
+  (reduce (fn [m :- (Map String Bool) c :- k/Claim] :- (Map String Bool)
+            (assoc m (claim-sig c) true))
+          {} claims))
+
+;; --- write THROUGH the coordinator (serialized, safe under concurrent agents) --
+(defn- tell-once [port :- Int op :- String te :- String pred :- String rv :- String] :- String
+  (let [v (fram.rt/coord-version port)]
+    (if (< v 0)
+      "nodaemon"
+      (if (= op "assert")
+        (fram.rt/coord-assert port te pred rv v)
+        (fram.rt/coord-retract port te pred rv v)))))
+
+(defn- tell-retry [port :- Int op :- String te :- String pred :- String rv :- String tries :- Int] :- String
+  (let [resp (tell-once port op te pred rv)]
+    (if (and (= resp "conflict") (> tries 0))
+      (tell-retry port op te pred rv (- tries 1))
+      resp)))
+
+;; --- terminal capture: a one-line thought -> a thread -> folded -------------
+(defn- ctrl? [s :- String] :- Bool
+  (or (str/includes? s "\n") (str/includes? s "\r")))
+
+(defn- add-claim [acc :- (Vec k/Claim) te :- String p :- String v :- String] :- (Vec k/Claim)
+  (if (str/blank? v) acc (conj acc (k/->Claim te p v))))
+
+(defn- ref-or-blank [v :- String] :- String
+  (if (str/blank? v) "" (str "@" v)))
+
+(defn- capture-claims [te :- String title :- String owner :- String source :- String
+                       author :- String lead :- String proposed :- String
+                       created-at :- String today :- String] :- (Vec k/Claim)
+  ;; NO `driver` at birth (operating-manual): making a thread active is a deliberate
+  ;; pickup (`tell <id> driver @x`), never a capture default — a driver cell here is
+  ;; exactly the "stray driver" pollution the-model warns about.
+  (let [c (add-claim [] te "title" title)
+        ;; the-model §7: `personal` is the IMPLICIT owner default — store `owner`
+        ;; only for a non-personal (billable/client) owner, so absence == personal.
+        c (if (= owner "personal") c (add-claim c te "owner" owner))
+        c (add-claim c te "source" source)
+        c (add-claim c te "created_by" (ref-or-blank author))
+        c (add-claim c te "lead" (ref-or-blank lead))
+        c (add-claim c te "proposed_by" (ref-or-blank proposed))
+        ;; created_at is an explicit full-ISO claim (now-iso), asserted at capture —
+        ;; the id is opaque now (UUIDv7), so ordering/display read THIS, not the id.
+        c (add-claim c te "created_at" created-at)
+        c (add-claim c te "updated_at" today)
+        c (add-claim c te "committed" today)]
+    c))
+
+(defn cmd-capture [threads-dir :- String log :- String title :- String owner :- String] :- Nil
+  (let [source (fram.rt/getenv-or "TERN_SOURCE" "self")
+        author (fram.rt/getenv-or "TERN_AUTHOR" "you")
+        lead (fram.rt/getenv-or "TERN_LEAD" "")
+        proposed (fram.rt/getenv-or "TERN_PROPOSED_BY" "")]
+  (cond
+    [(or (str/blank? title) (ctrl? title))
+     (println "usage: capture <title> [owner]   (title must be a non-empty single line)")]
+    [(ctrl? owner)
+     (println "capture: owner must be a single line")]
+    [(or (ctrl? source) (ctrl? author) (ctrl? lead) (ctrl? proposed))
+     (println "capture: TERN_SOURCE/AUTHOR/LEAD/PROPOSED_BY must each be a single line")]
+    [:else
+     (do
+       (fram.rt/ensure-dir threads-dir)
+       (let [id (uuidv7)
+             slug (fram.rt/slugify title)
+             today (fram.rt/today-iso)
+             created-at (fram.rt/now-iso)
+             te (str "@" id)
+             path (str threads-dir "/" id "-" slug ".md")
+             port (fram.rt/coord-port)]
+         ;; Coordinator-native: assert each capture claim THROUGH the daemon (the
+         ;; same serialized path as `tell`), then render the .md FROM the log. The
+         ;; log is the source of truth; the file is a regenerated view — so a
+         ;; capture can never strand title/provenance in a file. (The old file-first
+         ;; path did exactly that whenever the log had pending coordinator writes,
+         ;; i.e. routinely under a live fleet — the recurring two-way divergence.)
+         ;; UUIDv7 is collision-proof, so capture no longer reserves a file-lock id
+         ;; (the old now-id/reserve-id dance guarded same-second timestamp clashes).
+         (if (< (fram.rt/coord-version port) 0)
+           (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.")
+           (let [claims (capture-claims te title owner source author lead proposed created-at today)
+                 results (mapv (fn [c :- k/Claim] :- String
+                                 (tell-retry port "assert" (:l c) (:p c) (:r c) 5))
+                               claims)
+                 oks (count (filterv (fn [r :- String] :- Bool (str/starts-with? r "ok:")) results))]
+             (if (= oks (count claims))
+               (do
+                 (fram.rt/spit-file path (exp/thread-md (:claims (fold/fold (fram.rt/read-log log))) te))
+                 (println (str "captured -> " te "  " title "  [owner: " owner "]\n"
+                               "  file:      " path "\n"
+                               "  committed: " oks " claims via coordinator. Next: tern tell " id " <pred> <value>")))
+               (println (str "capture PARTIAL: only " oks "/" (count claims)
+                             " claim(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files.")))))))])))
+
+;; Resolve a thread ref (@id OR @handle) to its canonical @id and print it. The
+;; bin/tern wrapper calls this before routing tell/untell to fram, so a
+;; handle ref (`tern tell @perf ...`) lands on the right thread — fram itself
+;; is handle-blind and only ever sees the canonical id.
+(defn cmd-resolve [log :- String ref :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))]
+    (println (resolve-ref idx ref))))
+
+;; Entity-drift audit: repo path-form collisions (tags retired with relates_to).
+(defn cmd-audit [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        rd (audit/repo-drift idx)]
+    (println (str "REPO DRIFT — " (count rd) " group(s):"))
+    (doseq [g rd]
+      (println (str "  " (:norm g) ": " (str/join ", " (:forms g)))))))
+
+;; Integrity check = engine-generic structural rules (cycles, dangling refs) ++
+;; tern's WORK rules (abandoned deps, person/role refs) — tern.validate.
+;; The fram CLI `validate` only runs the generic half; this is the full check, so
+;; bin/tern routes `validate` here (and the MCP validate tool through it).
+(defn cmd-validate [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        problems (reduce
+                  (fn [acc :- (Vec String) te :- String] :- (Vec String)
+                    (reduce (fn [a :- (Vec String) v :- String] :- (Vec String)
+                              (conj a (str (short-id te) ": " v)))
+                            acc (val/violations-i idx te)))
+                  []
+                  (k/thread-ids-i idx))]
+    (if (empty? problems)
+      (println (str "OK — " (count (k/thread-ids-i idx)) " threads, no violations."))
+      (do (doseq [p problems] (println (str "  " p)))
+          (println (str (count problems) " violation(s)."))))))
+
+(defn cmd-ready [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        today (fram.rt/today-iso)
+        rs (proj/ready idx today fram.rt/str-lt?)]
+    (println (str "READY NOW — " (count rs)))
+    (doseq [te rs]
+      (println (str "  " (short-id te) "  " (trunc (title-of idx te) 56))))))
+
+(defn cmd-blocked [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        today (fram.rt/today-iso)
+        before? fram.rt/str-lt?
+        bs (filterv (fn [te :- String] :- Bool (= (proj/condition-i idx te today before?) "blocked"))
+                    (proj/work-thread-ids-i idx))]
+    (println (str "BLOCKED — " (count bs)))
+    (doseq [te bs]
+      (println (str "  " (short-id te) "  " (trunc (title-of idx te) 48)
+                    "  (waiting on " (count (proj/incomplete-deps idx te)) ")")))))
+
+(defn cmd-leverage [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        cands (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te)))
+                       (proj/work-thread-ids-i idx))
+        items (filterv (fn [it :- LevItem] :- Bool (> (:score it) 0))
+                       (mapv (fn [te :- String] :- LevItem
+                               (->LevItem te (proj/leverage-score idx te)))
+                             cands))
+        ranked (vec (take 15 (sort-by (fn [it :- LevItem] :- Int (- 0 (:score it))) items)))]
+    (println "TOP UNBLOCKERS — finishing this transitively frees the most stuck threads")
+    (doseq [it ranked]
+      (println (str "  unblocks " (:score it) "  " (short-id (:te it))
+                    "  " (trunc (title-of idx (:te it)) 46))))))
+
+(defn cmd-next [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        today (fram.rt/today-iso)
+        items (mapv
+               (fn [te :- String] :- NextItem
+                 (let [lev (proj/leverage-score idx te)
+                       doo (k/one-i idx te "do_on")
+                       urg (if (some? doo)
+                             (cond
+                               [(fram.rt/str-lt? doo today) 5]
+                               [(= doo today) 3]
+                               [:else 0])
+                             0)
+                       mom (if (some? (k/one-i idx te "driver")) 2 0)]
+                   (->NextItem te (+ (* 3 lev) (+ urg mom)))))
+               (proj/ready idx today fram.rt/str-lt?))
+        ranked (vec (take 12 (sort-by (fn [it :- NextItem] :- Int (- 0 (:score it))) items)))]
+    (println (str "WHAT TO WORK ON — top picks (" today ")"))
+    (doseq [it ranked]
+      (println (str "  [" (:score it) "] " (short-id (:te it)) "  "
+                    (trunc (title-of idx (:te it)) 50))))))
+
+(defn cmd-agenda [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        today (fram.rt/today-iso)
+        cands (filterv (fn [te :- String] :- Bool
+                         (and (not (proj/terminal-i? idx te)) (some? (k/one-i idx te "do_on"))))
+                       (proj/work-thread-ids-i idx))
+        items (mapv (fn [te :- String] :- AgendaItem
+                      (->AgendaItem te (let [d (k/one-i idx te "do_on")] (if (some? d) d ""))))
+                    cands)
+        overdue (vec (sort-by (fn [it :- AgendaItem] :- String (:do_on it))
+                              (filterv (fn [it :- AgendaItem] :- Bool (fram.rt/str-lt? (:do_on it) today)) items)))
+        todayb (filterv (fn [it :- AgendaItem] :- Bool (= (:do_on it) today)) items)
+        upcoming (vec (sort-by (fn [it :- AgendaItem] :- String (:do_on it))
+                               (filterv (fn [it :- AgendaItem] :- Bool (fram.rt/str-lt? today (:do_on it))) items)))]
+    (println (str "AGENDA — " today))
+    (println (str "OVERDUE (" (count overdue) ")"))
+    (doseq [it overdue] (println (str "  " (:do_on it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))
+    (println (str "TODAY (" (count todayb) ")"))
+    (doseq [it todayb] (println (str "  " (:do_on it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))
+    (println (str "UPCOMING (" (count upcoming) ")"))
+    (doseq [it upcoming] (println (str "  " (:do_on it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))))
+
+(defn- plate-group [idx :- k/Index label :- String grp :- (Vec String)] :- Nil
+  (when (not (empty? grp))
+    (println (str "\n" (proj/condition-emoji idx label) " " label " (" (count grp) ")"))
+    (doseq [te grp]
+      (println (str "  " (short-id te) "  " (trunc (title-of idx te) 52))))))
+
+(defn- in-condition [idx :- k/Index nonterm :- (Vec String) today :- String before? :- [String String -> Bool] c :- String] :- (Vec String)
+  (filterv (fn [te :- String] :- Bool (= (proj/condition-i idx te today before?) c)) nonterm))
+
+(defn cmd-plate [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        today (fram.rt/today-iso)
+        before? fram.rt/str-lt?
+        nonterm (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te)))
+                         (proj/work-thread-ids-i idx))]
+    (println (str "ON YOUR PLATE — " (count nonterm) " open"))
+    (plate-group idx "active" (in-condition idx nonterm today before? "active"))
+    (plate-group idx "ready" (in-condition idx nonterm today before? "ready"))
+    (plate-group idx "blocked" (in-condition idx nonterm today before? "blocked"))
+    (plate-group idx "dormant" (in-condition idx nonterm today before? "dormant"))
+    (plate-group idx "draft" (in-condition idx nonterm today before? "draft"))))
+
+;; --- structured (JSON) projections for the MCP edge --------------------------
+(defrecord JThread [id :- String title :- String condition :- String emoji :- String])
+(defrecord JPresentation [active :- String ready :- String blocked :- String draft :- String])
+(defrecord JReview [id :- String title :- String pred :- String detail :- String])
+(defrecord JClaim [predicate :- String value :- String])
+(defrecord JClockRow [id :- String title :- String est_h :- Int actual_sec :- Int done :- Bool])
+(defrecord JCalib [pct :- Int sample :- Int])
+(defrecord JClockReport [rows :- (Vec JClockRow) calibration :- JCalib])
+
+(defn- jthread [idx :- k/Index te :- String today :- String before? :- [String String -> Bool]] :- JThread
+  (let [c (proj/condition-i idx te today before?)]
+    (->JThread (short-id te) (title-of idx te) c (proj/condition-emoji idx c))))
+
+(defn cmd-json [log :- String what :- String arg :- String] :- Nil
+  (let [as (fram.rt/read-log log)
+        f (fold/fold as)
+        idx (k/build-index (:claims f))
+        today (fram.rt/today-iso)
+        before? fram.rt/str-lt?]
+    (cond
+      [(= what "plate")
+       (println (fram.rt/to-json
+                 (mapv (fn [te :- String] :- JThread (jthread idx te today before?))
+                       (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te)))
+                                (proj/work-thread-ids-i idx)))))]
+      [(= what "ready")
+       (println (fram.rt/to-json (mapv (fn [te :- String] :- JThread (jthread idx te today before?)) (proj/ready idx today before?))))]
+      [(= what "blocked")
+       (println (fram.rt/to-json (mapv (fn [te :- String] :- JThread (jthread idx te today before?))
+                                       (filterv (fn [te :- String] :- Bool (= (proj/condition-i idx te today before?) "blocked"))
+                                                (proj/work-thread-ids-i idx)))))]
+      [(= what "needs-review")
+       (let [latest (fold/fold-latest as)
+             today (fram.rt/today-iso)
+             reviews (stale/needs-review idx latest today
+                                         (fn [a :- String b :- String] :- Bool (fram.rt/str-lt? a b)))]
+         (println (fram.rt/to-json
+                   (mapv (fn [rv :- stale/Review] :- JReview
+                           (->JReview (short-id (:te rv)) (title-of idx (:te rv)) (:pred rv) (:detail rv)))
+                         reviews))))]
+      [(= what "clock-report")
+       (let [rs (clk/rows idx
+                          (fn [s :- String] :- Int (fram.rt/iso-to-seconds s))
+                          (fn [s :- String] :- Int (fram.rt/parse-int s)))
+             cal (clk/calibration rs)]
+         (println (fram.rt/to-json
+                   (->JClockReport
+                    (mapv (fn [r :- clk/Row] :- JClockRow
+                            (->JClockRow (short-id (:te r)) (title-of idx (:te r)) (:est-h r) (:act-sec r) (:term r)))
+                          rs)
+                    (->JCalib (:pct cal) (:sample cal))))))]
+      [(= what "show")
+       (println (fram.rt/to-json
+                 (mapv (fn [c :- k/Claim] :- JClaim (->JClaim (:p c) (:r c)))
+                       (k/q-by-l (:claims f) (str "@" arg)))))]
+      [(= what "presentation")
+       (println (fram.rt/to-json
+                 (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready")
+                                  (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))]
+      [:else (println "usage: json plate|ready|blocked|needs-review|clock-report|show <id>|presentation")])))
+
+(defn cmd-needs-review [log :- String] :- Nil
+  (let [as (fram.rt/read-log log)
+        idx (k/build-index (:claims (fold/fold as)))
+        latest (fold/fold-latest as)
+        today (fram.rt/today-iso)
+        reviews (stale/needs-review idx latest today
+                                    (fn [a :- String b :- String] :- Bool (fram.rt/str-lt? a b)))
+        promo (stale/promotable idx)]
+    (println (str "NEEDS REVIEW — " (count reviews) " judgment(s) whose inputs moved (" today ")"))
+    (doseq [rv reviews]
+      (println (str "  [" (:pred rv) "] " (short-id (:te rv)) "  " (trunc (title-of idx (:te rv)) 44)))
+      (println (str "      " (:detail rv))))
+    (println (str "\nPROMOTABLE — " (count promo) " uncommitted draft(s) that grew real structure"))
+    (doseq [te promo]
+      (println (str "  " (short-id te) "  " (trunc (title-of idx te) 52))))))
+
+;; --- clock: claim-native time logging ---------------------------------------
+(defn- fmt-hm [secs :- Int] :- String
+  (str (quot secs 3600) "h " (quot (mod secs 3600) 60) "m"))
+
+(defn- session-thread [idx :- k/Index sess :- String] :- String
+  (let [t (k/one-i idx sess "session_of")] (if (some? t) t "")))
+
+(defn- fresh-sid [idx :- k/Index seed :- String] :- String
+  (if (k/vec-contains? (:subjects idx) (str "@" seed))
+    (fresh-sid idx (fram.rt/bump-id seed))
+    seed))
+
+(defn cmd-clock-start [log :- String id :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        te (str "@" id)
+        run (clk/running-session idx)]
+    (cond
+      [(nil? (k/one-i idx te "title")) (println (str "no such thread: " id))]
+      [(some? run)
+       (println (str "already clocked in on " (short-id (session-thread idx run))
+                     " (session " (short-id run) ") — `clock stop` first"))]
+      [:else
+       (let [port (fram.rt/coord-port)]
+         (if (< (fram.rt/coord-version port) 0)
+           (println "no coordinator on 127.0.0.1:7977 — run `tern up`")
+           (let [sid (fresh-sid idx (fram.rt/now-id))
+                 ssub (str "@" sid)
+                 now (fram.rt/now-iso)
+                 r1 (tell-retry port "assert" ssub "session_of" te 5)
+                 r2 (tell-retry port "assert" ssub "start_time" now 5)]
+             (if (and (str/starts-with? r1 "ok:") (str/starts-with? r2 "ok:"))
+               (println (str "clocked in on " id " at " now "  (session " sid ")"))
+               (println (str "clock start FAILED to record (" r1 "/" r2 ") — retry"))))))])))
+
+(defn cmd-clock-stop [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        run (clk/running-session idx)
+        port (fram.rt/coord-port)]
+    (cond
+      [(nil? run) (println "not clocked in")]
+      [(< (fram.rt/coord-version port) 0)
+       (println "no coordinator on 127.0.0.1:7977 — run `tern up` (still clocked in)")]
+      [:else
+       (let [now (fram.rt/now-iso)
+             st (k/one-i idx run "start_time")
+             te (session-thread idx run)
+             dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)
+             resp (tell-retry port "assert" run "end_time" now 5)]
+         (if (str/starts-with? resp "ok:")
+           (println (str "clocked out of " (short-id te) " — this session " (fmt-hm dur)))
+           (println (str "clock stop FAILED to record end_time (" resp ") — still clocked in, retry"))))])))
+
+(defn cmd-clock-status [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        run (clk/running-session idx)]
+    (if (nil? run)
+      (println "not clocked in")
+      (let [now (fram.rt/now-iso)
+            st (k/one-i idx run "start_time")
+            te (session-thread idx run)
+            dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)]
+        (println (str "clocked in on " (short-id te) "  " (trunc (title-of idx te) 40)))
+        (println (str "  since " (if (some? st) st "?") "  (" (fmt-hm dur) " elapsed)"))))))
+
+(defn cmd-clock-report [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        rs (clk/rows idx
+                     (fn [s :- String] :- Int (fram.rt/iso-to-seconds s))
+                     (fn [s :- String] :- Int (fram.rt/parse-int s)))
+        cal (clk/calibration rs)]
+    (println (str "TIME LOGGED — estimate vs actual (" (count rs) " thread(s))"))
+    (doseq [r rs]
+      (println (str "  " (short-id (:te r)) "  est " (:est-h r) "h  actual " (fmt-hm (:act-sec r))
+                    "  " (trunc (title-of idx (:te r)) 38))))
+    (if (> (:sample cal) 0)
+      (println (str "\nCALIBRATION — across " (:sample cal) " done thread(s) with both: actuals ran "
+                    (:pct cal) "% of estimate"
+                    (if (> (:pct cal) 100) " (you under-estimate)" " (you over-estimate)")))
+      (println "\nCALIBRATION — not enough completed estimate+actual data yet"))))
+
+(defn cmd-clock-sync [log :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        dir (fram.rt/time-dir)
+        sessions (clk/syncable-sessions idx)
+        port (fram.rt/coord-port)]
+    (cond
+      [(empty? sessions) (println "nothing to sync — no closed, unsynced sessions")]
+      [(< (fram.rt/coord-version port) 0)
+       (println "no coordinator on 127.0.0.1:7977 — run `tern up` (sync records clockify_id, so it must be up first)")]
+      [:else
+       (let [ws (cf/default-workspace)]
+         (println (str "syncing " (count sessions) " session(s) to clockify (workspace " ws ")"))
+         (doseq [s sessions]
+           (let [te (session-thread idx s)
+                 owner (let [o (k/one-i idx te "owner")] (if (some? o) o "personal"))
+                 proj (cf/project-for dir owner)
+                 st (k/one-i idx s "start_time")
+                 en (k/one-i idx s "end_time")]
+             (cond
+               [(nil? proj)
+                (println (str "  – skip " (short-id s) "  (owner '" owner "' unmapped — `clock map " owner " <project-id>`)"))]
+               [(or (nil? st) (nil? en))
+                (println (str "  ! skip " (short-id s) "  (missing start/end)"))]
+               [:else
+                (let [cid (cf/create-entry ws proj st en (title-of idx te))]
+                  (if (= cid "")
+                    (println (str "  ! " (short-id s) "  (clockify returned no id)"))
+                    (let [wb (tell-retry port "assert" s "clockify_id" cid 5)]
+                      (if (str/starts-with? wb "ok:")
+                        (println (str "  ✓ " (short-id te) "  " st " → " en "  (clockify " cid ")"))
+                        (println (str "  !! " (short-id s) " PUSHED to clockify (" cid ") but failed to record it ("
+                                      wb ") — set manually to avoid a double-push: tell " (short-id s) " clockify_id " cid))))))])))
+         (println "done."))])))
+
+(defn- clock-window [log :- String prefixes :- (Vec String) label :- String] :- Nil
+  (let [idx (k/build-index (:claims (fold/fold (fram.rt/read-log log))))
+        rs (clk/logged-rows idx prefixes (fn [s :- String] :- Int (fram.rt/iso-to-seconds s)))
+        total (reduce (fn [m :- Int r :- clk/Row] :- Int (+ m (:act-sec r))) 0 rs)]
+    (println (str "LOGGED " label " — " (fmt-hm total) " across " (count rs) " thread(s)"))
+    (doseq [r rs]
+      (println (str "  " (fmt-hm (:act-sec r)) "  " (short-id (:te r)) "  " (trunc (title-of idx (:te r)) 40))))))
+
+(defn cmd-clock-today [log :- String] :- Nil
+  (clock-window log (conj [] (subs (fram.rt/now-iso) 0 10)) "today"))
+
+(defn cmd-clock-week [log :- String] :- Nil
+  (clock-window log (fram.rt/this-week-dates) "this week"))
+
+;; --- doctor: the daemon handshake -------------------------------------------
+(defn cmd-doctor [threads-dir :- String log :- String] :- Nil
+  (let [port (fram.rt/coord-port)
+        status (fram.rt/coord-status port)
+        up (not (= status "down"))
+        serving (str/includes? status log)
+        f (fold/fold (fram.rt/read-log log))
+        log-v (:version f)
+        daemon-v (fram.rt/coord-version port)
+        fresh (= daemon-v log-v)
+        file-claims (:claims (fold/fold (imp/load-corpus threads-dir)))
+        idx (k/build-index (:claims f))
+        ;; Files are a PROJECTION of the log: only title-bearing threads render to a
+        ;; .md, so person nodes / non-thread entities live ONLY in the log. Compare
+        ;; against the thread-claim slice, not the whole log — else doctor is wedged
+        ;; DEGRADED forever by e.g. a `display_name` person node it cannot represent.
+        thread-log (filterv (fn [c :- k/Claim] :- Bool (some? (k/one-i idx (:l c) "title"))) (:claims f))
+        tl-sigs (sig-member-map thread-log)
+        file-sigs (sig-member-map file-claims)
+        ;; file-ahead = a thread .md was hand-edited (claim not in the log) — the ONE
+        ;; real hazard. log-behind = log moved ahead, files not yet re-rendered —
+        ;; benign (a capture/tell that hasn't been exported), never DEGRADED.
+        file-ahead (filterv (fn [c :- k/Claim] :- Bool (nil? (get tl-sigs (claim-sig c)))) file-claims)
+        log-behind (filterv (fn [c :- k/Claim] :- Bool (nil? (get file-sigs (claim-sig c)))) thread-log)
+        clean (empty? file-ahead)
+        synced (and clean (empty? log-behind))]
+    (println "tern doctor")
+    (if up
+      (do
+        (println (str "  [ok]    coordinator UP on 127.0.0.1:" port))
+        (if serving
+          (println "  [ok]    serving the canonical log")
+          (println (str "  [WARN]  daemon is NOT serving " log " — status: " status)))
+        (if fresh
+          (println "  [ok]    daemon state matches the on-disk log")
+          (println (str "  [WARN]  daemon is STALE (loaded v" daemon-v ", log is v" log-v
+                        ") — the log changed out-of-band; restart: kill it + `tern up`"))))
+      (println (str "  [DOWN]  no coordinator on 127.0.0.1:" port " — writes won't serialize. Run `tern up`.")))
+    (cond
+      [synced (println "  [ok]    files <-> claim log in sync")]
+      [clean  (println (str "  [ok]    files behind the log by " (count log-behind)
+                            " thread-claim(s) — benign projection lag; `tern export` to refresh"))]
+      [:else  (println (str "  [WARN]  " (count file-ahead) " file claim(s) not in the log "
+                            "(a thread .md was hand-edited?) — reconcile via the coordinator, or `import`"))])
+    (if (and up (and serving (and clean fresh)))
+      (println "  => healthy: tell/untell + warm reads are safe")
+      (println "  => DEGRADED: fix the warnings above"))))
+
+;; --- dispatch (life verbs; engine verbs are routed to fram by the wrapper) ---
+(defn run [args :- (Vec String) threads-dir :- String log :- String] :- Nil
+  (let [cmd (if (empty? args) "" (first args))]
+    (cond
+      [(= cmd "capture")
+       (if (>= (count args) 2)
+         (cmd-capture threads-dir log (nth args 1) (if (>= (count args) 3) (nth args 2) "personal"))
+         (println "usage: capture <title> [owner]"))]
+      [(= cmd "ready")    (cmd-ready log)]
+      [(= cmd "blocked")  (cmd-blocked log)]
+      [(= cmd "leverage") (cmd-leverage log)]
+      [(= cmd "next")     (cmd-next log)]
+      [(= cmd "agenda")   (cmd-agenda log)]
+      [(= cmd "plate")    (cmd-plate log)]
+      [(= cmd "needs-review") (cmd-needs-review log)]
+      [(= cmd "audit")    (cmd-audit log)]
+      [(= cmd "resolve")
+       (if (>= (count args) 2)
+         (cmd-resolve log (nth args 1))
+         (println "usage: resolve <@handle|@id>"))]
+      [(= cmd "validate") (cmd-validate log)]
+      [(= cmd "doctor")   (cmd-doctor threads-dir log)]
+      [(= cmd "json")
+       (cmd-json log (if (> (count args) 1) (nth args 1) "")
+                 (if (> (count args) 2) (nth args 2) ""))]
+      [(= cmd "clock")
+       (let [sub (if (> (count args) 1) (nth args 1) "status")]
+         (cond
+           [(= sub "start")
+            (if (>= (count args) 3)
+              (cmd-clock-start log (nth args 2))
+              (println "usage: clock start <thread-id>"))]
+           [(= sub "stop")   (cmd-clock-stop log)]
+           [(= sub "status") (cmd-clock-status log)]
+           [(= sub "report") (cmd-clock-report log)]
+           [(= sub "today")  (cmd-clock-today log)]
+           [(= sub "week")   (cmd-clock-week log)]
+           [(= sub "sync")   (cmd-clock-sync log)]
+           [(= sub "map")
+            (if (>= (count args) 4)
+              (cf/cmd-map (fram.rt/time-dir) (nth args 2) (nth args 3))
+              (println "usage: clock map <owner> <project-id>"))]
+           [(= sub "projects")   (cf/cmd-projects)]
+           [(= sub "workspaces") (cf/cmd-workspaces)]
+           [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
+      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | plate | needs-review | audit | resolve <@handle|@id> | validate | doctor | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
+
+(defn -main [& args] :- Nil
+  (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

@@ -8,17 +8,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Lodestar
+      - name: Checkout Tern
         uses: actions/checkout@v4
         with:
-          path: lodestar
+          path: tern
 
-      # Pin the Fram engine to the commit Lodestar's committed out/ was built and
-      # tested against (single source of truth: lodestar/FRAM_VERSION). Fram's main
+      # Pin the Fram engine to the commit Tern's committed out/ was built and
+      # tested against (single source of truth: tern/FRAM_VERSION). Fram's main
       # moves independently; this keeps its churn from silently breaking us.
       - name: Resolve pinned Fram version
         id: fram
-        run: echo "ref=$(grep -v '^#' lodestar/FRAM_VERSION | head -1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+        run: echo "ref=$(grep -v '^#' tern/FRAM_VERSION | head -1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
       - name: Checkout Fram engine (pinned)
         uses: actions/checkout@v4
         with:
@@ -47,7 +47,7 @@ jobs:
         run: clojure -P
 
       - name: Domain tests (run on the committed out/, no Beagle build needed)
-        working-directory: lodestar
+        working-directory: tern
         run: |
           CP="out:../fram/out"
           bb -cp "$CP" clock_test.clj
@@ -58,9 +58,9 @@ jobs:
           FRAM_LOG=../fram/claims.log bb -cp "$CP" cnf_lifecycle_test.clj
 
       - name: Gateway integration smoke test
-        working-directory: lodestar
+        working-directory: tern
         run: FRAM_HOME="$GITHUB_WORKSPACE/fram" bash deploy/gateway/smoke_test.sh
 
       - name: Gateway cross-host test (FRAM_BIND=0.0.0.0 + :coordinator-host)
-        working-directory: lodestar
+        working-directory: tern
         run: FRAM_HOME="$GITHUB_WORKSPACE/fram" bash deploy/gateway/crosshost_test.sh

@@ -14,7 +14,7 @@ import { remaining } from "./budget";
 
 const REPO = resolve(import.meta.dir, "../..");
 const CLAIM_CLI = `${REPO}/cli/claim-cli.clj`;
-const PORT = process.env.LODESTAR_PORT ?? "7977";
+const PORT = process.env.TERN_PORT ?? "7977";
 
 interface ReadyThread {
   id: string;
@@ -25,7 +25,7 @@ interface ReadyThread {
 // Unblocked, committed, undriven work off the claim graph.
 function readyThreads(): ReadyThread[] {
   try {
-    const rows = JSON.parse(execSync("lodestar json ready", { encoding: "utf8", timeout: 8000 }).trim());
+    const rows = JSON.parse(execSync("tern json ready", { encoding: "utf8", timeout: 8000 }).trim());
     return Array.isArray(rows) ? rows : [];
   } catch {
     return [];

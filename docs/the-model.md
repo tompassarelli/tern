@@ -1,4 +1,4 @@
-# The Model — Lodestar as one scalable graph (Tom + agents)
+# The Model — Tern as one scalable graph (Tom + agents)
 
 *Design settled 2026-06-21. Architecture: **one shared ontology, separate write
 jurisdictions, one unified read view** (federated write model, unified semantic view).

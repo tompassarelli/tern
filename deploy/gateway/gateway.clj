@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; Lodestar auth gateway — the network-safe edge in front of per-tenant
+;; Tern auth gateway — the network-safe edge in front of per-tenant
 ;; coordinators. This is the ONE component the loopback coordinator was missing
 ;; to go from single-machine to remote/multi-tenant (see ../../docs/hosting.md).
 ;;
@@ -37,7 +37,7 @@
          '[clojure.edn :as edn]
          '[clojure.string :as str]
          '[clojure.java.io :as io]
-         '[lodestar.gatepolicy :as gp])   ; the security DECISIONS, real-typed in Beagle (not Any)
+         '[tern.gatepolicy :as gp])   ; the security DECISIONS, real-typed in Beagle (not Any)
 (import '[java.net Socket InetSocketAddress InetAddress]
         '[java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter InputStream])
 
@@ -55,7 +55,7 @@
     (set (remove str/blank? (map str/trim (str/split s #","))))))
 
 ;; Token hashing, tenant resolution, rate-limit accounting, and request validation
-;; are the gateway's security DECISIONS — they live in lodestar.gatepolicy with REAL
+;; are the gateway's security DECISIONS — they live in tern.gatepolicy with REAL
 ;; types (Tenant/Bucket records, Map String Tenant, Float). This file is the effects
 ;; shell: HTTP, sockets, the registry file, the buckets atom, the audit log.
 
@@ -228,7 +228,7 @@
 
 (load-registry!)
 (http/run-server handler {:port listen-port :ip "0.0.0.0"})
-(println (str "lodestar gateway listening on :" listen-port
+(println (str "tern gateway listening on :" listen-port
               "  tenants=" (:tenants @registry) " (" tenants-path ")"
               "  rate=" rate-per-s "/s burst=" burst " max-body=" max-body
               "  audit=" (or audit-path "stderr")))

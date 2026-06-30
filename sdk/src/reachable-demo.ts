@@ -3,8 +3,8 @@
 //
 //   AGENT_ID=demo1 MAX_PINGS=1 bun run src/reachable-demo.ts
 //   # then, from anywhere:
-//   bb cli/lodestar-listen... no — to PING it:
-//   bb ~/code/lodestar/cli/msg-cli.clj 7977 send tester demo1 "URGENT" "look at flake.bnix"
+//   bb cli/tern-listen... no — to PING it:
+//   bb ~/code/tern/cli/msg-cli.clj 7977 send tester demo1 "URGENT" "look at flake.bnix"
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { harnessOptions } from "./harness";
 import { inputChannel, subscribeFeed } from "./coordination";
@@ -13,8 +13,8 @@ const self = process.env.AGENT_ID ?? `sdk-reachable-${Date.now().toString(36).sl
 const maxPings = Number(process.env.MAX_PINGS ?? 1);
 
 const ch = inputChannel(
-  `You are lodestar coordination agent "${self}". Reply with ONE short line acknowledging you are live and listening. ` +
-  `Then stay idle. When you receive a message tagged [lodestar real-time ping ...], that is a peer reaching you in ` +
+  `You are tern coordination agent "${self}". Reply with ONE short line acknowledging you are live and listening. ` +
+  `Then stay idle. When you receive a message tagged [tern real-time ping ...], that is a peer reaching you in ` +
   `real time mid-run — reply with ONE line: who pinged you and what they want.`,
 );
 
@@ -26,7 +26,7 @@ const stop = subscribeFeed(self, (m) => {
 
 const q = query({ prompt: ch.stream(), options: harnessOptions({ self, model: "haiku", extraTools: ["Bash"] }) });
 
-console.log(`[reachable] @${self} live. Ping it:\n  bb ~/code/lodestar/cli/msg-cli.clj 7977 send tester ${self} "URGENT" "<msg>"\n`);
+console.log(`[reachable] @${self} live. Ping it:\n  bb ~/code/tern/cli/msg-cli.clj 7977 send tester ${self} "URGENT" "<msg>"\n`);
 for await (const msg of q as any) {
   if (msg.type === "assistant") {
     const txt = (msg.message?.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("");

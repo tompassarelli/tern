@@ -1,4 +1,4 @@
-;; coord.clj — the ONE shared coordination substrate for the lodestar *-cli.clj
+;; coord.clj — the ONE shared coordination substrate for the tern *-cli.clj
 ;; scripts (Foundation thread 019f100f Part B). Every CLI spoke the :7977 daemon
 ;; wire (:assert / :version / :retract / :resolved / :query) through a VERBATIM
 ;; copy of these helpers — 10 copies of send-op, 5 of assert!, 2 of retract!, and
@@ -25,13 +25,13 @@
 ;;   bb cli/coord.clj <port>            -> prints the daemon's :version (a ping)
 ;; Load it sibling-relative so cwd never matters:
 ;;   (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-;; then call lodestar.coord/send-op (or rebind the local names you use).
-(ns lodestar.coord
+;; then call tern.coord/send-op (or rebind the local names you use).
+(ns tern.coord
   (:require [clojure.edn :as edn] [clojure.java.io :as io]))
 
 ;; The canonical coordinator port. The CLIs take <port> as argv[0]; PORT is the
 ;; default/canonical reference (Part C's pred-cli + future callers read it).
-(def PORT (or (System/getenv "LODESTAR_PORT") "7977"))
+(def PORT (or (System/getenv "TERN_PORT") "7977"))
 
 ;; one request/response over the daemon socket: write one EDN op + newline, read
 ;; one EDN reply line. The atom every other helper is built from.
@@ -91,7 +91,7 @@
 ;;
 ;; ONE primitive, two reducers — the proof that quorum and budget are the same
 ;; shape seen through different folds:
-;;   quorum = count-distinct(worker) >= K   — lodestar-map's K-of-N barrier
+;;   quorum = count-distinct(worker) >= K   — tern-map's K-of-N barrier
 ;;   budget = Σ(charge)              <  cap  — the swarm gate's spend ceiling
 ;; Both fold a monotone reducer over the rows a Datalog BODY binds against the
 ;; scan engine. Both are commutative and idempotent (set semantics collapse a
@@ -163,7 +163,7 @@
 ;; COMMAND-AS-CLAIMS — the pending-command rule (single source).
 ;;
 ;; Roadmap tier I: a command is NOT an opaque {:op :args} body blob with a
-;; parse-envelope parser duplicated across msg-cli + lodestar-listen. It is CLAIMS
+;; parse-envelope parser duplicated across msg-cli + tern-listen. It is CLAIMS
 ;; on @cmd:<id> — `op` + `target` (the routing handle) + one claim per arg. PENDING
 ;; = has op+target, NO acked_by. This stratified Datalog rule is the forward-chaining
 ;; match BOTH the sender's `cmds` listing and the reactor drive off; it lives ONCE

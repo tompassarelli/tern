@@ -1,4 +1,4 @@
-# Example Caddy v2 reverse proxy — terminates TLS in front of the Lodestar gateway.
+# Example Caddy v2 reverse proxy — terminates TLS in front of the Tern gateway.
 #
 # Caddy handles automatic HTTPS (provisions + renews a real certificate from
 # Let's Encrypt for the named domain), terminates TLS, and forwards plain HTTP to
@@ -10,12 +10,12 @@
 # them; the gateway is the single authenticated edge.
 #
 # Usage:
-#   1. Replace lodestar.example.com with your real domain (DNS A/AAAA -> this host).
-#   2. Make sure the gateway is up on 127.0.0.1:8088 (lodestar-gateway.service).
+#   1. Replace tern.example.com with your real domain (DNS A/AAAA -> this host).
+#   2. Make sure the gateway is up on 127.0.0.1:8088 (tern-gateway.service).
 #   3. caddy run --config deploy/Caddyfile.example
 #      (or copy this to /etc/caddy/Caddyfile and `systemctl enable --now caddy`).
 
-lodestar.example.com {
+tern.example.com {
 	# Forward to the gateway on loopback (plain HTTP — TLS is terminated here).
 	reverse_proxy 127.0.0.1:8088
 

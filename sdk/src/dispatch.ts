@@ -1,5 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { getThreadClaims, getChildren } from "./lodestar-client";
+import { getThreadClaims, getChildren } from "./tern-client";
 import { derivePosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
 import { harnessOptions, DEFAULT_SYSTEM_PROMPT, type Effort } from "./harness";
@@ -67,7 +67,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
       extraTools: tools,
       model: process.env.AGENT_MODEL,
       effort: process.env.AGENT_EFFORT as Effort | undefined,
-      systemPrompt: `You are a lodestar worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
+      systemPrompt: `You are a tern worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
     }),
   })) {
     const msg = message as any;

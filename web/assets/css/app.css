@@ -4,7 +4,7 @@
    the static js (dag.js builds class strings), and the Phoenix web layer. */
 @source "../../app";
 @source "../js";
-@source "../../lib/lodestar_web";
+@source "../../lib/tern_web";
 
 /* ── Everforest Dark Hard — the design token system (matches the desktop:
    nixos-config stylix base16-schemes/everforest-dark-hard.yaml). v4 generates
@@ -17,7 +17,7 @@
   --color-muted: #859289;       /* base03 grey1 */
   --color-accent: #7fbbb3;      /* base0D blue */
   --color-accent-alt: #d699b6;  /* base0E purple */
-  --color-star: #dbbc7f;        /* base0A yellow — active/lodestar */
+  --color-star: #dbbc7f;        /* base0A yellow — active/tern */
   --color-ok: #a7c080;          /* base0B green — done */
   --color-warn: #e67e80;        /* base08 red — blocked */
 

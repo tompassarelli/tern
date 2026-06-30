@@ -1,4 +1,4 @@
-import type { Claim } from "./lodestar-client";
+import type { Claim } from "./tern-client";
 
 export interface Posture {
   planned: boolean;

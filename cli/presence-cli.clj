@@ -1,4 +1,4 @@
-;; presence-cli.clj — presence-as-claims (Lodestar gate-2 #30).
+;; presence-cli.clj — presence-as-claims (Tern gate-2 #30).
 ;;
 ;; THE TRICK: presence = a renewable LEASE. Liveness is judged by the COORDINATOR's
 ;; clock (the lease expiry), never a self-stamped wall-clock heartbeat. This kills
@@ -24,11 +24,11 @@
 ;; shared coord substrate: the cardinality-typed write verbs (move-C) live once in
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  lodestar.coord/send-op)
-(def append!  lodestar.coord/append!)
-(def put!     lodestar.coord/put!)
-(def retract! lodestar.coord/retract!)
-(def resolved lodestar.coord/resolved)
+(def send-op  tern.coord/send-op)
+(def append!  tern.coord/append!)
+(def put!     tern.coord/put!)
+(def retract! tern.coord/retract!)
+(def resolved tern.coord/resolved)
 
 (defn decode-lease [v]
   (when (string? v)
@@ -294,7 +294,7 @@
         (append! port re (name k) (str v)))        ; DYNAMIC pred -> append! (safe default)
       (prn {:recorded re :agent h :fields (count m)}))
 
-    ;; --- subscriptions: thread-watches as claims (consumed by lodestar-listen.clj) ---
+    ;; --- subscriptions: thread-watches as claims (consumed by tern-listen.clj) ---
     ;; subject = the agent's self node @<handle> (its self-reference channel is implicit; this
     ;; ADDS threads beyond it). multi-valued: an agent watches many threads.
     "watch"                                 ; <uuid> <thread-ref>  — subscribe to a thread
@@ -320,7 +320,7 @@
         (do (println (str "triggering compact for " h " roles=" (pr-str (map #(subs % 6) roles))))
             (put! port ae "needs_rotation" "true")   ; single (flag; LWW intent)
             (let [r (clojure.java.shell/sh "bash"
-                      (str (System/getenv "HOME") "/code/lodestar/sdk/src/compact.sh") h)]
+                      (str (System/getenv "HOME") "/code/tern/sdk/src/compact.sh") h)]
               (println (:out r))
               (when (seq (:err r)) (binding [*out* *err*] (println (:err r))))
               (System/exit (:exit r))))))

@@ -2,7 +2,7 @@ import Config
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
-config :lodestar, LodestarWeb.Endpoint,
+config :tern, TernWeb.Endpoint,
   http: [ip: {127, 0, 0, 1}, port: 4002],
   secret_key_base: "lGr6myZOrcWJ/UQQ4E3Ifa8yPuZx2LkOGi/Aih/nR8Tn8KU3xzVtnc46ohRQMsGj",
   server: false

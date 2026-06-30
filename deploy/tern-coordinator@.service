@@ -1,0 +1,30 @@
+# systemd template unit — one coordinator per tenant (instance-per-tenant).
+#   sudo cp deploy/tern-coordinator@.service /etc/systemd/system/
+#   # per-tenant env (unique FRAM_PORT + that tenant's log):
+#   sudo install -d /etc/tern
+#   printf 'FRAM_PORT=7801\nFRAM_LOG=/var/lib/tern/tenants/acme/claims.log\n' \
+#     | sudo tee /etc/tern/acme.env
+#   sudo systemctl enable --now tern-coordinator@acme
+[Unit]
+Description=Tern coordinator (tenant %i)
+After=network.target
+
+[Service]
+Type=simple
+User=tern
+Group=tern
+Environment=FRAM_HOME=/opt/fram
+EnvironmentFile=/etc/tern/%i.env
+ExecStart=/opt/fram/bin/fram-daemon ${FRAM_PORT} ${FRAM_LOG}
+Restart=on-failure
+RestartSec=2
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tern
+
+[Install]
+WantedBy=multi-user.target

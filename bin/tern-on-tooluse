@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# tern-on-tooluse — Claude Code PostToolUse "mail heartbeat".
+# After EVERY tool call, surface any new tern peer-messages for this agent via
+# hookSpecificOutput.additionalContext — no background task, no re-arm. Must NEVER block
+# or error out a tool call: bounded by `timeout`, swallows errors, always exits 0. jq-free
+# (jq isn't on PATH) — same sed/jget + agent-id derivation as tern-on-spawn so ids match.
+set -uo pipefail
+IN="$(cat 2>/dev/null || true)"
+# pull a flat JSON string field without jq
+jget() { printf '%s' "$IN" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
+sid="$(jget session_id)"
+REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
+RN="$(basename "$REPO")"
+ID="${TERN_AGENT_ID:-cc-$RN-${sid:0:8}}"
+[ "$ID" = "cc-$RN-" ] && ID="cc-$RN-$RANDOM"
+
+# peek + ack inbox — bounded; failure is silent (never wedge a tool call)
+MAIL="$(timeout 6 bb "$HOME/code/tern/cli/inbox-peek.clj" 7977 "$ID" 2>/dev/null || true)"
+[ -z "$MAIL" ] && exit 0
+
+CTX="[tern] new peer message(s):
+$MAIL"
+# emit additionalContext as valid JSON (escape \  then "  then newlines -> \n)
+esc="$(printf '%s' "$CTX" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')"
+printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$esc"
+exit 0

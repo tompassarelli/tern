@@ -1,5 +1,5 @@
-# The Fram engine commit that Lodestar's committed out/ is built and tested
-# against. Fram's main moves independently and Lodestar links its library API
+# The Fram engine commit that Tern's committed out/ is built and tested
+# against. Fram's main moves independently and Tern links its library API
 # (fram.kernel/fold/import/export/clock/json/rt), so we pin instead of tracking
 # main. Bump deliberately: check out the new Fram, rebuild (./build.sh), re-run
 # the tests, and update this SHA. CI and the Dockerfile both read this pin.

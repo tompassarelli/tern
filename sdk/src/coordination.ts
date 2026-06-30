@@ -1,14 +1,14 @@
 // Real-time coordination for SDK agents. A peer's ping is injected into the agent's
 // RUNNING query as a user turn — no re-arm, no background-task exit dance (the SDK twin
 // of the Claude Code interrupt, but cleaner). The query runs in streaming-input mode;
-// a continuous `lodestar-listen` subprocess feeds each delivered message into the channel.
+// a continuous `tern-listen` subprocess feeds each delivered message into the channel.
 import { spawn as procSpawn, type ChildProcess } from "node:child_process";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 
 const REPO = resolve(import.meta.dir, "..", "..");
-const LISTEN = `${REPO}/cli/lodestar-listen.clj`;
-const PORT = process.env.LODESTAR_PORT ?? "7977";
+const LISTEN = `${REPO}/cli/tern-listen.clj`;
+const PORT = process.env.TERN_PORT ?? "7977";
 
 function userMsg(text: string): SDKUserMessage {
   // priority 'now' = urgent: jump the queue so a real-time ping is seen ASAP.
@@ -36,8 +36,8 @@ export function inputChannel(initial: string) {
   };
 }
 
-// Subscribe to the lodestar feed for `self`; invoke onMail for each delivered message.
-// Implementation: loop `lodestar-listen --once` (which FLUSHES on exit — continuous mode
+// Subscribe to the tern feed for `self`; invoke onMail for each delivered message.
+// Implementation: loop `tern-listen --once` (which FLUSHES on exit — continuous mode
 // buffers its stdout when piped, so MAIL never arrives until the buffer fills). The
 // re-spawn loop lives HERE in the host process, so it is invisible to the agent — the
 // agent never re-arms. Returns stop() to tear down.
@@ -54,7 +54,7 @@ export function subscribeFeed(self: string, onMail: (summary: string) => void): 
       const from = /from:\s*(.*)/.exec(out)?.[1]?.trim() ?? "?";
       const subj = /subject:\s*(.*)/.exec(out)?.[1]?.trim() ?? "";
       const body = /body:\s*([\s\S]*?)\s*$/.exec(out)?.[1]?.trim();
-      if (body) onMail(`[lodestar real-time ping from ${from} — ${subj}]\n${body}`);
+      if (body) onMail(`[tern real-time ping from ${from} — ${subj}]\n${body}`);
       loop(); // re-arm host-side (the agent does nothing)
     });
   };

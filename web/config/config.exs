@@ -7,18 +7,18 @@
 # General application configuration
 import Config
 
-config :lodestar,
+config :tern,
   generators: [timestamp_type: :utc_datetime]
 
 # Configure the endpoint
-config :lodestar, LodestarWeb.Endpoint,
+config :tern, TernWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,
   render_errors: [
-    formats: [html: LodestarWeb.ErrorHTML, json: LodestarWeb.ErrorJSON],
+    formats: [html: TernWeb.ErrorHTML, json: TernWeb.ErrorJSON],
     layout: false
   ],
-  pubsub_server: Lodestar.PubSub,
+  pubsub_server: Tern.PubSub,
   live_view: [signing_salt: "d96UDWXJ"]
 
 # Configure LiveView
@@ -29,7 +29,7 @@ config :phoenix_live_view,
 # Configure esbuild (the version is required)
 config :esbuild,
   version: "0.25.4",
-  lodestar: [
+  tern: [
     args:
       ~w(js/app.js --bundle --target=es2022 --outdir=../priv/static/assets/js --external:/fonts/* --external:/images/* --alias:@=.),
     cd: Path.expand("../assets", __DIR__),
@@ -39,7 +39,7 @@ config :esbuild,
 # Configure tailwind (the version is required)
 config :tailwind,
   version: "4.3.0",
-  lodestar: [
+  tern: [
     args: ~w(
       --input=assets/css/app.css
       --output=priv/static/assets/css/app.css

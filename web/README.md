@@ -1,4 +1,4 @@
-# Lodestar
+# Tern
 
 To start your Phoenix server:
 

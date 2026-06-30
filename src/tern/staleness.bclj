@@ -1,0 +1,112 @@
+#lang beagle/clj
+(ns tern.staleness
+  "Belief-revision layer (D8): judgments revalidate when their inputs move.
+   A pure projection — it NEVER auto-flips a claim, only surfaces a needs-review
+   queue for a human to re-decide. Three judgment classes, three input models:
+     - time-judgment  valid_until   input = the clock; stale once past today.
+     - thread-ref edge relates_to/part_of/clarifies/amends
+                                    input = the target's resolution; stale when
+                                    the target is terminal (done/abandoned).
+     - estimate_hours               input = the thread's scope claims
+                                    (depends_on/part_of/body); stale when a scope
+                                    claim was (re)asserted at a tx LATER than the
+                                    estimate's own tx.
+   History (committed/outcome/abandoned/proposed_by/created_at) never goes stale;
+   derived views (ready/blocked/active) recompute and so can't go stale either.")
+
+(require fram.kernel :as k)
+(require tern.projections :as proj)
+(require fram.fold :as f)
+
+;; te = the thread, pred = which judgment, detail = why it needs review.
+(defrecord Review [te :- String pred :- String detail :- String])
+
+;; predicates whose (re)assertion materially changes an hours estimate.
+(def scope-preds :- (Vec String) ["depends_on" "part_of" "body"])
+;; loose thread-ref edges worth re-checking once their target is *abandoned*
+;; (canceled) — relating to dropped work is the genuine "is this still relevant?"
+;; signal. Excluded: `depends_on` (depends_on->abandoned is already a hard
+;; validation violation), and `part_of` (a child under a completed/abandoned
+;; parent is normal hierarchy, not a belief-revision signal).
+(def edge-preds :- (Vec String) ["relates_to" "clarifies" "amends"])
+;; write-event frames that mean a genuine edit AFTER initial creation. A bulk
+;; `import` assigns sequential tx in render order, so its tx-ordering is
+;; serialization, NOT causality, and must never imply a judgment went stale.
+(defn- real-edit-frame? [fr :- String] :- Bool
+  (or (= fr "coord") (or (= fr "agent") (= fr "cli"))))
+
+;; --- time-judgments: valid_until strictly before today ----------------------
+(defn time-stale [idx :- k/Index today :- String before? :- [String String -> Bool]] :- (Vec Review)
+  (reduce
+   (fn [acc :- (Vec Review) te :- String] :- (Vec Review)
+     (let [vu (k/one-i idx te "valid_until")]
+       (if (and (not (proj/terminal-i? idx te))
+                (and (some? vu) (before? vu today)))
+         (conj acc (->Review te "valid_until" (str vu " is past " today " — re-validate or drop")))
+         acc)))
+   []
+   (k/thread-ids-i idx)))
+
+;; --- loose thread-ref edges pointing at an abandoned (canceled) target -------
+(defn edge-stale [idx :- k/Index] :- (Vec Review)
+  (reduce
+   (fn [acc :- (Vec Review) te :- String] :- (Vec Review)
+     (if (proj/terminal-i? idx te)
+       acc
+       (reduce
+        (fn [a :- (Vec Review) p :- String] :- (Vec Review)
+          (reduce
+           (fn [b :- (Vec Review) tgt :- String] :- (Vec Review)
+             (if (some? (k/one-i idx tgt "abandoned"))
+               (conj b (->Review te p (str "→ " tgt " was abandoned — relationship may be stale")))
+               b))
+           a (k/many-i idx te p)))
+        acc edge-preds)))
+   []
+   (k/thread-ids-i idx)))
+
+;; --- estimate_hours predating a genuine later scope edit (tx + frame) --------
+;; Highest scope-claim tx for subject l that came from a real later edit
+;; (coord/agent/cli) — bulk-import scope claims are ignored (their tx-order is
+;; serialization, not a later change), so a freshly-migrated corpus is never
+;; estimate-stale; the rule lights up only once a real edit moves the scope.
+(defn- later-edit-scope-tx [latest :- (Vec f/Latest) l :- String] :- Int
+  (reduce (fn [m :- Int v :- f/Latest] :- Int
+            (if (and (= (:l v) l)
+                     (and (k/vec-contains? scope-preds (:p v))
+                          (and (real-edit-frame? (:frame v)) (> (:tx v) m))))
+              (:tx v) m))
+          0 latest))
+
+(defn estimate-stale [idx :- k/Index latest :- (Vec f/Latest)] :- (Vec Review)
+  (reduce
+   (fn [acc :- (Vec Review) v :- f/Latest] :- (Vec Review)
+     (if (and (= (:p v) "estimate_hours")
+              (and (not (proj/terminal-i? idx (:l v)))
+                   (> (later-edit-scope-tx latest (:l v)) (:tx v))))
+       (conj acc (->Review (:l v) "estimate_hours"
+                           (str (:r v) "h estimated before a later scope edit — re-estimate")))
+       acc))
+   []
+   latest))
+
+(defn needs-review [idx :- k/Index latest :- (Vec f/Latest) today :- String before? :- [String String -> Bool]] :- (Vec Review)
+  (vec (concat (time-stale idx today before?)
+               (vec (concat (edge-stale idx) (estimate-stale idx latest))))))
+
+;; --- promotion candidates: uncommitted drafts that grew real structure -------
+;; The promotion prompt (D8): a raw capture is just title+body+owner; once it
+;; gains a driver / estimate / dependency / relation it has become real work —
+;; surface it so a human can commit it (intent can't be derived, only prompted).
+(defn- has-structure? [idx :- k/Index te :- String] :- Bool
+  (or (some? (k/one-i idx te "driver"))
+      (or (some? (k/one-i idx te "estimate_hours"))
+          (or (some? (k/one-i idx te "part_of"))
+              (or (not (empty? (k/many-i idx te "depends_on")))
+                  (not (empty? (k/many-i idx te "relates_to"))))))))
+
+(defn promotable [idx :- k/Index] :- (Vec String)
+  (filterv (fn [te :- String] :- Bool
+             (and (nil? (k/one-i idx te "committed"))
+                  (and (not (proj/terminal-i? idx te)) (has-structure? idx te))))
+           (k/thread-ids-i idx)))

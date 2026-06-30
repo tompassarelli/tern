@@ -9,11 +9,11 @@
 ;; shared coord substrate: cardinality-typed write verbs (move-C) live once in
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op lodestar.coord/send-op)
-(def append! lodestar.coord/append!)
-(def put!    lodestar.coord/put!)
-(def one     lodestar.coord/resolved)
-(def many    lodestar.coord/many)
+(def send-op tern.coord/send-op)
+(def append! tern.coord/append!)
+(def put!    tern.coord/put!)
+(def one     tern.coord/resolved)
+(def many    tern.coord/many)
 
 (defn messages [port]      ; -> [[@msg-entity to-handle] ...]  (every entity carrying a `to`)
   (:ok (send-op port {:op :query

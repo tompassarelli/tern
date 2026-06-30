@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tenant lifecycle for the Lodestar gateway. Tokens are stored HASHED (sha-256);
+# Tenant lifecycle for the Tern gateway. Tokens are stored HASHED (sha-256);
 # the plaintext is printed ONCE. Rotation keeps the old token valid until you
 # revoke it, so clients can roll over with no downtime.
 #
@@ -10,7 +10,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FRAM="${FRAM_HOME:-$HOME/code/fram}"
 REGISTRY="${GATEWAY_TENANTS:-$HERE/tenants.edn}"
-DATA_ROOT="${LODESTAR_TENANT_ROOT:-$HOME/.local/state/lodestar/tenants}"
+DATA_ROOT="${TERN_TENANT_ROOT:-$HOME/.local/state/tern/tenants}"
 
 usage() {
   sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2

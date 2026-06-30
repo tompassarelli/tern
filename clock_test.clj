@@ -7,7 +7,7 @@
 ;;   bb -cp out clock_test.clj      (run from the repo root)
 (require '[fram.kernel :as k]
          '[fram.fold :as fold]
-         '[lodestar.clock :as clk]
+         '[tern.clock :as clk]
          '[fram.rt])
 
 (defn asrt [tx l p r] (fold/->Assertion tx "assert" l p r "agent"))

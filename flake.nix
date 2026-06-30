@@ -1,11 +1,11 @@
 {
-  description = "lodestar — claim-native work coordination (CLI + MCP, on babashka)";
+  description = "tern — claim-native work coordination (CLI + MCP, on babashka)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
 
-    # The Fram engine is lodestar's runtime library: bin/lodestar puts
+    # The Fram engine is tern's runtime library: bin/tern puts
     # $FRAM/out on the bb classpath (fram.kernel/fold/import/export/rt) and
     # shells $FRAM/bin/fram for engine verbs. Fram ships its compiled Clojure
     # in out/ (committed, runs on bare bb — no Beagle at runtime), so we consume
@@ -26,7 +26,7 @@
         lib = pkgs.lib;
 
         # Runtime PATH for the bb-backed CLIs. iproute2 (ss) + util-linux
-        # (setsid) are only exercised by `lodestar up` / fram-up (daemon
+        # (setsid) are only exercised by `tern up` / fram-up (daemon
         # lifecycle); harmless to include, and they make those verbs work too.
         runtimePath = lib.makeBinPath [
           pkgs.babashka
@@ -61,12 +61,12 @@
           '';
         };
 
-        # lodestar CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
+        # tern CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
         # packaged engine so the CLI is self-contained; an explicit env override
-        # still wins (the script reads ${FRAM_HOME:-...}). LODESTAR_BIN points the
+        # still wins (the script reads ${FRAM_HOME:-...}). TERN_BIN points the
         # MCP server at the wrapped CLI in this same out.
-        lodestarPkg = pkgs.stdenvNoCC.mkDerivation {
-          pname = "lodestar";
+        ternPkg = pkgs.stdenvNoCC.mkDerivation {
+          pname = "tern";
           version = "0.1.0";
           src = self;
           nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -76,44 +76,44 @@
             runHook preInstall
             mkdir -p $out/bin $out/out
             cp -r out/. $out/out/
-            cp bin/lodestar bin/lodestar-mcp $out/bin/
+            cp bin/tern bin/tern-mcp $out/bin/
 
-            wrapProgram $out/bin/lodestar \
+            wrapProgram $out/bin/tern \
               --prefix PATH : ${runtimePath} \
               --set-default FRAM_HOME ${framPkg}
 
-            wrapProgram $out/bin/lodestar-mcp \
+            wrapProgram $out/bin/tern-mcp \
               --prefix PATH : ${runtimePath} \
               --set-default FRAM_HOME ${framPkg} \
-              --set-default LODESTAR_BIN $out/bin/lodestar
+              --set-default TERN_BIN $out/bin/tern
             runHook postInstall
           '';
 
           meta = with lib; {
-            description = "lodestar — claim-native work coordination CLI + MCP server";
-            mainProgram = "lodestar";
+            description = "tern — claim-native work coordination CLI + MCP server";
+            mainProgram = "tern";
             platforms = platforms.unix;
           };
         };
       in {
         packages = {
-          default = lodestarPkg;
-          lodestar = lodestarPkg;
+          default = ternPkg;
+          tern = ternPkg;
           fram-engine = framPkg;
         };
 
         apps = {
           default = {
             type = "app";
-            program = "${lodestarPkg}/bin/lodestar";
+            program = "${ternPkg}/bin/tern";
           };
-          lodestar = {
+          tern = {
             type = "app";
-            program = "${lodestarPkg}/bin/lodestar";
+            program = "${ternPkg}/bin/tern";
           };
-          lodestar-mcp = {
+          tern-mcp = {
             type = "app";
-            program = "${lodestarPkg}/bin/lodestar-mcp";
+            program = "${ternPkg}/bin/tern-mcp";
           };
         };
 
@@ -129,7 +129,7 @@
             inotify-tools
             nodejs_22
 
-            # existing lodestar deps
+            # existing tern deps
             babashka
             bun
           ];

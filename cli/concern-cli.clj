@@ -17,11 +17,11 @@
 ;; the shared @concern:<id> string bridges the two jurisdictions, no distributed tx.
 ;; A NON-flipped repo (no code daemon) DEGRADES to the path-string footprint + intersection.
 ;;
-;; PORTS: argv[0] = the :7977 board (spine). $LODESTAR_CODE_PORT (set by bin/concern when
+;; PORTS: argv[0] = the :7977 board (spine). $TERN_CODE_PORT (set by bin/concern when
 ;; it finds a warm code daemon) = the per-repo CODE store (footprint). No code port ->
 ;; path-string fallback.
 ;;
-;; usage (port = lodestar board, 7977):
+;; usage (port = tern board, 7977):
 ;;   declare <agent> <repo> "<intent>" <foot,foot,...>    mint a concern (+ shows overlaps)
 ;;       footprint entries: a code NODE (@mod#n or module/name) on a flipped repo, else a path.
 ;;   overlap <concern-id>     who else is in my footprint (code-graph blast join, or path)
@@ -35,17 +35,17 @@
 ;; shared coord substrate: the cardinality-typed write verbs (move-C) live once in
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  lodestar.coord/send-op)
-(def append!  lodestar.coord/append!)
-(def put!     lodestar.coord/put!)
-(def many     lodestar.coord/many)
-(def resolved lodestar.coord/resolved)
+(def send-op  tern.coord/send-op)
+(def append!  tern.coord/append!)
+(def put!     tern.coord/put!)
+(def many     tern.coord/many)
+(def resolved tern.coord/resolved)
 
 ;; port coercion: coord/send-op does (int port), so every port must be a NUMBER, never a
 ;; string (env vars + the stored code_port claim arrive as strings).
 (defn ->port [p] (cond (nil? p) nil (number? p) p :else (Integer/parseInt (str p))))
 ;; the per-repo CODE daemon port (bin/concern discovers + exports it); nil => path fallback.
-(def code-port (let [p (System/getenv "LODESTAR_CODE_PORT")] (when (and p (seq p)) (->port p))))
+(def code-port (let [p (System/getenv "TERN_CODE_PORT")] (when (and p (seq p)) (->port p))))
 
 ;; one-column datalog query: bind ?e in `body`, return the column
 (defn q-col [port body]
@@ -138,7 +138,7 @@
         (println (str "       SHARES: " (str/join " " (sort (set/intersection mine (:touches m))))))))))
 
 ;; the effective code port for THIS concern: its own stored code_port (set at declare,
-;; so overlap/shape work from any cwd), else the ambient $LODESTAR_CODE_PORT. nil => path.
+;; so overlap/shape work from any cwd), else the ambient $TERN_CODE_PORT. nil => path.
 (defn surface [spine c statuses none-msg]
   (let [cport (or (->port (resolved spine c "code_port")) code-port)]
     (if cport (surface-code spine cport c statuses none-msg)

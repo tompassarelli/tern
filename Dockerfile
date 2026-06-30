@@ -1,4 +1,4 @@
-# Lodestar runtime image — the Fram engine + the Lodestar life domain.
+# Tern runtime image — the Fram engine + the Tern life domain.
 # One image, two roles (choose at run time):
 #   • coordinator (default CMD): a single tenant's sole-writer daemon (runs on the JVM)
 #   • gateway:                   the authenticated multi-tenant edge (runs on babashka)
@@ -7,11 +7,11 @@
 # shipped, so cross-host/bridge-network deployment is supported (the gateway can front
 # coordinators on other hosts). See docs/hosting.md and fram/docs/coordinator-bind-and-wire.md.
 #
-#   docker build -t lodestar:latest .
-#   docker run --rm --network host -v /srv/lodestar:/data lodestar:latest          # coordinator
-#   docker run --rm --network host -v /srv/lodestar:/srv/lodestar \
-#     -e GATEWAY_TENANTS=/srv/lodestar/tenants.edn lodestar:latest \
-#     bash -lc 'exec bb /opt/lodestar/deploy/gateway/gateway.clj'                   # gateway
+#   docker build -t tern:latest .
+#   docker run --rm --network host -v /srv/tern:/data tern:latest          # coordinator
+#   docker run --rm --network host -v /srv/tern:/srv/tern \
+#     -e GATEWAY_TENANTS=/srv/tern/tenants.edn tern:latest \
+#     bash -lc 'exec bb /opt/tern/deploy/gateway/gateway.clj'                   # gateway
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,17 +25,17 @@ RUN curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install 
 RUN curl -sL https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh -o /tmp/clj.sh \
  && bash /tmp/clj.sh && rm /tmp/clj.sh
 
-# Pinned to the Fram commit Lodestar is built against — keep in sync with
+# Pinned to the Fram commit Tern is built against — keep in sync with
 # FRAM_VERSION (override at build with --build-arg FRAM_REF=<sha>).
 ARG FRAM_REF=e78badabb43aa8ce1f507b8a8d74b86737cd34de
 WORKDIR /opt
 RUN git clone https://github.com/Autonymy/fram \
  && git -C fram checkout --quiet "${FRAM_REF}" \
  && (cd fram && clojure -P)   # prefetch the coordinator daemon's JVM deps (clojure + cheshire)
-COPY . /opt/lodestar
+COPY . /opt/tern
 
 ENV FRAM_HOME=/opt/fram \
-    PATH="/opt/lodestar/bin:/opt/fram/bin:${PATH}" \
+    PATH="/opt/tern/bin:/opt/fram/bin:${PATH}" \
     FRAM_PORT=7977 \
     FRAM_LOG=/data/claims.log \
     FRAM_THREADS=/data/threads \

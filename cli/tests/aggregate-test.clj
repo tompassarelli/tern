@@ -4,7 +4,7 @@
 ;;   bb cli/tests/aggregate-test.clj [port]
 (require '[clojure.java.io :as io])
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/../coord.clj"))
-(alias 'co (the-ns 'lodestar.coord))
+(alias 'co (the-ns 'tern.coord))
 
 (let [port (Integer/parseInt (or (first *command-line-args*) "7977"))
       tag  (format "%08x" (rand-int 0x7fffffff))

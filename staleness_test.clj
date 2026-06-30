@@ -7,7 +7,7 @@
 ;;   bb -cp out staleness_test.clj      (run from the repo root)
 (require '[fram.kernel :as k]
          '[fram.fold :as fold]
-         '[lodestar.staleness :as stale])
+         '[tern.staleness :as stale])
 
 (defn asrt [tx l p r frame] (fold/->Assertion tx "assert" l p r frame))
 

@@ -7,7 +7,7 @@
 ;; the engine schema uses (fram.schema setup! / def-predicate!).
 ;;
 ;; SCOPE NOTE: the registry lives as @pred:* CLAIMS over the canonical :7977 wire
-;; (the lodestar analogue of s/setup!), NOT as an edit to the engine. Engine
+;; (the tern analogue of s/setup!), NOT as an edit to the engine. Engine
 ;; fram/schema.bclj is @claim-canonical (text edits forbidden) and folding the
 ;; registry into the daemon's bootstrap is thread B's step — explicitly gated on
 ;; B owning what 'single' means. This thread builds the registry + the lint guard;
@@ -24,12 +24,12 @@
 
 ;; shared coord substrate (Foundation Part B): the wire helpers live once in cli/coord.clj.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  lodestar.coord/send-op)
-(def append!  lodestar.coord/append!)
-(def put!     lodestar.coord/put!)
-(def retract! lodestar.coord/retract!)
-(def resolved lodestar.coord/resolved)
-(def many     lodestar.coord/many)
+(def send-op  tern.coord/send-op)
+(def append!  tern.coord/append!)
+(def put!     tern.coord/put!)
+(def retract! tern.coord/retract!)
+(def resolved tern.coord/resolved)
+(def many     tern.coord/many)
 
 (def PRED-NS "@pred:")
 (defn pred-ent  [nm]  (str PRED-NS nm))
@@ -88,7 +88,7 @@
    ["holds"          "multi"  "ref"     "roles (@role:*) an agent holds"]
    ["watches"        "multi"  "ref"     "threads (@…) an agent subscribes to"]
    ["learning"       "multi"  "literal" "playbook learnings accumulated on a thread"]
-   ;; --- messaging (msg-cli, inbox-peek, lodestar-listen) ---
+   ;; --- messaging (msg-cli, inbox-peek, tern-listen) ---
    ["from"     "single" "literal" "sender handle of a message"]
    ["to"       "single" "literal" "recipient handle/role/wildcard of a message"]
    ["subject"  "single" "literal" "message subject line"]
@@ -108,7 +108,7 @@
    ["touches" "multi"  "literal" "file paths a concern touches (display label + the path-string footprint fallback for non-flipped repos)"]
    ["footprint" "multi" "ref"    "code NODE (@mod#n) in a concern's footprint — the cross-frame bridge (thread 019f1010-2705); asserted on the repo's warm CODE port, joined via the daemon's calls_defn blast closure (calls_defn itself is a fram daemon-internal derived edge, not a :7977 claim)"]
    ["code_port" "single" "literal" "port of the repo's warm code daemon, so a reader finds where a concern's footprint code store lives"]
-   ;; --- fan-out / barrier (lodestar-map) ---
+   ;; --- fan-out / barrier (tern-map) ---
    ["batch_kind"     "single" "literal" "kind of fan-out batch"]
    ["expected_count" "single" "literal" "N workers expected in a fan-out batch"]
    ["barrier_k"      "single" "literal" "K threshold for the K-of-N barrier"]
@@ -121,10 +121,10 @@
    ["done_payload"   "single" "literal" "a worker's DONE payload"]
    ["done_at"        "single" "literal" "instant a worker reported DONE"]
    ["worker"         "multi"  "literal" "worker handles spawned under a batch"]
-   ;; --- swarm budget (lodestar-listen) ---
+   ;; --- swarm budget (tern-listen) ---
    ["budget_total" "single" "literal" "the swarm token/cost budget ceiling"]
    ;; (budget_spent removed — budget is now derived: Σ(@run cost_usd), no mutated cell)
-   ;; --- run telemetry (presence-cli runmeta / lodestar-reconcile) ---
+   ;; --- run telemetry (presence-cli runmeta / tern-reconcile) ---
    ["cost_usd"       "single" "literal" "real USD cost of a run"]
    ["ended_at"       "single" "literal" "instant a run ended"]
    ["input_tokens"   "single" "literal" "run input tokens"]
@@ -196,7 +196,7 @@
           (if (= f eof) acc (recur (conj acc f))))))))
 
 (def pred-fn-names (set (map name pred-fns)))   ; match on simple name so a fully-qualified
-                                                ; lodestar.coord/append! is caught like a bare append!
+                                                ; tern.coord/append! is caught like a bare append!
 (defn preds-in-form [form]
   (let [found (atom #{})]
     (walk/postwalk

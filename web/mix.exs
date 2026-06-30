@@ -1,9 +1,9 @@
-defmodule Lodestar.MixProject do
+defmodule Tern.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :lodestar,
+      app: :tern,
       version: "0.1.0",
       elixir: "~> 1.15",
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -20,7 +20,7 @@ defmodule Lodestar.MixProject do
   # Type `mix help compile.app` for more information.
   def application do
     [
-      mod: {Lodestar.Application, []},
+      mod: {Tern.Application, []},
       extra_applications: [:logger, :runtime_tools]
     ]
   end
@@ -73,10 +73,10 @@ defmodule Lodestar.MixProject do
     [
       setup: ["deps.get", "assets.setup", "assets.build"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
-      "assets.build": ["compile", "tailwind lodestar", "esbuild lodestar"],
+      "assets.build": ["compile", "tailwind tern", "esbuild tern"],
       "assets.deploy": [
-        "tailwind lodestar --minify",
-        "esbuild lodestar --minify",
+        "tailwind tern --minify",
+        "esbuild tern --minify",
         "phx.digest"
       ],
       precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "test"]

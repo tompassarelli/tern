@@ -1,0 +1,12 @@
+# systemd timer — run the per-tenant claims.log backup daily.
+#   sudo cp deploy/tern-backup.timer /etc/systemd/system/
+#   sudo systemctl enable --now tern-backup.timer
+[Unit]
+Description=Daily Tern per-tenant claims.log backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

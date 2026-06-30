@@ -7,24 +7,24 @@
 # you'd quiesce the coordinator first; this trades that for zero downtime.)
 #
 # Config (env):
-#   LODESTAR_TENANT_ROOT     where tenants live, one subdir each containing a
-#                            claims.log (default "$HOME/.local/state/lodestar/tenants").
-#   LODESTAR_BACKUP_DIR      where snapshots are written, one subdir per tenant
-#                            (default "$HOME/.local/state/lodestar/backups").
-#   LODESTAR_BACKUP_KEEP_DAYS  prune snapshots older than this many days
+#   TERN_TENANT_ROOT     where tenants live, one subdir each containing a
+#                            claims.log (default "$HOME/.local/state/tern/tenants").
+#   TERN_BACKUP_DIR      where snapshots are written, one subdir per tenant
+#                            (default "$HOME/.local/state/tern/backups").
+#   TERN_BACKUP_KEEP_DAYS  prune snapshots older than this many days
 #                            (default 30).
 #
 # Usage:
 #   ./backup.sh                 # uses the defaults above
-#   LODESTAR_TENANT_ROOT=/var/lib/lodestar/tenants \
-#   LODESTAR_BACKUP_DIR=/var/lib/lodestar/backups ./backup.sh
+#   TERN_TENANT_ROOT=/var/lib/tern/tenants \
+#   TERN_BACKUP_DIR=/var/lib/tern/backups ./backup.sh
 #
-# Run it on a schedule with deploy/lodestar-backup.{service,timer}.
+# Run it on a schedule with deploy/tern-backup.{service,timer}.
 set -euo pipefail
 
-TENANT_ROOT="${LODESTAR_TENANT_ROOT:-$HOME/.local/state/lodestar/tenants}"
-BACKUP_DIR="${LODESTAR_BACKUP_DIR:-$HOME/.local/state/lodestar/backups}"
-KEEP_DAYS="${LODESTAR_BACKUP_KEEP_DAYS:-30}"
+TENANT_ROOT="${TERN_TENANT_ROOT:-$HOME/.local/state/tern/tenants}"
+BACKUP_DIR="${TERN_BACKUP_DIR:-$HOME/.local/state/tern/backups}"
+KEEP_DAYS="${TERN_BACKUP_KEEP_DAYS:-30}"
 
 found=0
 for tdir in "$TENANT_ROOT"/*/; do
