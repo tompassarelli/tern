@@ -151,7 +151,9 @@
     "declare"
     (let [[agent repo intent files] args
           fs (->> (str/split (or files "") #",") (map str/trim) (remove str/blank?))
-          id (str "concern-" (System/currentTimeMillis) "-" (subs (str (java.util.UUID/randomUUID)) 0 4))]
+          ;; @ sigil: every thread id in the claims log carries it; a bare id here made
+          ;; fram's export strip the wrong char. Old bare-id concerns are tolerated, not rewritten.
+          id (str "@concern-" (System/currentTimeMillis) "-" (subs (str (java.util.UUID/randomUUID)) 0 4))]
       ;; spine on the :7977 board (low-frequency declare/maturity); footprint NEVER lands here.
       (put! port id "title"  (str "[" repo "] " intent))   ; single
       (put! port id "kind"   "concern")                    ; single
