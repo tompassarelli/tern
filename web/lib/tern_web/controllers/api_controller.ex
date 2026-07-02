@@ -38,10 +38,10 @@ defmodule TernWeb.ApiController do
     json(conn, rows)
   end
 
-  # Live agent roster + fleet token totals from the agents daemon (:7978).
+  # Live agent roster + swarm token totals from the agents daemon (:7978).
   def presence(conn, _params) do
     roster = Tern.Presence.roster()
-    json(conn, %{agents: roster, fleet: Tern.Presence.fleet_tokens(roster)})
+    json(conn, %{agents: roster, swarm: Tern.Presence.swarm_tokens(roster)})
   end
 
   # Flat array in the shape wake's agents.wake `(entity agent …)` expects

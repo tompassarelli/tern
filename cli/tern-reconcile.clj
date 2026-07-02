@@ -3,11 +3,11 @@
 ;; that closes the feedback loop — without it, runmeta data is inert.
 ;;
 ;; usage:
-;;   bb fleet-reconcile.clj <port>                    — full report
-;;   bb fleet-reconcile.clj <port> by-model            — breakdown by model tier
-;;   bb fleet-reconcile.clj <port> drift               — estimate vs actual, sorted by overshoot
-;;   bb fleet-reconcile.clj <port> recent [N]           — last N runs (default 20)
-;;   bb fleet-reconcile.clj <port> agent <uuid>         — runs for one agent
+;;   bb tern-reconcile.clj <port>                    — full report
+;;   bb tern-reconcile.clj <port> by-model            — breakdown by model tier
+;;   bb tern-reconcile.clj <port> drift               — estimate vs actual, sorted by overshoot
+;;   bb tern-reconcile.clj <port> recent [N]           — last N runs (default 20)
+;;   bb tern-reconcile.clj <port> agent <uuid>         — runs for one agent
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str])
 
 ;; shared coord substrate (Foundation Part B): send-op lives once in cli/coord.clj.
@@ -119,7 +119,7 @@
       runs (mapv #(run-meta port %) entities)]
   (case (or verb "full")
     "full"
-    (do (println "=== FLEET TELEMETRY RECONCILIATION ===\n")
+    (do (println "=== SWARM TELEMETRY RECONCILIATION ===\n")
         (print-summary runs)
         (println) (print-by-model runs)
         (println "\n--- recent (last 10) ---")
@@ -143,5 +143,5 @@
             (print-recent mine 50))
         (println (str "No runs found for " uuid))))
 
-    (do (println "usage: fleet-reconcile.clj <port> [full|by-model|drift|recent [N]|agent <uuid>]")
+    (do (println "usage: tern-reconcile.clj <port> [full|by-model|drift|recent [N]|agent <uuid>]")
         (System/exit 2))))

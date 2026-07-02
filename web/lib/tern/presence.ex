@@ -99,8 +99,8 @@ defmodule Tern.Presence do
   defp fmt_duration(s) when s >= 60, do: "#{div(s, 60)}m #{rem(s, 60)}s"
   defp fmt_duration(s), do: "#{max(s, 0)}s"
 
-  @doc "Fleet token totals for the status line: %{context, total} as display strings."
-  def fleet_tokens(roster) do
+  @doc "Swarm token totals for the status line: %{context, total} as display strings."
+  def swarm_tokens(roster) do
     ctx = Enum.reduce(roster, 0, &(&1.context_tokens + &2))
     tot = Enum.reduce(roster, 0, &(&1.total_tokens + &2))
     %{context: fmt_tokens(ctx), total: fmt_tokens(tot)}

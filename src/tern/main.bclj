@@ -180,7 +180,7 @@
          ;; log is the source of truth; the file is a regenerated view — so a
          ;; capture can never strand title/provenance in a file. (The old file-first
          ;; path did exactly that whenever the log had pending coordinator writes,
-         ;; i.e. routinely under a live fleet — the recurring two-way divergence.)
+         ;; i.e. routinely under a live swarm — the recurring two-way divergence.)
          ;; UUIDv7 is collision-proof, so capture no longer reserves a file-lock id
          ;; (the old now-id/reserve-id dance guarded same-second timestamp clashes).
          (if (< (fram.rt/coord-version port) 0)

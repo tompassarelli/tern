@@ -2,7 +2,7 @@
 ;; scripts (Foundation thread 019f100f Part B). Every CLI spoke the :7977 daemon
 ;; wire (:assert / :version / :retract / :resolved / :query) through a VERBATIM
 ;; copy of these helpers — 10 copies of send-op, 5 of assert!, 2 of retract!, and
-;; ~11 single/multi resolved variants. One drift in any copy and the fleet's
+;; ~11 single/multi resolved variants. One drift in any copy and the swarm's
 ;; coordination silently diverges. This is the single definition they all load.
 ;;
 ;; WRITE VERBS — cardinality-typed (move-C). The one global-version CAS ritual that

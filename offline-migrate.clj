@@ -21,7 +21,7 @@
       (filter #(= (nth % 2) "migrated") (by-pred "source"))
       (filter #(= (nth % 2) "personal") (by-pred "owner"))
       (by-pred "coordination")
-      ;; fleet-junk driver cells (titleless zzz/probe lease nodes)
+      ;; swarm-junk driver cells (titleless zzz/probe lease nodes)
       (filter #(or (str/includes? (first %) "zzz") (str/includes? (first %) "probe")) (by-pred "driver"))
       ;; stale drivers on terminal (done/abandoned) threads
       (let [term (set (concat (map first (by-pred "outcome")) (map first (by-pred "abandoned"))))]

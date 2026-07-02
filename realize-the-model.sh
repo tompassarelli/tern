@@ -29,7 +29,7 @@ w tell @claude-code    display_name "claude-code"
 w tell @claude         display_name "claude"
 if [ "$FAIL" -ne 0 ]; then echo '!! 3a failed — aborting before bulk ops' >&2; exit 1; fi
 
-echo '== 3b: purge live fleet-junk driver cells (zzz/probe) =='
+echo '== 3b: purge live swarm-junk driver cells (zzz/probe) =='
 livefile "$T/driver" driver
 grep -E '@(.*zzz|probe)' "$T/driver" > "$T/junk" || true
 while IFS=$'\t' read -r s v; do [ -n "$s" ] && w untell "$s" driver "$v"; done < "$T/junk"

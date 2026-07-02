@@ -116,7 +116,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   return result;
 }
 
-// Spawn multiple agents in parallel — the core win over the bash fleet.
+// Spawn multiple agents in parallel — the core win over the bash swarm.
 export async function spawnParallel(
   tasks: SpawnOptions[]
 ): Promise<string[]> {

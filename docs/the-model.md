@@ -19,7 +19,7 @@ of agents *and* feel like one brain — they are not a trade-off.
   everywhere; `@tom` and `@claude-code` are the same identities everywhere. One
   ontology, one identity space.
 - **Separate — the write logs (jurisdictions).** Human-intent claims (your life-os:
-  `committed`/`outcome`/`driver`/`owner`) live in *their* log. Fleet machine-runtime
+  `committed`/`outcome`/`driver`/`owner`) live in *their* log. Swarm machine-runtime
   claims (`lease`/`heartbeat`/`epoch`/`fencing` — high-churn, disposable) live in
   *their own* log. Different lanes. **Machine churn never pollutes your canonical
   intent log** — the exact bug the review caught (a `driver` cell overloaded between
@@ -102,8 +102,8 @@ this fixes that). Orthogonal storage, totally-ordered display.
 
 ## 4. The coordination tier — machine, not intent (same graph, own shape)
 
-The fleet's *mechanics* are genuinely a different concern from a thread, so they get
-their own node kind **and their own write log (the fleet jurisdiction)** — sharing the
+The swarm's *mechanics* are genuinely a different concern from a thread, so they get
+their own node kind **and their own write log (the swarm jurisdiction)** — sharing the
 kernel's identities and surfacing in the unified view, but never written into your
 canonical intent log. They are **ephemeral** (TTL'd, garbage-collected, never durable
 history).
@@ -149,11 +149,11 @@ query. No new primitive.
 Separate write logs are the scaling *mechanism*, not an afterthought:
 
 - **Each jurisdiction is its own bounded write log + coordinator** (your life-os, the
-  fleet, later a per-project domain). Adding agents = adding/load-balancing fleet-side
+  swarm, later a per-project domain). Adding agents = adding/load-balancing swarm-side
   write capacity — never more contention on your intent log. This is what removes the
   "buckles at ~32 hammering writers" ceiling: you don't make one log faster, you stop
   routing machine churn through it at all.
-- **The high-churn tier lives in the fleet log** (heartbeats/leases at machine pace),
+- **The high-churn tier lives in the swarm log** (heartbeats/leases at machine pace),
   TTL'd and disposable. Your durable thread log moves at human/agent *thought* pace
   and stays small.
 - **Peer-local union views** — a reader (you, an agent) materializes the shared kernel
@@ -165,7 +165,7 @@ Separate write logs are the scaling *mechanism*, not an afterthought:
 You never see the lanes. You see one board that doesn't care whether it's holding 8
 agents or 800. *(The substrate plumbing — per-jurisdiction logs, subject-striped
 writes, retraction-aware union views — is the roadmap, tasks #2–#7, net-new and not
-yet built. The model + the jurisdiction discipline are adoptable now: the fleet
+yet built. The model + the jurisdiction discipline are adoptable now: the swarm
 already writes its own scratch log, never your canonical one.)*
 
 ---
@@ -214,10 +214,10 @@ its correct kind:
 | `mbox/` messages | the **thread graph** (claim/resolve/depend) + a thin residual for true direct messages |
 | `presence/*.md` files | **session** coordination nodes (heartbeat-derived liveness) |
 | `claims/BUILD-LOCK-*` | **lease** coordination nodes (holder/epoch/expiry/fencing) |
-| fleet tasks (in agent task-trackers) | **threads** in the one graph (owner = the project, `lead`/`driver` = an agent) |
+| swarm tasks (in agent task-trackers) | **threads** in the one graph (owner = the project, `lead`/`driver` = an agent) |
 
 Sequence: settle the schema (this doc) → stand up the durable shared coordinator/log
-→ move the fleet's coordination onto it (lease/session/threads) → cut agents off
+→ move the swarm's coordination onto it (lease/session/threads) → cut agents off
 agentchat → rip agentchat via nixos-config. The mechanism is already proven (lease,
 presence, messaging, watch all built + validated); this is wiring, in order.
 
