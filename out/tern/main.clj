@@ -419,34 +419,198 @@
 (defn cmd-clock-week [^String log]
   (clock-window log (fram.rt/this-week-dates) "this week"))
 
-(defn cmd-doctor [^String threads-dir ^String log]
+(defrecord Probe [up serving fresh port status daemon-v log-v log-claims idx stale hand log-behind])
+
+(defn probe-up [r] (:up r))
+
+(defn probe-serving [r] (:serving r))
+
+(defn probe-fresh [r] (:fresh r))
+
+(defn probe-port [r] (:port r))
+
+(defn probe-status [r] (:status r))
+
+(defn probe-daemon-v [r] (:daemon-v r))
+
+(defn probe-log-v [r] (:log-v r))
+
+(defn probe-log-claims [r] (:log-claims r))
+
+(defn probe-idx [r] (:idx r))
+
+(defn probe-stale [r] (:stale r))
+
+(defn probe-hand [r] (:hand r))
+
+(defn probe-log-behind [r] (:log-behind r))
+
+(defn- ^Boolean stale-projection? [idx c]
+  (and (k/single? (:p c)) (let [v (k/one-i idx (:l c) (:p c))]
+  (and (some? v) (not (= v (:r c)))))))
+
+(defn- ^Probe probe [^String threads-dir ^String log]
   (let [port (fram.rt/coord-port)
    status (fram.rt/coord-status port)
    up (not (= status "down"))
    serving (str/includes? status log)
    f (fold/fold (fram.rt/read-log log))
+   log-claims (:claims f)
    log-v (:version f)
    daemon-v (fram.rt/coord-version port)
    fresh (>= daemon-v log-v)
+   idx (k/build-index log-claims)
    file-claims (:claims (fold/fold (imp/load-corpus threads-dir)))
-   idx (k/build-index (:claims f))
-   thread-log (filterv (fn [c] (some? (k/one-i idx (:l c) "title"))) (:claims f))
+   thread-log (filterv (fn [c] (some? (k/one-i idx (:l c) "title"))) log-claims)
    tl-sigs (sig-member-map thread-log)
    file-sigs (sig-member-map file-claims)
    file-ahead (filterv (fn [c] (nil? (get tl-sigs (claim-sig c)))) file-claims)
    log-behind (filterv (fn [c] (nil? (get file-sigs (claim-sig c)))) thread-log)
-   clean (empty? file-ahead)
-   synced (and clean (empty? log-behind))]
+   stale (filterv (fn [c] (stale-projection? idx c)) file-ahead)
+   hand (filterv (fn [c] (not (stale-projection? idx c))) file-ahead)]
+  (->Probe up serving fresh port status daemon-v log-v log-claims idx stale hand log-behind)))
+
+(defn- ^Boolean safe? [^Probe p]
+  (and (:up p) (and (:serving p) (:fresh p))))
+
+(defn- ^String safety-line [^Probe p]
+  (if (safe? p) "healthy: tell/untell + warm reads are safe" (cond
+  (not (:up p)) (str "DEGRADED: coordinator DOWN on 127.0.0.1:" (:port p) " — run `tern up` (writes won't serialize)")
+  (not (:serving p)) (str "DEGRADED: daemon not serving the canonical log — status: " (:status p))
+  :else (str "DEGRADED: daemon STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p) ") — the log changed out-of-band; restart it + `tern up`"))))
+
+(defn- ^String hygiene-line [^Probe p]
+  (let [ns (count (:stale p))
+   nh (count (:hand p))
+   nb (count (:log-behind p))]
+  (if (and (= ns 0) (and (= nh 0) (= nb 0))) "" (str "hygiene: " (+ ns nb) " stale/lagging projection claim(s) — run `tern heal`" (if (> nh 0) (str "; " nh " hand-edited claim(s) — reconcile via tell/import") "")))))
+
+(defn cmd-doctor [^String threads-dir ^String log]
+  (let [p (probe threads-dir log)]
   (println "tern doctor")
-  (if up (do
-  (println (str "  [ok]    coordinator UP on 127.0.0.1:" port))
-  (if serving (println "  [ok]    serving the canonical log") (println (str "  [WARN]  daemon is NOT serving " log " — status: " status)))
-  (if fresh (if (= daemon-v log-v) (println "  [ok]    daemon state matches the on-disk log") (println (str "  [ok]    daemon current with the log (loaded v" daemon-v " > log v" log-v " — in-memory lease txs, never flat-logged)"))) (println (str "  [WARN]  daemon is STALE (loaded v" daemon-v " behind log v" log-v ") — the log changed out-of-band; restart: kill it + `tern up`")))) (println (str "  [DOWN]  no coordinator on 127.0.0.1:" port " — writes won't serialize. Run `tern up`.")))
+  (if (:up p) (do
+  (println (str "  [ok]    coordinator UP on 127.0.0.1:" (:port p)))
+  (if (:serving p) (println "  [ok]    serving the canonical log") (println (str "  [WARN]  daemon is NOT serving " log " — status: " (:status p))))
+  (if (:fresh p) (if (= (:daemon-v p) (:log-v p)) (println "  [ok]    daemon state matches the on-disk log") (println (str "  [ok]    daemon current with the log (loaded v" (:daemon-v p) " > log v" (:log-v p) " — in-memory lease txs, never flat-logged)"))) (println (str "  [WARN]  daemon is STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p) ") — the log changed out-of-band; restart: kill it + `tern up`")))) (println (str "  [DOWN]  no coordinator on 127.0.0.1:" (:port p) " — writes won't serialize. Run `tern up`.")))
+  (if (safe? p) (println "  => healthy: tell/untell + warm reads are safe") (println "  => DEGRADED: fix the warnings above"))
+  (println "  hygiene:")
+  (let [ns (count (:stale p))
+   nh (count (:hand p))
+   nb (count (:log-behind p))]
+  (if (and (= ns 0) (and (= nh 0) (= nb 0))) (println "    [ok]    files <-> claim log in sync") (do
+  (if (> ns 0) (do
+  (println (str "    " ns " stale projection claim(s) — run `tern heal`"))))
+  (if (> nh 0) (do
+  (println (str "    " nh " genuinely-new file claim(s) (hand edits) — reconcile via tell or import"))))
+  (if (> nb 0) (do
+  (println (str "    " nb " log claim(s) not yet in files — benign projection lag; run `tern heal`")))))))))
+
+(defn- distinct-ids [xs]
+  (reduce (fn [acc x] (if (k/vec-contains? acc x) acc (conj acc x))) [] xs))
+
+(defn- heal-targets [^Probe p]
+  (distinct-ids (mapv (fn [c] (:l c)) (vec (concat (:stale p) (:log-behind p))))))
+
+(defn- ^String file-subject [^String content]
+  (let [lines (fram.rt/split-on content "\n")
+   n (count lines)]
+  (loop [i 0]
   (cond
-  synced (println "  [ok]    files <-> claim log in sync")
-  clean (println (str "  [ok]    files behind the log by " (count log-behind) " thread-claim(s) — benign projection lag; `tern export` to refresh"))
-  :else (println (str "  [WARN]  " (count file-ahead) " file claim(s) not in the log " "(a thread .md was hand-edited?) — reconcile via the coordinator, or `import`")))
-  (if (and up (and serving (and clean fresh))) (println "  => healthy: tell/untell + warm reads are safe") (println "  => DEGRADED: fix the warnings above"))))
+  (>= i n) ""
+  (= "---" (str/trim (nth lines i))) ""
+  (str/starts-with? (str/trim (nth lines i)) "@") (str/trim (nth lines i))
+  :else (recur (+ i 1))))))
+
+(defn- ^String basename [^String threads-dir ^String path]
+  (let [pre (+ (count threads-dir) 1)]
+  (if (> (count path) pre) (subs path pre) path)))
+
+(defn- ^String file-owner [ids ^String name]
+  (reduce (fn [best id] (if (and (or (str/starts-with? name (str id "-")) (= name (str id ".md"))) (> (count id) (count best))) id best)) "" ids))
+
+(defrecord FileInfo [path owner head])
+
+(defn fileinfo-path [r] (:path r))
+
+(defn fileinfo-owner [r] (:owner r))
+
+(defn fileinfo-head [r] (:head r))
+
+(defn- scan-files [^String threads-dir files ids]
+  (mapv (fn [path] (->FileInfo path (file-owner ids (basename threads-dir path)) (file-subject (fram.rt/slurp path)))) files))
+
+(defn- ^String path-of [scan ^String id]
+  (reduce (fn [acc fi] (if (and (str/blank? acc) (= (:owner fi) id)) (:path fi) acc)) "" scan))
+
+(defn- broken-head-ids [scan idx]
+  (distinct-ids (reduce (fn [acc fi] (if (and (not (str/blank? (:owner fi))) (and (not (= (:head fi) (str "@" (:owner fi)))) (some? (k/one-i idx (str "@" (:owner fi)) "title")))) (conj acc (:owner fi)) acc)) [] scan)))
+
+(defn cmd-heal [^String threads-dir ^String log]
+  (let [p (probe threads-dir log)]
+  (cond
+  (not (empty? (:hand p))) (do
+  (println (str "heal REFUSED — " (count (:hand p)) " genuinely-new file claim(s) not in the log " "(hand edits). A human decides: adopt via `tell`, or bulk `import`. Nothing was touched:"))
+  (doseq [c (:hand p)]
+  (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72)))))
+  :else (let [files (fram.rt/list-md threads-dir)
+   ids (mapv (fn [te] (short-id te)) (k/thread-ids-i (:idx p)))
+   scan (scan-files threads-dir files ids)
+   diff-ids (mapv (fn [te] (short-id te)) (heal-targets p))
+   targets (distinct-ids (vec (concat diff-ids (broken-head-ids scan (:idx p)))))]
+  (if (empty? targets) (println "heal: nothing to do — every thread file already matches the log.") (do
+  (doseq [id targets]
+  (let [te (str "@" id)
+   title (let [t (k/one-i (:idx p) te "title")]
+  (if (some? t) t "untitled"))
+   existing (path-of scan id)
+   path (if (str/blank? existing) (str threads-dir "/" id "-" (fram.rt/slugify title) ".md") existing)]
+  (fram.rt/spit-file path (exp/thread-md (:log-claims p) te))
+  (println (str "  re-rendered " id "  " (trunc title 52)))))
+  (println (str "heal: re-rendered " (count targets) " thread file(s) from the log. Log untouched."))))))))
+
+(defrecord EntryPoint [te note created])
+
+(defn entrypoint-te [r] (:te r))
+
+(defn entrypoint-note [r] (:note r))
+
+(defn entrypoint-created [r] (:created r))
+
+(defn- ^String entry-note [idx ^String te]
+  (reduce (fn [acc v] (if (and (str/blank? acc) (str/starts-with? v "SESSION ENTRY POINT")) v acc)) "" (k/many-i idx te "note")))
+
+(defn- ^EntryPoint find-entry [idx]
+  (reduce (fn [best te] (let [note (entry-note idx te)]
+  (if (str/blank? note) best (let [c (let [cc (k/one-i idx te "created_at")]
+  (if (some? cc) cc ""))]
+  (if (or (str/blank? (:te best)) (fram.rt/str-lt? (:created best) c)) (->EntryPoint te note c) best))))) (->EntryPoint "" "" "") (k/thread-ids-i idx)))
+
+(defn cmd-boot [^String threads-dir ^String log]
+  (let [p (probe threads-dir log)
+   idx (:idx p)
+   today (fram.rt/today-iso)
+   before? fram.rt/str-lt?]
+  (println (str "=> " (safety-line p)))
+  (let [h (hygiene-line p)]
+  (if (not (str/blank? h)) (do
+  (println (str "   " h)))))
+  (let [e (find-entry idx)]
+  (if (str/blank? (:te e)) (println "\nENTRY POINT — none (no thread carries a `SESSION ENTRY POINT` note)") (do
+  (println (str "\nENTRY POINT — " (short-id (:te e)) "  " (title-of idx (:te e))))
+  (println (:note e))
+  (let [ls (k/many-i idx (:te e) "learning")]
+  (if (not (empty? ls)) (do
+  (println "\nSTANDING MANDATES (learning):")
+  (doseq [l ls]
+  (println (str "  - " l)))))))))
+  (let [nonterm (filterv (fn [te] (not (proj/terminal-i? idx te))) (proj/work-thread-ids-i idx))]
+  (println (str "\nBOARD — active " (count (in-condition idx nonterm today before? "active")) "  ready " (count (in-condition idx nonterm today before? "ready")) "  blocked " (count (in-condition idx nonterm today before? "blocked")) "  draft " (count (in-condition idx nonterm today before? "draft"))))
+  (let [cands (filterv (fn [te] (not (proj/terminal-i? idx te))) nonterm)
+   items (filterv (fn [it] (> (:score it) 0)) (mapv (fn [te] (->LevItem te (proj/leverage-score idx te))) cands))
+   ranked (vec (take 5 (sort-by (fn [it] (- 0 (:score it))) items)))]
+  (println "TOP LEVERAGE — finishing these transitively frees the most stuck threads")
+  (doseq [it ranked]
+  (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (title-of idx (:te it)))))))))
 
 (defn run [args ^String threads-dir ^String log]
   (let [cmd (if (empty? args) "" (first args))]
@@ -464,6 +628,8 @@
   (= cmd "resolve") (if (>= (count args) 2) (cmd-resolve log (nth args 1)) (println "usage: resolve <@handle|@id>"))
   (= cmd "validate") (cmd-validate log)
   (= cmd "doctor") (cmd-doctor threads-dir log)
+  (= cmd "heal") (cmd-heal threads-dir log)
+  (= cmd "boot") (cmd-boot threads-dir log)
   (= cmd "json") (cmd-json log (if (> (count args) 1) (nth args 1) "") (if (> (count args) 2) (nth args 2) ""))
   (= cmd "clock") (let [sub (if (> (count args) 1) (nth args 1) "status")]
   (cond
@@ -478,7 +644,7 @@
   (= sub "projects") (cf/cmd-projects)
   (= sub "workspaces") (cf/cmd-workspaces)
   :else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
-  :else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | doctor | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)"))))
+  :else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)"))))
 
 (defn -main [& args]
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

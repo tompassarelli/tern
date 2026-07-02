@@ -538,61 +538,270 @@
 (defn cmd-clock-week [log :- String] :- Nil
   (clock-window log (fram.rt/this-week-dates) "this week"))
 
-;; --- doctor: the daemon handshake -------------------------------------------
-(defn cmd-doctor [threads-dir :- String log :- String] :- Nil
+;; --- doctor/heal/boot shared: safety verdict + file/log hygiene diff ---------
+;; SAFETY (can I write + warm-read right now?) and HYGIENE (is the file projection
+;; tidy?) are ORTHOGONAL: a hand-edited .md never makes writes unsafe, and a stale
+;; daemon never means a file was tampered with. `probe` computes both from ONE log
+;; read + ONE corpus read so doctor/heal/boot classify identically.
+(defrecord Probe
+  [up :- Bool serving :- Bool fresh :- Bool         ; safety inputs
+   port :- Int status :- String daemon-v :- Int log-v :- Int
+   log-claims :- (Vec k/Claim)                      ; whole log (render/entry-point/board)
+   idx :- k/Index
+   stale :- (Vec k/Claim)                           ; file-ahead, superseded projection
+   hand :- (Vec k/Claim)                            ; file-ahead, genuinely-new (hand edit)
+   log-behind :- (Vec k/Claim)])                    ; thread-claims not yet rendered to files
+
+;; A file-ahead claim is a STALE PROJECTION (superseded, NOT a hand edit) iff its
+;; predicate is single-valued (k/single? reads FRAM_SINGLE_VALUED, the same vocab
+;; bin/tern exports) AND the log holds a DIFFERENT value for the same (subject,pred)
+;; — i.e. a `tell` replaced the value and the .md just wasn't re-rendered. Otherwise
+;; the log has no competing value: a genuine hand edit a human must reconcile.
+(defn- stale-projection? [idx :- k/Index c :- k/Claim] :- Bool
+  (and (k/single? (:p c))
+       (let [v (k/one-i idx (:l c) (:p c))]
+         (and (some? v) (not (= v (:r c)))))))
+
+(defn- probe [threads-dir :- String log :- String] :- Probe
   (let [port (fram.rt/coord-port)
         status (fram.rt/coord-status port)
         up (not (= status "down"))
         serving (str/includes? status log)
         f (fold/fold (fram.rt/read-log log))
+        log-claims (:claims f)
         log-v (:version f)
         daemon-v (fram.rt/coord-version port)
-        ;; loaded >= log is HEALTHY: ephemeral coordination txs (the lease primitive —
-        ;; presence register/renew ends in :acquire-lease) consume seqs in the daemon's
-        ;; shared counter but are deliberately never flat-logged, so the daemon routinely
-        ;; runs AHEAD of the log's max :tx. Staleness is only the OTHER direction:
-        ;; loaded < log = the log gained lines the daemon hasn't absorbed.
+        ;; loaded >= log is HEALTHY: ephemeral lease txs consume seqs in the daemon's
+        ;; shared counter but are never flat-logged, so the daemon routinely runs
+        ;; AHEAD of the log's max :tx. Staleness is only loaded < log.
         fresh (>= daemon-v log-v)
+        idx (k/build-index log-claims)
         file-claims (:claims (fold/fold (imp/load-corpus threads-dir)))
-        idx (k/build-index (:claims f))
         ;; Files are a PROJECTION of the log: only title-bearing threads render to a
         ;; .md, so person nodes / non-thread entities live ONLY in the log. Compare
-        ;; against the thread-claim slice, not the whole log — else doctor is wedged
-        ;; DEGRADED forever by e.g. a `display_name` person node it cannot represent.
-        thread-log (filterv (fn [c :- k/Claim] :- Bool (some? (k/one-i idx (:l c) "title"))) (:claims f))
+        ;; against the thread-claim slice, not the whole log.
+        thread-log (filterv (fn [c :- k/Claim] :- Bool (some? (k/one-i idx (:l c) "title"))) log-claims)
         tl-sigs (sig-member-map thread-log)
         file-sigs (sig-member-map file-claims)
-        ;; file-ahead = a thread .md was hand-edited (claim not in the log) — the ONE
-        ;; real hazard. log-behind = log moved ahead, files not yet re-rendered —
-        ;; benign (a capture/tell that hasn't been exported), never DEGRADED.
         file-ahead (filterv (fn [c :- k/Claim] :- Bool (nil? (get tl-sigs (claim-sig c)))) file-claims)
         log-behind (filterv (fn [c :- k/Claim] :- Bool (nil? (get file-sigs (claim-sig c)))) thread-log)
-        clean (empty? file-ahead)
-        synced (and clean (empty? log-behind))]
-    (println "tern doctor")
-    (if up
-      (do
-        (println (str "  [ok]    coordinator UP on 127.0.0.1:" port))
-        (if serving
-          (println "  [ok]    serving the canonical log")
-          (println (str "  [WARN]  daemon is NOT serving " log " — status: " status)))
-        (if fresh
-          (if (= daemon-v log-v)
-            (println "  [ok]    daemon state matches the on-disk log")
-            (println (str "  [ok]    daemon current with the log (loaded v" daemon-v
-                          " > log v" log-v " — in-memory lease txs, never flat-logged)")))
-          (println (str "  [WARN]  daemon is STALE (loaded v" daemon-v " behind log v" log-v
-                        ") — the log changed out-of-band; restart: kill it + `tern up`"))))
-      (println (str "  [DOWN]  no coordinator on 127.0.0.1:" port " — writes won't serialize. Run `tern up`.")))
+        stale (filterv (fn [c :- k/Claim] :- Bool (stale-projection? idx c)) file-ahead)
+        hand (filterv (fn [c :- k/Claim] :- Bool (not (stale-projection? idx c))) file-ahead)]
+    (->Probe up serving fresh port status daemon-v log-v log-claims idx stale hand log-behind)))
+
+;; SAFETY verdict: writes + warm reads are safe IFF the daemon is up, serving this
+;; log, and current with it. Hygiene NEVER enters this — a stale .md is not a write hazard.
+(defn- safe? [p :- Probe] :- Bool (and (:up p) (and (:serving p) (:fresh p))))
+
+(defn- safety-line [p :- Probe] :- String
+  (if (safe? p)
+    "healthy: tell/untell + warm reads are safe"
     (cond
-      [synced (println "  [ok]    files <-> claim log in sync")]
-      [clean  (println (str "  [ok]    files behind the log by " (count log-behind)
-                            " thread-claim(s) — benign projection lag; `tern export` to refresh"))]
-      [:else  (println (str "  [WARN]  " (count file-ahead) " file claim(s) not in the log "
-                            "(a thread .md was hand-edited?) — reconcile via the coordinator, or `import`"))])
-    (if (and up (and serving (and clean fresh)))
+      [(not (:up p)) (str "DEGRADED: coordinator DOWN on 127.0.0.1:" (:port p) " — run `tern up` (writes won't serialize)")]
+      [(not (:serving p)) (str "DEGRADED: daemon not serving the canonical log — status: " (:status p))]
+      [:else (str "DEGRADED: daemon STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p)
+                  ") — the log changed out-of-band; restart it + `tern up`")])))
+
+;; One-line hygiene summary ("" when tidy) for the boot screen.
+(defn- hygiene-line [p :- Probe] :- String
+  (let [ns (count (:stale p)) nh (count (:hand p)) nb (count (:log-behind p))]
+    (if (and (= ns 0) (and (= nh 0) (= nb 0)))
+      ""
+      (str "hygiene: " (+ ns nb) " stale/lagging projection claim(s) — run `tern heal`"
+           (if (> nh 0) (str "; " nh " hand-edited claim(s) — reconcile via tell/import") "")))))
+
+;; --- doctor: SAFETY handshake + HYGIENE report ------------------------------
+(defn cmd-doctor [threads-dir :- String log :- String] :- Nil
+  (let [p (probe threads-dir log)]
+    (println "tern doctor")
+    ;; SAFETY: the daemon handshake — the only inputs to the verdict.
+    (if (:up p)
+      (do
+        (println (str "  [ok]    coordinator UP on 127.0.0.1:" (:port p)))
+        (if (:serving p)
+          (println "  [ok]    serving the canonical log")
+          (println (str "  [WARN]  daemon is NOT serving " log " — status: " (:status p))))
+        (if (:fresh p)
+          (if (= (:daemon-v p) (:log-v p))
+            (println "  [ok]    daemon state matches the on-disk log")
+            (println (str "  [ok]    daemon current with the log (loaded v" (:daemon-v p)
+                          " > log v" (:log-v p) " — in-memory lease txs, never flat-logged)")))
+          (println (str "  [WARN]  daemon is STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p)
+                        ") — the log changed out-of-band; restart: kill it + `tern up`"))))
+      (println (str "  [DOWN]  no coordinator on 127.0.0.1:" (:port p) " — writes won't serialize. Run `tern up`.")))
+    (if (safe? p)
       (println "  => healthy: tell/untell + warm reads are safe")
-      (println "  => DEGRADED: fix the warnings above"))))
+      (println "  => DEGRADED: fix the warnings above"))
+    ;; HYGIENE: is the file projection tidy? NEVER changes the verdict above.
+    (println "  hygiene:")
+    (let [ns (count (:stale p)) nh (count (:hand p)) nb (count (:log-behind p))]
+      (if (and (= ns 0) (and (= nh 0) (= nb 0)))
+        (println "    [ok]    files <-> claim log in sync")
+        (do
+          (when (> ns 0)
+            (println (str "    " ns " stale projection claim(s) — run `tern heal`")))
+          (when (> nh 0)
+            (println (str "    " nh " genuinely-new file claim(s) (hand edits) — reconcile via tell or import")))
+          (when (> nb 0)
+            (println (str "    " nb " log claim(s) not yet in files — benign projection lag; run `tern heal`"))))))))
+
+;; --- heal: re-render stale/lagging thread files FROM the log (never the log) --
+;; Idempotent, fail-closed. Flushes projection drift WITHOUT whole-corpus `export`
+;; (which touches every file and refuses on any hand edit). Writes only .md files.
+(defn- distinct-ids [xs :- (Vec String)] :- (Vec String)
+  (reduce (fn [acc :- (Vec String) x :- String] :- (Vec String)
+            (if (k/vec-contains? acc x) acc (conj acc x))) [] xs))
+
+;; Subjects whose .md diverges from the log: a superseded claim OR a log claim not
+;; yet rendered. (hand edits are handled separately — heal refuses if any exist.)
+(defn- heal-targets [p :- Probe] :- (Vec String)
+  (distinct-ids (mapv (fn [c :- k/Claim] :- String (:l c))
+                      (vec (concat (:stale p) (:log-behind p))))))
+
+;; The @subject the importer would read from a file's head ("" if none/blank/before ---).
+(defn- file-subject [content :- String] :- String
+  (let [lines (fram.rt/split-on content "\n")
+        n (count lines)]
+    (loop [i 0]
+      (cond
+        [(>= i n) ""]
+        [(= "---" (str/trim (nth lines i))) ""]
+        [(str/starts-with? (str/trim (nth lines i)) "@") (str/trim (nth lines i))]
+        [:else (recur (+ i 1))]))))
+
+;; A file's basename (list-md returns "<threads-dir>/<name>").
+(defn- basename [threads-dir :- String path :- String] :- String
+  (let [pre (+ (count threads-dir) 1)]
+    (if (> (count path) pre) (subs path pre) path)))
+
+;; The bare thread id a filename (<id>-<slug>.md) belongs to: the LONGEST id whose
+;; "<id>-" prefixes the name (or "<id>.md" == name). Longest-match is load-bearing —
+;; a bare id like `topic-agent` must NOT claim `topic-agent-ability`'s file (they
+;; share the prefix); substring/first-match silently clobbers the wrong file.
+(defn- file-owner [ids :- (Vec String) name :- String] :- String
+  (reduce (fn [best :- String id :- String] :- String
+            (if (and (or (str/starts-with? name (str id "-")) (= name (str id ".md")))
+                     (> (count id) (count best)))
+              id best))
+          "" ids))
+
+(defrecord FileInfo [path :- String owner :- String head :- String])
+
+(defn- scan-files [threads-dir :- String files :- (Vec String) ids :- (Vec String)] :- (Vec FileInfo)
+  (mapv (fn [path :- String] :- FileInfo
+          (->FileInfo path (file-owner ids (basename threads-dir path))
+                      (file-subject (fram.rt/slurp path))))
+        files))
+
+;; The .md path already assigned to a bare id ("" if none) — overwrite THIS in place.
+(defn- path-of [scan :- (Vec FileInfo) id :- String] :- String
+  (reduce (fn [acc :- String fi :- FileInfo] :- String
+            (if (and (str/blank? acc) (= (:owner fi) id)) (:path fi) acc))
+          "" scan))
+
+;; Bare ids of files whose head @subject != their owning thread (headless, or a
+;; wrong/clobbered @subject) while the owner is a live titled thread — the importer
+;; would silently drop/misread these; re-render restores the projection.
+(defn- broken-head-ids [scan :- (Vec FileInfo) idx :- k/Index] :- (Vec String)
+  (distinct-ids
+   (reduce (fn [acc :- (Vec String) fi :- FileInfo] :- (Vec String)
+             (if (and (not (str/blank? (:owner fi)))
+                      (and (not (= (:head fi) (str "@" (:owner fi))))
+                           (some? (k/one-i idx (str "@" (:owner fi)) "title"))))
+               (conj acc (:owner fi))
+               acc))
+           [] scan)))
+
+(defn cmd-heal [threads-dir :- String log :- String] :- Nil
+  (let [p (probe threads-dir log)]
+    (cond
+      ;; Fail closed: a genuine hand edit is a human decision — never overwrite it.
+      [(not (empty? (:hand p)))
+       (do
+         (println (str "heal REFUSED — " (count (:hand p)) " genuinely-new file claim(s) not in the log "
+                       "(hand edits). A human decides: adopt via `tell`, or bulk `import`. Nothing was touched:"))
+         (doseq [c (:hand p)]
+           (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72)))))]
+      [:else
+       (let [files (fram.rt/list-md threads-dir)
+             ids (mapv (fn [te :- String] :- String (short-id te)) (k/thread-ids-i (:idx p)))
+             scan (scan-files threads-dir files ids)
+             ;; targets are BARE ids: superseded/lagging (diff) ∪ broken-head files.
+             diff-ids (mapv (fn [te :- String] :- String (short-id te)) (heal-targets p))
+             targets (distinct-ids (vec (concat diff-ids (broken-head-ids scan (:idx p)))))]
+         (if (empty? targets)
+           (println "heal: nothing to do — every thread file already matches the log.")
+           (do
+             (doseq [id targets]
+               (let [te (str "@" id)
+                     title (let [t (k/one-i (:idx p) te "title")] (if (some? t) t "untitled"))
+                     existing (path-of scan id)
+                     path (if (str/blank? existing)
+                            (str threads-dir "/" id "-" (fram.rt/slugify title) ".md")
+                            existing)]
+                 (fram.rt/spit-file path (exp/thread-md (:log-claims p) te))
+                 (println (str "  re-rendered " id "  " (trunc title 52)))))
+             (println (str "heal: re-rendered " (count targets)
+                           " thread file(s) from the log. Log untouched.")))))])))
+
+;; --- boot: the one-screen session-start view --------------------------------
+(defrecord EntryPoint [te :- String note :- String created :- String])
+
+;; The SESSION ENTRY POINT note on a thread ("" if none).
+(defn- entry-note [idx :- k/Index te :- String] :- String
+  (reduce (fn [acc :- String v :- String] :- String
+            (if (and (str/blank? acc) (str/starts-with? v "SESSION ENTRY POINT")) v acc))
+          "" (k/many-i idx te "note")))
+
+;; The most-recent (by created_at) thread carrying a SESSION ENTRY POINT note.
+(defn- find-entry [idx :- k/Index] :- EntryPoint
+  (reduce (fn [best :- EntryPoint te :- String] :- EntryPoint
+            (let [note (entry-note idx te)]
+              (if (str/blank? note)
+                best
+                (let [c (let [cc (k/one-i idx te "created_at")] (if (some? cc) cc ""))]
+                  (if (or (str/blank? (:te best)) (fram.rt/str-lt? (:created best) c))
+                    (->EntryPoint te note c)
+                    best)))))
+          (->EntryPoint "" "" "")
+          (k/thread-ids-i idx)))
+
+(defn cmd-boot [threads-dir :- String log :- String] :- Nil
+  (let [p (probe threads-dir log)
+        idx (:idx p)
+        today (fram.rt/today-iso)
+        before? fram.rt/str-lt?]
+    ;; 1. safety verdict (one line) + hygiene one-liner.
+    (println (str "=> " (safety-line p)))
+    (let [h (hygiene-line p)] (when (not (str/blank? h)) (println (str "   " h))))
+    ;; 2. ENTRY POINT — the standing note + learnings, FULL (no truncation).
+    (let [e (find-entry idx)]
+      (if (str/blank? (:te e))
+        (println "\nENTRY POINT — none (no thread carries a `SESSION ENTRY POINT` note)")
+        (do
+          (println (str "\nENTRY POINT — " (short-id (:te e)) "  " (title-of idx (:te e))))
+          (println (:note e))
+          (let [ls (k/many-i idx (:te e) "learning")]
+            (when (not (empty? ls))
+              (println "\nSTANDING MANDATES (learning):")
+              (doseq [l ls] (println (str "  - " l))))))))
+    ;; 3. board counts by derived condition.
+    (let [nonterm (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te)))
+                           (proj/work-thread-ids-i idx))]
+      (println (str "\nBOARD — active " (count (in-condition idx nonterm today before? "active"))
+                    "  ready " (count (in-condition idx nonterm today before? "ready"))
+                    "  blocked " (count (in-condition idx nonterm today before? "blocked"))
+                    "  draft " (count (in-condition idx nonterm today before? "draft"))))
+      ;; 4. top 5 by leverage (finishing these frees the most stuck threads).
+      (let [cands (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te))) nonterm)
+            items (filterv (fn [it :- LevItem] :- Bool (> (:score it) 0))
+                           (mapv (fn [te :- String] :- LevItem
+                                   (->LevItem te (proj/leverage-score idx te)))
+                                 cands))
+            ranked (vec (take 5 (sort-by (fn [it :- LevItem] :- Int (- 0 (:score it))) items)))]
+        (println "TOP LEVERAGE — finishing these transitively frees the most stuck threads")
+        (doseq [it ranked]
+          (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (title-of idx (:te it)))))))))
 
 ;; --- dispatch (life verbs; engine verbs are routed to fram by the wrapper) ---
 (defn run [args :- (Vec String) threads-dir :- String log :- String] :- Nil
@@ -617,6 +826,8 @@
          (println "usage: resolve <@handle|@id>"))]
       [(= cmd "validate") (cmd-validate log)]
       [(= cmd "doctor")   (cmd-doctor threads-dir log)]
+      [(= cmd "heal")     (cmd-heal threads-dir log)]
+      [(= cmd "boot")     (cmd-boot threads-dir log)]
       [(= cmd "json")
        (cmd-json log (if (> (count args) 1) (nth args 1) "")
                  (if (> (count args) 2) (nth args 2) ""))]
@@ -640,7 +851,7 @@
            [(= sub "projects")   (cf/cmd-projects)]
            [(= sub "workspaces") (cf/cmd-workspaces)]
            [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
-      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | doctor | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
+      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
 
 (defn -main [& args] :- Nil
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))
