@@ -13,14 +13,39 @@ sid="$(jget session_id)"
 evt="$(jget hook_event_name)"; [ -z "$evt" ] && evt="SessionStart"
 REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
 RN="$(basename "$REPO")"
-ID="${TERN_AGENT_ID:-cc-$RN-${sid:0:8}}"
-[ "$ID" = "cc-$RN-" ] && ID="cc-$RN-$RANDOM"
+IDDIR="${XDG_RUNTIME_DIR:-/tmp}/tern-agent-ids"
+DERIVED="cc-$RN-${sid:0:8}"
+
+# Identity, de-aliased. INVARIANT: one live actor == one id; an id is only
+# renewed/registered by the session that FIRST claimed it. An env pin
+# (TERN_AGENT_ID) is honored ONLY if no OTHER session already owns it. Otherwise
+# it's an INHERITED pin — a parent's TERN_AGENT_ID leaking into a subagent/child
+# through the process environment: SubagentSessionStart fires with the subagent's
+# OWN session_id but the parent's env, so honoring the pin would alias the parent
+# id (2026-07-03: cc-fram-* had 3 workstreams + mail answered by the wrong actor).
+# When the pin is already owned elsewhere, derive a distinct id from our own sid.
+ID=""
+pin="${TERN_AGENT_ID:-}"
+if [ -n "$pin" ]; then
+  owned_by_other=0
+  if [ -d "$IDDIR" ]; then
+    for f in "$IDDIR"/*; do
+      [ -e "$f" ] || continue                        # empty dir -> literal glob, skip
+      [ "${f##*/}" = "$sid" ] && continue            # our own prior claim doesn't count
+      [ "$(cat "$f" 2>/dev/null)" = "$pin" ] && { owned_by_other=1; break; }
+    done
+  fi
+  [ "$owned_by_other" = 0 ] && ID="$pin"             # legit: fresh/first claimant
+fi
+[ -z "$ID" ] && ID="$DERIVED"                        # inherited pin, or no pin at all
+[ "$ID" = "cc-$RN-" ] && ID="cc-$RN-$RANDOM"         # no sid -> can't derive; randomize
 
 # pin identity for the session's lifetime: tooluse renews THIS id, whatever cwd later
 # tool calls run in. Without the pin, identity flapped per (cwd-repo x session) and the
-# roster flooded with phantoms (188 cc-after-text-* ghosts, 2026-07-02).
+# roster flooded with phantoms (188 cc-after-text-* ghosts, 2026-07-02). Writing our
+# OWN sid's file also stakes the claim, so a concurrent sibling subagent that reads
+# the dir sees this id already owned and derives its own instead of aliasing.
 if [ -n "$sid" ]; then
-  IDDIR="${XDG_RUNTIME_DIR:-/tmp}/tern-agent-ids"
   mkdir -p "$IDDIR" 2>/dev/null && printf '%s' "$ID" > "$IDDIR/$sid" 2>/dev/null || true
 fi
 

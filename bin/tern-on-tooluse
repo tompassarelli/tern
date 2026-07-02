@@ -12,13 +12,19 @@ cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
 sid="$(jget session_id)"
 REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
 RN="$(basename "$REPO")"
-# identity resolution: env pin -> per-session cache (written by tern-on-spawn) ->
-# legacy cwd derivation. The cache keeps ONE identity per session; deriving from each
-# tool call's cwd minted a phantom agent per repo touched (roster flood, 2026-07-02).
-ID="${TERN_AGENT_ID:-}"
-if [ -z "$ID" ] && [ -n "$sid" ] && [ -r "${XDG_RUNTIME_DIR:-/tmp}/tern-agent-ids/$sid" ]; then
-  ID="$(cat "${XDG_RUNTIME_DIR:-/tmp}/tern-agent-ids/$sid" 2>/dev/null || true)"
+# identity resolution: per-session cache (written by tern-on-spawn — the per-sid
+# truth) -> env pin -> legacy cwd derivation. Cache BEFORE env is deliberate: env is
+# ambient and INHERITABLE, so a parent's TERN_AGENT_ID leaks into every subagent;
+# preferring env aliased them onto the parent id (2026-07-03, mail answered by the
+# wrong actor). The cache is keyed by session_id, so it cannot alias. Env stays only
+# as a fallback for a process whose spawn hook never fired (e.g. SDK-dispatched).
+# Deriving from each tool call's cwd minted a phantom agent per repo (flood 2026-07-02).
+CACHE="${XDG_RUNTIME_DIR:-/tmp}/tern-agent-ids/$sid"
+ID=""
+if [ -n "$sid" ] && [ -r "$CACHE" ]; then
+  ID="$(cat "$CACHE" 2>/dev/null || true)"
 fi
+[ -z "$ID" ] && ID="${TERN_AGENT_ID:-}"
 [ -z "$ID" ] && ID="cc-$RN-${sid:0:8}"
 [ "$ID" = "cc-$RN-" ] && ID="cc-$RN-$RANDOM"
 
