@@ -53,11 +53,24 @@
       now  (System/currentTimeMillis)]      ; same machine as coord -> agent-now ~ coord-now
   (case verb
     "register"
-    (let [[h dir sid] args, se (str "@session:" h)]
-      (put! port se "agent" h)                     ; single
-      (put! port se "dir" (or dir "?"))            ; single
-      (put! port se "session_id" (or sid "?"))     ; single
-      (put! port se "started_at" (str (java.time.Instant/now)))  ; single
+    ;; SESSION-START claims (agent/dir/session_id/started_at) are written ONCE per
+    ;; session — NOT on every register. The PostToolUse hook calls `register` on every
+    ;; tool call to renew the liveness lease; before this guard it ALSO re-put!
+    ;; started_at with a fresh (Instant/now) each time, and since started_at is single-
+    ;; valued that supersede appended ~1 log line PER TOOL CALL of pure churn (a busy
+    ;; agent bloats the log by hundreds of lines/session; agent/dir/session_id were
+    ;; already idempotent — same value each call — so started_at's ever-moving value was
+    ;; the entire bloat). The LEASE renewal MUST stay per-call: that IS the heartbeat.
+    ;; Re-stamp the session-start block only on a genuinely NEW session (session_id
+    ;; changed for this handle) or if started_at is somehow missing.
+    (let [[h dir sid] args, se (str "@session:" h)
+          new-session? (or (nil? (resolved port se "started_at"))
+                           (not= (str (or sid "?")) (str (resolved port se "session_id"))))]
+      (when new-session?
+        (put! port se "agent" h)                     ; single
+        (put! port se "dir" (or dir "?"))            ; single
+        (put! port se "session_id" (or sid "?"))     ; single
+        (put! port se "started_at" (str (java.time.Instant/now))))  ; single, once/session
       (prn (send-op port {:op :acquire-lease :res (str "session:" h) :holder h :ttl-ms TTL})))
 
     "renew"
