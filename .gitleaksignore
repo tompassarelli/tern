@@ -1,0 +1,7 @@
+# Accepted historical findings — fingerprint-scoped, nothing else ignored.
+# Phoenix dev/test secret_key_base: framework-generated throwaway keys, dev/test
+# env only (prod derives from env at runtime.exs:32), public on origin/main
+# since ae73183. Future edits to these files ARE still scanned.
+# Decision: Tom, 2026-07-02 (thread 019f2190-f441).
+ae73183fb389808454adf70445f05d69f64a4dbd:web/config/test.exs:generic-api-key:7
+ae73183fb389808454adf70445f05d69f64a4dbd:web/config/dev.exs:generic-api-key:16
