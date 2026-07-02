@@ -71,7 +71,31 @@ gjoa flipped: 57 modules, 429k claims, coordinator :48942. tern validate
   in unflipped repos — the honest answer shapes the talk)
 - `tern ask` surface; whether MCP core collapse changes the CLI too.
 
-## Session lineage
+## Session close state (appended at /clear; the program thread's ENTRY POINT
+note is canonical — this is the narrative copy)
+
+Back half of the session, after this file was first written:
+- **MCP collapse landed**: fram 188 tools/~11.8k tok → 10-tool TELL/ASK core
+  (~1.1k tok, 10.8×) — receipt #1 for context-to-competence (fram `1e151e2`).
+  Telemetry later showed agents had hallucinated `mcp__fram__tell` BEFORE it
+  existed — first verb-vote confirmation.
+- **Telemetry loop live**: `tern-mine` baselined 1.9GB of transcripts (top
+  finding: 367 consecutive StructuredOutput failures unstopped → escalation
+  thread). Claim engine exonerated: 3 rejects corpus-wide.
+- **Stream layer completed**: `tern-stream-sync` cursor-based log shipping
+  (zero-AI); session-end flush live, 5-min timer awaits firn rebuild.
+- **Tripwire shipped + soaking** (nixos-config `87d5fcf`): 85/85 matrix, 7ms;
+  flip to bypassPermissions for SDK lanes gated on zero false denies.
+- **"fleet" eradicated** from the living estate (5 repos + 14 thread retitles
+  + ~/code/fleet-coord → ~/code/coord-lab); swarm/pin/family replacements;
+  msa excluded (client), pins/archives/recorded-data verbatim by design.
+- **Move 1 PAUSED at trial boundary, 6/36 grid + 6/6 pilot, ALL PASS
+  attempt-0.** Interim curve: M1 out-tokens ∝ module size (20–38× vs M2 at
+  1,893 lines; 10× wall). HONEST CAVEAT: M1.5 def-level null ≈ M2 on output
+  tokens; M2's edge is input-side (~3×, grows with size) — final verdict =
+  total-cost analysis. 3 substrate bugs found under load (1 fixed+pushed,
+  fram `2cbc8fd`; 2 threaded). Resume: "resume move 1" → thread
+  019f200f-6c8d + macro/RESULTS.md steps (~$8–12 opus-4-5).
 
 Supersedes the markdown-dump era (last dump: fram docs/private
 SESSION-2026-07-02-consolidated-landing.md — content absorbed into threads +
