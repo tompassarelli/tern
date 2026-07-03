@@ -15,9 +15,12 @@ import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
 const REPO = resolve(import.meta.dir, "..", "..");
-const TERN = `${REPO}/bin/tern`;
 const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
-const PORT = process.env.TERN_PORT ?? "7977";
+// Resolved lazily (at call time, not module load) so env overrides apply regardless of
+// import order — and so tests can point notifications at a fake. TERN_BIN is the same
+// convention the harness uses for the tern engine path.
+const ternBin = () => process.env.TERN_BIN ?? `${REPO}/bin/tern`;
+const port = () => process.env.TERN_PORT ?? "7977";
 
 export interface DeathContext {
   thread?: string; // the driven thread (dispatch) — gets its own agent_death claim
@@ -45,16 +48,17 @@ export function deathCommands(
   ts: string = new Date().toISOString(),
 ): Array<{ cmd: string; args: string[] }> {
   const line = `${agentId} | ${reason} | ${ts}`;
+  const tern = ternBin();
   const cmds: Array<{ cmd: string; args: string[] }> = [
-    { cmd: TERN, args: ["tell", "@swarm", "agent_death", line] },
+    { cmd: tern, args: ["tell", "@swarm", "agent_death", line] },
   ];
   if (ctx.thread) {
-    cmds.push({ cmd: TERN, args: ["tell", ctx.thread, "agent_death", line] });
+    cmds.push({ cmd: tern, args: ["tell", ctx.thread, "agent_death", line] });
   }
   if (ctx.coordinator) {
     cmds.push({
       cmd: "bb",
-      args: [MSG_CLI, PORT, "send", agentId, ctx.coordinator, "AGENT DEATH", `${reason} (${ts})`],
+      args: [MSG_CLI, port(), "send", agentId, ctx.coordinator, "AGENT DEATH", `${reason} (${ts})`],
     });
   }
   return cmds;
