@@ -137,6 +137,20 @@ function withCoordination(self: string, base: string): string {
   return `${base}\n${proto}`;
 }
 
+// AGENT_CAVEMAN=full|lite|off — appends terse-output instruction to every spawned agent.
+function cavemanAppendix(): string {
+  const mode = process.env.AGENT_CAVEMAN ?? "full";
+  if (mode === "full") return "\n\n" +
+    "CAVEMAN OUTPUT MODE (full) — respond terse like smart caveman. Drop articles (a/an/the), " +
+    "filler (just/really/basically/actually), pleasantries, hedging. Fragments OK. Short synonyms. " +
+    "Technical terms exact. ALL technical substance stays. Code blocks, commit messages, quoted errors: " +
+    "write NORMAL, never compressed. Security warnings and irreversible-action confirmations: write normal, clear.";
+  if (mode === "lite") return "\n\n" +
+    "CAVEMAN OUTPUT MODE (lite) — terse. No filler, no pleasantries, minimal hedging. " +
+    "Technical substance exact. Code/commits/quoted errors/security content: normal prose.";
+  return "";
+}
+
 // The single Options builder. dispatch.ts + spawn.ts both route through here.
 export function harnessOptions(o: HarnessOpts): Options {
   registerPresence(o.self);
@@ -149,7 +163,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     model: resolveModel(o.model),
     effort: o.effort, // the reasoning knob spawn.ts used to drop on the floor
     permissionMode: "acceptEdits",
-    systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT),
+    systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + cavemanAppendix(),
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
   } as Options;
 }
