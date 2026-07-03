@@ -16,6 +16,12 @@ defmodule TernWeb.ApiController do
   # Kanban lanes (derived status) for the board view.
   def board(conn, _params), do: json(conn, Tern.Threads.board())
 
+  # EXP-025 arena: two-arm live task board for one experiment. ?exp=<exp_id>.
+  def arena(conn, %{"exp" => exp}) when is_binary(exp) and exp != "",
+    do: json(conn, Tern.Arena.view(exp))
+
+  def arena(conn, _params), do: json(conn, %{exp: nil, start_ts: "", columns: %{}})
+
   # Live agent roster for the agents panel.
   def agents(conn, _params), do: json(conn, %{agents: Tern.Presence.roster()})
 
@@ -241,6 +247,11 @@ defmodule TernWeb.ApiController do
 
   def agents_view(conn, _params),
     do: conn |> put_resp_content_type("text/html") |> send_resp(200, shell("agents", "agents", "/js/tern-agents.js"))
+
+  # EXP-025 arena shell — the filmable two-arm task board. Open at
+  # /arena?exp=<exp_id>; the renderer reads exp from the query string.
+  def arena_view(conn, _params),
+    do: conn |> put_resp_content_type("text/html") |> send_resp(200, shell("arena", "arena", "/js/tern-arena.js"))
 
   # The full 2-panel client (workbench + agents). Loads every renderer; the
   # orchestrator (tern-app.js, last) lays out the frames + view toggle.

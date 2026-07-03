@@ -183,6 +183,20 @@ defmodule Tern.Fram do
   end
 
   @doc """
+  Latest resolved value for entity+predicate. `resolved`'s `:values` is
+  insertion-ordered (oldest→newest), so for a pred that ACCUMULATES (not in the
+  daemon's single-valued set) the last element is the current value; a genuinely
+  single-valued pred falls back to `:value`. nil if absent.
+  """
+  def latest(port, te, pred) do
+    case query(port, resolved_op(te, pred)) do
+      %{values: vs} when is_list(vs) and vs != [] -> vs |> List.last() |> to_string()
+      %{value: v} when not is_nil(v) -> to_string(v)
+      _ -> nil
+    end
+  end
+
+  @doc """
   Every [s, p, o] triple in a daemon's graph. This is the 1.67MB hot read, so it
   takes the JSON path (`json_query/2` → Jason) and transparently falls back to the
   EDN decoder against older daemons that ignore `:fmt`.

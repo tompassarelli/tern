@@ -1,0 +1,127 @@
+#!/usr/bin/env bb
+;; EXP-025 ARENA seed — fabricates a filmable demo run for the tern web arena.
+;;
+;; Creates 5 shared tasks × 2 arms (control | graph) as board threads carrying
+;; the fixed event contract (exp_id, arm, task_id, title, state, cost_usd,
+;; wall_s, updated), then drives their states over ~60s so /arena?exp=<id>
+;; renders + updates live. graph arm runs faster/cheaper (the EXP-025 thesis);
+;; control burns extra attempts + cost, one task blocks, one fails.
+;;
+;; One process, one short-lived TCP socket per op straight to the board daemon
+;; on :7977 (OCC via :base) — fast, unlike the CLI (which cold-starts a JVM per
+;; call). Re-drivable: each run mints a FRESH exp id unless one is passed.
+;;
+;;   usage: bin/arena-seed [exp_id]
+(require '[clojure.edn :as edn])
+
+(def PORT 7977)
+(def exp (or (first *command-line-args*)
+             (str "EXP-025-demo-"
+                  (.format (java.time.LocalTime/now)
+                           (java.time.format.DateTimeFormatter/ofPattern "HHmmss")))))
+
+(defn now-iso []
+  (.format (java.time.OffsetDateTime/now java.time.ZoneOffset/UTC)
+           (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd'T'HH:mm:ss'Z'")))
+
+(defn send-op [op]
+  (let [s (java.net.Socket. "127.0.0.1" PORT)]
+    (.setSoTimeout s 6000)
+    (let [o (.getOutputStream s)
+          i (clojure.java.io/reader (.getInputStream s))]
+      (.write o (.getBytes (str op "\n"))) (.flush o)
+      (let [r (.readLine i)] (.close s) (edn/read-string r)))))
+
+(defn version [] (:version (send-op "{:op :version}")))
+
+(defn esc [x] (-> (str x) (clojure.string/replace "\\" "\\\\") (clojure.string/replace "\"" "\\\"")))
+
+(defn assert! [te p r]
+  (loop [tries 5]
+    (let [v (version)
+          resp (send-op (format "{:op :assert :te \"%s\" :p \"%s\" :r \"%s\" :base %d}"
+                                 (esc te) (esc p) (esc r) v))]
+      (cond
+        (or (:ok resp) (:version resp)) resp
+        (and (pos? tries) (or (:reject resp) (:conflict resp))) (recur (dec tries))
+        :else resp))))
+
+(def task-ids ["PR-142" "PR-153" "PR-188" "PR-201" "PR-219"])
+(def titles ["fix cljs reader edge case" "nil-safe transducer arity"
+             "async channel close race" "spec gen shrink loop"
+             "protocol dispatch cache"])
+
+;; deterministic, human-legible thread ids so a re-run of the SAME exp reuses
+;; the same threads (no duplicate discovery).
+(defn tid [arm idx] (str "@arena-" exp "-" arm "-" idx))
+
+(defn capture! [arm idx]
+  (let [id (tid arm idx) t (nth task-ids idx)]
+    (assert! id "title"    (str "[" arm "] " t " " (nth titles idx)))
+    (assert! id "exp_id"   exp)
+    (assert! id "arm"      arm)
+    (assert! id "task_id"  t)
+    (assert! id "state"    "pending")
+    (assert! id "cost_usd" "0.00")
+    (assert! id "wall_s"   "0")
+    (assert! id "updated"  (now-iso))))
+
+(defn mut [arm idx state cost wall]
+  (let [id (tid arm idx)]
+    (assert! id "state"    state)
+    (assert! id "cost_usd" cost)
+    (assert! id "wall_s"   wall)
+    (assert! id "updated"  (now-iso))))
+
+(println "arena exp:" exp)
+(println "open:      http://127.0.0.1:8088/arena?exp=" exp)
+(println)
+(println "capturing 10 task threads…")
+(doseq [idx (range 5) arm ["control" "graph"]] (capture! arm idx))
+(println "seeded. driving states (~60s)…")
+
+(defn step [t ms] (println (str "  t+" t "s")) (Thread/sleep ms))
+
+;; kick everything to running
+(doseq [idx (range 5)] (mut "graph" idx "running" "0.05" "3"))
+(doseq [idx (range 5)] (mut "control" idx "running" "0.08" "4"))
+(step 4 4000)
+
+(mut "graph" 0 "green" "0.11" "12")
+(mut "graph" 1 "running" "0.14" "11")
+(mut "control" 0 "running" "0.31" "18")
+(mut "control" 1 "attempt-2" "0.44" "22")
+(step 9 5000)
+
+(mut "graph" 1 "green" "0.19" "17")
+(mut "graph" 2 "running" "0.16" "14")
+(mut "control" 0 "attempt-2" "0.55" "29")
+(mut "control" 2 "blocked" "0.38" "24")
+(step 15 6000)
+
+(mut "graph" 2 "green" "0.24" "21")
+(mut "graph" 3 "running" "0.20" "16")
+(mut "control" 0 "green" "0.71" "41")
+(mut "control" 1 "attempt-3" "0.66" "35")
+(mut "control" 4 "attempt-2" "0.52" "31")
+(step 22 7000)
+
+(mut "graph" 3 "green" "0.27" "24")
+(mut "graph" 4 "running" "0.22" "18")
+(mut "control" 1 "green" "0.88" "44")
+(mut "control" 3 "running" "0.49" "33")
+(step 30 8000)
+
+(mut "graph" 4 "green" "0.31" "27")
+(mut "control" 3 "attempt-2" "0.74" "46")
+(mut "control" 4 "attempt-3" "0.81" "48")
+(step 40 10000)
+
+(mut "control" 3 "green" "1.02" "58")
+(mut "control" 4 "failed" "1.19" "63")
+(mut "control" 2 "blocked" "0.61" "61")
+(step 52 12000)
+
+(println)
+(println "done. control landed 3/5 (PR-188 blocked, PR-219 failed); graph landed 5/5.")
+(println "arena still live at: http://127.0.0.1:8088/arena?exp=" exp)

@@ -20,6 +20,7 @@ defmodule TernWeb.Router do
     get "/dag", ApiController, :dag
     get "/list", ApiController, :list
     get "/board", ApiController, :board
+    get "/arena", ApiController, :arena
     get "/agents", ApiController, :agents
     get "/agents/:handle/stream", ApiController, :agent_stream
     get "/presence", ApiController, :presence
@@ -45,6 +46,7 @@ defmodule TernWeb.Router do
     get "/wb", ApiController, :wake_board
     get "/list", ApiController, :list_view
     get "/board", ApiController, :board_view
+    get "/arena", ApiController, :arena_view
     get "/agents", ApiController, :agents_view
     get "/app", ApiController, :app_view
   end
