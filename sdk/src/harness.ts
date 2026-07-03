@@ -137,6 +137,21 @@ function withCoordination(self: string, base: string): string {
   return `${base}\n${proto}`;
 }
 
+// AGENT_ESO=on|off — appends dense-handoff instruction to every spawned agent.
+// When on, agents emit uniform arrays of ≥10 records as ESO instead of JSON/markdown.
+function esoAppendix(): string {
+  const mode = process.env.AGENT_ESO ?? "on";
+  if (mode !== "on") return "";
+  return "\n\n" +
+    "DENSE HANDOFF — when a final report contains a uniform array of ≥10 similar records " +
+    "(grep hits, findings, file lists), emit it in ESO format instead of JSON or markdown table.\n" +
+    "Mini-syntax (full spec: ~/code/tern/sdk/src/vendor/eso/SPEC.md):\n" +
+    "  !eso/1              ← required header\n" +
+    "  name=value          ← scalar field\n" +
+    "  items[N]{a,b,c}     ← N records, schema declared once; N is a checksum\n" +
+    "  val1\\tval2\\tval3   ← one tab-delimited row per record (strings with tabs/newlines use JSON quoting)";
+}
+
 // AGENT_CAVEMAN=full|lite|off — appends terse-output instruction to every spawned agent.
 function cavemanAppendix(): string {
   const mode = process.env.AGENT_CAVEMAN ?? "full";
@@ -163,7 +178,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     model: resolveModel(o.model),
     effort: o.effort, // the reasoning knob spawn.ts used to drop on the floor
     permissionMode: "acceptEdits",
-    systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + cavemanAppendix(),
+    systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + cavemanAppendix() + esoAppendix(),
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
   } as Options;
 }
