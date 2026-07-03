@@ -119,14 +119,18 @@
     :schema {:type "object"
              :properties {:id {:type "string" :description "Thread ID to dispatch (e.g. 2026-06-27-193317)"}
                           :model {:type "string" :description "Model tier: opus, sonnet, haiku (default: sonnet)"}
-                          :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}}
+                          :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}
+                          :role {:type "string" :description "Praxis role block: executor|implementer|integrator|designer|researcher (optional)"}
+                          :posture {:type "string" :description "Praxis posture block: explore|deliver|preserve (optional)"}}
              :required ["id"]}}
    {:name "spawn"
     :desc "Spawn an ad-hoc agent with a prompt (no pre-existing thread needed). For thread-driven work, prefer capture + dispatch instead. Returns the agent ID."
     :schema {:type "object"
              :properties {:prompt {:type "string" :description "The task prompt for the agent"}
                           :model {:type "string" :description "Model tier: opus, sonnet, haiku (default: sonnet)"}
-                          :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}}
+                          :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}
+                          :role {:type "string" :description "Praxis role block: executor|implementer|integrator|designer|researcher (optional)"}
+                          :posture {:type "string" :description "Praxis posture block: explore|deliver|preserve (optional)"}}
              :required ["prompt"]}}])
 
 (defn call-sdk [nm args]
@@ -136,10 +140,14 @@
       (let [id (get args "id")
             model (get args "model")
             effort (get args "effort")
+            role (get args "role")
+            posture (get args "posture")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
-                      model  (assoc "AGENT_MODEL" model)
-                      effort (assoc "AGENT_EFFORT" effort))]
+                      model   (assoc "AGENT_MODEL" model)
+                      effort  (assoc "AGENT_EFFORT" effort)
+                      role    (assoc "AGENT_ROLE" role)
+                      posture (assoc "AGENT_POSTURE" posture))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/tern/agents/" agent-id ".log"))]
           (.mkdirs (.getParentFile log))
           (proc/process {:env cmd-env :out log :err log}
@@ -153,10 +161,14 @@
       (let [prompt (get args "prompt")
             model (get args "model")
             effort (get args "effort")
+            role (get args "role")
+            posture (get args "posture")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
-                      model  (assoc "AGENT_MODEL" model)
-                      effort (assoc "AGENT_EFFORT" effort))]
+                      model   (assoc "AGENT_MODEL" model)
+                      effort  (assoc "AGENT_EFFORT" effort)
+                      role    (assoc "AGENT_ROLE" role)
+                      posture (assoc "AGENT_POSTURE" posture))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/tern/agents/" agent-id ".log"))]
           (.mkdirs (.getParentFile log))
           (proc/process {:env cmd-env :out log :err log}

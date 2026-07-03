@@ -17,6 +17,10 @@ interface SpawnOptions {
   maxTurns?: number;
   budgetUsd?: number; // per-run (or per-tier when escalating) USD spend cap (thread 019f1194-ca57)
   escalate?: boolean; // escalate-not-kill: climb the ladder on struggle instead of stopping
+  role?: string;
+  posture?: string;
+  // Known limitation: on escalate path the system prompt is built once at the starting tier,
+  // so a mid-flight model change does not swap the model-delta block.
 }
 
 export async function spawn(opts: SpawnOptions): Promise<string> {
@@ -51,6 +55,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       extraTools: opts.tools ?? ["Read", "Edit", "Write", "Bash", "Grep", "Glob"],
       model: rung().model, effort: rung().effort,
       systemPrompt: opts.systemPrompt, maxTurns: opts.maxTurns,
+      role: opts.role, posture: opts.posture,
     }),
   });
 

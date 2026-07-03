@@ -110,6 +110,8 @@ export interface HarnessOpts {
   effort?: Effort;
   systemPrompt?: string;
   maxTurns?: number;
+  role?: string;
+  posture?: string;
 }
 
 // Auto-connect every SDK-spawned agent to tern coordination — the SDK twin of
@@ -171,6 +173,75 @@ function globalLawsAppendix(): string {
   }
 }
 
+// PRAXIS_DIR — role/posture/delta files live here (read-only inputs, never edited by agents).
+const PRAXIS_DIR = `${process.env.HOME}/code/nixos-config/dotfiles/claude/docs/praxis`;
+
+function extractFenceFromSection(text: string, heading: string): string | null {
+  const lines = text.split("\n");
+  const headingLower = `## ${heading.toLowerCase()}`;
+  let sectionStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().toLowerCase() === headingLower) { sectionStart = i + 1; break; }
+  }
+  if (sectionStart === -1) return null;
+  let fenceOpen = -1;
+  for (let i = sectionStart; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (fenceOpen === -1 && trimmed.startsWith("## ")) break; // next heading, no fence found
+    if (fenceOpen === -1 && trimmed.startsWith("```")) { fenceOpen = i + 1; continue; }
+    if (fenceOpen !== -1 && trimmed.startsWith("```")) return lines.slice(fenceOpen, i).join("\n");
+  }
+  return null;
+}
+
+function extractFirstFence(text: string): string | null {
+  const lines = text.split("\n");
+  let fenceOpen = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (fenceOpen === -1 && trimmed.startsWith("```")) { fenceOpen = i + 1; continue; }
+    if (fenceOpen !== -1 && trimmed.startsWith("```")) return lines.slice(fenceOpen, i).join("\n");
+  }
+  return null;
+}
+
+// AGENT_PRAXIS=on|off — appends role/posture/model-delta blocks to every spawned agent.
+// Fail-open: any missing file, heading, or fence skips that block silently.
+export function praxisAppendix(model?: string, role?: string, posture?: string): string {
+  const effectiveRole = role ?? process.env.AGENT_ROLE;
+  const effectivePosture = posture ?? process.env.AGENT_POSTURE;
+  const blocks: string[] = [];
+
+  if (effectiveRole) {
+    try {
+      const content = extractFenceFromSection(readFileSync(`${PRAXIS_DIR}/roles.md`, "utf8"), effectiveRole);
+      if (content) blocks.push(`## Praxis — role: ${effectiveRole}\n${content}`);
+    } catch { /* fail-open */ }
+  }
+
+  if (effectivePosture) {
+    try {
+      const content = extractFenceFromSection(readFileSync(`${PRAXIS_DIR}/postures.md`, "utf8"), effectivePosture);
+      if (content) blocks.push(`## Praxis — posture: ${effectivePosture}\n${content}`);
+    } catch { /* fail-open */ }
+  }
+
+  if ((process.env.AGENT_PRAXIS ?? "on") === "on") {
+    const lm = model ?? "";
+    const deltaFile = lm.includes("opus") ? `${PRAXIS_DIR}/deltas/opus.md`
+      : lm.includes("sonnet") ? `${PRAXIS_DIR}/deltas/sonnet.md`
+      : null;
+    if (deltaFile) {
+      try {
+        const content = extractFirstFence(readFileSync(deltaFile, "utf8"));
+        if (content) blocks.push(`## Praxis — model delta\n${content}`);
+      } catch { /* fail-open */ }
+    }
+  }
+
+  return blocks.length ? "\n\n" + blocks.join("\n\n") : "";
+}
+
 // AGENT_CAVEMAN=full|lite|off — appends terse-output instruction to every spawned agent.
 function cavemanAppendix(): string {
   const mode = process.env.AGENT_CAVEMAN ?? "full";
@@ -197,7 +268,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     model: resolveModel(o.model),
     effort: o.effort, // the reasoning knob spawn.ts used to drop on the floor
     permissionMode: "acceptEdits",
-    systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + globalLawsAppendix() + cavemanAppendix() + esoAppendix(),
+    systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + globalLawsAppendix() + praxisAppendix(o.model, o.role, o.posture) + cavemanAppendix() + esoAppendix(),
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
   } as Options;
 }
