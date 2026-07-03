@@ -6,6 +6,7 @@ import { harnessOptions, DEFAULT_SYSTEM_PROMPT, type Effort } from "./harness";
 import { inputChannel, subscribeFeed } from "./coordination";
 import { tokensOf } from "./budget";
 import { recordRun } from "./telemetry";
+import { notifyDeath } from "./death";
 
 const PLAN_TOOLS = ["Read", "Grep", "Glob", "Bash"];
 const EXEC_TOOLS = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
@@ -54,46 +55,59 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
 
   let result = "";
   let resultMsg: any = null;
+  let outcome = "ran";
 
   // Real-time coordination: run the prompt in streaming-input mode so peers can inject
   // pings into THIS run (no re-arm — subscribeFeed re-spawns host-side, invisibly).
   const ch = inputChannel(prompt);
   const stopFeed = subscribeFeed(agentId, (m) => ch.push(m));
 
-  for await (const message of query({
-    prompt: ch.stream(),
-    options: harnessOptions({
-      self: agentId,
-      extraTools: tools,
-      model: process.env.AGENT_MODEL,
-      effort: process.env.AGENT_EFFORT as Effort | undefined,
-      systemPrompt: `You are a tern worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
-    }),
-  })) {
-    const msg = message as any;
-    stream.writeSDKMessage(msg);
+  // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
+  // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) the generator THROWS exitError
+  // here. catch -> outcome "died" + notifyDeath (agent_death claim on this thread + @swarm,
+  // peer ping to the coordinator); finally -> ALWAYS stop the feed, close the channel, and
+  // record the run so the coordinator learns of the death instead of noticing silence.
+  try {
+    for await (const message of query({
+      prompt: ch.stream(),
+      options: harnessOptions({
+        self: agentId,
+        extraTools: tools,
+        model: process.env.AGENT_MODEL,
+        effort: process.env.AGENT_EFFORT as Effort | undefined,
+        systemPrompt: `You are a tern worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
+      }),
+    })) {
+      const msg = message as any;
+      stream.writeSDKMessage(msg);
 
-    if ("result" in msg) {
-      result = msg.result;
-      resultMsg = msg;
-      if (ch.pending() === 0) { ch.end(); break; } // task done + no pending peer ping -> finish
-    }
+      if ("result" in msg) {
+        result = msg.result;
+        resultMsg = msg;
+        if (ch.pending() === 0) { break; } // task done + no pending peer ping -> finish
+      }
 
-    if (msg.type === "assistant" && msg.message?.content) {
-      for (const block of msg.message.content) {
-        if (block.type === "text" && block.text?.trim()) {
-          process.stdout.write(block.text);
+      if (msg.type === "assistant" && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === "text" && block.text?.trim()) {
+            process.stdout.write(block.text);
+          }
         }
       }
     }
+  } catch (err) {
+    outcome = "died";
+    notifyDeath(agentId, err, { thread: threadId, coordinator: process.env.AGENT_COORDINATOR });
+  } finally {
+    stopFeed();
+    try { ch.end(); } catch { /* already closed */ }
   }
-  stopFeed();
 
   // Spend is no longer charged to a counter here; it is summed from the @run
   // cost_usd claim this run records below (remaining() folds Σ over @run costs).
   recordRun({ thread: threadId, agent: agentId, tokens: tokensOf(resultMsg),
-              durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome: "ran" });
-  console.log(`\n[dispatch] @${threadId} complete`);
+              durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome });
+  console.log(`\n[dispatch] @${threadId} ${outcome === "died" ? "DIED" : "complete"}`);
   return { threadId, posture: postureLabel, result };
 }
 

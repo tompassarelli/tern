@@ -3,6 +3,7 @@ import { StreamWriter } from "./stream-writer";
 import { harnessOptions, type Effort } from "./harness";
 import { tokensOf, costOf, remaining } from "./budget";
 import { recordRun } from "./telemetry";
+import { notifyDeath } from "./death";
 import { inputChannel } from "./coordination";
 import { makeStruggleState, updateStruggle, checkStruggle, resetStruggle } from "./struggle";
 import { LADDER, tierIndexOf, decideEscalation, escalateInFlight } from "./ladder";
@@ -19,6 +20,8 @@ interface SpawnOptions {
   escalate?: boolean; // escalate-not-kill: climb the ladder on struggle instead of stopping
   role?: string;
   posture?: string;
+  coordinator?: string; // spawning coordinator handle -> gets a direct peer ping on death
+  queryFn?: typeof query; // injection seam for tests; defaults to the real SDK query()
   // Known limitation: on escalate path the system prompt is built once at the starting tier,
   // so a mid-flight model change does not swap the model-delta block.
 }
@@ -48,7 +51,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   const escalations: Array<{ from: string; to: string; reason: string; atCost: number }> = [];
   const end = (oc: string) => { outcome = oc; try { ch.end(); } catch { /* already closed */ } };
 
-  const q = query({
+  const q = (opts.queryFn ?? query)({
     prompt: ch.stream(),
     options: harnessOptions({
       self: agentId,
@@ -59,6 +62,13 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     }),
   });
 
+  // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
+  // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) readMessages() THROWS exitError
+  // here. Without this try/catch the throw escaped -> recordRun skipped, no death signal,
+  // channel leaked. Now: catch -> outcome "died" + notifyDeath (claim + peer ping); finally
+  // -> ALWAYS end the channel + record the run; return the PARTIAL result (supervision, not
+  // fail-fast) so one worker's death never rejects a spawnParallel Promise.all batch.
+  try {
   for await (const message of q) {
     const msg = message as any;
     stream.writeSDKMessage(msg);
@@ -107,6 +117,12 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       }
       if (ch.pending() === 0) { end("ran"); break; } // MUST end the channel or the query hangs
     }
+  }
+  } catch (err) {
+    outcome = "died";
+    notifyDeath(agentId, err, { thread: undefined, coordinator: opts.coordinator ?? process.env.AGENT_COORDINATOR });
+  } finally {
+    end(outcome); // idempotent: close the channel so the query + any leak unwinds
   }
 
   recordRun({
