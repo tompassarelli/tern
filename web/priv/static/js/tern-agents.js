@@ -79,21 +79,28 @@
     return r;
   }
 
-  function roleStyle(role) {
-    return role === "user"
-      ? { label: EF.accent, text: EF.ink, border: EF.accent }
-      : { label: EF.purple, text: EF.ink, border: EF.edge };
+  // Per-kind chat styling. "user" = human turn (accent, distinct); "text" =
+  // assistant prose; "tool" = a tool invocation (name only); "result" = a final
+  // result payload. Unknown kinds fall back to the assistant look.
+  function kindStyle(kind) {
+    switch (kind) {
+      case "user":   return { label: "user",      color: EF.accent, text: EF.ink,   border: EF.accent, mono: false };
+      case "tool":   return { label: "tool",      color: EF.star,   text: EF.star,  border: EF.star,   mono: true  };
+      case "result": return { label: "result",    color: EF.ok,     text: EF.muted, border: EF.ok,     mono: false };
+      default:       return { label: "assistant", color: EF.purple, text: EF.ink,   border: EF.edge,   mono: false };
+    }
   }
 
   function chatLine(m) {
-    const s = roleStyle(m.role);
+    const s = kindStyle(m.kind);
     const line = el("div",
       `padding:6px 14px;border-left:2px solid ${s.border};margin:4px 0;`);
     line.append(el("div",
-      `font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${s.label};margin-bottom:2px;`,
-      m.role || "agent"));
+      `font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${s.color};margin-bottom:2px;`,
+      s.label));
     line.append(el("div",
-      `font-size:13px;color:${s.text};white-space:pre-wrap;word-break:break-word;`, m.text || ""));
+      `font-size:13px;color:${s.text};white-space:pre-wrap;word-break:break-word;` +
+      (s.mono ? `font-family:ui-monospace,monospace;` : ``), m.text || ""));
     return line;
   }
 
