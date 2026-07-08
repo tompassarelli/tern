@@ -860,7 +860,104 @@
         (doseq [it ranked]
           (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (title-of idx (:te it)))))))))
 
+;; --- schema-seed: predicate metadata AS claims (schema-as-claims) -----------
+;; Predicates are ENTITIES: subject "@<pred>" carries its own metadata claims
+;; (cardinality single|multi, value_kind ref|literal, acyclic true). fram's new
+;; precedence is claim > env > legacy fallback; this command derives the seed set
+;; from the CURRENT env vocab + the live log so the graph can carry what the env
+;; list carried, then it drops out. Writes go THROUGH the coordinator (same path
+;; as `tell`): the subject IS the @-prefixed predicate name.
+;;   (a) cardinality single for each pred in FRAM_SINGLE_VALUED (parsed from the
+;;       env at runtime — the SAME list bin/tern exports; not duplicated here).
+;;       Every other live pred defaults multi and needs NO claim.
+;;   (b) acyclic true for depends_on and part_of.
+;;   (c) value_kind ref for preds whose live objects are ALL @-refs with >=1
+;;       occurrence (mirrors fram.tools/all-ref?); literal is the default, omitted.
+;; --dry-run (default) prints the exact claim list and writes nothing; --execute
+;; writes, but first aborts loudly if any predicate name collides with a live
+;; thread id (asserting @title on a real thread @title would pollute it).
+
+(defn- split-ws [s :- String] :- (Vec String)
+  (filterv (fn [w :- String] :- Bool (not (str/blank? w))) (vec (str/split s #"\s+"))))
+
+(defn- single-valued-preds [] :- (Vec String)
+  (split-ws (fram.rt/getenv-or "FRAM_SINGLE_VALUED" "")))
+
+;; Mirror fram.tools/all-ref?: pred appears >=1 time AND every object is an @-ref.
+(defn- all-ref? [claims :- (Vec k/Claim) pred :- String] :- Bool
+  (loop [cs claims seen false]
+    (if (empty? cs)
+      seen
+      (let [c (first cs)]
+        (if (= (:p c) pred)
+          (if (str/starts-with? (:r c) "@")
+            (recur (rest cs) true)
+            false)
+          (recur (rest cs) seen))))))
+
+(defn- distinct-preds [claims :- (Vec k/Claim)] :- (Vec String)
+  (reduce (fn [acc :- (Vec String) c :- k/Claim] :- (Vec String)
+            (if (k/vec-contains? acc (:p c)) acc (conj acc (:p c))))
+          [] claims))
+
+(defn- seed-claims [log :- String] :- (Vec k/Claim)
+  (let [claims (live-claims log)
+        card (mapv (fn [p :- String] :- k/Claim (k/->Claim (str "@" p) "cardinality" "single"))
+                   (single-valued-preds))
+        acyc (mapv (fn [p :- String] :- k/Claim (k/->Claim (str "@" p) "acyclic" "true"))
+                   ["depends_on" "part_of"])
+        refs (filterv (fn [p :- String] :- Bool (all-ref? claims p)) (distinct-preds claims))
+        vk (mapv (fn [p :- String] :- k/Claim (k/->Claim (str "@" p) "value_kind" "ref")) refs)]
+    (vec (concat card acyc vk))))
+
+(defn cmd-schema-seed [log :- String execute :- Bool] :- Nil
+  (let [seeds (seed-claims log)]
+    (if (not execute)
+      (do
+        (println (str "schema-seed DRY-RUN — " (count seeds) " claim(s); nothing written."))
+        (doseq [c seeds] (println (str "  tell " (:l c) " " (:p c) " " (:r c))))
+        (println "Run `tern schema-seed --execute` (coordinator session) to write."))
+      (let [idx (live-idx log)
+            subs (distinct-ids (mapv (fn [c :- k/Claim] :- String (:l c)) seeds))
+            collisions (filterv (fn [s :- String] :- Bool (some? (k/one-i idx s "title"))) subs)]
+        (if (not (empty? collisions))
+          (do
+            (println (str "!!! schema-seed ABORTED — " (count collisions)
+                          " predicate name(s) collide with a live thread id."))
+            (println "    Writing predicate metadata onto these would pollute real threads:")
+            (doseq [s collisions] (println (str "      " s "  (has a `title` claim — is a thread)")))
+            (println "    No claims written. Rename the colliding thread(s) or exclude the pred(s)."))
+          (let [port (fram.rt/coord-port)]
+            (if (< (fram.rt/coord-version port) 0)
+              (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.")
+              (let [results (mapv (fn [c :- k/Claim] :- String
+                                    (tell-retry port "assert" (:l c) (:p c) (:r c) 5))
+                                  seeds)
+                    oks (count (filterv (fn [r :- String] :- Bool (str/starts-with? r "ok:")) results))]
+                (println (str "schema-seed EXECUTED — " oks "/" (count seeds)
+                              " claim(s) committed via coordinator."))))))))))
+
+;; --- tools: TERN's curated tool surface (NOT the generated per-predicate one) -
+;; fram's engine dispatch would print the generated per-predicate catalog; tern
+;; owns its AI surface, so `tern tools` lists the curated MCP verbs (bin/tern-mcp
+;; is authoritative) and notes the engine core + that vocabulary is DATA.
+(defn cmd-tools [] :- Nil
+  (do
+    (println "TERN — curated tool surface (the MCP verbs; bin/tern-mcp is authoritative):")
+    (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
+    (println "  read/write : show · capture · tell · untell · validate")
+    (println "  time       : clock start|stop|status|report")
+    (println "  agents     : dispatch · spawn")
+    (println "  view       : presentation")
+    (println "")
+    (println "Engine core underneath: fram = 10 tools (tell/untell/show/ask/validate + 5 graph-edit verbs).")
+    (println "Vocabulary is DATA, not tools: `tern show <pred>` reveals a predicate's metadata")
+    (println "(cardinality/value_kind/acyclic claims). Seed that metadata with `tern schema-seed`.")))
+
 ;; --- dispatch (life verbs; engine verbs are routed to fram by the wrapper) ---
+(defn- has-flag? [args :- (Vec String) f :- String] :- Bool
+  (not (empty? (filterv (fn [a :- String] :- Bool (= a f)) args))))
+
 (defn run [args :- (Vec String) threads-dir :- String log :- String] :- Nil
   (let [cmd (if (empty? args) "" (first args))]
     (cond
@@ -882,6 +979,8 @@
          (cmd-resolve log (nth args 1))
          (println "usage: resolve <@handle|@id>"))]
       [(= cmd "validate") (cmd-validate log)]
+      [(= cmd "schema-seed") (cmd-schema-seed log (has-flag? args "--execute"))]
+      [(= cmd "tools")    (cmd-tools)]
       [(= cmd "doctor")   (cmd-doctor threads-dir log)]
       [(= cmd "heal")     (cmd-heal threads-dir log)]
       [(= cmd "boot")     (cmd-boot threads-dir log)]
@@ -908,7 +1007,7 @@
            [(= sub "projects")   (cf/cmd-projects)]
            [(= sub "workspaces") (cf/cmd-workspaces)]
            [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
-      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
+      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
 
 (defn -main [& args] :- Nil
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

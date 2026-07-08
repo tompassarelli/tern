@@ -25,7 +25,7 @@ FRAM="${FRAM_HOME:-$HOME/code/fram}"
 TERN="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
-  ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|doctor|heal|boot|clock)
+  ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema-seed|tools|doctor|heal|boot|clock)
     # `validate` runs tern's FULL check (engine-generic ++ tern work rules,
     # tern.validate) — the fram CLI `validate` is generic-only since the work
     # rules moved out of the kernel. The MCP validate tool shells through here too.

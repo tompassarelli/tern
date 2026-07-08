@@ -162,6 +162,48 @@ There is **no** canonical field order to memorize and no required-field
 ceremony beyond `title`. `tern export` writes a stable order; hand-edits
 that go through `import` get re-normalized on the next `export`.
 
+### Schema-as-claims: predicates are entities
+
+Predicate metadata is **not** a fixed table or an env list — it lives IN the log
+as claims about the predicate, which is itself an entity with subject `@<pred>`:
+
+- `@<pred> cardinality single|multi` — a single-valued predicate replaces its
+  value on re-assert; a multi-valued one accumulates. Default (no claim) is
+  **multi**.
+- `@<pred> value_kind ref|literal` — `ref` objects are `@`-prefixed thread refs;
+  `literal` is the default (its claim is omitted).
+- `@<pred> acyclic true` — the edge may not form a cycle (`depends_on`, `part_of`).
+
+Precedence when the engine classifies a predicate is **claim > env > legacy
+fallback**: a `cardinality` claim in the log wins over the `FRAM_SINGLE_VALUED`
+env list, which wins over the built-in default. Read a predicate's metadata the
+same way you read any thread — `tern show <pred>` (e.g. `tern show title`).
+
+`tern schema-seed` derives the seed set from today's vocab + the live log, then
+prints it (`--dry-run`, the default) or writes it through the coordinator
+(`--execute`): `cardinality single` for every `FRAM_SINGLE_VALUED` predicate,
+`acyclic true` for `depends_on`/`part_of`, and `value_kind ref` for predicates
+whose live objects are all `@`-refs. It aborts loudly if a predicate name
+collides with a live thread id (writing `@title` metadata onto a real thread
+titled "title" would pollute it). This is the migration path off the env list:
+seed the claims once, and the log carries what `FRAM_SINGLE_VALUED` used to.
+
+The AI tool surface reflects this. `tern tools` lists TERN's **curated** verbs
+(the MCP surface: `ready`/`next`/`board`/…/`tell`/`show`/`dispatch`/`spawn`);
+the fram engine core underneath is **10 tools** (`tell`/`untell`/`show`/`ask`/
+`validate` + 5 graph-edit verbs). Vocabulary is data, not tools — there is no
+per-predicate tool catalog to memorize; `tern show <pred>` reveals a predicate.
+
+### Worlds: the coordination log is not a dumping ground
+
+Claims live in **worlds** — separate append logs. The coordination log (this
+directory's `claims.log`) holds work/intent threads and their schema. Experiment
+runs, telemetry, benchmark samples, and other high-volume machine output live in
+their **own** world log, never the coordination log. Mixing them would bury the
+work graph under machine noise and drag every fold/validate over data that isn't
+about coordination. Keep the coordination world small and human-meaningful; give
+each experiment or telemetry stream its own world.
+
 ### ids and filenames
 
 The id is `2026-06-15-150040` — `yyyy-MM-dd-HHmmss`, dash-separated,
@@ -467,6 +509,8 @@ tern show <id>   # one thread's claims + body; resolves id/slug/substring
 tern validate    # integrity check (see below)
 tern audit       # corpus-health report
 tern needs-review # belief-revision queue: judgments whose inputs moved
+tern tools       # TERN's curated tool surface (the MCP verbs) + the engine core
+tern schema-seed # derive predicate-metadata claims (--dry-run default | --execute)
 ```
 
 `needs-review` is the staleness view (a pure projection — it never auto-flips a

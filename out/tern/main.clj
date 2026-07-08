@@ -625,6 +625,64 @@
   (doseq [it ranked]
   (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (title-of idx (:te it)))))))))
 
+(defn- split-ws [^String s]
+  (filterv (fn [w] (not (str/blank? w))) (vec (str/split s #"\s+"))))
+
+(defn- single-valued-preds []
+  (split-ws (fram.rt/getenv-or "FRAM_SINGLE_VALUED" "")))
+
+(defn- ^Boolean all-ref? [claims ^String pred]
+  (loop [cs claims
+   seen false]
+  (if (empty? cs) seen (let [c (first cs)]
+  (if (= (:p c) pred) (if (str/starts-with? (:r c) "@") (recur (rest cs) true) false) (recur (rest cs) seen))))))
+
+(defn- distinct-preds [claims]
+  (reduce (fn [acc c] (if (k/vec-contains? acc (:p c)) acc (conj acc (:p c)))) [] claims))
+
+(defn- seed-claims [^String log]
+  (let [claims (live-claims log)
+   card (mapv (fn [p] (k/->Claim (str "@" p) "cardinality" "single")) (single-valued-preds))
+   acyc (mapv (fn [p] (k/->Claim (str "@" p) "acyclic" "true")) ["depends_on" "part_of"])
+   refs (filterv (fn [p] (all-ref? claims p)) (distinct-preds claims))
+   vk (mapv (fn [p] (k/->Claim (str "@" p) "value_kind" "ref")) refs)]
+  (vec (concat card acyc vk))))
+
+(defn cmd-schema-seed [^String log ^Boolean execute]
+  (let [seeds (seed-claims log)]
+  (if (not execute) (do
+  (println (str "schema-seed DRY-RUN — " (count seeds) " claim(s); nothing written."))
+  (doseq [c seeds]
+  (println (str "  tell " (:l c) " " (:p c) " " (:r c))))
+  (println "Run `tern schema-seed --execute` (coordinator session) to write.")) (let [idx (live-idx log)
+   subs (distinct-ids (mapv (fn [c] (:l c)) seeds))
+   collisions (filterv (fn [s] (some? (k/one-i idx s "title"))) subs)]
+  (if (not (empty? collisions)) (do
+  (println (str "!!! schema-seed ABORTED — " (count collisions) " predicate name(s) collide with a live thread id."))
+  (println "    Writing predicate metadata onto these would pollute real threads:")
+  (doseq [s collisions]
+  (println (str "      " s "  (has a `title` claim — is a thread)")))
+  (println "    No claims written. Rename the colliding thread(s) or exclude the pred(s).")) (let [port (fram.rt/coord-port)]
+  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.") (let [results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) seeds)
+   oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
+  (println (str "schema-seed EXECUTED — " oks "/" (count seeds) " claim(s) committed via coordinator."))))))))))
+
+(defn cmd-tools []
+  (do
+  (println "TERN — curated tool surface (the MCP verbs; bin/tern-mcp is authoritative):")
+  (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
+  (println "  read/write : show · capture · tell · untell · validate")
+  (println "  time       : clock start|stop|status|report")
+  (println "  agents     : dispatch · spawn")
+  (println "  view       : presentation")
+  (println "")
+  (println "Engine core underneath: fram = 10 tools (tell/untell/show/ask/validate + 5 graph-edit verbs).")
+  (println "Vocabulary is DATA, not tools: `tern show <pred>` reveals a predicate's metadata")
+  (println "(cardinality/value_kind/acyclic claims). Seed that metadata with `tern schema-seed`.")))
+
+(defn- ^Boolean has-flag? [args ^String f]
+  (not (empty? (filterv (fn [a] (= a f)) args))))
+
 (defn run [args ^String threads-dir ^String log]
   (let [cmd (if (empty? args) "" (first args))]
   (cond
@@ -640,6 +698,8 @@
   (= cmd "audit") (cmd-audit log)
   (= cmd "resolve") (if (>= (count args) 2) (cmd-resolve log (nth args 1)) (println "usage: resolve <@handle|@id>"))
   (= cmd "validate") (cmd-validate log)
+  (= cmd "schema-seed") (cmd-schema-seed log (has-flag? args "--execute"))
+  (= cmd "tools") (cmd-tools)
   (= cmd "doctor") (cmd-doctor threads-dir log)
   (= cmd "heal") (cmd-heal threads-dir log)
   (= cmd "boot") (cmd-boot threads-dir log)
@@ -657,7 +717,7 @@
   (= sub "projects") (cf/cmd-projects)
   (= sub "workspaces") (cf/cmd-workspaces)
   :else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
-  :else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)"))))
+  :else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)"))))
 
 (defn -main [& args]
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))
