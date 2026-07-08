@@ -1,4 +1,4 @@
-// Telemetry auto-capture — write each agent run's tuple as claims so the system
+// Telemetry auto-capture — write each agent run's tuple as facts so the system
 // has a queryable feedback loop (calibrate estimates against actuals, see who ran
 // what at what cost). Records to a dedicated `run-<agent>-<ts>` subject that has
 // NO title, so runs never show up as threads on the board — they're queryable via
@@ -27,7 +27,7 @@ export function recordRun(rec: RunRecord): void {
   // base36 ms suffix keeps the id unique per agent without a clock dependency the
   // board cares about; this is runtime code, not a workflow script, so Date is fine.
   const id = `run-${rec.agent}-${Date.now().toString(36)}`;
-  const claims: Array<[string, string]> = [
+  const facts: Array<[string, string]> = [
     ["kind", "run"],
     ["thread", rec.thread],
     ["agent", rec.agent],
@@ -37,17 +37,17 @@ export function recordRun(rec: RunRecord): void {
     ["outcome", rec.outcome],
     ["at", new Date().toISOString()],
   ];
-  if (rec.costUsd != null) claims.push(["cost_usd", rec.costUsd.toFixed(4)]);
-  if (rec.numTurns != null) claims.push(["num_turns", String(rec.numTurns)]);
-  if (rec.errorCount != null) claims.push(["error_count", String(rec.errorCount)]);
+  if (rec.costUsd != null) facts.push(["cost_usd", rec.costUsd.toFixed(4)]);
+  if (rec.numTurns != null) facts.push(["num_turns", String(rec.numTurns)]);
+  if (rec.errorCount != null) facts.push(["error_count", String(rec.errorCount)]);
   if (rec.escalationTier != null && rec.escalationTier >= 0)
-    claims.push(["escalation_tier", String(rec.escalationTier)]);
+    facts.push(["escalation_tier", String(rec.escalationTier)]);
   if (rec.escalations && rec.escalations.length) {
-    claims.push(["escalation_count", String(rec.escalations.length)]);
-    claims.push(["escalation_path", rec.escalations.map((e) => `${e.from}>${e.to}`).join(" ")]);
-    claims.push(["escalation_reasons", rec.escalations.map((e) => e.reason).join(",")]);
+    facts.push(["escalation_count", String(rec.escalations.length)]);
+    facts.push(["escalation_path", rec.escalations.map((e) => `${e.from}>${e.to}`).join(" ")]);
+    facts.push(["escalation_reasons", rec.escalations.map((e) => e.reason).join(",")]);
   }
-  for (const [p, v] of claims) {
+  for (const [p, v] of facts) {
     // async + ignored: never let telemetry add latency to, or break, the run.
     try {
       execFile("tern", ["tell", id, p, v], () => {});

@@ -5,9 +5,9 @@
 // here, consistently, for both dispatch.ts and spawn.ts.
 //
 // The two things that make a tern agent more than a generic worker:
-//   1. tern MCP — native claim-graph verbs (capture/tell/ready/next/...),
-//      so agents act on claims, not by Edit-ing text files.
-//   2. command_peer — emit a {:op :args} envelope over the claim feed; fram-1's
+//   1. tern MCP — native fact-graph verbs (capture/tell/ready/next/...),
+//      so agents act on facts, not by Edit-ing text files.
+//   2. command_peer — emit a {:op :args} envelope over the fact feed; fram-1's
 //      reactor (Phase 1) dispatches it. An agent commands a PEER with no human
 //      and no parent in the loop. This is P2: the centralized-dispatch break.
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
@@ -51,7 +51,7 @@ function ednArgs(args: Record<string, unknown>): string {
 
 // In-process MCP server: the decentralized peer-command tool. Emits the envelope
 // via `msg-cli send-cmd <self> <to> <op> <args-edn>`; the reactor picks it off
-// the fram feed. Contract (fram-1, Phase 0): {:op :spawn|:dispatch|:tell|:claim}.
+// the fram feed. Contract (fram-1, Phase 0): {:op :spawn|:dispatch|:tell|:acquire}.
 export function peerCommandServer(self: string) {
   return createSdkMcpServer({
     name: "tern-peer",
@@ -59,14 +59,14 @@ export function peerCommandServer(self: string) {
     tools: [
       tool(
         "command_peer",
-        "Command a PEER agent over the tern claim feed — fram-1's reactor " +
+        "Command a PEER agent over the tern fact feed — fram-1's reactor " +
           "dispatches it, no human relay. ops: spawn {prompt, model?} | " +
-          "dispatch {thread} | tell {id, pred, value} | claim {resource}.",
+          "dispatch {thread} | tell {id, pred, value} | acquire {resource}.",
         {
           to: z
             .string()
             .describe("recipient handle: a handle ('fram-1'), 'all', or dir wildcard ('nixos-config-*')"),
-          op: z.enum(["spawn", "dispatch", "tell", "claim"]),
+          op: z.enum(["spawn", "dispatch", "tell", "acquire"]),
           args: z
             .record(z.string(), z.any())
             .describe("op-specific args, e.g. {prompt:'...'} for spawn, {thread:'@id'} for dispatch"),
@@ -89,7 +89,7 @@ export function peerCommandServer(self: string) {
   });
 }
 
-// The native claim-graph tools every agent gets (stdio MCP -> the tern engine).
+// The native fact-graph tools every agent gets (stdio MCP -> the tern engine).
 const NATIVE_TOOLS = [
   "mcp__tern__capture",
   "mcp__tern__tell",
@@ -274,8 +274,8 @@ export function harnessOptions(o: HarnessOpts): Options {
 }
 
 export const DEFAULT_SYSTEM_PROMPT =
-  "You are a tern worker agent on a shared claim graph. Prefer the native " +
+  "You are a tern worker agent on a shared fact graph. Prefer the native " +
   "tern tools over editing text: capture/tell to record work, ready/next to " +
   "find it, dispatch/spawn for in-process subagents, and command_peer to hand " +
-  "work to another agent over the claim feed (decentralized — no human relay). " +
-  "Claim before you edit shared code. Report concisely.";
+  "work to another agent over the fact feed (decentralized — no human relay). " +
+  "Acquire before you edit shared code. Report concisely.";

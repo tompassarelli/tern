@@ -2,7 +2,7 @@
 // (OOM SIGKILL / parent SIGTERM / idle Transport-closed), the async generator throws
 // exitError to us. Before this module, that throw escaped the message loop and the
 // coordinator learned of the death only by noticing silence. Here we turn a death into
-// a first-class CLAIM (so it is queryable off the graph) plus a direct peer PING (so a
+// a first-class FACT (so it is queryable off the graph) plus a direct peer PING (so a
 // listening coordinator wakes at once) — fitting tern's existing idioms:
 //   - `tern tell @swarm agent_death "<line>"`   (@swarm is the coordinator-visible roster
 //     node — already where budget_total lives), and the driven thread if known;
@@ -23,7 +23,7 @@ const ternBin = () => process.env.TERN_BIN ?? `${REPO}/bin/tern`;
 const port = () => process.env.TERN_PORT ?? "7977";
 
 export interface DeathContext {
-  thread?: string; // the driven thread (dispatch) — gets its own agent_death claim
+  thread?: string; // the driven thread (dispatch) — gets its own agent_death fact
   coordinator?: string; // spawning coordinator handle — gets a direct peer ping
 }
 
@@ -39,7 +39,7 @@ export function deathReason(err: unknown): string {
 }
 
 // PURE: build the exact command specs a death emits, so the notification path is testable
-// without shelling out or touching the coordinator. Order: claims first (durable record),
+// without shelling out or touching the coordinator. Order: facts first (durable record),
 // peer ping last (transient wake). @swarm always; thread + coordinator only when known.
 export function deathCommands(
   agentId: string,

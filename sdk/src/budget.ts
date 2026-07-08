@@ -1,7 +1,7 @@
 // Cost budget — the declarative spend cap (replaces the concurrency cap). Set it
 // once: `tern tell @swarm budget_total 25` (a USD ceiling). Spend is a DERIVED
 // SUM, never a mutated counter: remaining = budget_total − Σ(@run:* cost_usd),
-// folded live from the immutable per-run `@run:<sid> cost_usd` claims presence-cli
+// folded live from the immutable per-run `@run:<sid> cost_usd` facts presence-cli
 // already writes (the same aggregate cli/tern-reconcile.clj reports). No
 // `budget_spent` cell, no `:bump` op, no cross-file sync — full who-spent-what
 // provenance for free. Executors stop dispatching once the sum crosses the cap.
@@ -32,7 +32,7 @@ function coordOp(op: string): Promise<string> {
   });
 }
 
-// Resolve a single-valued claim to a number, or null if unset/unreadable.
+// Resolve a single-valued fact to a number, or null if unset/unreadable.
 async function readNum(pred: string): Promise<number | null> {
   try {
     const r = await coordOp(`{:op :resolved :te ${JSON.stringify(SUBJECT)} :p ${JSON.stringify(pred)}}`);
@@ -44,7 +44,7 @@ async function readNum(pred: string): Promise<number | null> {
 }
 
 // Σ(@run:* cost_usd) — the live spend, folded from the immutable per-run cost
-// claims (a Datalog aggregate, no mutable cell). The find returns (run, cost)
+// facts (a Datalog aggregate, no mutable cell). The find returns (run, cost)
 // PAIRS so two runs with an identical cost stay distinct rows — a cost-only find
 // would collapse them under set semantics and under-count. 0 when none recorded.
 async function spentSum(): Promise<number> {
@@ -101,7 +101,7 @@ export function costOf(model: string | undefined, usage: any): number {
 
 // Total tokens for one agent run (input + output + cache) from the SDK result msg.
 // Retained: telemetry's recordRun folds this into the @run tuple. Spend itself is
-// no longer charged here — it is summed from the @run cost_usd claims at read time.
+// no longer charged here — it is summed from the @run cost_usd facts at read time.
 export function tokensOf(resultMsg: any): number {
   const u = resultMsg?.usage ?? {};
   return (

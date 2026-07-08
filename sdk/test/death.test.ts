@@ -1,6 +1,6 @@
 // Pure tests for the death-notification contract — no side effects, no live coordinator.
 // deathCommands() is the single source of "what a death emits"; asserting its shape here
-// locks the contract (agent_death claim on @swarm + thread; peer ping to the coordinator).
+// locks the contract (agent_death fact on @swarm + thread; peer ping to the coordinator).
 import { test, expect, describe } from "bun:test";
 import { deathReason, deathCommands } from "../src/death";
 
@@ -27,13 +27,13 @@ describe("deathReason", () => {
 describe("deathCommands", () => {
   const TS = "2026-07-04T00:00:00.000Z";
 
-  test("bare: one claim on @swarm, carrying agent | reason | ts", () => {
+  test("bare: one fact on @swarm, carrying agent | reason | ts", () => {
     const cmds = deathCommands("W3", "exited with code 1", {}, TS);
     expect(cmds).toHaveLength(1);
     expect(cmds[0].args).toEqual(["tell", "@swarm", "agent_death", "W3 | exited with code 1 | " + TS]);
   });
 
-  test("with thread: a second identical claim on the driven thread", () => {
+  test("with thread: a second identical fact on the driven thread", () => {
     const cmds = deathCommands("P1", "signal 9", { thread: "019f2800" }, TS);
     expect(cmds).toHaveLength(2);
     expect(cmds[0].args[1]).toBe("@swarm"); // @swarm first (roster), thread second
@@ -51,7 +51,7 @@ describe("deathCommands", () => {
     expect(ping.args).toContain("AGENT DEATH"); // subject
   });
 
-  test("full context: @swarm claim, thread claim, then coordinator ping — in order", () => {
+  test("full context: @swarm fact, thread fact, then coordinator ping — in order", () => {
     const cmds = deathCommands("P5", "signal 15", { thread: "T", coordinator: "coord" }, TS);
     expect(cmds).toHaveLength(3);
     expect(cmds[0].args[1]).toBe("@swarm");

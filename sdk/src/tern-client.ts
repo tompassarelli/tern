@@ -1,11 +1,11 @@
 import { execSync } from "child_process";
 
-export interface Claim {
+export interface Fact {
   predicate: string;
   value: string;
 }
 
-export function getThreadClaims(threadId: string): Claim[] {
+export function getThreadFacts(threadId: string): Fact[] {
   try {
     const out = execSync(`tern json show ${threadId}`, {
       encoding: "utf-8",

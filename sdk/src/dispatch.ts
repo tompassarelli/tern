@@ -1,5 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { getThreadClaims, getChildren } from "./tern-client";
+import { getThreadFacts, getChildren } from "./tern-client";
 import { derivePosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
 import { harnessOptions, DEFAULT_SYSTEM_PROMPT, type Effort } from "./harness";
@@ -19,20 +19,20 @@ interface DispatchResult {
 }
 
 export async function dispatch(threadId: string): Promise<DispatchResult> {
-  const claims = getThreadClaims(threadId);
-  if (!claims.length) {
-    throw new Error(`Thread @${threadId} not found or has no claims`);
+  const facts = getThreadFacts(threadId);
+  if (!facts.length) {
+    throw new Error(`Thread @${threadId} not found or has no facts`);
   }
 
   const children = getChildren(threadId);
   const hasChildren = children.length > 0;
-  const posture = derivePosture(claims, hasChildren);
+  const posture = derivePosture(facts, hasChildren);
 
   if (posture.hasOutcome) {
     return { threadId, posture: "atomic", result: "already done" };
   }
 
-  const prompt = buildPrompt(threadId, posture, claims);
+  const prompt = buildPrompt(threadId, posture, facts);
   const tools = posture.atomic
     ? EXEC_TOOLS
     : posture.planned
@@ -64,7 +64,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
 
   // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
   // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) the generator THROWS exitError
-  // here. catch -> outcome "died" + notifyDeath (agent_death claim on this thread + @swarm,
+  // here. catch -> outcome "died" + notifyDeath (agent_death fact on this thread + @swarm,
   // peer ping to the coordinator); finally -> ALWAYS stop the feed, close the channel, and
   // record the run so the coordinator learns of the death instead of noticing silence.
   try {
@@ -104,7 +104,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   }
 
   // Spend is no longer charged to a counter here; it is summed from the @run
-  // cost_usd claim this run records below (remaining() folds Σ over @run costs).
+  // cost_usd fact this run records below (remaining() folds Σ over @run costs).
   recordRun({ thread: threadId, agent: agentId, tokens: tokensOf(resultMsg),
               durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome });
   console.log(`\n[dispatch] @${threadId} ${outcome === "died" ? "DIED" : "complete"}`);

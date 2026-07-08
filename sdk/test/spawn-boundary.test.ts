@@ -2,7 +2,7 @@
 // Injects a queryFn whose async generator THROWS mid-stream — exactly what the real SDK
 // does when its subprocess dies (readMessages() rethrows exitError) — and asserts spawn():
 //   1. does NOT reject (returns a partial string) — supervision, not fail-fast;
-//   2. emits the death notification (agent_death claim on @swarm) via the fix's finally path.
+//   2. emits the death notification (agent_death fact on @swarm) via the fix's finally path.
 // All coordinator writes are redirected to a fake `tern` on PATH + TERN_BIN, logged to a
 // temp file; TERN_PORT points at an unused port so any stray bb write no-ops.
 import { test, expect, beforeAll, afterAll } from "bun:test";
@@ -18,7 +18,7 @@ beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "tern-death-"));
   log = join(dir, "death.log");
   // Fake `tern`: append every invocation's args to the log, succeed. Stands in for both the
-  // death claim (tell @swarm ...) and the telemetry recordRun tells — neither hits the graph.
+  // death fact (tell @swarm ...) and the telemetry recordRun tells — neither hits the graph.
   const fake = join(dir, "tern");
   writeFileSync(fake, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${log}"\nexit 0\n`);
   chmodSync(fake, 0o755);
@@ -64,7 +64,7 @@ test("a query that dies mid-stream -> partial return + agent_death notification"
   expect(threw).toBe(false);
   expect(typeof result).toBe("string");
 
-  // 2. The death was announced: an agent_death claim on @swarm naming the dead agent.
+  // 2. The death was announced: an agent_death fact on @swarm naming the dead agent.
   expect(existsSync(log)).toBe(true);
   const logged = readFileSync(log, "utf8");
   expect(logged).toContain("tell @swarm agent_death");

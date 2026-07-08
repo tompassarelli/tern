@@ -1,4 +1,4 @@
-import type { Claim } from "./tern-client";
+import type { Fact } from "./tern-client";
 
 export interface Posture {
   planned: boolean;
@@ -9,17 +9,17 @@ export interface Posture {
   hasOutcome: boolean;
 }
 
-// Derive agent posture from a thread's claims.
-// planned: explicit `planned true` claim, or has part_of children (derived externally)
-// atomic: planned + no children (leaf node), or explicit `atomic true` claim
+// Derive agent posture from a thread's facts.
+// planned: explicit `planned true` fact, or has part_of children (derived externally)
+// atomic: planned + no children (leaf node), or explicit `atomic true` fact
 export function derivePosture(
-  claims: Claim[],
+  facts: Fact[],
   hasChildren: boolean
 ): Posture {
   const get = (pred: string) =>
-    claims.find((c) => c.predicate === pred)?.value;
+    facts.find((c) => c.predicate === pred)?.value;
   const has = (pred: string) =>
-    claims.some((c) => c.predicate === pred);
+    facts.some((c) => c.predicate === pred);
 
   const explicitPlanned = get("planned") === "true";
   const explicitAtomic = get("atomic") === "true";
@@ -40,10 +40,10 @@ export function derivePosture(
 export function buildPrompt(
   threadId: string,
   posture: Posture,
-  claims: Claim[]
+  facts: Fact[]
 ): string {
   const context = `Thread: ${posture.title} (@${threadId})`;
-  const notes = claims
+  const notes = facts
     .filter((c) => c.predicate === "note")
     .map((c) => c.value)
     .join("\n");

@@ -1,5 +1,5 @@
 // P4 — self-organized discovery. An IDLE agent finds its own work with no human
-// and no command: pull ready threads off the claim graph, ATOMICALLY claim the
+// and no command: pull ready threads off the fact graph, ATOMICALLY acquire the
 // driver (fram-1's P3 lease — race-proof, so N agents never double-drive the same
 // thread), dispatch it through the harness, release. Jittered exponential backoff
 // on empty/contended rounds so a swarm desyncs instead of thundering an empty queue.
@@ -13,7 +13,7 @@ import { dispatch } from "./dispatch";
 import { remaining } from "./budget";
 
 const REPO = resolve(import.meta.dir, "../..");
-const CLAIM_CLI = `${REPO}/cli/claim-cli.clj`;
+const ACQUIRE_CLI = `${REPO}/cli/acquire-cli.clj`;
 const PORT = process.env.TERN_PORT ?? "7977";
 
 interface ReadyThread {
@@ -22,7 +22,7 @@ interface ReadyThread {
   condition: string;
 }
 
-// Unblocked, committed, undriven work off the claim graph.
+// Unblocked, committed, undriven work off the fact graph.
 function readyThreads(): ReadyThread[] {
   try {
     const rows = JSON.parse(execSync("tern json ready", { encoding: "utf8", timeout: 8000 }).trim());
@@ -32,11 +32,11 @@ function readyThreads(): ReadyThread[] {
   }
 }
 
-// Atomic driver claim (fram-1's P3 lease). True iff THIS agent won; false = a peer
-// holds it (claim-cli exits 1 + prints DENIED). The race agentchat never closed.
-function claimDriver(thread: string, holder: string): boolean {
+// Atomic driver acquire (fram-1's P3 lease). True iff THIS agent won; false = a peer
+// holds it (acquire-cli exits 1 + prints DENIED). The race agentchat never closed.
+function acquireDriver(thread: string, holder: string): boolean {
   try {
-    execFileSync("bb", [CLAIM_CLI, PORT, "claim", thread, holder], { stdio: "pipe" });
+    execFileSync("bb", [ACQUIRE_CLI, PORT, "acquire", thread, holder], { stdio: "pipe" });
     return true;
   } catch {
     return false;
@@ -45,7 +45,7 @@ function claimDriver(thread: string, holder: string): boolean {
 
 function releaseDriver(thread: string, holder: string): void {
   try {
-    execFileSync("bb", [CLAIM_CLI, PORT, "release", thread, holder], { stdio: "pipe" });
+    execFileSync("bb", [ACQUIRE_CLI, PORT, "release", thread, holder], { stdio: "pipe" });
   } catch {}
 }
 
@@ -77,12 +77,12 @@ export async function discover(self: string, opts: DiscoverOpts = {}): Promise<s
       await backoff("token budget spent");
       continue;
     }
-    let claimed = false;
+    let acquired = false;
     for (const t of readyThreads()) {
-      if (!claimDriver(t.id, self)) continue; // peer got it — try the next ready thread
-      claimed = true;
+      if (!acquireDriver(t.id, self)) continue; // peer got it — try the next ready thread
+      acquired = true;
       empty = 0;
-      console.log(`[discover] ${self} claimed ${t.id} — ${t.title}`);
+      console.log(`[discover] ${self} acquired ${t.id} — ${t.title}`);
       try {
         await dispatch(t.id); // dispatch bills its token usage to the budget
         done.push(t.id);
@@ -94,7 +94,7 @@ export async function discover(self: string, opts: DiscoverOpts = {}): Promise<s
       }
       break; // re-poll fresh — the graph moved
     }
-    if (!claimed) await backoff("no claimable work");
+    if (!acquired) await backoff("no acquirable work");
   }
   console.log(`[discover] ${self} exiting — drove ${done.length} thread(s)`);
   return done;

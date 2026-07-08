@@ -65,7 +65,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
   // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) readMessages() THROWS exitError
   // here. Without this try/catch the throw escaped -> recordRun skipped, no death signal,
-  // channel leaked. Now: catch -> outcome "died" + notifyDeath (claim + peer ping); finally
+  // channel leaked. Now: catch -> outcome "died" + notifyDeath (fact + peer ping); finally
   // -> ALWAYS end the channel + record the run; return the PARTIAL result (supervision, not
   // fail-fast) so one worker's death never rejects a spawnParallel Promise.all batch.
   try {
