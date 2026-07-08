@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# tern-invoice — invoice state machine over billable tern threads.
+#   tern-invoice bill <invoice_id> [owner]   stamp uninvoiced work onto an invoice
+#   tern-invoice paid <invoice_id>           mark an invoice paid
+#   tern-invoice unbilled [owner]            list not-yet-invoiced billable work
+set -euo pipefail
+export TERN_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+FRAM="${FRAM_HOME:-$HOME/code/fram}"
+export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/tern/claims.log}"
+exec bb -cp "$TERN_HOME/out:$FRAM/out" "$TERN_HOME/cli/tern-invoice.clj" "$@"
