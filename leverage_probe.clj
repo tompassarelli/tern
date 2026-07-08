@@ -1,12 +1,12 @@
-;; leverage_probe.clj — the ONE honest empirical test of "claim-native = less code".
+;; leverage_probe.clj — the ONE honest empirical test of "fact-native = less code".
 ;; Computes leverage TWO ways over the live log and proves they agree, so the LOC
 ;; comparison rests on identical output, not hand-waving:
 ;;   (A) shipped imperative: proj/transitive-dependents (manual loop+cycle-guard over k/Index)
 ;;   (B) Datalog: a recursive `reaches` rule over the reified store (the chartroom-proven closure)
 ;; Honest accounting (printed below): (B)'s RULE is tiny, but it cannot run without the
 ;; reified-store loader + the hand-listed predicate schema — a cost tern does NOT pay today.
-;;   FRAM_LOG=~/.local/state/tern/claims.log bb -cp out leverage_probe.clj
-(require '[fram.cnf :as c] '[fram.schema :as s] '[fram.datalog :as d]
+;;   FRAM_LOG=~/.local/state/tern/facts.log bb -cp out leverage_probe.clj
+(require '[fram.store :as c] '[fram.schema :as s] '[fram.datalog :as d]
          '[fram.kernel :as k] '[tern.projections :as proj] '[fram.fold :as fold]
          '[fram.rt] '[clojure.string :as str] '[clojure.set :as set] '[clojure.java.io :as io])
 
@@ -14,8 +14,8 @@
 (when (or (nil? log) (not (.exists (io/file log))))
   (println "leverage_probe: skipped — set FRAM_LOG") (System/exit 0))
 
-(def flat-claims (:facts (fold/fold (fram.rt/read-log log))))
-(def idx (k/build-index flat-claims))
+(def flat-facts (:facts (fold/fold (fram.rt/read-log log))))
+(def idx (k/build-index flat-facts))
 (def work-ids (k/work-thread-ids-i idx))
 
 ;; --- (A) shipped imperative closure ----------------------------------------
@@ -32,12 +32,12 @@
 (def ctx (c/new-store))
 (def tx (c/begin-tx! ctx "leverage"))
 (s/setup! ctx tx)
-(doseq [p (distinct (map :p flat-claims))]
+(doseq [p (distinct (map :p flat-facts))]
   (s/def-predicate! ctx p (if (single-preds p) "single" "multi") (if (ref-preds p) "ref" "literal") tx))
 (def memo (atom {}))
 (defn ent-for! [sid] (or (get @memo sid) (let [id (c/entity! ctx)] (swap! memo assoc sid id) (s/name! ctx id sid tx) id)))
 (defn ref? [x] (str/starts-with? x "@"))
-(doseq [cl flat-claims]
+(doseq [cl flat-facts]
   (let [subj (ent-for! (:l cl)) p (:p cl) r (:r cl)]
     (if (ref? r) (s/link! ctx subj p (ent-for! r) tx) (s/assert! ctx subj p r tx))))
 
@@ -61,7 +61,7 @@
         work-ids))
 
 (println "== leverage probe: imperative closure vs Datalog reaches closure ==")
-(println (str "  live log: " (count flat-claims) " claims, " (count work-ids) " work-threads"))
+(println (str "  live log: " (count flat-facts) " facts, " (count work-ids) " work-threads"))
 (println (str "  threads with non-empty leverage (imperative): "
               (count (filter (fn [[_ s]] (pos? s)) imp-score))))
 (if (empty? diffs)

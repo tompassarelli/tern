@@ -37,7 +37,7 @@ COPY . /opt/tern
 ENV FRAM_HOME=/opt/fram \
     PATH="/opt/tern/bin:/opt/fram/bin:${PATH}" \
     FRAM_PORT=7977 \
-    FRAM_LOG=/data/claims.log \
+    FRAM_LOG=/data/facts.log \
     FRAM_THREADS=/data/threads \
     FRAM_TIME_DIR=/data/time
 

@@ -1,4 +1,4 @@
-;; clock_test.clj — claim-native time-logging roll-up guard.
+;; clock_test.clj — fact-native time-logging roll-up guard.
 ;;
 ;; Proves sessions (titleless @sess entities with session_of/start_time/end_time)
 ;; roll up to per-thread actual seconds, the open session is detected, and the

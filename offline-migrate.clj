@@ -4,7 +4,7 @@
 ;; the daemon. Subjects keep their literal `@` (we write :l exactly as the log has
 ;; it — no CLI @-prepend involved). Persons use `display_name` (`name` reserved).
 (require '[clojure.edn :as edn] '[clojure.string :as str])
-(def path "/home/tom/code/tern-data/claims.log")
+(def path "/home/tom/code/tern-data/facts.log")
 (def recs (with-open [r (clojure.java.io/reader path)] (mapv edn/read-string (line-seq r))))
 (def maxtx (apply max (map :tx recs)))
 (def tx (inc maxtx))

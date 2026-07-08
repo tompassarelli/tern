@@ -121,7 +121,7 @@
 ;; Read verbs query the warm coordinator's already-folded live view instead of
 ;; paying the per-process cold fold (read-log EDN parse + fold ≈ 700ms on the
 ;; 11k-line log; the warm fetch + JSON decode ≈ 75ms). The daemon serves the
-;; view in fold emission order (the :claims wire-op contract (wire name frozen)), so every listing stays
+;; view in fold emission order (the :facts wire-op contract (wire name frozen)), so every listing stays
 ;; byte-identical to the cold path. [] from coord-live-facts is the capability
 ;; handshake — daemon down, an older daemon without the op, or one serving a
 ;; DIFFERENT log — and falls back to the cold fold, so every verb works

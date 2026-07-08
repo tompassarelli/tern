@@ -1,7 +1,7 @@
 ;; capture_test.clj — the UUIDv7-handle model on the capture path:
 ;;   (1) capture mints a UUIDv7 id (an opaque, version-7 uuid — NOT the old
 ;;       @yyyy-MM-dd-HHmmss timestamp scheme), and
-;;   (2) asserts an explicit full-ISO `created_at` claim (now-iso) at birth, while
+;;   (2) asserts an explicit full-ISO `created_at` fact (now-iso) at birth, while
 ;;   (3) `resolve-ref` maps a @handle (or @id) ref to the canonical @id, latest
 ;;       created_at winning ties — the boundary fram never sees a handle through.
 ;;   bb -cp out:../fram/out capture_test.clj      (run from the repo root)
@@ -17,7 +17,7 @@
 ;; --- (2) created_at present + full-ISO via capture-facts (private) ----------
 (def cap (#'m/capture-facts "@t1" "Test thread" "personal" "self" "" "" ""
                              "2026-06-28T07:00:00" "2026-06-28"))
-(defn claim-val [claims pred] (:r (first (filter #(= (:p %) pred) claims))))
+(defn fact-val [facts pred] (:r (first (filter #(= (:p %) pred) facts))))
 
 ;; --- (3) resolve-ref: handle -> canonical id (latest created_at wins) --------
 (def rc
@@ -36,10 +36,10 @@
    ["uuidv7 parses as a UUID, version 7"         (= 7 (.version (java.util.UUID/fromString u1)))]
    ["uuidv7 ids are distinct"                    (not= u1 u2)]
    ["uuidv7 is k-sortable (earlier < later)"     (neg? (compare u1 u2))]
-   ["capture asserts a created_at claim"         (some? (claim-val cap "created_at"))]
-   ["created_at is the full-ISO now-iso value"   (= "2026-06-28T07:00:00" (claim-val cap "created_at"))]
+   ["capture asserts a created_at fact"          (some? (fact-val cap "created_at"))]
+   ["created_at is the full-ISO now-iso value"   (= "2026-06-28T07:00:00" (fact-val cap "created_at"))]
    ["created_at (full-ISO) differs from committed (date)"
-    (not= (claim-val cap "created_at") (claim-val cap "committed"))]
+    (not= (fact-val cap "created_at") (fact-val cap "committed"))]
    ["resolve @handle -> latest-created canonical id"   (= "@id-new" (m/resolve-ref ridx "@perf"))]
    ["resolve bare handle (no @) also resolves"         (= "@id-new" (m/resolve-ref ridx "perf"))]
    ["resolve real @id is passthrough"                  (= "@id-old" (m/resolve-ref ridx "@id-old"))]

@@ -1,17 +1,17 @@
-;; cnf_lifecycle_test.clj — Stage 4 gate: the tern lifecycle derivations
+;; lifecycle_test.clj — Stage 4 gate: the tern lifecycle derivations
 ;; (terminal / work-thread / blocked / ready) expressed AS Datalog rules over the
 ;; reified store must produce the SAME results as the hand-coded flat projections.
-;; Derivation replaces bespoke code — the CNF thesis, checked on the live corpus.
-;;   FRAM_LOG=/path bb -cp out cnf_lifecycle_test.clj
-(require '[fram.cnf :as c] '[fram.schema :as s] '[fram.datalog :as d]
+;; Derivation replaces bespoke code — the store-layer thesis, checked on the live corpus.
+;;   FRAM_LOG=/path bb -cp out lifecycle_test.clj
+(require '[fram.store :as c] '[fram.schema :as s] '[fram.datalog :as d]
          '[fram.kernel :as k] '[tern.projections :as proj] '[fram.fold :as fold]
          '[fram.rt] '[clojure.string :as str] '[clojure.set :as set] '[clojure.java.io :as io])
 
 (def log (System/getenv "FRAM_LOG"))
 (when (or (nil? log) (not (.exists (io/file log))))
-  (println "cnf_lifecycle_test: skipped — set FRAM_LOG") (System/exit 0))
+  (println "lifecycle_test: skipped — set FRAM_LOG") (System/exit 0))
 
-(def flat-claims (:facts (fold/fold (fram.rt/read-log log))))
+(def flat-facts (:facts (fold/fold (fram.rt/read-log log))))
 
 ;; --- hand-coded (flat) projections = the golden reference -------------------
 ;; proj/ready now takes today + before? and excludes future-do_on (dormant)
@@ -19,7 +19,7 @@
 ;; the golden EQUALITY we drive ready with a far-future `today` (no live do_on can
 ;; be in the future of it) — a dormancy-FREE base. Dormancy itself is covered
 ;; directly in projections_test.clj, not pushed into the Datalog layer.
-(def flat-idx (k/build-index flat-claims))
+(def flat-idx (k/build-index flat-facts))
 (def far-future "9999-12-31")
 (defn before? [a b] (neg? (compare a b)))
 (def flat-ready (set (proj/ready flat-idx far-future before?)))
@@ -35,17 +35,17 @@
 (def ctx (c/new-store))
 (def tx (c/begin-tx! ctx "lifecycle"))
 (s/setup! ctx tx)
-(doseq [p (distinct (map :p flat-claims))]
+(doseq [p (distinct (map :p flat-facts))]
   (s/def-predicate! ctx p (if (single-preds p) "single" "multi") (if (ref-preds p) "ref" "literal") tx))
 (def memo (atom {}))
 (defn ent-for! [sid] (or (get @memo sid) (let [id (c/entity! ctx)] (swap! memo assoc sid id) (s/name! ctx id sid tx) id)))
 (defn ref? [x] (str/starts-with? x "@"))
-(doseq [cl flat-claims]
+(doseq [cl flat-facts]
   (let [subj (ent-for! (:l cl)) p (:p cl) r (:r cl)]
     (if (ref? r) (s/link! ctx subj p (ent-for! r) tx) (s/assert! ctx subj p r tx))))
 
 ;; --- the tern lifecycle, AS RULES (lifecycle DERIVED from the explicit
-;;     committed/outcome/abandoned claims — never a stored heuristic) -----------
+;;     committed/outcome/abandoned facts — never a stored heuristic) -----------
 (def out-p (c/value-id ctx "outcome"))
 (def ab-p  (c/value-id ctx "abandoned"))
 (def tit-p (c/value-id ctx "title"))

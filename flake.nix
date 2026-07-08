@@ -1,5 +1,5 @@
 {
-  description = "tern — claim-native work coordination (CLI + MCP, on babashka)";
+  description = "tern — fact-native work coordination (CLI + MCP, on babashka)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -90,7 +90,7 @@
           '';
 
           meta = with lib; {
-            description = "tern — claim-native work coordination CLI + MCP server";
+            description = "tern — fact-native work coordination CLI + MCP server";
             mainProgram = "tern";
             platforms = platforms.unix;
           };
