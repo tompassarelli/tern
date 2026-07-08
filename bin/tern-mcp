@@ -31,7 +31,8 @@
    "everything else is a literal. ids look like 2026-06-16-101500.\n\n"
    "How to work with it:\n"
    "- capture: turn a thought/task into a thread.\n"
-   "- tell / untell: add or retract a single claim about a thread "
+   "- tell / retract: add or remove a single claim about a thread — tell "
+   "asserts, retract removes (untell accepted as a legacy alias) "
    "(e.g. tell <id> depends_on <other-id>, tell <id> estimate_hours 4, "
    "tell <id> do_on 2026-06-20, tell <id> outcome shipped).\n"
    "- ready / next / board / blocked / agenda / leverage: see what to work on.\n"
@@ -47,7 +48,7 @@
    "status glyph; do NOT invent your own emoji or decoration. Keep it terse, group by "
    "project, lead with active work. The user owns the map — to change a glyph: "
    "tell @ui emoji_<condition> \"<glyph>\" (conditions: active/ready/blocked/draft).\n\n"
-   "Prefer capture for new work and tell/untell for changes; the system serializes "
+   "Prefer capture for new work and tell/retract for changes; the system serializes "
    "and rule-checks every write, so just state claims and let it enforce integrity.\n\n"
    "DRIVING AGENTS (multi-agent work): use `dispatch` to spawn an agent for a thread — "
    "it reads thread claims, derives posture (unplanned/atomic/composite), and dispatches via "
@@ -91,12 +92,12 @@
                                          :value {:type "string"}}
              :required ["id" "predicate" "value"]}
     :argv (fn [a] ["tell" (get a "id") (get a "predicate") (get a "value")])}
-   {:name "untell"       :desc "Retract one claim about a thread."
+   {:name "retract"      :desc "Retract one claim about a thread. (untell accepted as a legacy alias.)"
     :schema {:type "object" :properties {:id {:type "string"}
                                          :predicate {:type "string"}
                                          :value {:type "string"}}
              :required ["id" "predicate" "value"]}
-    :argv (fn [a] ["untell" (get a "id") (get a "predicate") (get a "value")])}
+    :argv (fn [a] ["retract" (get a "id") (get a "predicate") (get a "value")])}
    {:name "clock_start"  :desc "Start logging time against a thread (one session at a time)."
     :schema {:type "object" :properties {:id {:type "string"}} :required ["id"]}
     :argv (fn [a] ["clock" "start" (get a "id")])}
@@ -178,7 +179,9 @@
                                             "\nAgent is running in the background. "
                                             "Watch via web client (:8088).")}]}))))
 
-(defn find-tool [nm] (first (filter #(= (:name %) nm) tools)))
+;; `untell` is an accepted legacy alias for `retract` — route it to the same tool.
+(def tool-aliases {"untell" "retract"})
+(defn find-tool [nm] (let [nm (get tool-aliases nm nm)] (first (filter #(= (:name %) nm) tools))))
 (defn find-sdk-tool [nm] (first (filter #(= (:name %) nm) sdk-tools)))
 
 (defn call-tool [nm args]

@@ -945,12 +945,12 @@
   (do
     (println "TERN — curated tool surface (the MCP verbs; bin/tern-mcp is authoritative):")
     (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
-    (println "  read/write : show · capture · tell · untell · validate")
+    (println "  read/write : show · capture · tell · retract · validate   (untell = legacy alias of retract)")
     (println "  time       : clock start|stop|status|report")
     (println "  agents     : dispatch · spawn")
     (println "  view       : presentation")
     (println "")
-    (println "Engine core underneath: fram = 10 tools (tell/untell/show/ask/validate + 5 graph-edit verbs).")
+    (println "Engine core underneath: fram = 10 tools (tell/retract/show/ask/validate + 5 graph-edit verbs).")
     (println "Vocabulary is DATA, not tools: `tern show <pred>` reveals a predicate's metadata")
     (println "(cardinality/value_kind/acyclic claims). Seed that metadata with `tern schema-seed`.")))
 
@@ -1007,7 +1007,7 @@
            [(= sub "projects")   (cf/cmd-projects)]
            [(= sub "workspaces") (cf/cmd-workspaces)]
            [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
-      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/merge route to fram)")])))
+      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)")])))
 
 (defn -main [& args] :- Nil
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

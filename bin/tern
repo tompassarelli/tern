@@ -48,7 +48,10 @@ case "${1:-}" in
     # the existing :subscribe seam — no daemon change. Inherits FRAM_LOG/FRAM_THREADS.
     #   tern reactor [port] [debounce-ms]   (defaults: 7977, 400)
     exec bb "$TERN/cli/tern-reactor.clj" "${2:-7977}" "${@:3}" ;;
-  tell|untell)
+  tell|untell|retract)
+    # `retract` is the primary agent-facing retraction verb (R&N TELL/RETRACT);
+    # `untell` is an accepted legacy alias. Both map onto fram's `untell` CLI verb
+    # (whose wire op is already "retract") at the boundary below.
     # Handles (and @ids) are a TERN concern: fram is handle-blind and re-adds
     # the leading @ to the bare subject it's handed. So resolve the SUBJECT ref to
     # its canonical id here first — that's what makes `tern tell @perf ...`
@@ -66,7 +69,8 @@ case "${1:-}" in
         *)      set -- "$1" "${canon#@}" "${@:3}" ;;
       esac
     fi
-    exec "$FRAM/bin/fram" "$@" ;;
+    framverb="$1"; [ "$framverb" = retract ] && framverb=untell
+    exec "$FRAM/bin/fram" "$framverb" "${@:2}" ;;
   *)  # engine verbs: import/export/show/set/merge/watch
     exec "$FRAM/bin/fram" "$@" ;;
 esac

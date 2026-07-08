@@ -5,7 +5,7 @@
 > `docs/claim-native-redesign.md`):
 > - **One project/CLI/engine: `tern`.** `los thread`/`los validate` are
 >   **retired** — use `tern` (ready/blocked/next/agenda/board/show/leverage/
->   validate/capture/tell/untell/import/export/audit/doctor/up). Time tracking is
+>   validate/capture/tell/retract/import/export/audit/doctor/up). Time tracking is
 >   **`tern clock`** (claim-native sessions; `los time` and the JSON clock-in
 >   are gone — Clockify is just a sync target now).
 > - **Thread files are CLAIM TRIPLES, not YAML.** `@<id>` subject + `predicate
@@ -190,7 +190,7 @@ seed the claims once, and the log carries what `FRAM_SINGLE_VALUED` used to.
 
 The AI tool surface reflects this. `tern tools` lists TERN's **curated** verbs
 (the MCP surface: `ready`/`next`/`board`/…/`tell`/`show`/`dispatch`/`spawn`);
-the fram engine core underneath is **10 tools** (`tell`/`untell`/`show`/`ask`/
+the fram engine core underneath is **10 tools** (`tell`/`retract`/`show`/`ask`/
 `validate` + 5 graph-edit verbs). Vocabulary is data, not tools — there is no
 per-predicate tool catalog to memorize; `tern show <pred>` reveals a predicate.
 
@@ -529,7 +529,7 @@ condition.
 ```sh
 tern capture "<title>" [owner]              # mint a new thread (claim-first)
 tern tell   <id> <pred> <value>             # add/replace a claim, via the coordinator
-tern untell <id> <pred> <value>             # retract a claim, via the coordinator
+tern retract <id> <pred> <value>            # retract a claim, via the coordinator (untell = legacy alias)
 tern merge  <from> <to>                     # fold one node into another
 tern import                                 # fold file edits into the claim log
 tern export <out-dir>                       # regenerate files from the log
@@ -556,7 +556,7 @@ rules (also in the global CLAUDE.md):
    file and run `tern import`. Distinct files don't collide, so file-edit +
    `import` is safe for whole new threads.
 3. **Field changes on existing threads:** go through the coordinator with
-   `tern tell` / `untell` (serialized, rule-checked, retries on conflict).
+   `tern tell` / `retract` (serialized, rule-checked, retries on conflict).
    **Do NOT use `tern set`** — it appends the log directly and races. (`set`
    exists; it's for single-writer/offline situations only.)
 4. **Do NOT run `tern export` during concurrent work** — it regenerates
@@ -605,7 +605,7 @@ If you are an AI (Claude or otherwise) editing this directory:
    speculative captures that need triage. **Never set a `driver` at birth** —
    making a thread active is a deliberate pickup Tom owns.
 6. **Add a `## Log` entry** noting that you created the thread and why.
-7. **Prefer the coordinator for field changes** — `tern tell`/`untell`, not
+7. **Prefer the coordinator for field changes** — `tern tell`/`retract`, not
    `tern set`. Run `tern validate` after a batch.
 8. **Do not invent predicates lightly.** Adding a predicate is cheap mechanically
    (no parser to touch), but the *bar is a real recurring fact*, surfaced across
@@ -628,7 +628,7 @@ If you are an AI (Claude or otherwise) editing this directory:
 - **Free-string tags.** Relate to a `@topic-*` thread (`relates_to @topic-x`).
 - **Dangling refs.** Every `@`-ref must point at a node that exists; `validate`
   rejects otherwise.
-- **`tern set` under concurrency.** Use `tell`/`untell` through the
+- **`tern set` under concurrency.** Use `tell`/`retract` through the
   coordinator.
 - **`tern export` during concurrent work.** It clobbers un-imported edits.
 - **A `project` field or `projects/` subfolder.** A project is a thread with
