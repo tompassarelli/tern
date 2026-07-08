@@ -18,9 +18,9 @@ of agents *and* feel like one brain — they are not a trade-off.
   validation rules, the lifecycle classifier semantics. A thread means the same thing
   everywhere; `@tom` and `@claude-code` are the same identities everywhere. One
   ontology, one identity space.
-- **Separate — the write logs (jurisdictions).** Human-intent claims (your life-os:
+- **Separate — the write logs (jurisdictions).** Human-intent facts (your life-os:
   `committed`/`outcome`/`driver`/`owner`) live in *their* log. Swarm machine-runtime
-  claims (`lease`/`heartbeat`/`epoch`/`fencing` — high-churn, disposable) live in
+  facts (`lease`/`heartbeat`/`epoch`/`fencing` — high-churn, disposable) live in
   *their own* log. Different lanes. **Machine churn never pollutes your canonical
   intent log** — the exact bug the review caught (a `driver` cell overloaded between
   "Tom is pushing this" and "agent holds a mutex") is structurally impossible across
@@ -43,7 +43,7 @@ the mistake nearly every task system makes. The conflations we refuse:
 | commonly conflated | kept separate here |
 |---|---|
 | a single `status` enum (todo/doing/blocked/done) | **separate axes**: commitment, completion, activity, blocked, schedule (§3) |
-| the claim vs. its interpretation | claims are **stored**; conditions (active/ready/blocked/done) are **derived** queries, never stored labels |
+| the fact vs. its interpretation | facts are **stored**; conditions (active/ready/blocked/done) are **derived** queries, never stored labels |
 | human **intent** vs. machine **mechanism** | `driver` (an actor is pushing a thread) is *not* a `lease` (a machine holds exclusive access). Different predicates, different node kinds (§4) |
 | durable intent vs. ephemeral bookkeeping | threads are durable; leases/heartbeats are a TTL'd **tier** (§4) — never permanently written into the intent log |
 | loose grouping vs. hard dependency | `relates_to` (association) is *not* `depends_on` (execution block). Never merged |
@@ -74,11 +74,11 @@ Same graph; the shape tells you what you're looking at.
 
 ## 3. The thread shape — orthogonal axes, derived conditions
 
-A thread carries several **independent** claims. None is a status; each is its own
+A thread carries several **independent** facts. None is a status; each is its own
 queryable axis. A thread can be committed *and* blocked *and* scheduled-for-tomorrow
 at once, and each is true separately.
 
-| axis | the claim (stored) | the condition (derived) |
+| axis | the fact (stored) | the condition (derived) |
 |---|---|---|
 | **commitment** | `committed` (date) / `abandoned` (reason) | desired = committed ∧ ¬abandoned; canceled = abandoned |
 | **completion** | `outcome` (what came of it) | done = outcome present |
@@ -131,11 +131,11 @@ thread model:
 - Agents pick up work by asking the graph **"what's `ready` and unresolved?"** —
   `ready` / `next` / `plate`, the same projections you use, filtered to a lane
   (by `owner`, or by `relates_to @some-topic`, or by `lead @themselves`).
-- An agent **claims** a thread by setting `driver @itself` (→ active). It records
+- An agent **acquires** a thread by setting `driver @itself` (→ active). It records
   progress as it goes and `outcome` when done. `depends_on` gives execution order
   for free.
 - Because the work *is* the shared graph, most of agentchat's message bus
-  **dissolves** — agents coordinate *stigmergically* through thread state (claim,
+  **dissolves** — agents coordinate *stigmergically* through thread state (acquire,
   resolve, depend) rather than by mailing each other. Directed messages shrink to a
   thin residual (a dispatch, a question) — not the backbone.
 
@@ -160,7 +160,7 @@ Separate write logs are the scaling *mechanism*, not an afterthought:
   + whatever jurisdictions it subscribes to into its own in-process index and queries
   locally. No central read bottleneck, no RPC at query time. This is the "one board."
 - **The kernel is tiny** — shared identities + the vocabulary itself (predicates +
-  cardinality, as claims). Jurisdictions hang off it as leaves.
+  cardinality, as facts). Jurisdictions hang off it as leaves.
 
 You never see the lanes. You see one board that doesn't care whether it's holding 8
 agents or 800. *(The substrate plumbing — per-jurisdiction logs, subject-striped
@@ -194,7 +194,7 @@ needs-review).
   billable/client owner). Today it's 98.8% the constant `personal`; it earns its
   function only on the ~5 exceptions.
 - `source` → keep `{tom, ai, bug}` (`ai` triggers extra scrutiny — a real function);
-  drop the `migrated` value (it's history, not a claim about the thread) and the 4
+  drop the `migrated` value (it's history, not a fact about the thread) and the 4
   phantom unused enum members.
 
 **Drop (no function):** `created_by` (the mechanical author is always the AI and is
@@ -211,9 +211,9 @@ its correct kind:
 
 | agentchat today | → its home in the graph |
 |---|---|
-| `mbox/` messages | the **thread graph** (claim/resolve/depend) + a thin residual for true direct messages |
+| `mbox/` messages | the **thread graph** (acquire/resolve/depend) + a thin residual for true direct messages |
 | `presence/*.md` files | **session** coordination nodes (heartbeat-derived liveness) |
-| `claims/BUILD-LOCK-*` | **lease** coordination nodes (holder/epoch/expiry/fencing) |
+| `acquire/BUILD-LOCK-*` | **lease** coordination nodes (holder/epoch/expiry/fencing) |
 | swarm tasks (in agent task-trackers) | **threads** in the one graph (owner = the project, `lead`/`driver` = an agent) |
 
 Sequence: settle the schema (this doc) → stand up the durable shared coordinator/log

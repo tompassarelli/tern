@@ -14,7 +14,7 @@ The hosted product today exposes **the engine, not the app.**
 
 Walk the seam as it actually is:
 
-- A tenant instance is **one `fram-daemon` + one `claims.log`** (see
+- A tenant instance is **one `fram-daemon` + one `facts.log`** (see
   `deploy/tern-coordinator@.service`, `deploy/docker-compose.example.yml`).
   There is no Tern process in a tenant — only the Fram coordinator.
 - The gateway (`deploy/gateway/gateway.clj`) authenticates a bearer token, maps
@@ -25,7 +25,7 @@ Walk the seam as it actually is:
 - But the real life verbs — `ready`, `blocked`, `next`, `plate`, `agenda`,
   `leverage`, `show`, `needs-review`, `capture`, `clock start/stop/status/report`,
   `presentation` — live in `tern.main` (and the MCP server that wraps it),
-  **not in the engine.** Reads *fold the tenant's `claims.log` locally* and
+  **not in the engine.** Reads *fold the tenant's `facts.log` locally* and
   derive lifecycle (`cmd-ready`, `cmd-plate`, etc. all do
   `(fold/fold (fram.rt/read-log log))` then project); writes (`capture`, `clock`)
   go through the coordinator via `coord-assert`/`coord-retract`.
@@ -69,7 +69,7 @@ locally, and return the (JSON) stdout.
 - **+** Stateless — no new long-lived per-tenant process; composes cleanly with
   the existing gateway and the systemd/compose topology.
 - **−** **Babashka cold-start per call.** Each verb spawns a fresh `bb -m
-  tern.main`, which re-reads and re-folds the whole `claims.log` every time.
+  tern.main`, which re-reads and re-folds the whole `facts.log` every time.
   Fine at personal-graph size and low call rates; visibly bad for a chatty AI or
   a web UI that fans out several reads per view.
 - **−** Reads bypass the warm coordinator graph entirely — the CLI folds the log
@@ -158,16 +158,16 @@ and no second auth or second writer.
 
 Fram has added its **own engine-level MCP + structured-query surface**; Tern
 already has an MCP server. They must not duplicate or fight. The rule mirrors the
-repo seam (see `hosting.md` → "The engine ↔ app seam"): **Fram owns the neutral claim engine; Tern
+repo seam (see `hosting.md` → "The engine ↔ app seam"): **Fram owns the neutral fact engine; Tern
 owns the life domain.** MCP-wise:
 
 | | **Engine MCP (Fram)** | **App / life MCP (Tern)** |
 |---|---|---|
-| Mental model | "query/assert claims" | "run my work + life" |
-| Audience | tools reasoning about the *claim graph* generically | a chat AI / app reasoning about *threads, plates, time* |
+| Mental model | "query/assert facts" | "run my work + life" |
+| Audience | tools reasoning about the *fact graph* generically | a chat AI / app reasoning about *threads, plates, time* |
 | Surface | neutral query (datalog/structured), `assert`, `retract`, `validate`, `version`, `status` | `ready`, `next`, `plate`, `blocked`, `agenda`, `leverage`, `show`, `needs_review`, `capture`, `tell`, `untell`, `clock_*`, `presentation` |
 | Semantics | knows triples; **no lifecycle, no clock, no presentation** | derives lifecycle (committed/outcome/abandoned/driver/depends_on), clock roll-up, emoji contract |
-| Where it folds | the coordinator's in-memory graph | folds the tenant's `claims.log` (today via the CLI verbs) |
+| Where it folds | the coordinator's in-memory graph | folds the tenant's `facts.log` (today via the CLI verbs) |
 | Vocabulary | engine-generic (subject/predicate/object) | life vocab (`@topic-*`, `do_on`, `estimate_hours`, `session_of`, …) |
 | Owns | Fram repo | Tern repo |
 
@@ -177,13 +177,13 @@ Boundary rules:
    over the *life* vocabulary; they stay in Tern. Fram exposing them would
    pull domain code into the engine — the exact complecting the engine↔app
    seam forbids.
-2. **No raw-claim manipulation duplicated in the life MCP.** Tern's `tell`/
+2. **No raw-fact manipulation duplicated in the life MCP.** Tern's `tell`/
    `untell`/`capture` are *opinionated, provenance-stamped* writes (see
-   `capture-claims` — it stamps `source`/`created_by`/`lead`/`committed`/…). The
+   `capture-facts` — it stamps `source`/`created_by`/`lead`/`committed`/…). The
    engine MCP's `assert`/`retract` are the *neutral* primitive. Tern's writes
    ultimately bottom out on the same coordinator ops, but the life MCP should not
    re-expose a bare `assert` as a "Tern" tool — that's the engine's job.
-3. **One does not proxy the other.** The life MCP reaches claims by folding the
+3. **One does not proxy the other.** The life MCP reaches facts by folding the
    tenant log / driving the coordinator directly (as it does now), **not** by
    calling the engine MCP. The two MCP servers are siblings over the same
    coordinator, layered by altitude, not stacked.
@@ -247,7 +247,7 @@ altitudes.
 
 This adds the **app** to the hosted surface without touching the engine until the
 churn settles, keeps **one** auth point and **one** writer, and leaves the
-leave-anytime / plain-text / claim-identical-export guarantees from `hosting.md`
+leave-anytime / plain-text / fact-identical-export guarantees from `hosting.md`
 untouched in every mode.
 
 ---

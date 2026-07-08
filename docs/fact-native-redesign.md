@@ -1,21 +1,21 @@
-# Claim-Native Redesign — SHIPPED 2026-06-15
+# Fact-Native Redesign — SHIPPED 2026-06-15
 
 *Drafted then **executed** 2026-06-15. Status: **SHIPPED** — this is now a
 historical design record, not a pending plan. The live corpus migrated
 (173 → 406 threads, validate clean), `los` was **deleted** (not "rewritten in
 lockstep" as the staging below anticipated — its `time` capability was ported to
 `tern time` and the rest retired in favor of tern). The current operating
-manual is `docs/operating-manual.md`. Rollback: git tag `pre-claim-native` (both repos).
+manual is `docs/operating-manual.md`. Rollback: git tag `pre-fact-native` (both repos).
 Stage/Q sections below are kept verbatim as the original plan; where they say "los
 in lockstep" or "nothing started yet," read them as the pre-execution plan.*
 
 ## Why
 
-The flip made the claim graph canonical and the `.md` files a projection. But the
-projection — and parts of the model — still carry **pre-claim assumptions**:
+The flip made the fact graph canonical and the `.md` files a projection. But the
+projection — and parts of the model — still carry **pre-fact assumptions**:
 
-- **YAML frontmatter** — a *denormalized* record that reshapes atomic claims into
-  typed fields + lists (a second, fragile serialization of claims the log already holds).
+- **YAML frontmatter** — a *denormalized* record that reshapes atomic facts into
+  typed fields + lists (a second, fragile serialization of facts the log already holds).
 - **Entity types smuggled into string prefixes** (`thread:`/`person:`/`tag:`/`owner:`/`repo:`)
   — type as a string convention instead of structure.
 - **A flat `state` enum** that crushes several *orthogonal* axes onto one line.
@@ -23,7 +23,7 @@ projection — and parts of the model — still carry **pre-claim assumptions**:
 - **Run-together ids** (`20260615150040`) — opaque *and* unreadable.
 
 The throughline of every decision below: **replace flat labels / denormalized
-encodings with structure.** End state — *one shape everywhere*: the claim
+encodings with structure.** End state — *one shape everywhere*: the fact
 `(subject predicate object)`. Conditions (active, blocked, done, …) are **derived
 from structure**, never stored as labels.
 
@@ -31,9 +31,9 @@ from structure**, never stored as labels.
 
 ## The model (decisions locked in conversation)
 
-### D1 — Files are claim triples, not YAML
-The on-disk file becomes the thread's claims rendered as triples + the dictated
-prose body. Same shape as the log (which is already claims-as-text). Round-trip
+### D1 — Files are fact triples, not YAML
+The on-disk file becomes the thread's facts rendered as triples + the dictated
+prose body. Same shape as the log (which is already facts-as-text). Round-trip
 reuses the log's EDN read/write — so the YAML quoting/injection bug class (the
 `dq` mess) **cannot exist**.
 
@@ -46,15 +46,15 @@ reuses the log's EDN read/write — so the YAML quoting/injection bug class (the
 Resume the gjoa + reference/lean work. Pick it back up today.
 ```
 
-### D2 — No "fields", only claims
-There is no per-field parser. `import`/`export` become **generic claim read/write**.
-The denormalized machinery deletes: `parse-flat-fm`, `thread->claims` (its 21
+### D2 — No "fields", only facts
+There is no per-field parser. `import`/`export` become **generic fact read/write**.
+The denormalized machinery deletes: `parse-flat-fm`, `thread->facts` (its 21
 hardcoded fields), the export frontmatter assembler. **Adding a predicate never
 requires touching the parser** — there are no fields, only predicates.
 
 ### D3 — No type tags, no entity prefixes; kinds are *structural*
 Drop `thread:`/`person:`/`owner:`/`tag:`/`repo:` prefixes. A "type" is not a stored
-label (nominal) — it is a **shape** (structural): a saved query over claim-shape.
+label (nominal) — it is a **shape** (structural): a saved query over fact-shape.
 You can't *eliminate* the type, only move it from declared → derived; the shape is
 the irreducible part, and it lives as a query, not a tag.
 
@@ -100,7 +100,7 @@ There is **no `state`/`phase`/`disposition` predicate** — condition is a query
 Fixed-width so id↔slug splits by position, not first-dash. Opaque key, but glanceable.
 
 ### D8 — Belief-revision / staleness layer
-Claims are not one temporal kind. Three classes; treat each differently:
+Facts are not one temporal kind. Three classes; treat each differently:
 
 - **History** (immutable, never stale): `created_at`, `proposed_by`,
   `committed`/`outcome`/`abandoned`. Append-only truth.
@@ -114,10 +114,10 @@ Claims are not one temporal kind. Three classes; treat each differently:
   event stream (`tern watch`), surfaced for a human call.
 - `valid_until` is the **time-based special case** of a judgment (input = clock).
 
-### D9 — Capture is prose/dictation-first, claim-first
+### D9 — Capture is prose/dictation-first, fact-first
 You dictate text dumps; you don't hand-author fields. So capture = "dump → store
-as body + extract claims," not "title → emit a record." Reshape `tern capture`
-around the claim-native write path (the env-provenance work folds in). The current
+as body + extract facts," not "title → emit a record." Reshape `tern capture`
+around the fact-native write path (the env-provenance work folds in). The current
 title-first/YAML-emitting capture is replaced.
 
 ---
@@ -142,7 +142,7 @@ title-first/YAML-emitting capture is replaced.
   validator / display in `los-bb/src/los/{main,thread}.bclj` must learn the
   triple format. **This breaks `los` unless done in lockstep.**
 - **Corpus** — all **173** live threads + **9** bundled examples: id reformat +
-  tags→relates_to (+ mint topic threads) + state→lifecycle claims + YAML→triples +
+  tags→relates_to (+ mint topic threads) + state→lifecycle facts + YAML→triples +
   prefix-strip/`@`-refs. One coordinated rewrite.
 - **Docs** — `docs/operating-manual.md` (the spec) rewritten for the new model.
 
@@ -154,19 +154,19 @@ independent stages.
 
 ## Plan (staged, each gated by round-trip + validate, git-backed)
 
-**Stage 0 — Safety.** Tag `pre-claim-native` in tern + tern. Confirm
+**Stage 0 — Safety.** Tag `pre-fact-native` in tern + tern. Confirm
 baseline round-trip + `tern validate` + `los validate` all green.
 
 **Stage 1 — New engine, proven on the 9 bundled threads (zero live impact).**
 Generic triple import/export; `@`-refs; structural kinds (`title`=thread);
 `relates_to` + dangling validation; lifecycle predicates + derived conditions;
 drop state enum + tags + prefixes + audit tag funcs. Migrate the 9 bundled
-fixtures as the proof; round-trip must be claim-identical and projections sane.
+fixtures as the proof; round-trip must be fact-identical and projections sane.
 
 **Stage 2 — Migration script** (old corpus → new). One transform: id reformat
 (+ rewrite every `part_of`/`depends_on`/`relates_to` cross-ref), tags→relates_to
 (auto-mint a topic thread per distinct tag; `merge` the obvious ones into existing
-threads), state→lifecycle claims (`ready/active`→`committed`; `active`→ leave a
+threads), state→lifecycle facts (`ready/active`→`committed`; `active`→ leave a
 driver; `done`→`outcome`; `canceled`→`abandoned`+reason; `draft`→ no committed),
 prefix-strip → `@`-refs, YAML→triples. **Dry-run on a copy**; diff; validate.
 
@@ -174,9 +174,9 @@ prefix-strip → `@`-refs, YAML→triples. **Dry-run on a copy**; diff; validate
 display for the new model. Test against the migrated copy.
 
 **Stage 4 — Cutover.** Apply the migration to the live corpus; `tern validate`
-+ `los validate` green; commit. Rollback = `pre-claim-native` tag.
++ `los validate` green; commit. Rollback = `pre-fact-native` tag.
 
-**Stage 5 — Capture reshape** (D9) — prose/dictation-first, claim-first.
+**Stage 5 — Capture reshape** (D9) — prose/dictation-first, fact-first.
 
 **Stage 6 — Staleness/`needs-review`** (D8) — predicate-class map + the
 tx-staleness projection + promotion prompts off `watch`.
@@ -202,6 +202,6 @@ tx-staleness projection + promotion prompts off `watch`.
 - This deletes more code than it adds (the field machinery, the enum, the YAML
   quoter, tag-drift) — but the **corpus + los migration is the real cost/risk**,
   and it touches your daily tooling.
-- Everything is reversible via the `pre-claim-native` tag; nothing ships without
+- Everything is reversible via the `pre-fact-native` tag; nothing ships without
   round-trip + both validators green.
 - Nothing here is started yet. This is the plan to react to.

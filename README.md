@@ -28,7 +28,7 @@ operator works — adapt the wrapper to your own setup.
   (`import`/`export`/`show`/`validate`/`tell`/`untell`/…) route to Fram.
 - **MCP** → `bin/tern-mcp`: the AI-facing edge — every tool maps to a tested
   CLI op through the coordinator write path.
-- **Data** → your own private store (the canonical `claims.log`, projected to
+- **Data** → your own private store (the canonical `facts.log`, projected to
   `~/.local/state/tern/` at runtime). Data is **not** part of this repo.
 
 ## Hosting
@@ -46,7 +46,7 @@ operator works — adapt the wrapper to your own setup.
   pending (sequenced), the open decisions, and the engine↔app seam. Start here.
 - `docs/operating-manual.md` — the working manual: thread model, fact format,
   derived lifecycle, the CLI surface, and session behavior.
-- `docs/claim-native-redesign.md` — the design record for the claim-native model.
+- `docs/fact-native-redesign.md` — the design record for the fact-native model.
 - `docs/PROPOSAL.md` — the original vision and architecture.
 
 ## Running and building
@@ -73,7 +73,7 @@ the life-domain modules into `out/`; commit the result when sources change. Set
 CP="out:$FRAM_HOME/out"
 bb -cp "$CP" clock_test.clj
 bb -cp "$CP" staleness_test.clj
-FRAM_LOG="$FRAM_HOME/claims.log" bb -cp "$CP" cnf_lifecycle_test.clj
+FRAM_LOG="$FRAM_HOME/facts.log" bb -cp "$CP" lifecycle_test.clj
 bash deploy/gateway/smoke_test.sh        # gateway auth + routing
 ```
 

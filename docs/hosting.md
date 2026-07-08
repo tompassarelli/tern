@@ -9,7 +9,7 @@ what's an MVP, and what's still ahead.
 ## The architecture (recap)
 
 ```
-threads/*.md ──import──▶ claims.log (append-only) ──fold──▶ in-memory graph
+threads/*.md ──import──▶ facts.log (append-only) ──fold──▶ in-memory graph
                                                               │
                               coordinator daemon  ◀── clients query + assert
                               (sole writer, 127.0.0.1)        │
@@ -17,7 +17,7 @@ threads/*.md ──import──▶ claims.log (append-only) ──fold──▶ 
                                                    ready / blocked / leverage / clock
 ```
 
-- **Truth** is an append-only `claims.log` of `(subject, predicate, object)` triples.
+- **Truth** is an append-only `facts.log` of `(subject, predicate, object)` triples.
 - **The coordinator** is a single-writer babashka daemon: it folds the log into an
   in-memory graph and serves `query`/`assert`/`retract` over a **loopback** socket
   with optimistic concurrency and commit-time rule checks. It binds `127.0.0.1`
@@ -57,12 +57,12 @@ Same as Mode 1 on a server, with one of:
 ## Mode 3 — Multi-tenant SaaS (you host for others)
 
 **Model: instance-per-tenant.** Each account gets its own coordinator + its own
-`claims.log`. An authenticated gateway routes each request to the right one.
+`facts.log`. An authenticated gateway routes each request to the right one.
 
 ```
-                         ┌─ coordinator(acme)   + acme/claims.log
-client ─HTTPS─▶ proxy ─▶ gateway ─┼─ coordinator(globex) + globex/claims.log
-              (TLS)   (authn +    └─ coordinator(…)      + …/claims.log
+                         ┌─ coordinator(acme)   + acme/facts.log
+client ─HTTPS─▶ proxy ─▶ gateway ─┼─ coordinator(globex) + globex/facts.log
+              (TLS)   (authn +    └─ coordinator(…)      + …/facts.log
                        tenant route)
 ```
 
@@ -78,7 +78,7 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 ### Why instance-per-tenant (not one shared graph)
 
 - **Isolation is the only safe boundary.** The per-assertion `frame` records *who
-  asserted* a claim — it's provenance, not authorization. A shared graph
+  asserted* a fact — it's provenance, not authorization. A shared graph
   partitioned by frame would let any authenticated caller assert any frame. So
   tenancy = **separate logs + separate coordinators**, full stop.
 - **The architecture makes it cheap.** A tenant is *already* just "a log + a
@@ -91,7 +91,7 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
   process (µs commits). You scale by adding tenant instances across hosts, not by
   scaling one graph. Very large *single* tenants would eventually swap the
   in-memory-fold + flat-log for a transactional store (XTDB/Datomic/Datahike) — the
-  claim model is unchanged; only the substrate underneath swaps.
+  fact model is unchanged; only the substrate underneath swaps.
 
 ---
 
@@ -106,12 +106,12 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
   `:coordinator-host` at the private address; the raw port is still never publicly
   exposed (gateway-only ingress). Add mTLS between gateway and coordinator over
   untrusted links.
-- Plain-text data, no telemetry, `export` is claim-identical — the leave-anytime
+- Plain-text data, no telemetry, `export` is fact-identical — the leave-anytime
   guarantee holds in every mode, including hosted.
 
 ## Operations
 
-- **Backups:** each tenant's `claims.log` is append-only plain text — back it up
+- **Backups:** each tenant's `facts.log` is append-only plain text — back it up
   with `git`/snapshots/object storage. `import`/`export` round-trips are lossless.
 - **Supervision:** systemd template unit per tenant (`tern-coordinator@<id>`)
   + the gateway unit; both `Restart=on-failure`. Or one container per coordinator.
@@ -126,7 +126,7 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 
 | Capability | State |
 |---|---|
-| Claim log, fold, Datalog derivation, single-writer coordinator | **built** (Fram, tested) |
+| Fact log, fold, Datalog derivation, single-writer coordinator | **built** (Fram, tested) |
 | Lifecycle/clock/billing projections | **built** (Tern, tested) |
 | Runs on bare babashka, no build step | **built** (`out/` committed) |
 | Single-machine + SSH-tunnel remote | **built** |

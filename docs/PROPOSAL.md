@@ -1,4 +1,4 @@
-# Proposal: Claim-Native Coordination System
+# Proposal: Fact-Native Coordination System
 
 **Working codename:** Tern *(placeholder — rename at review)*
 **Status:** Draft for internal review
@@ -10,7 +10,7 @@
 ## 1. Summary
 
 A self-hosted, agent-native system for coordinating work and life. The
-canonical store is a **claim graph** (relational assertions), not text files
+canonical store is a **fact graph** (relational assertions), not text files
 and not rows. The primary interface is an **agent you talk to** ("what's on my
 plate?", "what should I work on?") that returns structured answers and keeps
 the graph true with near-zero manual upkeep. It is multi-writer safe by design
@@ -26,32 +26,32 @@ does, from your actual prose and work. Not "never wrong" — wrong only in
 ## 2. Why this wins (the wedge)
 
 1. **Agent-maintained truth.** Every PM tool rots because updating it is manual
-   toil. Kill the toil: you *talk*, the agent writes/updates claims. The #1
+   toil. Kill the toil: you *talk*, the agent writes/updates facts. The #1
    failure mode of the category disappears.
-2. **Personal + work unified.** Same claim store; `owner`/context is a *frame*
+2. **Personal + work unified.** Same fact store; `owner`/context is a *frame*
    you query from, not a separate product. One familiar way to coordinate, at
    work and at home.
 3. **Relational substrate fits the domain.** PM *is* dependencies, ownership,
    blocking, provenance, "who decided what." Incumbents bolt that onto rows
    badly. We store it natively, with provenance and obligation-checking. The
    non-fungible win over "agent edits frontmatter + git" is **interning**
-   (rename a person/repo once, not in 100 files) and **cross-cutting claims**
+   (rename a person/repo once, not in 100 files) and **cross-cutting facts**
    (one decision referenced by many threads is one object, not N drifting copies).
 
 ## 3. Goals / Non-goals
 
 **Goals**
-- Claims as the single source of truth; text is anchored, never the primary key.
+- Facts as the single source of truth; text is anchored, never the primary key.
 - Safe concurrent multi-agent operation (10+ writers) on one machine.
 - Agent-native interface first; thin CLI; HTTP for clients later.
 - Self-hostable, single-tenant first, multi-tenant later.
 - 98%-correct prose→structure extraction is acceptable **because** text is
-  always anchored and claims are re-derivable.
+  always anchored and facts are re-derivable.
 
 **Non-goals (explicit guardrails)**
 - **No sentence atomization as source of truth.** We do *targeted* extraction
-  into a small controlled schema, not open-ended "every clause becomes claims."
-  Prose is stored as a text value; claims are a derived index over it.
+  into a small controlled schema, not open-ended "every clause becomes facts."
+  Prose is stored as a text value; facts are a derived index over it.
 - No drag-and-drop board as the primary UX.
 - No distributed consensus / multi-machine write coordination in v1 (one
   coordinator process; single machine).
@@ -79,7 +79,7 @@ does, from your actual prose and work. Not "never wrong" — wrong only in
                   │ append
                   ▼
   ┌─────────────────────────────────────┐
-  │  claims.log  (append-only, on disk)  │  ← persistence + full history
+  │  facts.log  (append-only, on disk)  │  ← persistence + full history
   │  + out-of-line text blobs (by hash)  │
   └─────────────────────────────────────┘
 ```
@@ -94,20 +94,20 @@ it and the single authority on "what's true now."
 Object   = addressable identity
 Entity   = object only                       (a thread, a person, a predicate)
 Value    = object + interned literal         (canonical; "Tom" is one object)
-Claim    = object + (left predicate right)   ; identity = hash(l,p,r)
-Assertion (log event) = (tx, op, claim-hash, frame, timestamp)
+Fact    = object + (left predicate right)   ; identity = hash(l,p,r)
+Assertion (log event) = (tx, op, fact-hash, frame, timestamp)
    op    = assert | retract
    frame = asserter + context (e.g. personal | client:acme)
 ```
 
-- **Claims are interned by `hash(l,p,r)`** → identical content is the same claim →
+- **Facts are interned by `hash(l,p,r)`** → identical content is the same fact →
   dedup, rename-in-one-place, conflict detection all work.
 - **Truth is a fold, not a stored bit.** Current state = fold over assertions
   under a chosen frame/policy (default: latest-assert-wins + supersession).
 - **Provenance is first-class** via `frame` on every assertion (this is also
   the personal/work seam).
 - **A thread is a view, not a record:** the entity of kind `thread` plus its
-  claims (`deliverable`, `owner`, `state`, `depends_on`, …) and anchored body
+  facts (`deliverable`, `owner`, `state`, `depends_on`, …) and anchored body
   text. `.md` files become a one-time import and an optional render target.
 
 **Log line (conceptual):**
@@ -128,8 +128,8 @@ clients. "Safe" decomposes into three guarantees:
 | Incoherence (two valid writes → contradiction) | rejected | validate against current state + rules at commit |
 
 **Protocol (coordinator API):**
-- `query(pattern, frame) → {claims, version}`
-- `assert(claims, base_version, frame) → {ack, version} | {reject, reason, current}`
+- `query(pattern, frame) → {facts, version}`
+- `assert(facts, base_version, frame) → {ack, version} | {reject, reason, current}`
 - `subscribe(pattern) → stream` *(optional; live updates for agents)*
 
 **Optimistic concurrency:** an `assert` carries the `base_version` it assumed.
@@ -138,10 +138,10 @@ state; the agent re-reads and retries. No locks held across agent think-time.
 
 **Throughput:** agents *think* in parallel (seconds); they *commit* through one
 point (microseconds). Serialized commit is not a bottleneck at any realistic
-agent count. (Validated in prior CNF experiments: shared daemon + serialized
+agent count. (Validated in prior store-layer experiments: shared daemon + serialized
 writes eliminated cross-agent coordination bugs with real agents.)
 
-## 7. Extraction pipeline (prose → claims)
+## 7. Extraction pipeline (prose → facts)
 
 Extraction is done by the LLM, **constrained**, not free-form:
 
@@ -156,9 +156,9 @@ Extraction is done by the LLM, **constrained**, not free-form:
    hard part, and it is load-bearing for multi-agent safety (10 agents
    extracting blind = instant fragmentation).
 3. **Text is always anchored.** The verbatim prose is stored as a value;
-   claims are a derived, re-buildable index over it. Therefore 98% is *safe*:
+   facts are a derived, re-buildable index over it. Therefore 98% is *safe*:
    the 2% is recoverable, auditable, and re-derivable. Never reason
-   claims→claims drifting from the anchor (telephone-game / drift guard).
+   facts→facts drifting from the anchor (telephone-game / drift guard).
 
 ## 8. Operational schema (starter, controlled vocabulary)
 
@@ -210,9 +210,9 @@ Computed from the fold; never stored as truth:
   log + fold + rules.
 - **CLI client:** native (GraalVM) for fast per-invocation startup; talks to the
   coordinator over a local socket.
-- **Store, v1 (single-tenant / self-host):** append-only `claims.log` file +
+- **Store, v1 (single-tenant / self-host):** append-only `facts.log` file +
   in-memory fold. Git is backup. *No database.*
-- **Store, product (multi-tenant):** the **same claim model** over a real
+- **Store, product (multi-tenant):** the **same fact model** over a real
   transactional store (Datomic / XTDB / Datahike) — earns its place only at
   multi-tenant durability scale. Model is unchanged; substrate swaps underneath.
 - **Extraction:** Claude, constrained to the schema, registry-grounded.
@@ -222,7 +222,7 @@ Computed from the fold; never stored as truth:
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
 | **0 — Proof** *(done)* | Graph queries over current files | ready/blocked/leverage run on 142 real threads |
-| **1 — Substrate** | Claim kernel + append log + in-memory fold + coordinator (single proc, local socket); import 142 threads → claims | All Phase-0 queries run over *claims*; optimistic `assert`/reject works; round-trips to a rendered view |
+| **1 — Substrate** | Fact kernel + append log + in-memory fold + coordinator (single proc, local socket); import 142 threads → facts | All Phase-0 queries run over *facts*; optimistic `assert`/reject works; round-trips to a rendered view |
 | **2 — Agent + extraction** | Tool/MCP interface; targeted, registry-grounded extraction; text anchoring; "plate/next" intents | Tom runs real client + personal work through it for 2 weeks; board stays current with zero manual upkeep |
 | **3 — Concurrency hardening** | Prove 10 concurrent agents safe | Conflict tests: 0 corruption, contradictions rejected, obligations enforced under load |
 | **4 — Self-host** | Packaging, auth, frames (personal/work), HTTP API | A second person self-hosts and coordinates a shared thread |
@@ -242,7 +242,7 @@ Computed from the fold; never stored as truth:
 | Risk | Mitigation |
 |---|---|
 | Extraction reference-drift (synonym soup) | Entity-linking against live registry at write; controlled schema |
-| 98% error compounding | Text always anchored; claims re-derivable; never claims→claims |
+| 98% error compounding | Text always anchored; facts re-derivable; never facts→facts |
 | Scope creep into sentence-atomization | Explicit non-goal; targeted schema only |
 | Product is 80% non-tech (distribution, trust, workflow depth) | Dogfood-first; scope v1 ruthlessly; incumbents are the real risk, not the data model |
 | Single coordinator = SPOF/bottleneck | Fine at single-node scale; product store handles durability; replication later |
@@ -262,5 +262,5 @@ Computed from the fold; never stored as truth:
 
 ---
 
-*Phase 0 is done. Phase 1 is the first build: claim kernel + log + coordinator +
+*Phase 0 is done. Phase 1 is the first build: fact kernel + log + coordinator +
 import. Recommend starting there on approval.*
