@@ -1,5 +1,5 @@
 #lang beagle/clj
-(ns tern.gatepolicy
+(ns north.gatepolicy
   "Pure security/policy DECISIONS for the auth gateway, with REAL types (not Any —
   Any would defeat the point; the checker must know the shapes). The effects (HTTP,
   sockets, the registry file, the buckets atom, audit IO) stay in gateway.clj; this

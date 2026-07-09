@@ -17,11 +17,11 @@
 ;; the shared @concern:<id> string bridges the two jurisdictions, no distributed tx.
 ;; A NON-flipped repo (no code daemon) DEGRADES to the path-string footprint + intersection.
 ;;
-;; PORTS: argv[0] = the :7977 board (spine). $TERN_CODE_PORT (set by bin/concern when
+;; PORTS: argv[0] = the :7977 board (spine). $NORTH_CODE_PORT (set by bin/concern when
 ;; it finds a warm code daemon) = the per-repo CODE store (footprint). No code port ->
 ;; path-string fallback.
 ;;
-;; usage (port = tern board, 7977):
+;; usage (port = north board, 7977):
 ;;   declare <agent> <repo> "<intent>" <foot,foot,...>    mint a concern (+ shows overlaps)
 ;;       footprint entries: a code NODE (@mod#n or module/name) on a flipped repo, else a path.
 ;;   overlap <concern-id> [--landing]   who else is in my footprint, any status (code-graph
@@ -36,13 +36,13 @@
 ;; shared coord substrate: the cardinality-typed write verbs (move-C) live once in
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  tern.coord/send-op)
-(def append!  tern.coord/append!)
-(def put!     tern.coord/put!)
-(def many     tern.coord/many)
-(def resolved tern.coord/resolved)
-(def online?  tern.coord/online?)   ; renewable-lease liveness — same rule as the presence roster
-(def lease-of tern.coord/lease-of)  ; raw lease {:holder :exp :epoch} — needed for lapse-age
+(def send-op  north.coord/send-op)
+(def append!  north.coord/append!)
+(def put!     north.coord/put!)
+(def many     north.coord/many)
+(def resolved north.coord/resolved)
+(def online?  north.coord/online?)   ; renewable-lease liveness — same rule as the presence roster
+(def lease-of north.coord/lease-of)  ; raw lease {:holder :exp :epoch} — needed for lapse-age
 
 ;; ---- liveness-derived concern DECAY (design 019f4418) -----------------------
 ;; A concern's owner is judged live by the SAME renewable-lease rule the presence
@@ -95,7 +95,7 @@
 ;; string (env vars + the stored code_port fact arrive as strings).
 (defn ->port [p] (cond (nil? p) nil (number? p) p :else (Integer/parseInt (str p))))
 ;; the per-repo CODE daemon port (bin/concern discovers + exports it); nil => path fallback.
-(def code-port (let [p (System/getenv "TERN_CODE_PORT")] (when (and p (seq p)) (->port p))))
+(def code-port (let [p (System/getenv "NORTH_CODE_PORT")] (when (and p (seq p)) (->port p))))
 
 ;; concern-id args arrive from humans/agents in either form; every fact subject in
 ;; the log carries the @ sigil, so a bare id here writes to a PHANTOM bare node —
@@ -221,7 +221,7 @@
           (println (str "       SHARES: " (str/join " " (sort (set/intersection mine (:touches m)))))))))))
 
 ;; the effective code port for THIS concern: its own stored code_port (set at declare,
-;; so overlap/shape work from any cwd), else the ambient $TERN_CODE_PORT. nil => path.
+;; so overlap/shape work from any cwd), else the ambient $NORTH_CODE_PORT. nil => path.
 (defn surface [spine c statuses none-msg]
   (let [cport (or (->port (resolved spine c "code_port")) code-port)]
     (if cport (surface-code spine cport c statuses none-msg)

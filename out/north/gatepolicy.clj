@@ -1,4 +1,4 @@
-(ns tern.gatepolicy
+(ns north.gatepolicy
   (:require [clojure.string :as str])
   (:import [java.security MessageDigest]))
 

@@ -1,4 +1,4 @@
-;; schema_test.clj — the vocabulary census (`tern schema`): the kind classifier
+;; schema_test.clj — the vocabulary census (`north schema`): the kind classifier
 ;; and the census roll-up.
 ;;   (1) kind-of: explicit `kind` fact > `title`=>thread > subject-prefix
 ;;       heuristic > schema-as-facts predicate > other. Handles @-prefixed and
@@ -6,7 +6,7 @@
 ;;   (2) census: per-kind subject + fact counts, sorted by fact count desc.
 ;;   (3) predicate metadata (cardinality/value_kind) is surfaced from the graph.
 ;;   bb -cp out:../fram/out schema_test.clj      (run from the repo root)
-(require '[fram.kernel :as k] '[tern.main :as m])
+(require '[fram.kernel :as k] '[north.main :as m])
 
 ;; one subject per kind: some kind-tagged, some inferred from prefix/title only.
 (def facts

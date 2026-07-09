@@ -1,6 +1,6 @@
-(ns tern.staleness
+(ns north.staleness
   (:require [fram.kernel :as k]
-            [tern.projections :as proj]
+            [north.projections :as proj]
             [fram.fold :as f]))
 
 (defrecord Review [te pred detail])

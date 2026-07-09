@@ -1,5 +1,5 @@
 #lang beagle/clj
-(ns tern.staleness
+(ns north.staleness
   "Belief-revision layer (D8): judgments revalidate when their inputs move.
    A pure projection — it NEVER auto-flips a fact, only surfaces a needs-review
    queue for a human to re-decide. Three judgment classes, three input models:
@@ -15,7 +15,7 @@
    derived views (ready/blocked/active) recompute and so can't go stale either.")
 
 (require fram.kernel :as k)
-(require tern.projections :as proj)
+(require north.projections :as proj)
 (require fram.fold :as f)
 
 ;; te = the thread, pred = which judgment, detail = why it needs review.

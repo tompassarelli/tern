@@ -3,9 +3,9 @@
 # (strip the leading @ that the log/livefile carries). Values pass as-is. Persons
 # use `display_name` (`name` is a reserved engine/schema predicate).
 set -uo pipefail
-cd /home/tom/code/tern
-LS="bin/tern"
-DATA=/home/tom/code/tern-data/facts.log
+cd /home/tom/code/north
+LS="bin/north"
+DATA=/home/tom/code/north-data/facts.log
 T=$(mktemp -d); FAIL=0; N=0
 # w <verb> <subject(@-or-bare)> <pred> <value...> — strips a leading @ from the subject only
 w() { local verb="$1" s="${2#@}"; shift 2; local out

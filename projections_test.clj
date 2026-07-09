@@ -6,7 +6,7 @@
 ;;   bb -cp out:$FRAM/out projections_test.clj      (run from the repo root)
 (require '[fram.kernel :as k]
          '[fram.fold :as fold]
-         '[tern.projections :as proj])
+         '[north.projections :as proj])
 
 (defn asrt [tx l p r frame] (fold/->FactOp tx "assert" l p r frame))
 

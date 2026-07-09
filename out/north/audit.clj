@@ -1,4 +1,4 @@
-(ns tern.audit
+(ns north.audit
   (:require [fram.kernel :as k]
             [clojure.string :as str]))
 

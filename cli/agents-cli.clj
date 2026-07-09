@@ -1,7 +1,7 @@
 #!/usr/bin/env bb
-;; agents-cli.clj — tern's agent verbs: spawn · request · agents · watch · tell · retask.
-;; Agents are a TERN concern (spawns run on the tern substrate, register presence,
-;; write facts); this file is their CLI home. bin/tern routes the verbs here.
+;; agents-cli.clj — north's agent verbs: spawn · request · agents · watch · tell · retask.
+;; Agents are a NORTH concern (spawns run on the north substrate, register presence,
+;; write facts); this file is their CLI home. bin/north routes the verbs here.
 ;; Ported from the convoy cockpit 2026-07-09 when the ownership rule moved the
 ;; verbs to their owner; convoy remains the cross-stack dashboard (my-agents).
 ;; Vocabulary law: facts (never claims), lanes/agents (never fleet).
@@ -11,11 +11,11 @@
          '[clojure.java.io :as io])
 
 (def HOME (System/getenv "HOME"))
-(def TERN (str HOME "/code/tern"))
+(def NORTH (str HOME "/code/north"))
 (def GAFFER (str HOME "/code/gaffer"))
-(def AGENT-LOGDIR (str HOME "/.local/state/tern/agents"))
-(def DIAL-TABLE (str GAFFER "/docs/adapters/tern.md"))
-(def PORT (or (System/getenv "TERN_PORT") "7977"))
+(def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
+(def DIAL-TABLE (str GAFFER "/docs/adapters/north.md"))
+(def PORT (or (System/getenv "NORTH_PORT") "7977"))
 
 (def color? (and (nil? (System/getenv "NO_COLOR"))
                  (some? (System/console))))
@@ -49,13 +49,13 @@
                              #"\s+([a-z]+)\s+(sonnet|opus|haiku)\s+(low|medium|high|xhigh|max)\s+(\S+)\s+(\S+)\s*"
                              ln)]
                    [role {:model model :effort effort
-                          :tern-role (when-not (#{"—" "-"} trole) trole)
+                          :north-role (when-not (#{"—" "-"} trole) trole)
                           :posture posture}])))
          (into {}))))
 
 ;; ---- agent identity facts (one log scan; single-valued predicates) ----------
 (defn agent-facts []
-  (let [log-path (str HOME "/.local/state/tern/facts.log")]
+  (let [log-path (str HOME "/.local/state/north/facts.log")]
     (when (.exists (io/file log-path))
       (try
         (->> (str/split-lines (slurp log-path))
@@ -88,7 +88,7 @@
 
 ;; ---- presence ---------------------------------------------------------------
 (defn presence-rows []
-  (let [r (run ["bb" (str TERN "/cli/presence-cli.clj") PORT "presence"] :timeout 6000)]
+  (let [r (run ["bb" (str NORTH "/cli/presence-cli.clj") PORT "presence"] :timeout 6000)]
     (cond
       (:timeout r) {:err "presence probe timed out"}
       (not (:ok r)) {:err "presence unavailable"}
@@ -106,7 +106,7 @@
 
 ;; ---- verbs -------------------------------------------------------------------
 (defn cmd-agents [_]
-  (echo-cmd "bb" (str TERN "/cli/presence-cli.clj") PORT "presence")
+  (echo-cmd "bb" (str NORTH "/cli/presence-cli.clj") PORT "presence")
   (let [pr (presence-rows)
         af (or (agent-facts) {})]
     (if (:err pr)
@@ -131,23 +131,23 @@
     (cond
       (nil? dt) (println (red "gaffer dial table not found:") DIAL-TABLE)
       (or (nil? role) (nil? prompt))
-      (do (println (red "usage:") "tern spawn <role> \"<prompt>\" [--notify <peer>] [--dry-run]")
+      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--notify <peer>] [--dry-run]")
           (println "roles:" (str/join " " (sort (keys dt)))))
       (not (dt role))
       (do (println (red (str "unknown role: " role)))
           (println "roles:" (str/join " " (sort (keys dt)))))
       :else
-      (let [{:keys [model effort tern-role posture]} (dt role)
+      (let [{:keys [model effort north-role posture]} (dt role)
             aid (str "lane-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             env (cond-> {"AGENT_ID" aid "AGENT_MODEL" model "AGENT_EFFORT" effort}
-                  tern-role (assoc "AGENT_ROLE" tern-role)
+                  north-role (assoc "AGENT_ROLE" north-role)
                   posture   (assoc "AGENT_POSTURE" posture)
                   notify    (assoc "AGENT_COORDINATOR" notify))
-            spawn-ts (str TERN "/sdk/src/spawn.ts")
+            spawn-ts (str NORTH "/sdk/src/spawn.ts")
             envs (str/join " " (map (fn [[k v]] (str k "=" v)) (sort env)))]
         (println (dim "# gaffer dials for role") (bold role) (dim "->")
                  (str "model=" model " effort=" effort
-                      (when tern-role (str " role=" tern-role))
+                      (when north-role (str " role=" north-role))
                       (when posture (str " posture=" posture))))
         (echo-cmd envs "bun run" spawn-ts (str "\"" prompt "\""))
         (if dry?
@@ -160,12 +160,12 @@
             (p/process (into [] ["bun" "run" spawn-ts prompt])
                        {:extra-env env :out :write :err :write :out-file log :err-file log})
             (println (grn "spawned") (bold aid))
-            (println "watch:" (cyn (str "tern watch " aid)))))))))
+            (println "watch:" (cyn (str "north watch " aid)))))))))
 
 ;; req = fork-everything intake: self-triaging opus-high handler + ping-back.
 (defn cmd-request [args]
   (let [notify (or (second (drop-while #(not= "--notify" %) args))
-                   (System/getenv "TERN_NOTIFY"))
+                   (System/getenv "NORTH_NOTIFY"))
         text (str/join " " (remove #(or (#{"--notify" "--dry-run"} %)
                                         (= % notify)) args))
         dry? (some #{"--dry-run"} args)
@@ -176,34 +176,34 @@
                       "Strictly synchronous; commit checkpoints; never push unless asked; "
                       "report to docs/private/.")]
     (if (str/blank? text)
-      (println (red "usage:") "tern request \"<request>\" [--notify <peer>]")
+      (println (red "usage:") "north request \"<request>\" [--notify <peer>]")
       (cmd-spawn (cond-> ["integrator" (str "REQUEST: " text "\n\nOPERATING CONTRACT: " contract)]
                    dry?   (conj "--dry-run")
                    notify (into ["--notify" notify]))))))
 
 (defn cmd-watch [[id & _]]
   (if (nil? id)
-    (println (red "usage:") "tern watch <agent-id>")
+    (println (red "usage:") "north watch <agent-id>")
     (let [log (io/file AGENT-LOGDIR (str id ".log"))]
       (if (.exists log)
         (do (echo-cmd "tail -n 40 -f" (str log))
             (p/exec "tail" "-n" "40" "-f" (str log)))
         (do (println (ylw "no transcript log at") (str log))
-            (println "fallback:" (cyn "open http://127.0.0.1:8088") (dim "(tern web)")))))))
+            (println "fallback:" (cyn "open http://127.0.0.1:8088") (dim "(north web)")))))))
 
 (defn cmd-tell-agent [args]
   (let [rest0 (vec (remove #{"--dry-run"} args))
         dry? (some #{"--dry-run"} args)
         from-idx (.indexOf rest0 "--from")
         from (if (>= from-idx 0) (nth rest0 (inc from-idx) nil)
-                 (or (System/getenv "TERN_AGENT_ID") "tern-cli"))
+                 (or (System/getenv "NORTH_AGENT_ID") (System/getenv "TERN_AGENT_ID") "north-cli"))  ;; TERN_AGENT_ID: transitional fallback, remove post-cutover
         pos (if (>= from-idx 0)
               (keep-indexed #(when-not (#{from-idx (inc from-idx)} %1) %2) rest0)
               rest0)
         [id msg] pos]
     (if (or (nil? id) (nil? msg))
-      (println (red "usage:") "tern steer <agent-id> \"<msg>\" [--from <me>]")
-      (let [argv ["bb" (str TERN "/cli/msg-cli.clj") PORT "send" from id "steer" msg]]
+      (println (red "usage:") "north steer <agent-id> \"<msg>\" [--from <me>]")
+      (let [argv ["bb" (str NORTH "/cli/msg-cli.clj") PORT "send" from id "steer" msg]]
         (echo-cmd (str/join " " argv))
         (if dry?
           (println (ylw "[dry-run]") "not sent.")
@@ -214,15 +214,15 @@
 ;; context loss (facts, not chat).
 (defn cmd-retask [[id goal & _]]
   (if (or (nil? id) (nil? goal))
-    (println (red "usage:") "tern retask <agent-id> \"<new-goal>\"")
+    (println (red "usage:") "north retask <agent-id> \"<new-goal>\"")
     (let [subj (str "agent:" (str/replace-first id #"^@?(agent:)?" ""))
           bare (subs subj (count "agent:"))
-          tern-bin (str TERN "/bin/tern")
-          t1 (run [tern-bin "tell" subj "goal" goal] :timeout 6000)
+          north-bin (str NORTH "/bin/north")
+          t1 (run [north-bin "tell" subj "goal" goal] :timeout 6000)
           af (or (agent-facts) {})
           facts (assoc (get af bare {}) "goal" goal)
           dn (render-display-name bare facts)
-          t2 (run [tern-bin "tell" subj "display_name" dn] :timeout 6000)]
+          t2 (run [north-bin "tell" subj "display_name" dn] :timeout 6000)]
       (if (and (:ok t1) (:ok t2))
         (do (println (grn "retasked") (bold bare))
             (println "  " dn))
@@ -237,9 +237,9 @@
     "spawn"   (cmd-spawn args)
     "request" (cmd-request args)
     ;; renamed 2026-07-09 (user: full word, pairs with /request) — teach, don't alias
-    "req"     (do (println "renamed: tern request") (System/exit 1))
+    "req"     (do (println "renamed: north request") (System/exit 1))
     "watch"   (cmd-watch args)
     "steer"   (cmd-tell-agent args)
     "retask"  (cmd-retask args)
-    (do (println "usage: tern {agents|spawn|request|watch|steer|retask} ...")
+    (do (println "usage: north {agents|spawn|request|watch|steer|retask} ...")
         (System/exit 1))))

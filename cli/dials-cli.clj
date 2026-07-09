@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; tern dials — routing-analytics read projection over the @run telemetry stream.
+;; north dials — routing-analytics read projection over the @run telemetry stream.
 ;;
 ;; Answers "are we deploying the right model at the right effort?" from the fact log,
 ;; NOT from doctrine belief. Every @run-<agent>-<ts> subject carries an effective dial
@@ -13,14 +13,14 @@
 ;; loopback doc; this view surfaces cohorts, the judge/RATE step assigns fit.
 ;;
 ;; Facts, never claims: this projects asserted @run facts; it computes, it does not rate.
-;; Read-only. Companion to `tern health` (run health rollup) and `tern trace` (failures).
+;; Read-only. Companion to `north health` (run health rollup) and `north trace` (failures).
 
 (require '[clojure.edn :as edn]
          '[clojure.string :as str])
 
 (def log-path
-  (or (System/getenv "TERN_FACTS_LOG")
-      (str (System/getenv "HOME") "/.local/state/tern/facts.log")))
+  (or (System/getenv "NORTH_FACTS_LOG")
+      (str (System/getenv "HOME") "/.local/state/north/facts.log")))
 
 (defn read-facts
   "Fold the append-only EDN log into subject -> {pred -> value}, honoring
@@ -90,7 +90,7 @@
         facts (read-facts log-path)
         rs (runs facts)
         groups (sort-by key (group-by group-key rs))]
-    (println (format "tern dials — %d runs over %s   (group: %s)\n"
+    (println (format "north dials — %d runs over %s   (group: %s)\n"
                      (count rs) log-path (name group-key)))
     (println (format "%-22s %4s  %9s  %10s  %6s  %7s  %-6s %-6s %s"
                      (str/upper-case (name group-key)) "n" "Σcost" "Σtokens" "turns" "wall" "ok" "esc" "other-outcomes"))

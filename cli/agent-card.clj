@@ -9,7 +9,7 @@
 ;; Pure functions, no coordinator dependency: load-file'd by presence-cli.clj as a
 ;; library and required directly by agent_identity_test.clj. No main-guard needed —
 ;; nothing runs at load.
-(ns tern.agent-card
+(ns north.agent-card
   (:require [clojure.string :as str]))
 
 (defn- blank? [s] (or (nil? s) (str/blank? (str s))))

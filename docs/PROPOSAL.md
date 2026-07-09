@@ -1,6 +1,6 @@
 # Proposal: Fact-Native Coordination System
 
-**Working codename:** Tern *(placeholder — rename at review)*
+**Working codename:** North *(placeholder — rename at review)*
 **Status:** Draft for internal review
 **Author:** Tom + Claude
 **Date:** 2026-06-14
@@ -251,7 +251,7 @@ Computed from the fold; never stored as truth:
 
 ## 15. Open decisions for review
 
-1. **Product name** (codename Tern is a placeholder).
+1. **Product name** (codename North is a placeholder).
 2. **Multi-tenant store** choice — defer to Phase 5, but flag preferences.
 3. **Per-predicate conflict policy** details beyond the starter set.
 4. **Value model** (`value_financial` / `value_joy`) — how/when elicited; this

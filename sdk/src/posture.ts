@@ -1,4 +1,4 @@
-import type { Fact } from "./tern-client";
+import type { Fact } from "./north-client";
 
 export interface Posture {
   planned: boolean;

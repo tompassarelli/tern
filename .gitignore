@@ -4,7 +4,7 @@ src/fram
 # tenant registry holds token hashes + topology — keep it out of git
 deploy/gateway/tenants.edn
 
-# NOTE: the compiled Clojure in out/ IS committed (Tern runs on bare
+# NOTE: the compiled Clojure in out/ IS committed (North runs on bare
 # babashka, no Beagle needed at runtime — mirrors Fram). Rebuild with ./build.sh
 # and commit the result when the .bclj sources change.
 

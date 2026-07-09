@@ -3,8 +3,8 @@
 // does when its subprocess dies (readMessages() rethrows exitError) — and asserts spawn():
 //   1. does NOT reject (returns a partial string) — supervision, not fail-fast;
 //   2. emits the death notification (agent_death fact on @swarm) via the fix's finally path.
-// All coordinator writes are redirected to a fake `tern` on PATH + TERN_BIN, logged to a
-// temp file; TERN_PORT points at an unused port so any stray bb write no-ops.
+// All coordinator writes are redirected to a fake `north` on PATH + NORTH_BIN, logged to a
+// temp file; NORTH_PORT points at an unused port so any stray bb write no-ops.
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -15,27 +15,27 @@ let log: string;
 const origEnv = { ...process.env };
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "tern-death-"));
+  dir = mkdtempSync(join(tmpdir(), "north-death-"));
   log = join(dir, "death.log");
-  // Fake `tern`: append every invocation's args to the log, succeed. Stands in for both the
+  // Fake `north`: append every invocation's args to the log, succeed. Stands in for both the
   // death fact (tell @swarm ...) and the telemetry recordRun tells — neither hits the graph.
-  const fake = join(dir, "tern");
+  const fake = join(dir, "north");
   writeFileSync(fake, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${log}"\nexit 0\n`);
   chmodSync(fake, 0o755);
 
   process.env.PATH = `${dir}:${process.env.PATH}`;
-  process.env.TERN_BIN = fake;
-  process.env.TERN_PORT = "59999"; // unused -> presence/any bb write silently no-ops
-  process.env.TERN_STREAM_DIR = dir; // keep stream jsonl out of ~/code/agent-data
+  process.env.NORTH_BIN = fake;
+  process.env.NORTH_PORT = "59999"; // unused -> presence/any bb write silently no-ops
+  process.env.NORTH_STREAM_DIR = dir; // keep stream jsonl out of ~/code/agent-data
   process.env.AGENT_LAWS = "off"; // trim system-prompt file reads; irrelevant to the boundary
   process.env.AGENT_PRAXIS = "off";
 });
 
 afterAll(() => {
   process.env.PATH = origEnv.PATH;
-  process.env.TERN_BIN = origEnv.TERN_BIN;
-  process.env.TERN_PORT = origEnv.TERN_PORT;
-  process.env.TERN_STREAM_DIR = origEnv.TERN_STREAM_DIR;
+  process.env.NORTH_BIN = origEnv.NORTH_BIN;
+  process.env.NORTH_PORT = origEnv.NORTH_PORT;
+  process.env.NORTH_STREAM_DIR = origEnv.NORTH_STREAM_DIR;
   process.env.AGENT_LAWS = origEnv.AGENT_LAWS;
   process.env.AGENT_PRAXIS = origEnv.AGENT_PRAXIS;
   try { rmSync(dir, { recursive: true, force: true }); } catch {}

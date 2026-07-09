@@ -1,11 +1,11 @@
 {
-  description = "tern — fact-native work coordination (CLI + MCP, on babashka)";
+  description = "north — fact-native work coordination (CLI + MCP, on babashka)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
 
-    # The Fram engine is tern's runtime library: bin/tern puts
+    # The Fram engine is north's runtime library: bin/north puts
     # $FRAM/out on the bb classpath (fram.kernel/fold/import/export/rt) and
     # shells $FRAM/bin/fram for engine verbs. Fram ships its compiled Clojure
     # in out/ (committed, runs on bare bb — no Beagle at runtime), so we consume
@@ -26,7 +26,7 @@
         lib = pkgs.lib;
 
         # Runtime PATH for the bb-backed CLIs. iproute2 (ss) + util-linux
-        # (setsid) are only exercised by `tern up` / fram-up (daemon
+        # (setsid) are only exercised by `north up` / fram-up (daemon
         # lifecycle); harmless to include, and they make those verbs work too.
         runtimePath = lib.makeBinPath [
           pkgs.babashka
@@ -61,12 +61,12 @@
           '';
         };
 
-        # tern CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
+        # north CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
         # packaged engine so the CLI is self-contained; an explicit env override
-        # still wins (the script reads ${FRAM_HOME:-...}). TERN_BIN points the
+        # still wins (the script reads ${FRAM_HOME:-...}). NORTH_BIN points the
         # MCP server at the wrapped CLI in this same out.
         ternPkg = pkgs.stdenvNoCC.mkDerivation {
-          pname = "tern";
+          pname = "north";
           version = "0.1.0";
           src = self;
           nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -76,44 +76,44 @@
             runHook preInstall
             mkdir -p $out/bin $out/out
             cp -r out/. $out/out/
-            cp bin/tern bin/tern-mcp $out/bin/
+            cp bin/north bin/north-mcp $out/bin/
 
-            wrapProgram $out/bin/tern \
+            wrapProgram $out/bin/north \
               --prefix PATH : ${runtimePath} \
               --set-default FRAM_HOME ${framPkg}
 
-            wrapProgram $out/bin/tern-mcp \
+            wrapProgram $out/bin/north-mcp \
               --prefix PATH : ${runtimePath} \
               --set-default FRAM_HOME ${framPkg} \
-              --set-default TERN_BIN $out/bin/tern
+              --set-default NORTH_BIN $out/bin/north
             runHook postInstall
           '';
 
           meta = with lib; {
-            description = "tern — fact-native work coordination CLI + MCP server";
-            mainProgram = "tern";
+            description = "north — fact-native work coordination CLI + MCP server";
+            mainProgram = "north";
             platforms = platforms.unix;
           };
         };
       in {
         packages = {
           default = ternPkg;
-          tern = ternPkg;
+          north = ternPkg;
           fram-engine = framPkg;
         };
 
         apps = {
           default = {
             type = "app";
-            program = "${ternPkg}/bin/tern";
+            program = "${ternPkg}/bin/north";
           };
-          tern = {
+          north = {
             type = "app";
-            program = "${ternPkg}/bin/tern";
+            program = "${ternPkg}/bin/north";
           };
-          tern-mcp = {
+          north-mcp = {
             type = "app";
-            program = "${ternPkg}/bin/tern-mcp";
+            program = "${ternPkg}/bin/north-mcp";
           };
         };
 
@@ -129,7 +129,7 @@
             inotify-tools
             nodejs_22
 
-            # existing tern deps
+            # existing north deps
             babashka
             bun
           ];

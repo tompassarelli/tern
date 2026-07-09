@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; health-cli.clj — `tern health`: the aggregate coordination rollup.
+;; health-cli.clj — `north health`: the aggregate coordination rollup.
 ;;
 ;; READ-ONLY. ONE fold over the DURABLE append-only log — coord.clj's doctrine
 ;; ("everything countable is a fold over an append-only log, never a mutated cell").
@@ -14,17 +14,17 @@
 ;;
 ;; NO new predicates: this is a VIEW over facts that already exist. Degrades to a
 ;; single line if :7977 is unreachable — never hangs, never throws out.
-;;   usage: tern health [--forks-since <hours>]   (default fork scan window 24h)
+;;   usage: north health [--forks-since <hours>]   (default fork scan window 24h)
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
          '[babashka.process :as p])
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  tern.coord/send-op)
-(def resolved tern.coord/resolved)
-(def many     tern.coord/many)
+(def send-op  north.coord/send-op)
+(def resolved north.coord/resolved)
+(def many     north.coord/many)
 
 (def HOME (System/getenv "HOME"))
-(def TERN (str HOME "/code/tern"))
-(def PORT (Integer/parseInt (or (System/getenv "TERN_PORT") "7977")))
+(def NORTH (str HOME "/code/north"))
+(def PORT (Integer/parseInt (or (System/getenv "NORTH_PORT") "7977")))
 
 ;; ANSI only on a real TTY; piped/captured (the convoy pane parses this) stays plain.
 (def use-color? (some? (System/console)))
@@ -48,7 +48,7 @@
 ;; join here by ~30x: on the coordinator's planner each extra join clause is a full
 ;; predicate scan (~1.4s/clause on a 155k-fact log), whereas `resolved` is
 ;; entity-indexed (~0.6ms). run-rows went 4.4s -> 0.15s; the kind=lane pair is
-;; only 20 entities. This is what kept `tern health` inside the my-agents pane budget.
+;; only 20 entities. This is what kept `north health` inside the my-agents pane budget.
 (defn ids-with [port pred val]        ; entity ids where pred=val (literal object, cheap)
   (map first (rows port ["e"] [{:rel "triple" :args [{:var "e"} pred val]}])))
 
@@ -91,7 +91,7 @@
 
 ;; ---- concerns: COMPOSE over `concern ls` (its own liveness DECAY, not re-derived) ----
 (defn concern-line []
-  (let [r (try (deref (p/process [(str TERN "/bin/concern") "ls"] {:out :string :err :string})
+  (let [r (try (deref (p/process [(str NORTH "/bin/concern") "ls"] {:out :string :err :string})
                       4000 nil)
                (catch Exception _ nil))
         header (some-> r :out str/split-lines first)]
@@ -107,7 +107,7 @@
       (dim "concern ls unavailable"))))
 
 ;; ---- zombie forks (F4): agent-handle git authors absent from the roster --------
-(def known-repos ["tern" "convoy" "fram" "gaffer" "nixos-config" "beagle"])
+(def known-repos ["north" "convoy" "fram" "gaffer" "nixos-config" "beagle"])
 (def handle-shape #"^(lane-|sdk-|session-|cc-|dispatch-|agent-)")
 (defn zombie-forks [port since-h]
   (let [known (agent-ids port)]
@@ -134,13 +134,13 @@
     ;; connectivity probe: one cheap read. Down => single honest line, exit 0.
     (let [probe (try (send-op PORT {:op :version}) (catch Exception e ::down))]
       (when (= probe ::down)
-        (println (red (str "tern health — coordinator :" PORT " unreachable (is `tern up` running?)")))
+        (println (red (str "north health — coordinator :" PORT " unreachable (is `north up` running?)")))
         (System/exit 0)))
-    (println (str (bold "tern health") "  ·  :" PORT "  ·  " (str (java.time.Instant/now))))
+    (println (str (bold "north health") "  ·  :" PORT "  ·  " (str (java.time.Instant/now))))
     (println)
     ;; Fold the two expensive joins over the 155k-fact log ONCE, then reuse. run-rows
     ;; (4-way join) and lane-outcome-rows each fed multiple sections before — recomputing
-    ;; them per-section made `tern health` a ~12s command that always timed out the
+    ;; them per-section made `north health` a ~12s command that always timed out the
     ;; my-agents 4s pane. One fold each keeps it inside the pane budget.
     (let [rr  (run-rows PORT)
           lor (lane-outcome-rows PORT)]
@@ -187,5 +187,5 @@
 
 (try (-main (vec *command-line-args*))
      (catch Throwable t
-       (binding [*out* *err*] (println (str "tern health: " (.getMessage t))))
+       (binding [*out* *err*] (println (str "north health: " (.getMessage t))))
        (System/exit 1)))

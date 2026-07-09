@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# north-mine — cognitive telemetry miner over Claude Code session transcripts.
+# Extracts verb votes (hallucinated tool names), retry loops, guard denials,
+# engine rejects, and doc re-reads; appends them as facts via the coordinator.
+#   north-mine [--dry-run] [--full] [--root DIR] [--report FILE] [--limit N] [--verbose]
+exec bb "$HOME/code/north/cli/north-mine.clj" "${NORTH_PORT:-7977}" "$@"

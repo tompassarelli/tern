@@ -1,11 +1,11 @@
-;; validate_test.clj — tern's WORK-semantics integrity rules, lifted out of
-;; the fram kernel into tern.validate: a depends_on edge to a withdrawn
+;; validate_test.clj — north's WORK-semantics integrity rules, lifted out of
+;; the fram kernel into north.validate: a depends_on edge to a withdrawn
 ;; (abandoned) thread, and person-ref integrity (lead/driver/proposed_by must
-;; point at a node carrying a `display_name`). Plus: tern.validate composes
+;; point at a node carrying a `display_name`). Plus: north.validate composes
 ;; these ON TOP of the engine's generic rules (cycles/dangling), so violations-i
 ;; surfaces both. (The generic half is covered in fram/tests/kernel_violations_test.clj.)
 ;;   bb -cp out:$FRAM/out validate_test.clj      (run from the repo root)
-(require '[fram.kernel :as k] '[tern.validate :as val])
+(require '[fram.kernel :as k] '[north.validate :as val])
 
 (defn idx-of [facts] (k/build-index facts))
 (defn has? [v sub] (some #(clojure.string/includes? % sub) v))
@@ -45,7 +45,7 @@
    (k/->Fact "@dead" "abandoned" "2026-01-01")
    (k/->Fact "@w4" "depends_on" "@dead")])
 
-;; composition: full violations-i = engine-generic ++ tern-work.
+;; composition: full violations-i = engine-generic ++ north-work.
 (def mixed-facts
   [(k/->Fact "@w5" "title" "W5")
    (k/->Fact "@w5" "driver" "@ghost")
@@ -71,5 +71,5 @@
 (let [fails (remove second checks)]
   (doseq [[nm ok] checks] (println (if ok "  [PASS] " "  [FAIL] ") nm))
   (if (empty? fails)
-    (println "\ntern.validate:" (count checks) "/" (count checks) "PASS")
-    (do (println "\ntern.validate:" (count fails) "FAILED") (System/exit 1))))
+    (println "\nnorth.validate:" (count checks) "/" (count checks) "PASS")
+    (do (println "\nnorth.validate:" (count fails) "FAILED") (System/exit 1))))

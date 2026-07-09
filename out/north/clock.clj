@@ -1,6 +1,6 @@
-(ns tern.clock
+(ns north.clock
   (:require [fram.kernel :as k]
-            [tern.projections :as proj]
+            [north.projections :as proj]
             [clojure.string :as str]))
 
 (defn running-session [idx]

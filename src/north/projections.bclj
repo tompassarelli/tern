@@ -1,5 +1,5 @@
 #lang beagle/clj
-(ns tern.projections
+(ns north.projections
   "Read-only dependency-derived views over an indexed fact set (k/Index).
   O(threads) via the index, not O(threads * facts).")
 
@@ -8,10 +8,10 @@
 
 ;; --- lifecycle vocab + derivation (moved out of the fram kernel) -------------
 ;; Lifecycle is DERIVED, never a stored status: the engine stores the facts but
-;; tern OWNS the derivation. terminal = resolved (outcome/abandoned/
+;; north OWNS the derivation. terminal = resolved (outcome/abandoned/
 ;; superseded_by); withdrawn = a depends_on target that's suspect to depend on
-;; (abandoned). The vocab mirrors the env contract bin/tern exports
-;; (FRAM_TERMINAL_PREDS / FRAM_WITHDRAWN_PREDS); the defaults ARE the tern
+;; (abandoned). The vocab mirrors the env contract bin/north exports
+;; (FRAM_TERMINAL_PREDS / FRAM_WITHDRAWN_PREDS); the defaults ARE the north
 ;; lifecycle vocab. (The fram kernel still carries terminal-preds for the
 ;; coordinator's the-model §9 terminal-cascade — a separate daemon concern.)
 (def terminal-preds :- (Vec String)

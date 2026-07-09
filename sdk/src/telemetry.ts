@@ -23,7 +23,7 @@ export interface RunRecord {
   outcome: string; // "ran" | "error" | "budget_exceeded" | "budget_exhausted" | "struggle_ceiling"
   // escalate-not-kill (thread 019f1194-ca57) — present only on escalation-enabled runs.
   // Option A yields ONE @run row per spawn with an internal escalation chain, NOT one
-  // row per tier (tern-reconcile.clj queries adapt in lockstep — follow-up).
+  // row per tier (north-reconcile.clj queries adapt in lockstep — follow-up).
   costUsd?: number; // authoritative SDK total_cost_usd (falls back to the in-loop estimate)
   numTurns?: number; // SDKResultMessage.num_turns (was dropped before)
   errorCount?: number; // tool_result errors this run
@@ -61,7 +61,7 @@ export function recordRun(rec: RunRecord): void {
   for (const [p, v] of facts) {
     // async + ignored: never let telemetry add latency to, or break, the run.
     try {
-      execFile("tern", ["tell", id, p, v], () => {});
+      execFile("north", ["tell", id, p, v], () => {});
     } catch {
       /* swallow */
     }

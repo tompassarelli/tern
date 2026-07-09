@@ -1,4 +1,4 @@
-;; presence-cli.clj — presence-as-facts (Tern gate-2 #30).
+;; presence-cli.clj — presence-as-facts (North gate-2 #30).
 ;;
 ;; THE TRICK: presence = a renewable LEASE. Liveness is judged by the COORDINATOR's
 ;; clock (the lease expiry), never a self-stamped wall-clock heartbeat. This kills
@@ -25,13 +25,13 @@
 ;; decode-lease/lease-of/online? — the renewable-lease liveness rule — ALSO live there
 ;; now, so this roster and concern-cli judge "online" by the exact same definition.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  tern.coord/send-op)
-(def append!  tern.coord/append!)
-(def put!     tern.coord/put!)
-(def retract! tern.coord/retract!)
-(def resolved tern.coord/resolved)
-(def decode-lease tern.coord/decode-lease)
-(def lease-of     tern.coord/lease-of)
+(def send-op  north.coord/send-op)
+(def append!  north.coord/append!)
+(def put!     north.coord/put!)
+(def retract! north.coord/retract!)
+(def resolved north.coord/resolved)
+(def decode-lease north.coord/decode-lease)
+(def lease-of     north.coord/lease-of)
 
 (defn sessions [port]      ; -> [[session-entity handle] ...]  ONE row per uuid.
   ;; `agent` is overloaded: it anchors @session:<h> (the session) AND every @run:<sid> (cost
@@ -303,7 +303,7 @@
         (append! port re (name k) (str v)))        ; DYNAMIC pred -> append! (safe default)
       (prn {:recorded re :agent h :fields (count m)}))
 
-    ;; --- subscriptions: thread-watches as facts (consumed by tern-listen.clj) ---
+    ;; --- subscriptions: thread-watches as facts (consumed by north-listen.clj) ---
     ;; subject = the agent's self node @<handle> (its self-reference channel is implicit; this
     ;; ADDS threads beyond it). multi-valued: an agent watches many threads.
     "watch"                                 ; <uuid> <thread-ref>  — subscribe to a thread
@@ -329,7 +329,7 @@
         (do (println (str "triggering compact for " h " roles=" (pr-str (map #(subs % 6) roles))))
             (put! port ae "needs_rotation" "true")   ; single (flag; LWW intent)
             (let [r (clojure.java.shell/sh "bash"
-                      (str (System/getenv "HOME") "/code/tern/sdk/src/compact.sh") h)]
+                      (str (System/getenv "HOME") "/code/north/sdk/src/compact.sh") h)]
               (println (:out r))
               (when (seq (:err r)) (binding [*out* *err*] (println (:err r))))
               (System/exit (:exit r))))))

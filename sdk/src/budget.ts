@@ -1,15 +1,15 @@
 // Cost budget — the declarative spend cap (replaces the concurrency cap). Set it
-// once: `tern tell @swarm budget_total 25` (a USD ceiling). Spend is a DERIVED
+// once: `north tell @swarm budget_total 25` (a USD ceiling). Spend is a DERIVED
 // SUM, never a mutated counter: remaining = budget_total − Σ(@run:* cost_usd),
 // folded live from the immutable per-run `@run:<sid> cost_usd` facts presence-cli
-// already writes (the same aggregate cli/tern-reconcile.clj reports). No
+// already writes (the same aggregate cli/north-reconcile.clj reports). No
 // `budget_spent` cell, no `:bump` op, no cross-file sync — full who-spent-what
 // provenance for free. Executors stop dispatching once the sum crosses the cap.
 // No budget_total set => unbounded (opt-in).
 import { createConnection } from "node:net";
 
-const PORT = Number(process.env.TERN_PORT ?? 7977);
-const SUBJECT = process.env.TERN_BUDGET ?? "@swarm";
+const PORT = Number(process.env.NORTH_PORT ?? 7977);
+const SUBJECT = process.env.NORTH_BUDGET ?? "@swarm";
 
 // One line-delimited EDN request/response against the coordinator socket.
 function coordOp(op: string): Promise<string> {

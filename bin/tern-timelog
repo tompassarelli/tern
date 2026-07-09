@@ -1,10 +1,1 @@
-#!/usr/bin/env bash
-# tern-timelog — invoice-ready worklog CSV from tern billing facts.
-# Reuses the fram fold engine (same view tern itself reads). CSV -> stdout,
-# grouped-by-invoice totals -> stderr, so `tern-timelog msa > invoice.csv` is clean.
-#   tern-timelog [owner] [invoice_id]
-set -euo pipefail
-TERN="$(cd "$(dirname "$0")/.." && pwd)"
-FRAM="${FRAM_HOME:-$HOME/code/fram}"
-export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/tern/facts.log}"
-exec bb -cp "$TERN/out:$FRAM/out" "$TERN/cli/tern-timelog.clj" "$@"
+north-timelog

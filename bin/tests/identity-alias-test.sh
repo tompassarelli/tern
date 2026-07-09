@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regression test for the presence-identity ALIASING bug (thread 019f2496-23f2,
-# 2026-07-03): a parent session's TERN_AGENT_ID env pin leaked through the process
+# 2026-07-03): a parent session's NORTH_AGENT_ID env pin leaked through the process
 # environment into its Claude subagents (SubagentSessionStart inherits the parent
 # env but carries the subagent's OWN session_id). Both spawn + tooluse preferred the
 # env pin over the per-session cache, so every subagent aliased the parent id — the
@@ -17,13 +17,13 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)"
-SPAWN="$BIN/tern-on-spawn"
-TOOLUSE="$BIN/tern-on-tooluse"
+SPAWN="$BIN/north-on-spawn"
+TOOLUSE="$BIN/north-on-tooluse"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-export XDG="$TMP/xdg"; mkdir -p "$XDG/tern-agent-ids"
-CACHE="$XDG/tern-agent-ids"
+export XDG="$TMP/xdg"; mkdir -p "$XDG/north-agent-ids"
+CACHE="$XDG/north-agent-ids"
 export BB_REG_LOG="$TMP/registered.log"; : > "$BB_REG_LOG"
 
 # --- bb shim: record the id passed to `presence-cli register`, swallow inbox-peek ---
@@ -57,11 +57,11 @@ run_hook() {
   : > "$BB_REG_LOG"
   if [ -n "$pin" ]; then
     json "$sid" "$REPO_DIR" "$evt" | env -i HOME="$HOME" PATH="$SHIM:$PATH" \
-      XDG_RUNTIME_DIR="$XDG" BB_REG_LOG="$BB_REG_LOG" TERN_PORT=1 \
-      TERN_AGENT_ID="$pin" bash "$hook" >/dev/null 2>&1
+      XDG_RUNTIME_DIR="$XDG" BB_REG_LOG="$BB_REG_LOG" NORTH_PORT=1 \
+      NORTH_AGENT_ID="$pin" bash "$hook" >/dev/null 2>&1
   else
     json "$sid" "$REPO_DIR" "$evt" | env -i HOME="$HOME" PATH="$SHIM:$PATH" \
-      XDG_RUNTIME_DIR="$XDG" BB_REG_LOG="$BB_REG_LOG" TERN_PORT=1 \
+      XDG_RUNTIME_DIR="$XDG" BB_REG_LOG="$BB_REG_LOG" NORTH_PORT=1 \
       bash "$hook" >/dev/null 2>&1
   fi
   tail -n1 "$BB_REG_LOG" 2>/dev/null || true
@@ -81,7 +81,7 @@ eq "parent cache file == its id"        "cc-fram-d5523b3b" "$(cache_of "$PARENT"
 
 echo "== 2. subagent SubagentSessionStart w/ INHERITED env pin gets its OWN id =="
 # parent already owns cc-fram-d5523b3b (case 1 seeded the cache); the subagent
-# inherits TERN_AGENT_ID=cc-fram-d5523b3b but has its own session_id.
+# inherits NORTH_AGENT_ID=cc-fram-d5523b3b but has its own session_id.
 reg="$(run_hook "$SPAWN" "$SUB" SubagentSessionStart "cc-fram-d5523b3b")"
 ne "subagent does NOT alias parent id"  "cc-fram-d5523b3b" "$reg"
 eq "subagent gets own derived id"       "cc-fram-aaaa1111" "$reg"

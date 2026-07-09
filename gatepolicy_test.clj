@@ -1,7 +1,7 @@
 ;; gatepolicy_test.clj — the gateway's security decisions, now REAL-typed Beagle
 ;; (Tenant/Bucket records, Map String Tenant), proven behavior-identical to the
 ;; untyped shell they were lifted from.  bb -cp out:$FRAM/out gatepolicy_test.clj
-(require '[tern.gatepolicy :as gp])
+(require '[north.gatepolicy :as gp])
 (def checks (atom []))
 (defn chk [n ok] (swap! checks conj [n ok]))
 (chk "sha256-hex matches known vector"

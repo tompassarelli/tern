@@ -7,7 +7,7 @@ export interface Fact {
 
 export function getThreadFacts(threadId: string): Fact[] {
   try {
-    const out = execSync(`tern json show ${threadId}`, {
+    const out = execSync(`north json show ${threadId}`, {
       encoding: "utf-8",
       timeout: 5000,
     });
@@ -20,7 +20,7 @@ export function getThreadFacts(threadId: string): Fact[] {
 export function getChildren(parentId: string): string[] {
   try {
     const out = execSync(
-      `tern json query '{"find":"child","where":[["child","part_of","@${parentId}"]]}'`,
+      `north json query '{"find":"child","where":[["child","part_of","@${parentId}"]]}'`,
       { encoding: "utf-8", timeout: 5000 }
     );
     const parsed = JSON.parse(out.trim());

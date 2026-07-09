@@ -4,17 +4,17 @@
 ;; signals in preference order:
 ;;   (a) AGENT presence lease — @lease:session:<handle> exp still in the future
 ;;       (the SAME renewable-lease rule concern-cli/coord.clj `online?` uses).
-;;   (b) RECENCY fallback — `updated_at` within TERN_DRIVER_STALE_DAYS (default 14).
+;;   (b) RECENCY fallback — `updated_at` within NORTH_DRIVER_STALE_DAYS (default 14).
 ;; Asserts: fresh lease => live; expired lease falls through to recency; a human
 ;; (no lease) rides recency; stale on both axes => parked; no driver => not-active;
 ;; a garbage updated_at never crashes.
 ;;   bb -cp out:../fram/out board_active_test.clj      (run from the repo root)
-(require '[fram.kernel :as k] '[tern.main :as m] '[fram.rt :as rt])
+(require '[fram.kernel :as k] '[north.main :as m] '[fram.rt :as rt])
 
 ;; A fixed "now" pinned to a real ISO datetime so the runtime date helpers agree.
 (def now-str "2026-07-09T12:00:00")
 (def now-secs (rt/iso-to-seconds now-str))
-(def window (* 14 86400))                 ; TERN_DRIVER_STALE_DAYS default
+(def window (* 14 86400))                 ; NORTH_DRIVER_STALE_DAYS default
 
 (defn lease-val [exp-secs] (str "sess|" (* exp-secs 1000) "|0"))
 (def fresh-exp   (+ now-secs 1800))       ; +30m -> live lease

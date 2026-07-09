@@ -1,5 +1,5 @@
-;; reap_test.clj — the reactor's liveness-reap verdict (tern.reap, split from
-;; tern-reactor.clj so it is testable off in-memory facts). The bug this guards:
+;; reap_test.clj — the reactor's liveness-reap verdict (north.reap, split from
+;; north-reactor.clj so it is testable off in-memory facts). The bug this guards:
 ;; recordRun (sdk/src/spawn.ts) lands a lane's `outcome` on @run-<id>-<ts> (with an
 ;; `agent <id>` fact), NOT on @agent:<id> — so the old sweep, checking the lane's OWN
 ;; outcome, read a clean-finishing lane as silent and reaped it (false positive on
@@ -11,7 +11,7 @@
 
 ;; Fixed "now" (epoch ms) so lease/spawned deltas are exact and clock-free.
 (def now   1000000000000)
-(def STALE tern.reap/LANE-STALE-MS)           ; 30min
+(def STALE north.reap/LANE-STALE-MS)           ; 30min
 (def lapsed-exp (- now (* 40 60 1000)))       ; lease expired 40min ago -> stale
 (def fresh-exp  (+ now (* 20 60 1000)))       ; lease valid 20min out    -> live
 (def recent-exp (- now (* 5  60 1000)))       ; lease expired  5min ago  -> too new
@@ -19,8 +19,8 @@
 (def new-spawn  (- now (* 2 60 1000)))        ; spawned 2min ago -> leaseless too new
 
 ;; reap-lane? [now lane-outcome resolved? lease-exp spawned-ms]
-(defn resolved? [h touts deaths] (tern.reap/lane-resolved? h touts deaths))
-(defn reap? [& args] (apply tern.reap/reap-lane? args))
+(defn resolved? [h touts deaths] (north.reap/lane-resolved? h touts deaths))
+(defn reap? [& args] (apply north.reap/reap-lane? args))
 
 (def cases
   [;; --- the false-positive gate: finished lane (outcome on @run) NEVER reaped -----

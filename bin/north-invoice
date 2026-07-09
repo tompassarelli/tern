@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# north-invoice — invoice state machine over billable north threads.
+#   north-invoice bill <invoice_id> [owner]   stamp uninvoiced work onto an invoice
+#   north-invoice paid <invoice_id>           mark an invoice paid
+#   north-invoice unbilled [owner]            list not-yet-invoiced billable work
+set -euo pipefail
+export NORTH_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+FRAM="${FRAM_HOME:-$HOME/code/fram}"
+export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
+exec bb -cp "$NORTH_HOME/out:$FRAM/out" "$NORTH_HOME/cli/north-invoice.clj" "$@"

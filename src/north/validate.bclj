@@ -1,6 +1,6 @@
 #lang beagle/clj
-(ns tern.validate
-  "Tern's integrity check: the engine's GENERIC structural rules (cycles,
+(ns north.validate
+  "North's integrity check: the engine's GENERIC structural rules (cycles,
   dangling refs — fram.kernel/violations-i) PLUS the WORK-semantics rules the
   engine no longer owns. The work rules were lifted out of the fram kernel to
   here: a depends_on edge to a withdrawn (abandoned) thread is suspect, and the
@@ -9,7 +9,7 @@
   refs, not lifecycle or person/role vocab.")
 
 (require fram.kernel :as k)
-(require tern.projections :as proj)
+(require north.projections :as proj)
 
 ;; WORK-semantics violations over the index (the rules lifted out of the kernel's
 ;; violations-i). Lifecycle-aware (terminal/withdrawn) + person/role vocab —
@@ -46,6 +46,6 @@
               (k/many-i idx te "proposed_by"))]
     v-pb))
 
-;; Full tern validate over one thread = engine-generic ++ tern-work.
+;; Full north validate over one thread = engine-generic ++ north-work.
 (defn violations-i [idx :- k/Index te :- String] :- (Vec String)
   (vec (concat (k/violations-i idx te) (work-violations-i idx te))))

@@ -2,7 +2,7 @@
 // is a FACT on @agent:<id> in the coordination log (design: thread 019f40f8).
 // Predicates (single-valued, declared via the schema-write gate): kind role model
 // vendor effort goal spawned_at display_name; repo stays multi (threads span repos).
-// Writes shell to the installed `tern tell` (the proven serialized OCC path) and
+// Writes shell to the installed `north tell` (the proven serialized OCC path) and
 // are NON-FATAL: a facts failure must never kill a spawn.
 import { execFileSync } from "node:child_process";
 
@@ -16,7 +16,7 @@ export interface AgentIdentity {
   goal?: string;
   // spawning coordinator handle. Persisted (not just held at ping time) so it survives
   // the spawning session: the reactor's died-unreported sweep reads it to ping on a
-  // silent hard-kill (sweep-lanes! in tern-reactor.clj), and `tern health` folds it to
+  // silent hard-kill (sweep-lanes! in north-reactor.clj), and `north health` folds it to
   // compute ping-loss (lanes that carried a coordinator but landed no COMPLETE/DEATH).
   coordinator?: string;
 }
@@ -32,11 +32,11 @@ export function renderDisplayName(id: string, f: AgentIdentity): string {
 }
 
 function tell(subject: string, pred: string, value: string) {
-  execFileSync("tern", ["tell", subject, pred, value], { stdio: "ignore", timeout: 10_000 });
+  execFileSync("north", ["tell", subject, pred, value], { stdio: "ignore", timeout: 10_000 });
 }
 
 export function writeAgentFacts(agentId: string, f: AgentIdentity): void {
-  const subject = `agent:${agentId}`; // tern tell @-prefixes bare ids
+  const subject = `agent:${agentId}`; // north tell @-prefixes bare ids
   const facts: Array<[string, string | undefined]> = [
     ["kind", f.kind],
     ["role", f.role],

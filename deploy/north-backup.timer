@@ -1,0 +1,12 @@
+# systemd timer — run the per-tenant facts.log backup daily.
+#   sudo cp deploy/north-backup.timer /etc/systemd/system/
+#   sudo systemctl enable --now north-backup.timer
+[Unit]
+Description=Daily North per-tenant facts.log backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

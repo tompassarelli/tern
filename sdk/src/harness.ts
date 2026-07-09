@@ -1,11 +1,11 @@
 // The lean harness — our own agent runtime over the Claude Agent SDK. One place
-// that builds the query Options for every tern agent, so the things Claude
+// that builds the query Options for every north agent, so the things Claude
 // Code's CLI doesn't give us (native graph tools, agent-to-agent command, the
 // reasoning-effort knob, current model pins, our system prompt) are configured
 // here, consistently, for both dispatch.ts and spawn.ts.
 //
-// The two things that make a tern agent more than a generic worker:
-//   1. tern MCP — native fact-graph verbs (capture/tell/ready/next/...),
+// The two things that make a north agent more than a generic worker:
+//   1. north MCP — native fact-graph verbs (capture/tell/ready/next/...),
 //      so agents act on facts, not by Edit-ing text files.
 //   2. command_peer — emit a {:op :args} envelope over the fact feed; fram-1's
 //      reactor (Phase 1) dispatches it. An agent commands a PEER with no human
@@ -17,12 +17,12 @@ import { execFile, execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-// sdk/src/harness.ts -> repo root (~/code/tern).
+// sdk/src/harness.ts -> repo root (~/code/north).
 const REPO = resolve(import.meta.dir, "../..");
-const ENGINE = `${REPO}/bin/tern`;
-const MCP = `${REPO}/bin/tern-mcp`;
+const ENGINE = `${REPO}/bin/north`;
+const MCP = `${REPO}/bin/north-mcp`;
 const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
-const PORT = process.env.TERN_PORT ?? "7977";
+const PORT = process.env.NORTH_PORT ?? "7977";
 
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -54,12 +54,12 @@ function ednArgs(args: Record<string, unknown>): string {
 // the fram feed. Contract (fram-1, Phase 0): {:op :spawn|:dispatch|:tell|:acquire}.
 export function peerCommandServer(self: string) {
   return createSdkMcpServer({
-    name: "tern-peer",
+    name: "north-peer",
     version: "0.1.0",
     tools: [
       tool(
         "command_peer",
-        "Command a PEER agent over the tern fact feed — fram-1's reactor " +
+        "Command a PEER agent over the north fact feed — fram-1's reactor " +
           "dispatches it, no human relay. ops: spawn {prompt, model?} | " +
           "dispatch {thread} | tell {id, pred, value} | acquire {resource}.",
         {
@@ -89,18 +89,18 @@ export function peerCommandServer(self: string) {
   });
 }
 
-// The native fact-graph tools every agent gets (stdio MCP -> the tern engine).
+// The native fact-graph tools every agent gets (stdio MCP -> the north engine).
 const NATIVE_TOOLS = [
-  "mcp__tern__capture",
-  "mcp__tern__tell",
-  "mcp__tern__show",
-  "mcp__tern__ready",
-  "mcp__tern__next",
-  "mcp__tern__board",
-  "mcp__tern__plate",
-  "mcp__tern__dispatch",
-  "mcp__tern__spawn",
-  "mcp__tern-peer__command_peer",
+  "mcp__north__capture",
+  "mcp__north__tell",
+  "mcp__north__show",
+  "mcp__north__ready",
+  "mcp__north__next",
+  "mcp__north__board",
+  "mcp__north__plate",
+  "mcp__north__dispatch",
+  "mcp__north__spawn",
+  "mcp__north-peer__command_peer",
 ];
 
 export interface HarnessOpts {
@@ -114,8 +114,8 @@ export interface HarnessOpts {
   posture?: string;
 }
 
-// Auto-connect every SDK-spawned agent to tern coordination — the SDK twin of
-// the bin/tern-on-spawn SessionStart hook. Presence so it shows on the roster;
+// Auto-connect every SDK-spawned agent to north coordination — the SDK twin of
+// the bin/north-on-spawn SessionStart hook. Presence so it shows on the roster;
 // the concern protocol appended to the system prompt so it self-coordinates.
 function registerPresence(self: string): void {
   // fire-and-forget — coordination must never delay or break a spawn.
@@ -127,7 +127,7 @@ function registerPresence(self: string): void {
 // SDK-lane presence heartbeat (F2). registerPresence writes the lease ONCE at
 // spawn; the 30min TTL then lapses under any lane working longer — falsely
 // `lapsed` while alive, which the concern-decay machinery reads as STALE. Fix:
-// renew the lease on ACTIVITY. This is the SDK twin of bin/tern-on-tooluse (the
+// renew the lease on ACTIVITY. This is the SDK twin of bin/north-on-tooluse (the
 // Claude Code PostToolUse hook) — renewal MEANS "this agent ran a tool just now"
 // (IS-WORKING), so a lapsed lease stays a real death signal. NOT a setInterval:
 // a timer on a hung-but-alive process would renew forever and defeat the
@@ -144,7 +144,7 @@ function renewPresence(self: string): void {
   lastRenew.set(self, now); // stamp before dispatch so a burst of tool calls spawns one bb
   // Best-effort + timeout-bounded: any failure is swallowed, never breaks the
   // tool call. On failure, roll the stamp back (only if no newer renew landed)
-  // so the next tool call retries — same retry semantics as tern-on-tooluse.
+  // so the next tool call retries — same retry semantics as north-on-tooluse.
   execFile("bb", [`${REPO}/cli/presence-cli.clj`, PORT, "renew", self], { timeout: 5000 }, (err) => {
     if (err && lastRenew.get(self) === now) lastRenew.set(self, prev);
   });
@@ -152,7 +152,7 @@ function renewPresence(self: string): void {
 function withCoordination(self: string, base: string): string {
   const repo = process.cwd().split("/").filter(Boolean).pop() ?? "repo";
   const proto = [
-    ``, `## tern coordination`,
+    ``, `## north coordination`,
     `You are agent "${self}" in "${repo}". Other agents may work here concurrently.`,
     `Coordinate through CONCERNS, not locks — work coexists; declaring never blocks. Before`,
     `editing code for a feature, declare it so others can see + shape around your work:`,
@@ -174,7 +174,7 @@ function esoAppendix(): string {
   return "\n\n" +
     "DENSE HANDOFF — when a final report contains a uniform array of ≥10 similar records " +
     "(grep hits, findings, file lists), emit it in ESO format instead of JSON or markdown table.\n" +
-    "Mini-syntax (full spec: ~/code/tern/sdk/src/vendor/eso/SPEC.md):\n" +
+    "Mini-syntax (full spec: ~/code/north/sdk/src/vendor/eso/SPEC.md):\n" +
     "  !eso/1              ← required header\n" +
     "  name=value          ← scalar field\n" +
     "  items[N]{a,b,c}     ← N records, schema declared once; N is a checksum\n" +
@@ -287,8 +287,8 @@ export function harnessOptions(o: HarnessOpts): Options {
   registerPresence(o.self);
   return {
     mcpServers: {
-      tern: { type: "stdio", command: MCP, args: [], env: { ...process.env, TERN_BIN: ENGINE } },
-      "tern-peer": peerCommandServer(o.self),
+      north: { type: "stdio", command: MCP, args: [], env: { ...process.env, NORTH_BIN: ENGINE } },
+      "north-peer": peerCommandServer(o.self),
     },
     allowedTools: [...(o.extraTools ?? []), ...NATIVE_TOOLS],
     model: resolveModel(o.model),
@@ -305,8 +305,8 @@ export function harnessOptions(o: HarnessOpts): Options {
 }
 
 export const DEFAULT_SYSTEM_PROMPT =
-  "You are a tern worker agent on a shared fact graph. Prefer the native " +
-  "tern tools over editing text: capture/tell to record work, ready/next to " +
+  "You are a north worker agent on a shared fact graph. Prefer the native " +
+  "north tools over editing text: capture/tell to record work, ready/next to " +
   "find it, dispatch/spawn for in-process subagents, and command_peer to hand " +
   "work to another agent over the fact feed (decentralized — no human relay). " +
   "Acquire before you edit shared code. Report concisely.";

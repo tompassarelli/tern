@@ -1,10 +1,10 @@
-;; lifecycle_test.clj — Stage 4 gate: the tern lifecycle derivations
+;; lifecycle_test.clj — Stage 4 gate: the north lifecycle derivations
 ;; (terminal / work-thread / blocked / ready) expressed AS Datalog rules over the
 ;; reified store must produce the SAME results as the hand-coded flat projections.
 ;; Derivation replaces bespoke code — the store-layer thesis, checked on the live corpus.
 ;;   FRAM_LOG=/path bb -cp out lifecycle_test.clj
 (require '[fram.store :as c] '[fram.schema :as s] '[fram.datalog :as d]
-         '[fram.kernel :as k] '[tern.projections :as proj] '[fram.fold :as fold]
+         '[fram.kernel :as k] '[north.projections :as proj] '[fram.fold :as fold]
          '[fram.rt] '[clojure.string :as str] '[clojure.set :as set] '[clojure.java.io :as io])
 
 (def log (System/getenv "FRAM_LOG"))
@@ -44,7 +44,7 @@
   (let [subj (ent-for! (:l cl)) p (:p cl) r (:r cl)]
     (if (ref? r) (s/link! ctx subj p (ent-for! r) tx) (s/assert! ctx subj p r tx))))
 
-;; --- the tern lifecycle, AS RULES (lifecycle DERIVED from the explicit
+;; --- the north lifecycle, AS RULES (lifecycle DERIVED from the explicit
 ;;     committed/outcome/abandoned facts — never a stored heuristic) -----------
 (def out-p (c/value-id ctx "outcome"))
 (def ab-p  (c/value-id ctx "abandoned"))

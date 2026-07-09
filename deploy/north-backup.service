@@ -1,0 +1,23 @@
+# systemd oneshot — snapshot every tenant's facts.log (run on a schedule by
+# north-backup.timer; this unit does the work).
+#   sudo cp deploy/north-backup.service /etc/systemd/system/
+#   sudo cp deploy/north-backup.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now north-backup.timer
+[Unit]
+Description=North per-tenant facts.log backup
+
+[Service]
+Type=oneshot
+User=north
+Group=north
+Environment=NORTH_TENANT_ROOT=/var/lib/north/tenants
+Environment=NORTH_BACKUP_DIR=/var/lib/north/backups
+ExecStart=/opt/north/deploy/backup.sh
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/north

@@ -4,7 +4,7 @@
 historical design record, not a pending plan. The live corpus migrated
 (173 → 406 threads, validate clean), `los` was **deleted** (not "rewritten in
 lockstep" as the staging below anticipated — its `time` capability was ported to
-`tern time` and the rest retired in favor of tern). The current operating
+`north time` and the rest retired in favor of north). The current operating
 manual is `docs/operating-manual.md`. Rollback: git tag `pre-fact-native` (both repos).
 Stage/Q sections below are kept verbatim as the original plan; where they say "los
 in lockstep" or "nothing started yet," read them as the pre-execution plan.*
@@ -74,7 +74,7 @@ Structure can't tell whether `personal` is a ref or the literal "personal" — s
 ### D5 — `tags` → `relates_to`
 Relatedness is an **edge to a real thread**, validated (no dangling concept). A
 former tag *becomes a thread*; grouping is the graph query "what `relates_to`
-@X", not a string match. (`tag:tern` → the tern umbrella thread.)
+@X", not a string match. (`tag:north` → the north umbrella thread.)
 
 ### D6 — `state` enum dissolves into orthogonal axes (derived, not stored)
 The flat enum conflated independent axes — some that *cycle*, some that *ratchet*.
@@ -111,12 +111,12 @@ Facts are not one temporal kind. Three classes; treat each differently:
   routes to a **`needs-review`** queue; the human re-decides.
 - **Promotion prompts** (e.g. draft grew real structure → "commit it?"): not a
   staleness *computation* (can't derive intent) — a **change-trigger** off the
-  event stream (`tern watch`), surfaced for a human call.
+  event stream (`north watch`), surfaced for a human call.
 - `valid_until` is the **time-based special case** of a judgment (input = clock).
 
 ### D9 — Capture is prose/dictation-first, fact-first
 You dictate text dumps; you don't hand-author fields. So capture = "dump → store
-as body + extract facts," not "title → emit a record." Reshape `tern capture`
+as body + extract facts," not "title → emit a record." Reshape `north capture`
 around the fact-native write path (the env-provenance work folds in). The current
 title-first/YAML-emitting capture is replaced.
 
@@ -133,7 +133,7 @@ title-first/YAML-emitting capture is replaced.
 
 ## Blast radius (three systems + two corpora)
 
-- **tern engine** — `kernel` (drop state enum + tag; add relates_to + structural
+- **north engine** — `kernel` (drop state enum + tag; add relates_to + structural
   kind + lifecycle predicates + derived conditions), `import`/`export` (generic
   triples, delete field machinery), `audit` (tag-drift/long-tail-tags die),
   `main`, `rt` (id format), `coord`.
@@ -154,8 +154,8 @@ independent stages.
 
 ## Plan (staged, each gated by round-trip + validate, git-backed)
 
-**Stage 0 — Safety.** Tag `pre-fact-native` in tern + tern. Confirm
-baseline round-trip + `tern validate` + `los validate` all green.
+**Stage 0 — Safety.** Tag `pre-fact-native` in north + north. Confirm
+baseline round-trip + `north validate` + `los validate` all green.
 
 **Stage 1 — New engine, proven on the 9 bundled threads (zero live impact).**
 Generic triple import/export; `@`-refs; structural kinds (`title`=thread);
@@ -173,7 +173,7 @@ prefix-strip → `@`-refs, YAML→triples. **Dry-run on a copy**; diff; validate
 **Stage 3 — `los` in lockstep.** Triple parser, schema updates, validation +
 display for the new model. Test against the migrated copy.
 
-**Stage 4 — Cutover.** Apply the migration to the live corpus; `tern validate`
+**Stage 4 — Cutover.** Apply the migration to the live corpus; `north validate`
 + `los validate` green; commit. Rollback = `pre-fact-native` tag.
 
 **Stage 5 — Capture reshape** (D9) — prose/dictation-first, fact-first.

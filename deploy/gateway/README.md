@@ -1,7 +1,7 @@
-# Tern auth gateway
+# North auth gateway
 
 The network-safe edge in front of the (loopback-only, unauthenticated) coordinator.
-It is the single component that takes Tern from *single-machine* to *remote
+It is the single component that takes North from *single-machine* to *remote
 and multi-tenant* — without changing the fact model, the write-safety, or the
 "export and walk away" guarantee.
 
@@ -84,7 +84,7 @@ Built and tested here:
       **never logs the object value** `:r`. Unauthorized attempts are logged too.
 - [x] **Rate limiting + body-size cap** — per-tenant token bucket; bounded read → `413`.
 - [x] **TLS** — terminate in a reverse proxy; see `../Caddyfile.example`.
-- [x] **Supervision** — `../tern-coordinator@.service` + `../tern-gateway.service`.
+- [x] **Supervision** — `../north-coordinator@.service` + `../north-gateway.service`.
 - [x] **Cross-host coordinators** — Fram `FRAM_BIND=0.0.0.0` + the registry's
       `:coordinator-host`; exercised by `./crosshost_test.sh` in CI.
 

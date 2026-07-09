@@ -1,5 +1,5 @@
 #lang beagle/clj
-(ns tern.clockify
+(ns north.clockify
   "Clockify integration — the BILLING projection of fact-native sessions.
    The canonical time store is the fact graph (fram.clock sessions); this
    module only pushes closed billable sessions outward to Clockify on demand and

@@ -5,7 +5,7 @@
 ;;   (3) `resolve-ref` maps a @handle (or @id) ref to the canonical @id, latest
 ;;       created_at winning ties — the boundary fram never sees a handle through.
 ;;   bb -cp out:../fram/out capture_test.clj      (run from the repo root)
-(require '[fram.kernel :as k] '[tern.main :as m] '[clojure.string :as str])
+(require '[fram.kernel :as k] '[north.main :as m] '[clojure.string :as str])
 
 ;; --- (1) uuidv7: a real version-7 uuid, not a date --------------------------
 (def uuid-re #"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")

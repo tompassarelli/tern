@@ -2,7 +2,7 @@
 # ensure-private-docs — make docs/private/ a gitignored sink for internal agent
 # notes in THIS repo. Idempotent; safe to run on every session start.
 #
-# Convention (tern thread 019f1194-d4b7): internal notes / status / scratch /
+# Convention (north thread 019f1194-d4b7): internal notes / status / scratch /
 # handoffs go in docs/private/ (gitignored), NEVER in public docs/. This guarantees
 # the ignore rule exists BEFORE anything is written there, so a stray `git add` of an
 # internal note can't leak it to a public repo.

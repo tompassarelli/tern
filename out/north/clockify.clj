@@ -1,4 +1,4 @@
-(ns tern.clockify
+(ns north.clockify
   (:require [clojure.string :as str]
             [fram.rt :as rt]
             [fram.json :as json]))

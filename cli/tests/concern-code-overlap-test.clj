@@ -10,7 +10,7 @@
 ;;   - status appends a monotone `reached` maturity level (set-single! is gone, 4);
 ;;   - a repo with no code daemon DEGRADES to the path-string footprint (acceptance 7).
 ;; Daemon-side scope-correctness + rename-stability live in fram's
-;; tests/coord_concern_overlap_test.clj; this guards the tern CLI seam.
+;; tests/coord_concern_overlap_test.clj; this guards the north CLI seam.
 ;; SKIPs cleanly if fram's compiled out/ or .fram/code.log is absent.
 ;;   bb cli/tests/concern-code-overlap-test.clj
 ;; ============================================================================
@@ -19,7 +19,7 @@
 
 (def fram (str (System/getProperty "user.home") "/code/fram"))
 (def code-log (str fram "/.fram/code.log"))
-(def lode (str (System/getProperty "user.home") "/code/tern"))
+(def lode (str (System/getProperty "user.home") "/code/north"))
 (when-not (and (.exists (io/file (str fram "/out"))) (.exists (io/file code-log)))
   (println "SKIP — fram out/ or .fram/code.log absent (run fram build + an ingest first).")
   (System/exit 0))
@@ -75,7 +75,7 @@
 (println "hot node" node "->" (:count some-blast) "callers; using caller" caller)
 (check "warm daemon resolves a code node with callers" (and node caller (pos? (:count some-blast))))
 
-(def env {"TERN_CODE_PORT" (str cport)})
+(def env {"NORTH_CODE_PORT" (str cport)})
 (def outA (cli env "declare" "alice" "~/code/fram" "rework kernel ctor" node))
 (def cidA (second (re-find #"(concern-\d+-[a-f0-9]+)" outA)))
 (cli env "declare" "bob" "~/code/fram" "tweak a caller" caller)

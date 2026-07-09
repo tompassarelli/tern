@@ -1,6 +1,6 @@
-# Hosting Tern
+# Hosting North
 
-Tern runs three ways off **one architecture** — your laptop, a server you own,
+North runs three ways off **one architecture** — your laptop, a server you own,
 or a multi-tenant service you host for others. There is no fork in the design; the
 only thing that changes between modes is the **transport in front of the
 coordinator socket**. This doc covers all three and is honest about what's built,
@@ -13,7 +13,7 @@ threads/*.md ──import──▶ facts.log (append-only) ──fold──▶ i
                                                               │
                               coordinator daemon  ◀── clients query + assert
                               (sole writer, 127.0.0.1)        │
-                                                   consumer (Tern) derives
+                                                   consumer (North) derives
                                                    ready / blocked / leverage / clock
 ```
 
@@ -22,7 +22,7 @@ threads/*.md ──import──▶ facts.log (append-only) ──fold──▶ i
   in-memory graph and serves `query`/`assert`/`retract` over a **loopback** socket
   with optimistic concurrency and commit-time rule checks. It binds `127.0.0.1`
   and is **unauthenticated by design**.
-- **Tern** is the life domain on top (lifecycle projections, clock, billing).
+- **North** is the life domain on top (lifecycle projections, clock, billing).
 - **Runtime dependency is just [babashka](https://babashka.org)** — the compiled
   Clojure is committed in both repos (`out/`); Beagle is only needed to rebuild.
 
@@ -36,9 +36,9 @@ The default. One operator, one box, the coordinator on `127.0.0.1`.
 
 ```sh
 git clone https://github.com/tompassarelli/fram     ~/code/fram
-git clone https://github.com/tompassarelli/tern ~/code/tern
-~/code/tern/bin/tern up        # start the coordinator (idempotent)
-~/code/tern/bin/tern ready     # use it
+git clone https://github.com/tompassarelli/north ~/code/north
+~/code/north/bin/north up        # start the coordinator (idempotent)
+~/code/north/bin/north ready     # use it
 ```
 
 No build step (runs on the committed `out/`), no network exposure, no auth needed.
@@ -113,11 +113,11 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 
 - **Backups:** each tenant's `facts.log` is append-only plain text — back it up
   with `git`/snapshots/object storage. `import`/`export` round-trips are lossless.
-- **Supervision:** systemd template unit per tenant (`tern-coordinator@<id>`)
+- **Supervision:** systemd template unit per tenant (`north-coordinator@<id>`)
   + the gateway unit; both `Restart=on-failure`. Or one container per coordinator.
 - **Upgrades:** pull the repos (or a new image tag) and restart; the log format is
   stable and forward-only.
-- **Health:** gateway `GET /healthz`; coordinator liveness via `tern doctor` /
+- **Health:** gateway `GET /healthz`; coordinator liveness via `north doctor` /
   an `{:op :status}` RPC.
 
 ---
@@ -127,14 +127,14 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 | Capability | State |
 |---|---|
 | Fact log, fold, Datalog derivation, single-writer coordinator | **built** (Fram, tested) |
-| Lifecycle/clock/billing projections | **built** (Tern, tested) |
+| Lifecycle/clock/billing projections | **built** (North, tested) |
 | Runs on bare babashka, no build step | **built** (`out/` committed) |
 | Single-machine + SSH-tunnel remote | **built** |
 | Authenticated gateway (bearer → tenant → coordinator), per-tenant isolation | **built** (`deploy/gateway`, smoke-tested in CI) |
 | Token rotation/revocation, audit logging, rate limit + body cap | **built** (gateway; covered by the smoke test) |
 | Tenant provisioning + systemd/Docker/compose | **built** (`deploy/`) |
 | TLS termination | **built** example (`deploy/Caddyfile.example`) — delegated to a reverse proxy |
-| Per-tenant backups (snapshot + prune, timer) | **built** (`deploy/backup.sh` + `tern-backup.{service,timer}`) |
+| Per-tenant backups (snapshot + prune, timer) | **built** (`deploy/backup.sh` + `north-backup.{service,timer}`) |
 | Cross-host coordinators (`FRAM_BIND=0.0.0.0` + `:coordinator-host`) | **built** (Fram `FRAM_BIND`; gateway routing; `crosshost_test.sh` in CI) |
 | mTLS between gateway and coordinator (untrusted links) | **planned** |
 | Control plane (provisioning API, quotas, key mgmt beyond a file) | **planned** |
@@ -155,12 +155,12 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 None of this is a foundation rewrite — it's the product layer the
 [proposal](PROPOSAL.md) (Phases 4–5) already mapped.
 
-### The engine ↔ app seam (where Fram ends and Tern begins)
+### The engine ↔ app seam (where Fram ends and North begins)
 
 The two repos meet at exactly one interface — the coordinator's line-delimited EDN
 wire protocol. The durable contract-of-record lives in Fram at
 `docs/coordinator-bind-and-wire.md` (the seam, the protocol surface, the
-`FRAM_BIND` security invariant, and the topology). Tern consumes that protocol
+`FRAM_BIND` security invariant, and the topology). North consumes that protocol
 through the gateway and links Fram's library API for projections (pinned via
 [`FRAM_VERSION`](../FRAM_VERSION)); it never reaches past the protocol into engine
 internals.

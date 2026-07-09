@@ -4,10 +4,10 @@
 ;;   (A) shipped imperative: proj/transitive-dependents (manual loop+cycle-guard over k/Index)
 ;;   (B) Datalog: a recursive `reaches` rule over the reified store (the chartroom-proven closure)
 ;; Honest accounting (printed below): (B)'s RULE is tiny, but it cannot run without the
-;; reified-store loader + the hand-listed predicate schema — a cost tern does NOT pay today.
-;;   FRAM_LOG=~/.local/state/tern/facts.log bb -cp out leverage_probe.clj
+;; reified-store loader + the hand-listed predicate schema — a cost north does NOT pay today.
+;;   FRAM_LOG=~/.local/state/north/facts.log bb -cp out leverage_probe.clj
 (require '[fram.store :as c] '[fram.schema :as s] '[fram.datalog :as d]
-         '[fram.kernel :as k] '[tern.projections :as proj] '[fram.fold :as fold]
+         '[fram.kernel :as k] '[north.projections :as proj] '[fram.fold :as fold]
          '[fram.rt] '[clojure.string :as str] '[clojure.set :as set] '[clojure.java.io :as io])
 
 (def log (System/getenv "FRAM_LOG"))
@@ -22,7 +22,7 @@
 (def imp-closure (into {} (map (fn [te] [te (set (proj/transitive-dependents idx te))]) work-ids)))
 (def imp-score   (into {} (map (fn [te] [te (proj/leverage-score idx te)]) work-ids)))
 
-;; --- reified-store loader (the scaffolding (B) requires; tern pays NONE of this today) ---
+;; --- reified-store loader (the scaffolding (B) requires; north pays NONE of this today) ---
 (def single-preds #{"title" "owner" "lead" "driver" "assignee" "source" "part_of"
                     "do_on" "valid_until" "estimate_hours" "created_at" "updated_at"
                     "body" "created_by" "committed" "outcome" "abandoned"
@@ -75,6 +75,6 @@
 (println "  (A) imperative, shipped:  transitive-dependents (12) + leverage-score (4) = 16 lines, ZERO setup, runs on k/Index.")
 (println "  (B) Datalog reaches:      the rule itself = 4 lines (2 d/rule clauses).")
 (println "      BUT (B) cannot run without the reified store: ~17-line loader (single-preds/ref-preds")
-(println "      schema + def-predicate! loop + ent-for! memo + ref? + load loop) that tern pays NOWHERE today.")
+(println "      schema + def-predicate! loop + ent-for! memo + ref? + load loop) that north pays NOWHERE today.")
 (println "  => marginal (store already populated): 4 < 16, real win on the RECURSIVE case.")
 (println "  => single-derivation adoption (leverage alone): 4+17 = 21 > 16, NET LOSS + a rotting predicate schema.")

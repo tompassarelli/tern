@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; EXP-025 ARENA seed — fabricates a filmable demo run for the tern web arena.
+;; EXP-025 ARENA seed — fabricates a filmable demo run for the north web arena.
 ;;
 ;; Creates 5 shared tasks × 2 arms (control | graph) as board threads carrying
 ;; the fixed event contract (exp_id, arm, task_id, title, state, cost_usd,

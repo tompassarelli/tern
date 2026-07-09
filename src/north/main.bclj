@@ -1,28 +1,28 @@
 #lang beagle/clj
-(ns tern.main
-  "Tern life CLI: the lifecycle/projection verbs (ready, blocked, leverage,
+(ns north.main
+  "North life CLI: the lifecycle/projection verbs (ready, blocked, leverage,
   next, agenda, board, capture, clock, needs-review, audit, doctor, json). Runs on
   the Fram engine (fram.*); engine verbs (tell/set/import/...) are routed to
-  the fram CLI by the bin/tern wrapper."
+  the fram CLI by the bin/north wrapper."
   (:gen-class))
 
 (require fram.kernel :as k)
 (require fram.fold :as fold)
 (require fram.import :as imp)
 (require fram.export :as exp)
-(require tern.projections :as proj)
-(require tern.validate :as val)
-(require tern.staleness :as stale)
-(require tern.clock :as clk)
-(require tern.audit :as audit)
-(require tern.clockify :as cf)
+(require north.projections :as proj)
+(require north.validate :as val)
+(require north.staleness :as stale)
+(require north.clock :as clk)
+(require north.audit :as audit)
+(require north.clockify :as cf)
 (require clojure.string :as str)
 (require fram.rt)
 (import java.util.Random)   ; non-java.lang classes need an explicit import
 (import java.util.UUID)
 
 (declare-extern fram.rt/read-log [String -> (Vec fold/FactOp)])
-;; NOTE: NO write-log extern. Tern is a CLIENT — it mutates state ONLY through
+;; NOTE: NO write-log extern. North is a CLIENT — it mutates state ONLY through
 ;; the coordinator (tell-retry -> coord-assert/retract). The removed `write-log`
 ;; was a direct log-file bypass; capture reached for it and stranded data in files
 ;; (the 2026-06-23 divergence bug). Not declaring it makes the bypass impossible.
@@ -51,10 +51,10 @@
 (declare-extern fram.rt/coord-status [Int -> String])
 (declare-extern fram.rt/coord-live-facts [Int String -> (Vec k/Fact)])
 
-;; --- thread id: tern-owned UUIDv7 minter --------------------------------
+;; --- thread id: north-owned UUIDv7 minter --------------------------------
 ;; A UUIDv7 packs a 48-bit ms timestamp in the high bits, so ids are both
 ;; collision-proof and k-sortable (lexicographic order ~ chronological). This is
-;; tern-owned ON PURPOSE: fram.rt/now-id (the @timestamp scheme) has other
+;; north-owned ON PURPOSE: fram.rt/now-id (the @timestamp scheme) has other
 ;; callers and stays untouched. created_at — not the id's internal bits — is the
 ;; app's ordering/display key; the id carries only identity.
 (defn uuidv7 [] :- String
@@ -110,7 +110,7 @@
 
 ;; --- entity KIND: the census classifier ------------------------------------
 ;; Every subject rolls up to one census bucket. Precedence: an explicit `kind`
-;; fact (concern-cli/session writers stamp it; tern capture now stamps
+;; fact (concern-cli/session writers stamp it; north capture now stamps
 ;; kind=thread) WINS; else a `title` means thread; else a subject-prefix
 ;; heuristic; else the schema-as-facts predicate check; else other. The heuristic
 ;; is a FALLBACK for the un-kinded legacy bulk — new entities self-identify, so it
@@ -239,9 +239,9 @@
   ;; exactly the "stray driver" pollution the-model warns about.
   (let [c (add-fact [] te "title" title)
         ;; KIND AT CAPTURE (coordination-v2): every new thread self-identifies as
-        ;; kind=thread in the SAME coordinator write batch — so `tern schema` and any
+        ;; kind=thread in the SAME coordinator write batch — so `north schema` and any
         ;; world-separation view can group by kind without a subject-prefix guess.
-        ;; single-valued (bin/tern FRAM_SINGLE_VALUED); mirrors concern-cli, which
+        ;; single-valued (bin/north FRAM_SINGLE_VALUED); mirrors concern-cli, which
         ;; already stamps kind=concern. NO backfill of old subjects (reactor/migration).
         c (add-fact c te "kind" "thread")
         ;; the-model §7: `personal` is the IMPLICIT owner default — store `owner`
@@ -259,17 +259,17 @@
     c))
 
 (defn cmd-capture [threads-dir :- String log :- String title :- String owner :- String] :- Nil
-  (let [source (fram.rt/getenv-or "TERN_SOURCE" "self")
-        author (fram.rt/getenv-or "TERN_AUTHOR" "you")
-        lead (fram.rt/getenv-or "TERN_LEAD" "")
-        proposed (fram.rt/getenv-or "TERN_PROPOSED_BY" "")]
+  (let [source (fram.rt/getenv-or "NORTH_SOURCE" "self")
+        author (fram.rt/getenv-or "NORTH_AUTHOR" "you")
+        lead (fram.rt/getenv-or "NORTH_LEAD" "")
+        proposed (fram.rt/getenv-or "NORTH_PROPOSED_BY" "")]
   (cond
     [(or (str/blank? title) (ctrl? title))
      (println "usage: capture <title> [owner]   (title must be a non-empty single line)")]
     [(ctrl? owner)
      (println "capture: owner must be a single line")]
     [(or (ctrl? source) (ctrl? author) (ctrl? lead) (ctrl? proposed))
-     (println "capture: TERN_SOURCE/AUTHOR/LEAD/PROPOSED_BY must each be a single line")]
+     (println "capture: NORTH_SOURCE/AUTHOR/LEAD/PROPOSED_BY must each be a single line")]
     [:else
      (do
        (fram.rt/ensure-dir threads-dir)
@@ -289,7 +289,7 @@
          ;; UUIDv7 is collision-proof, so capture no longer reserves a file-lock id
          ;; (the old now-id/reserve-id dance guarded same-second timestamp clashes).
          (if (< (fram.rt/coord-version port) 0)
-           (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.")
+           (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `north up`.")
            (let [facts (capture-facts te title owner source author lead proposed created-at today)
                  results (mapv (fn [c :- k/Fact] :- String
                                  (tell-retry port "assert" (:l c) (:p c) (:r c) 5))
@@ -300,13 +300,13 @@
                  (fram.rt/spit-file path (exp/thread-md (:facts (fold/fold (fram.rt/read-log log))) te))
                  (println (str "captured -> " te "  " title "  [owner: " owner "]\n"
                                "  file:      " path "\n"
-                               "  committed: " oks " facts via coordinator. Next: tern tell " id " <pred> <value>")))
+                               "  committed: " oks " facts via coordinator. Next: north tell " id " <pred> <value>")))
                (println (str "capture PARTIAL: only " oks "/" (count facts)
                              " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files.")))))))])))
 
 ;; Resolve a thread ref (@id OR @handle) to its canonical @id and print it. The
-;; bin/tern wrapper calls this before routing tell/untell to fram, so a
-;; handle ref (`tern tell @perf ...`) lands on the right thread — fram itself
+;; bin/north wrapper calls this before routing tell/untell to fram, so a
+;; handle ref (`north tell @perf ...`) lands on the right thread — fram itself
 ;; is handle-blind and only ever sees the canonical id.
 ;; FAIL-CLOSED: a ref that LOOKS like an id (hex/date chars + dashes only) but
 ;; resolved to nothing prints "ERROR ..." — the wrapper aborts the write instead
@@ -328,7 +328,7 @@
              (nil? (k/one-i idx (str "@" (short-id ref)) "title")))
       (println (str "ERROR unresolved id-like ref " ref
                     " — not a thread id, unique prefix, or handle"
-                    " (ambiguous/truncated? `tern show " (short-id ref) "` lists candidates)"))
+                    " (ambiguous/truncated? `north show " (short-id ref) "` lists candidates)"))
       (println r))))
 
 ;; Entity-drift audit: repo path-form collisions (tags retired with relates_to).
@@ -340,9 +340,9 @@
       (println (str "  " (:norm g) ": " (str/join ", " (:forms g)))))))
 
 ;; Integrity check = engine-generic structural rules (cycles, dangling refs) ++
-;; tern's WORK rules (abandoned deps, person/role refs) — tern.validate.
+;; north's WORK rules (abandoned deps, person/role refs) — north.validate.
 ;; The fram CLI `validate` only runs the generic half; this is the full check, so
-;; bin/tern routes `validate` here (and the MCP validate tool through it).
+;; bin/north routes `validate` here (and the MCP validate tool through it).
 (defn cmd-validate [log :- String] :- Nil
   (let [idx (live-idx log)
         problems (reduce
@@ -376,7 +376,7 @@
     (doseq [te shown]
       (println (str "  " (short-id te) "  " (trunc (title-of idx te) 56))))
     (when (and (not all) (> (count rs) (count shown)))
-      (println (str "  … +" (- (count rs) (count shown)) " more · tern ready --all")))))
+      (println (str "  … +" (- (count rs) (count shown)) " more · north ready --all")))))
 
 (defn cmd-blocked [log :- String] :- Nil
   (let [idx (live-idx log)
@@ -473,7 +473,7 @@
 ;;       honest liveness signal carried in the warm triple view: the day the thread
 ;;       was last mutated. (The driver-fact TX time would be crisper but lives in
 ;;       fold provenance the board's warm read deliberately doesn't carry.) Fresh
-;;       iff updated within TERN_DRIVER_STALE_DAYS (default 14) — a human works a
+;;       iff updated within NORTH_DRIVER_STALE_DAYS (default 14) — a human works a
 ;;       thread across days/weeks, so the window is loose vs the lease's minutes.
 ;;       This fallback also rescues an agent whose lease lapsed but whose thread
 ;;       still saw activity inside the window.
@@ -521,9 +521,9 @@
                 (and (> us 0) (< (- now-secs us) window-secs))))))))))
 
 (defn- driver-stale-window-secs [] :- Int
-  ;; TERN_DRIVER_STALE_DAYS (default 14) -> seconds. Mirrors the env-config pattern
+  ;; NORTH_DRIVER_STALE_DAYS (default 14) -> seconds. Mirrors the env-config pattern
   ;; projections uses for the terminal/withdrawn vocab.
-  (let [d (fram.rt/parse-int (fram.rt/getenv-or "TERN_DRIVER_STALE_DAYS" "14"))]
+  (let [d (fram.rt/parse-int (fram.rt/getenv-or "NORTH_DRIVER_STALE_DAYS" "14"))]
     (* (if (> d 0) d 14) 86400)))
 
 ;; board (kanban prior; `plate` kept as a hidden alias — vocabulary pass, thread 019f2032)
@@ -565,22 +565,22 @@
         rranked (vec (take 15 (sort-by (fn [it :- LevItem] :- Int (- 0 (:score it))) ritems)))]
     (println (str "BOARD — " (count threads) " open threads · " (count active) " active · "
                   (count readyl) " ready · " (count blockedl) " blocked · "
-                  nconcern " concerns   (tern board --all for the full kanban)"))
+                  nconcern " concerns   (north board --all for the full kanban)"))
     (when (not (empty? active))
       (println (str "\n" (proj/condition-emoji idx "active") " ACTIVE — who's on what (" (count active) ")"))
       (doseq [te ashow]
         (println (str "  " (let [dl (driver-label idx te)] (if (str/blank? dl) "?" dl))
                       "  " (short-id te) "  " (trunc (title-of idx te) 44))))
       (when (> (count active) (count ashow))
-        (println (str "  … +" (- (count active) (count ashow)) " more · tern board --all"))))
+        (println (str "  … +" (- (count active) (count ashow)) " more · north board --all"))))
     (when (> nparked 0)
-      (println (str "\n" nparked " parked driver(s) — stale, not shown (tern board --all)")))
+      (println (str "\n" nparked " parked driver(s) — stale, not shown (north board --all)")))
     (println (str "\n" (proj/condition-emoji idx "ready") " READY — top " (count rranked)
                   " of " (count readyl) " by leverage"))
     (doseq [it rranked]
       (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))
     (when (> (count readyl) (count rranked))
-      (println (str "  … +" (- (count readyl) (count rranked)) " more · tern board --all")))))
+      (println (str "  … +" (- (count readyl) (count rranked)) " more · north board --all")))))
 
 (defn cmd-board [log :- String all :- Bool] :- Nil
   (let [idx (live-idx log)
@@ -699,7 +699,7 @@
       [:else
        (let [port (fram.rt/coord-port)]
          (if (< (fram.rt/coord-version port) 0)
-           (println "no coordinator on 127.0.0.1:7977 — run `tern up`")
+           (println "no coordinator on 127.0.0.1:7977 — run `north up`")
            (let [sid (fresh-sid idx (fram.rt/now-id))
                  ssub (str "@" sid)
                  now (fram.rt/now-iso)
@@ -716,7 +716,7 @@
     (cond
       [(nil? run) (println "not clocked in")]
       [(< (fram.rt/coord-version port) 0)
-       (println "no coordinator on 127.0.0.1:7977 — run `tern up` (still clocked in)")]
+       (println "no coordinator on 127.0.0.1:7977 — run `north up` (still clocked in)")]
       [:else
        (let [now (fram.rt/now-iso)
              st (k/one-i idx run "start_time")
@@ -763,7 +763,7 @@
     (cond
       [(empty? sessions) (println "nothing to sync — no closed, unsynced sessions")]
       [(< (fram.rt/coord-version port) 0)
-       (println "no coordinator on 127.0.0.1:7977 — run `tern up` (sync records clockify_id, so it must be up first)")]
+       (println "no coordinator on 127.0.0.1:7977 — run `north up` (sync records clockify_id, so it must be up first)")]
       [:else
        (let [ws (cf/default-workspace)]
          (println (str "syncing " (count sessions) " session(s) to clockify (workspace " ws ")"))
@@ -819,7 +819,7 @@
 
 ;; A file-ahead fact is a STALE PROJECTION (superseded, NOT a hand edit) iff its
 ;; predicate is single-valued (k/single? reads FRAM_SINGLE_VALUED, the same vocab
-;; bin/tern exports) AND the log holds a DIFFERENT value for the same (subject,pred)
+;; bin/north exports) AND the log holds a DIFFERENT value for the same (subject,pred)
 ;; — i.e. a `tell` replaced the value and the .md just wasn't re-rendered. Otherwise
 ;; the log has no competing value: a genuine hand edit a human must reconcile.
 (defn- stale-projection? [idx :- k/Index c :- k/Fact] :- Bool
@@ -862,23 +862,23 @@
   (if (safe? p)
     "healthy: tell/untell + warm reads are safe"
     (cond
-      [(not (:up p)) (str "DEGRADED: coordinator DOWN on 127.0.0.1:" (:port p) " — run `tern up` (writes won't serialize)")]
+      [(not (:up p)) (str "DEGRADED: coordinator DOWN on 127.0.0.1:" (:port p) " — run `north up` (writes won't serialize)")]
       [(not (:serving p)) (str "DEGRADED: daemon not serving the canonical log — status: " (:status p))]
       [:else (str "DEGRADED: daemon STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p)
-                  ") — the log changed out-of-band; restart it + `tern up`")])))
+                  ") — the log changed out-of-band; restart it + `north up`")])))
 
 ;; One-line hygiene summary ("" when tidy) for the boot screen.
 (defn- hygiene-line [p :- Probe] :- String
   (let [ns (count (:stale p)) nh (count (:hand p)) nb (count (:log-behind p))]
     (if (and (= ns 0) (and (= nh 0) (= nb 0)))
       ""
-      (str "hygiene: " (+ ns nb) " stale/lagging projection fact(s) — run `tern heal`"
+      (str "hygiene: " (+ ns nb) " stale/lagging projection fact(s) — run `north heal`"
            (if (> nh 0) (str "; " nh " hand-edited fact(s) — reconcile via tell/import") "")))))
 
 ;; --- doctor: SAFETY handshake + HYGIENE report ------------------------------
 (defn cmd-doctor [threads-dir :- String log :- String] :- Nil
   (let [p (probe threads-dir log)]
-    (println "tern doctor")
+    (println "north doctor")
     ;; SAFETY: the daemon handshake — the only inputs to the verdict.
     (if (:up p)
       (do
@@ -892,8 +892,8 @@
             (println (str "  [ok]    daemon current with the log (loaded v" (:daemon-v p)
                           " > log v" (:log-v p) " — in-memory lease txs, never flat-logged)")))
           (println (str "  [WARN]  daemon is STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p)
-                        ") — the log changed out-of-band; restart: kill it + `tern up`"))))
-      (println (str "  [DOWN]  no coordinator on 127.0.0.1:" (:port p) " — writes won't serialize. Run `tern up`.")))
+                        ") — the log changed out-of-band; restart: kill it + `north up`"))))
+      (println (str "  [DOWN]  no coordinator on 127.0.0.1:" (:port p) " — writes won't serialize. Run `north up`.")))
     (if (safe? p)
       (println "  => healthy: tell/untell + warm reads are safe")
       (println "  => DEGRADED: fix the warnings above"))
@@ -904,11 +904,11 @@
         (println "    [ok]    files <-> fact log in sync")
         (do
           (when (> ns 0)
-            (println (str "    " ns " stale projection fact(s) — run `tern heal`")))
+            (println (str "    " ns " stale projection fact(s) — run `north heal`")))
           (when (> nh 0)
             (println (str "    " nh " genuinely-new file fact(s) (hand edits) — reconcile via tell or import")))
           (when (> nb 0)
-            (println (str "    " nb " log fact(s) not yet in files — benign projection lag; run `tern heal`"))))))))
+            (println (str "    " nb " log fact(s) not yet in files — benign projection lag; run `north heal`"))))))))
 
 ;; --- heal: re-render stale/lagging thread files FROM the log (never the log) --
 ;; Idempotent, fail-closed. Flushes projection drift WITHOUT whole-corpus `export`
@@ -1076,7 +1076,7 @@
 ;; list carried, then it drops out. Writes go THROUGH the coordinator (same path
 ;; as `tell`): the subject IS the @-prefixed predicate name.
 ;;   (a) cardinality single for each pred in FRAM_SINGLE_VALUED (parsed from the
-;;       env at runtime — the SAME list bin/tern exports; not duplicated here).
+;;       env at runtime — the SAME list bin/north exports; not duplicated here).
 ;;       Every other live pred defaults multi and needs NO fact.
 ;;   (b) acyclic true for depends_on and part_of.
 ;;   (c) value_kind ref for preds whose live objects are ALL @-refs with >=1
@@ -1124,7 +1124,7 @@
       (do
         (println (str "schema-seed DRY-RUN — " (count seeds) " fact(s); nothing written."))
         (doseq [c seeds] (println (str "  tell " (:l c) " " (:p c) " " (:r c))))
-        (println "Run `tern schema-seed --execute` (coordinator session) to write."))
+        (println "Run `north schema-seed --execute` (coordinator session) to write."))
       (let [idx (live-idx log)
             subs (distinct-ids (mapv (fn [c :- k/Fact] :- String (:l c)) seeds))
             collisions (filterv (fn [s :- String] :- Bool (some? (k/one-i idx s "title"))) subs)]
@@ -1137,7 +1137,7 @@
             (println "    No facts written. Rename the colliding thread(s) or exclude the pred(s)."))
           (let [port (fram.rt/coord-port)]
             (if (< (fram.rt/coord-version port) 0)
-              (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.")
+              (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `north up`.")
               (let [results (mapv (fn [c :- k/Fact] :- String
                                     (tell-retry port "assert" (:l c) (:p c) (:r c) 5))
                                   seeds)
@@ -1145,13 +1145,13 @@
                 (println (str "schema-seed EXECUTED — " oks "/" (count seeds)
                               " fact(s) committed via coordinator."))))))))))
 
-;; --- tools: TERN's curated tool surface (NOT the generated per-predicate one) -
-;; fram's engine dispatch would print the generated per-predicate catalog; tern
-;; owns its AI surface, so `tern tools` lists the curated MCP verbs (bin/tern-mcp
+;; --- tools: NORTH's curated tool surface (NOT the generated per-predicate one) -
+;; fram's engine dispatch would print the generated per-predicate catalog; north
+;; owns its AI surface, so `north tools` lists the curated MCP verbs (bin/north-mcp
 ;; is authoritative) and notes the engine core + that vocabulary is DATA.
 (defn cmd-tools [] :- Nil
   (do
-    (println "TERN — curated tool surface (the MCP verbs; bin/tern-mcp is authoritative):")
+    (println "NORTH — curated tool surface (the MCP verbs; bin/north-mcp is authoritative):")
     (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
     (println "  vocabulary : schema (census by kind) · schema-seed (declare predicate metadata)")
     (println "  read/write : show · capture · tell · retract · validate   (untell = legacy alias of retract)")
@@ -1160,11 +1160,11 @@
     (println "  view       : presentation")
     (println "")
     (println "Engine core underneath: fram = 10 tools (tell/retract/show/ask/validate + 5 graph-edit verbs).")
-    (println "Vocabulary is DATA, not tools: `tern show <pred>` reveals a predicate's metadata")
-    (println "(cardinality/value_kind/acyclic facts). Seed that metadata with `tern schema-seed`.")))
+    (println "Vocabulary is DATA, not tools: `north show <pred>` reveals a predicate's metadata")
+    (println "(cardinality/value_kind/acyclic facts). Seed that metadata with `north schema-seed`.")))
 
 ;; --- schema: the vocabulary census (READ side; schema-seed is the WRITE side) --
-;; "What schemas exist in tern?" answered as a standing tool: subjects + live-fact
+;; "What schemas exist in north?" answered as a standing tool: subjects + live-fact
 ;; counts grouped by entity kind (kind-of), top predicates per kind, and the
 ;; declared predicate metadata (cardinality/value_kind/acyclic — schema-as-facts).
 ;; ONE fold (live-facts) then pure map-reduce; sorted by fact count so the biggest
@@ -1288,7 +1288,7 @@
            [(= sub "projects")   (cf/cmd-projects)]
            [(= sub "workspaces") (cf/cmd-workspaces)]
            [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
-      [:else (println "tern usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)")])))
+      [:else (println "north usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)")])))
 
 (defn -main [& args] :- Nil
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

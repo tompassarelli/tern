@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# north-timelog — invoice-ready worklog CSV from north billing facts.
+# Reuses the fram fold engine (same view north itself reads). CSV -> stdout,
+# grouped-by-invoice totals -> stderr, so `north-timelog msa > invoice.csv` is clean.
+#   north-timelog [owner] [invoice_id]
+set -euo pipefail
+NORTH="$(cd "$(dirname "$0")/.." && pwd)"
+FRAM="${FRAM_HOME:-$HOME/code/fram}"
+export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
+exec bb -cp "$NORTH/out:$FRAM/out" "$NORTH/cli/north-timelog.clj" "$@"

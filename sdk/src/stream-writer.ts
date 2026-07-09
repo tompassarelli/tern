@@ -2,7 +2,7 @@ import { appendFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
 const STREAM_DIR =
-  process.env.TERN_STREAM_DIR ??
+  process.env.NORTH_STREAM_DIR ??
   join(process.env.HOME ?? "", "code/agent-data");
 
 // Write SDK messages to .stream.jsonl in the same format the web client tails.

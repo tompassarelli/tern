@@ -1,10 +1,10 @@
-# Tern
+# North
 
 The life app — what you steer by. Capture an intention; query what's **ready**,
 **blocked**, and the highest-leverage keystone. The board is *derived* from a
 graph of facts, never hand-maintained.
 
-Tern is a **consumer of the [Fram](https://github.com/tompassarelli/fram)
+North is a **consumer of the [Fram](https://github.com/tompassarelli/fram)
 engine** (a domain-neutral fact substrate). It supplies the *life domain*: the
 lifecycle projections, the cardinality vocab (`FRAM_SINGLE_VALUED`), capture
 conventions, time tracking, and the operating manual.
@@ -19,17 +19,17 @@ operator works — adapt the wrapper to your own setup.
 
 - **Engine** → [Fram](https://github.com/tompassarelli/fram) (`~/code/fram`):
   facts, Datalog, the coordinator daemon. The hard substrate.
-- **Life domain** → `src/tern/{projections,clock,clockify,staleness,audit}.bclj`:
+- **Life domain** → `src/north/{projections,clock,clockify,staleness,audit}.bclj`:
   the lifecycle derivations, billing projection, and staleness layer that make
   the engine a life app.
-- **CLI** → `bin/tern`: aims the Fram engine at your data and sets capture
+- **CLI** → `bin/north`: aims the Fram engine at your data and sets capture
   provenance defaults. Life verbs (`ready`/`blocked`/`leverage`/`next`/`agenda`/
-  `board`/`capture`/`clock`/…) route to `tern.main`; engine verbs
+  `board`/`capture`/`clock`/…) route to `north.main`; engine verbs
   (`import`/`export`/`show`/`validate`/`tell`/`untell`/…) route to Fram.
-- **MCP** → `bin/tern-mcp`: the AI-facing edge — every tool maps to a tested
+- **MCP** → `bin/north-mcp`: the AI-facing edge — every tool maps to a tested
   CLI op through the coordinator write path.
 - **Data** → your own private store (the canonical `facts.log`, projected to
-  `~/.local/state/tern/` at runtime). Data is **not** part of this repo.
+  `~/.local/state/north/` at runtime). Data is **not** part of this repo.
 
 ## Hosting
 
@@ -53,16 +53,16 @@ operator works — adapt the wrapper to your own setup.
 
 **Running needs only [babashka](https://babashka.org)** — the compiled Clojure is
 committed in `out/` (no Beagle required at runtime), same as Fram. You need the
-Fram engine checked out too (`FRAM_HOME`, default `~/code/fram`); `bin/tern`
+Fram engine checked out too (`FRAM_HOME`, default `~/code/fram`); `bin/north`
 puts both on the classpath.
 
-Tern links Fram's library API, so it's **pinned** to a specific Fram commit in
+North links Fram's library API, so it's **pinned** to a specific Fram commit in
 [`FRAM_VERSION`](FRAM_VERSION) (CI and the Dockerfile read it). Fram's `main` moves
 independently; bump the pin deliberately when you rebuild `out/` against a newer
 engine.
 
 To **rebuild** from the `.bclj` sources you also need
-[Beagle](https://github.com/tompassarelli/beagle) (the Lisp Tern is written
+[Beagle](https://github.com/tompassarelli/beagle) (the Lisp North is written
 in). `build.sh` links the engine sources in (`src/fram`, gitignored) and compiles
 the life-domain modules into `out/`; commit the result when sources change. Set
 `FRAM_HOME`/`BEAGLE_HOME` if they aren't at `~/code/fram` / `~/code/beagle`.

@@ -3,8 +3,8 @@
 // exitError to us. Before this module, that throw escaped the message loop and the
 // coordinator learned of the death only by noticing silence. Here we turn a death into
 // a first-class FACT (so it is queryable off the graph) plus a direct peer PING (so a
-// listening coordinator wakes at once) — fitting tern's existing idioms:
-//   - `tern tell @swarm agent_death "<line>"`   (@swarm is the coordinator-visible roster
+// listening coordinator wakes at once) — fitting north's existing idioms:
+//   - `north tell @swarm agent_death "<line>"`   (@swarm is the coordinator-visible roster
 //     node — already where budget_total lives), and the driven thread if known;
 //   - `msg-cli send <agentId> <coordinator> "AGENT DEATH" "<reason>"` for the direct ping.
 //
@@ -17,10 +17,10 @@ import { resolve } from "node:path";
 const REPO = resolve(import.meta.dir, "..", "..");
 const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
 // Resolved lazily (at call time, not module load) so env overrides apply regardless of
-// import order — and so tests can point notifications at a fake. TERN_BIN is the same
-// convention the harness uses for the tern engine path.
-const ternBin = () => process.env.TERN_BIN ?? `${REPO}/bin/tern`;
-const port = () => process.env.TERN_PORT ?? "7977";
+// import order — and so tests can point notifications at a fake. NORTH_BIN is the same
+// convention the harness uses for the north engine path.
+const ternBin = () => process.env.NORTH_BIN ?? `${REPO}/bin/north`;
+const port = () => process.env.NORTH_PORT ?? "7977";
 
 export interface DeathContext {
   thread?: string; // the driven thread (dispatch) — gets its own agent_death fact
@@ -48,12 +48,12 @@ export function deathCommands(
   ts: string = new Date().toISOString(),
 ): Array<{ cmd: string; args: string[] }> {
   const line = `${agentId} | ${reason} | ${ts}`;
-  const tern = ternBin();
+  const north = ternBin();
   const cmds: Array<{ cmd: string; args: string[] }> = [
-    { cmd: tern, args: ["tell", "@swarm", "agent_death", line] },
+    { cmd: north, args: ["tell", "@swarm", "agent_death", line] },
   ];
   if (ctx.thread) {
-    cmds.push({ cmd: tern, args: ["tell", ctx.thread, "agent_death", line] });
+    cmds.push({ cmd: north, args: ["tell", ctx.thread, "agent_death", line] });
   }
   if (ctx.coordinator) {
     cmds.push({

@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; trace-cli.clj — `tern trace <agent-id>`: single-agent lifecycle diagnosis.
+;; trace-cli.clj — `north trace <agent-id>`: single-agent lifecycle diagnosis.
 ;;
 ;; READ-ONLY. Walks the INVARIANT SPINE checklist (workflow-map §2) for ONE id and
 ;; flags the FIRST failing stage, printing the exact confirm command per stage. It is
@@ -9,18 +9,18 @@
 ;; workflow-map F-mode (F1–F7) with the remedy.
 ;;
 ;;   ✓ present/healthy   · expected-absent / n-a   ✗ genuine failure
-;;   usage: tern trace <agent-id>
+;;   usage: north trace <agent-id>
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str])
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op  tern.coord/send-op)
-(def resolved tern.coord/resolved)
-(def many     tern.coord/many)
-(def lease-of tern.coord/lease-of)
+(def send-op  north.coord/send-op)
+(def resolved north.coord/resolved)
+(def many     north.coord/many)
+(def lease-of north.coord/lease-of)
 
 (def HOME (System/getenv "HOME"))
-(def TERN (str HOME "/code/tern"))
-(def AGENT-LOGDIR (str HOME "/.local/state/tern/agents"))
-(def PORT (Integer/parseInt (or (System/getenv "TERN_PORT") "7977")))
+(def NORTH (str HOME "/code/north"))
+(def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
+(def PORT (Integer/parseInt (or (System/getenv "NORTH_PORT") "7977")))
 (def NOW (System/currentTimeMillis))
 
 (def use-color? (some? (System/console)))
@@ -80,11 +80,11 @@
 (defn -main [args]
   (let [raw (first args)]
     (when (str/blank? raw)
-      (println (red "usage:") "tern trace <agent-id>") (System/exit 2))
+      (println (red "usage:") "north trace <agent-id>") (System/exit 2))
     (let [id (str/replace raw #"^@?(agent:)?" "")
           probe (try (send-op PORT {:op :version}) (catch Exception _ ::down))]
       (when (= probe ::down)
-        (println (red (str "tern trace — coordinator :" PORT " unreachable"))) (System/exit 1))
+        (println (red (str "north trace — coordinator :" PORT " unreachable"))) (System/exit 1))
       (let [kind (afact id "kind")
             l (lease id)
             online (boolean (and l (> (:exp l) NOW)))
@@ -119,14 +119,14 @@
                                 :else nil)
             inbox (inbox-to id)]
         ;; header
-        (println (str (bold "tern trace ") (bold id) "  ·  :" PORT))
+        (println (str (bold "north trace ") (bold id) "  ·  :" PORT))
         (println (str "lineage  " (name lineage) "   " (dim (str "(identity: " id-expect ")"))))
         (println)
         ;; 1 ROSTER
         (println (stage 1 (if on-roster :ok :fail) "1 ROSTER"
                         (if on-roster (str "on roster (" id ")")
                             (red "NOT on roster — no lease / identity / session"))
-                        "tern agents"))
+                        "north agents"))
         ;; 2 IDENTITY
         (let [mark (cond idfull :ok
                          (= lineage :sdk-lane) :fail          ; a lane MUST have full identity
@@ -137,7 +137,7 @@
                            (= kind "session") (str "kind=session repo=" (or (afact id "repo") "?") " (partial — expected)")
                            (= lineage :dispatch) "none — dispatch lineage writes no @agent facts (expected)"
                            :else "absent")]
-          (println (stage 2 mark "2 IDENTITY" detail (str "tern show @agent:" id))))
+          (println (stage 2 mark "2 IDENTITY" detail (str "north show @agent:" id))))
         ;; 3 PRESENCE — lapsed is a FAILURE only if the agent is NOT terminal (still supposed to be alive)
         (let [mark (cond online :ok
                          (nil? l) (if terminal? :na :fail)
@@ -147,7 +147,7 @@
                            (nil? l) (if terminal? "no lease (finished/never-registered)" (red "no lease found"))
                            :else (str "lapsed " (ago lapse) " ago"
                                       (when terminal? (dim " (finished — expected)"))))]
-          (println (stage 3 mark "3 PRESENCE" detail "tern agents")))
+          (println (stage 3 mark "3 PRESENCE" detail "north agents")))
         ;; 4 WORK
         (let [mark (if (or active-concern tx (seq concerns)) :ok :na)
               detail (str (if active-concern
@@ -156,11 +156,11 @@
                           (if tx (str " · transcript " (ago (- NOW (:mtime tx))) " old, " (:size tx) "b")
                               (dim " · no transcript")))]
           (println (stage 4 mark "4 WORK" detail
-                          (if active-concern (str "concern ls " (or (:repo active-concern) "")) (str "tern watch " id)))))
+                          (if active-concern (str "concern ls " (or (:repo active-concern) "")) (str "north watch " id)))))
         ;; 5 STEER
         (println (stage 5 :na "5 STEER"
                         (if (pos? inbox) (str inbox " message(s) addressed to it") (dim "none sent"))
-                        (str "bb " TERN "/cli/msg-cli.clj " PORT " inbox " id)))
+                        (str "bb " NORTH "/cli/msg-cli.clj " PORT " inbox " id)))
         ;; 6 COMPLETION / DEATH
         (let [mark (cond (= terminal-kind :ran) :ok
                          (nil? terminal-kind) (if online :na :fail)   ; not terminal + offline = missing signal
@@ -172,7 +172,7 @@
                        :stopped (str (ylw (str "outcome=" (:outcome last-run))))
                        (if online (dim "still running — no terminal signal yet")
                            (red "NO completion/death signal (offline, unrecorded)")))]
-          (println (stage 6 mark "6 COMPLETION" detail "tern show @swarm")))
+          (println (stage 6 mark "6 COMPLETION" detail "north show @swarm")))
         ;; 7 REAPING
         (let [stale-concern (first (filter #(and (= (:status %) "building")) concerns))
               detail (str (cond online "live — not reaped"
@@ -181,13 +181,13 @@
                                 :else (str "lease lapsed " (ago lapse) " — awaiting reap"))
                           (when (and stale-concern (not online))
                             (ylw (str " · concern still " (:status stale-concern) " (STALE)"))))]
-          (println (stage 7 :na "7 REAPING" detail "tern agents / concern ls")))
+          (println (stage 7 :na "7 REAPING" detail "north agents / concern ls")))
         (println)
         ;; ---- verdict (first genuine failure + F-mode) ----
         (let [verdict
               (cond
                 (not on-roster)
-                (red "F4 — not on any roster: a zombie fork, a bad id, or an unmanaged actor. Confirm via git author vs `tern agents`.")
+                (red "F4 — not on any roster: a zombie fork, a bad id, or an unmanaged actor. Confirm via git author vs `north agents`.")
                 (= terminal-kind :died)
                 (str (red "F1 — API-death mid-lane.") " agent_death recorded. Remedy: re-dispatch the thread (idempotent); enable AGENT_ESCALATE=1 for chronic deaths; read the partial result first.")
                 (= terminal-kind :died-unreported)
@@ -195,9 +195,9 @@
                 (and on-roster (not terminal?) (not online))
                 (str (red "F2/F3 — offline with NO completion signal.")
                      (if l " Lease lapsed but still present:" " Lease gone entirely (expired + reaped, or never leased):")
-                     " if the transcript moved after the lease expiry → F2 (lapsed-but-alive): trust the transcript. Else it died silently — the reactor reaps it as died-unreported within 30min (confirm: `tern show @agent:" id "` for outcome=died-unreported).")
+                     " if the transcript moved after the lease expiry → F2 (lapsed-but-alive): trust the transcript. Else it died silently — the reactor reaps it as died-unreported within 30min (confirm: `north show @agent:" id "` for outcome=died-unreported).")
                 (and (= lineage :sdk-lane) (not idfull))
-                (red "F6 — SDK-lane missing identity facts: possible id-collision/aliasing, or writeAgentFacts failed. Check `tern show @agent:<id>` for contradictory repos/goals.")
+                (red "F6 — SDK-lane missing identity facts: possible id-collision/aliasing, or writeAgentFacts failed. Check `north show @agent:<id>` for contradictory repos/goals.")
                 (and (= terminal-kind :ran) online)
                 (grn "healthy — online; a completed run is recorded (outcome=ran). No failure.")
                 (= terminal-kind :ran)
@@ -209,4 +209,4 @@
     (System/exit 0)))
 
 (try (-main (vec *command-line-args*))
-     (catch Throwable t (binding [*out* *err*] (println (str "tern trace: " (.getMessage t)))) (System/exit 1)))
+     (catch Throwable t (binding [*out* *err*] (println (str "north trace: " (.getMessage t)))) (System/exit 1)))

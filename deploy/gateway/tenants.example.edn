@@ -1,4 +1,4 @@
-;; Tern gateway tenant registry (example).
+;; North gateway tenant registry (example).
 ;; Copy to tenants.edn (gitignored) — or let provision.sh manage it.
 ;;
 ;; One entry per tenant: a SET of accepted bearer-token hashes (sha-256 hex, never

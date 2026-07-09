@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# north-arm <agent-id> — alias for `north listen <agent-id>` (the front door).
+# Arms your real-time interrupt listener.
+# RUN THIS AS A BACKGROUND TASK. It is dormant on the coordinator socket (zero poll,
+# zero tokens) until a peer addresses you (a msg to your id or "*", or a watched thread
+# moves), then prints the message and EXITS. In a run-in-background harness that exit
+# re-invokes you with the message — that is the interrupt. Read it, act, then re-arm.
+exec bb "$HOME/code/north/cli/north-listen.clj" 7977 "${1:?usage: north-arm <agent-id>}" --once

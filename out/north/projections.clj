@@ -1,4 +1,4 @@
-(ns tern.projections
+(ns north.projections
   (:require [fram.kernel :as k]
             [clojure.string :as str]))
 

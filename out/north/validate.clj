@@ -1,6 +1,6 @@
-(ns tern.validate
+(ns north.validate
   (:require [fram.kernel :as k]
-            [tern.projections :as proj]))
+            [north.projections :as proj]))
 
 (defn work-violations-i [idx ^String te]
   (let [term? (proj/terminal-i? idx te)

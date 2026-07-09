@@ -3,10 +3,10 @@
 > **⚠️ MODEL CHANGED 2026-06-15 — fact-native cutover.** This manual now
 > describes the current model. What changed (full spec:
 > `docs/fact-native-redesign.md`):
-> - **One project/CLI/engine: `tern`.** `los thread`/`los validate` are
->   **retired** — use `tern` (ready/blocked/next/agenda/board/show/leverage/
+> - **One project/CLI/engine: `north`.** `los thread`/`los validate` are
+>   **retired** — use `north` (ready/blocked/next/agenda/board/show/leverage/
 >   validate/capture/tell/retract/import/export/audit/doctor/up). Time tracking is
->   **`tern clock`** (fact-native sessions; `los time` and the JSON clock-in
+>   **`north clock`** (fact-native sessions; `los time` and the JSON clock-in
 >   are gone — Clockify is just a sync target now).
 > - **Thread files are FACT TRIPLES, not YAML.** `@<id>` subject + `predicate
 >   object` lines + `---` + prose body. Refs are `@id`; literals are EDN.
@@ -18,7 +18,7 @@
 > - **ids** are `2026-06-15-150040` (dashed, fixed-width).
 > - Rollback: git tag `pre-fact-native` (both repos).
 
-This directory is the canonical thread layer for tern. Read this before
+This directory is the canonical thread layer for north. Read this before
 creating, mutating, or interpreting any thread file here. The full spec lives at
 `docs/fact-native-redesign.md`; this file is the working manual — the
 rules an editor (human or AI) needs in front of them to act correctly.
@@ -31,14 +31,14 @@ A flat directory of files, one per thread, each rendering a thread's **fact
 triples** plus a prose body. Filenames are for navigation; the `@<id>` subject
 line is canonical identity.
 
-**The source of truth is the Tern fact graph** (`tern-data/facts.log`), not the
+**The source of truth is the North fact graph** (`north-data/facts.log`), not the
 files. The `threads/*` files are a *faithful projection* of the facts, regenerated
-by `tern export`; the import↔export round-trip is lossless (fact-identical), so
-you can still edit a file and `tern import` folds the edit back into the graph.
+by `north export`; the import↔export round-trip is lossless (fact-identical), so
+you can still edit a file and `north import` folds the edit back into the graph.
 If a tool and the files disagree, reconcile through the fact log — `import` to
 absorb file edits, `export` to regenerate files — and the fact graph wins.
 (Pre-cutover state is recoverable at git tag `pre-fact-native`;
-the pre-graph markdown era is at `pre-tern-flip`.)
+the pre-graph markdown era is at `pre-north-flip`.)
 
 This is not a project-management app. It is a thought-to-state substrate for a
 solo operator. Most "tasks" in normal PM tools are too small to be threads. Most
@@ -106,7 +106,7 @@ Resume the gjoa + reference/lean work. Pick it back up later today.
 
 ## Log
 
-2026-06-15 — captured via `tern capture`.
+2026-06-15 — captured via `north capture`.
 ```
 
 ### Refs vs literals (`@` sigil)
@@ -130,7 +130,7 @@ old YAML quoting/injection bug class cannot occur — but get the quoting right 
 ### The predicate vocabulary
 
 Predicates are just facts; there is no fixed schema of "fields." These are the
-ones in live use (run `tern show <id>` on a few real threads to see them):
+ones in live use (run `north show <id>` on a few real threads to see them):
 
 | predicate      | object kind         | meaning                                                            |
 |----------------|---------------------|--------------------------------------------------------------------|
@@ -159,7 +159,7 @@ To assert a **multi-valued** predicate (`relates_to`, `depends_on`, `repo`,
 `proposed_by`), repeat the line — one fact per value. There are no YAML lists.
 
 There is **no** canonical field order to memorize and no required-field
-ceremony beyond `title`. `tern export` writes a stable order; hand-edits
+ceremony beyond `title`. `north export` writes a stable order; hand-edits
 that go through `import` get re-normalized on the next `export`.
 
 ### Schema-as-facts: predicates are entities
@@ -177,9 +177,9 @@ as facts about the predicate, which is itself an entity with subject `@<pred>`:
 Precedence when the engine classifies a predicate is **fact > env > legacy
 fallback**: a `cardinality` fact in the log wins over the `FRAM_SINGLE_VALUED`
 env list, which wins over the built-in default. Read a predicate's metadata the
-same way you read any thread — `tern show <pred>` (e.g. `tern show title`).
+same way you read any thread — `north show <pred>` (e.g. `north show title`).
 
-`tern schema-seed` derives the seed set from today's vocab + the live log, then
+`north schema-seed` derives the seed set from today's vocab + the live log, then
 prints it (`--dry-run`, the default) or writes it through the coordinator
 (`--execute`): `cardinality single` for every `FRAM_SINGLE_VALUED` predicate,
 `acyclic true` for `depends_on`/`part_of`, and `value_kind ref` for predicates
@@ -188,8 +188,8 @@ collides with a live thread id (writing `@title` metadata onto a real thread
 titled "title" would pollute it). This is the migration path off the env list:
 seed the facts once, and the log carries what `FRAM_SINGLE_VALUED` used to.
 
-`tern schema` is the **read** side — a standing vocabulary census that answers
-"what schemas exist in tern?" from one live fold. It groups every subject into an
+`north schema` is the **read** side — a standing vocabulary census that answers
+"what schemas exist in north?" from one live fold. It groups every subject into an
 **entity kind** and reports per-kind subject + live-fact counts, the top
 predicates in each, and the declared predicate metadata
 (`cardinality`/`value_kind`/`acyclic`). Kind is derived by: an explicit `kind`
@@ -200,11 +200,11 @@ prefixes); else a `title` means `thread`; else a schema-as-facts subject is a
 themselves — today the `session-telemetry` bulk dwarfs the work graph, which is
 the number that drives the worlds split below.
 
-The AI tool surface reflects this. `tern tools` lists TERN's **curated** verbs
+The AI tool surface reflects this. `north tools` lists NORTH's **curated** verbs
 (the MCP surface: `ready`/`next`/`board`/…/`tell`/`show`/`dispatch`/`spawn`);
 the fram engine core underneath is **10 tools** (`tell`/`retract`/`show`/`ask`/
 `validate` + 5 graph-edit verbs). Vocabulary is data, not tools — there is no
-per-predicate tool catalog to memorize; `tern show <pred>` reveals a predicate.
+per-predicate tool catalog to memorize; `north show <pred>` reveals a predicate.
 
 ### Worlds: the coordination log is not a dumping ground
 
@@ -216,16 +216,16 @@ work graph under machine noise and drag every fold/validate over data that isn't
 about coordination. Keep the coordination world small and human-meaningful; give
 each experiment or telemetry stream its own world.
 
-Every new entity **self-identifies its kind at birth**: `tern capture` stamps
+Every new entity **self-identifies its kind at birth**: `north capture` stamps
 `kind thread` in the same coordinator write batch (`kind` is single-valued;
 concern-cli already stamps `kind concern`, telemetry writers `kind run`/`session`).
 No backfill — old subjects stay un-kinded and fall to the census's prefix
 heuristic; the kinded set grows forward. This is the seam the worlds split rides
-on: once entities carry their kind, `tern schema` counts each world's mass
+on: once entities carry their kind, `north schema` counts each world's mass
 exactly, and moving telemetry to its own log is a filter on a fact, not a guess.
 (One open overlap to reconcile: reflection entities also use `kind`
 document/decision/observation — see the reflections section — so a reflection
-captured via `tern capture` starts `kind thread` and must be re-told its
+captured via `north capture` starts `kind thread` and must be re-told its
 reflection kind; a follow-up should decide whether entity-kind and reflection-kind
 are one predicate or two.)
 
@@ -240,13 +240,13 @@ not the id. Fixed width means the id↔slug split is by position, not first-dash
 - The on-disk filename pairs the id with a snake_case slug. (Current corpus
   filenames render the id run-together —
   `20260615150040-pick_back_up_gjoa_reference_lean_work.md` — while the `@id`
-  *inside* is dashed. The id inside the file is canonical; let `tern export`
+  *inside* is dashed. The id inside the file is canonical; let `north export`
   own filenames rather than hand-renaming.)
 - The id never changes. The slug portion may be renamed (rare); the id stays put.
-- Hand-minting an id: `date +%Y-%m-%d-%H%M%S`. But prefer `tern capture`,
+- Hand-minting an id: `date +%Y-%m-%d-%H%M%S`. But prefer `north capture`,
   which mints it for you.
-- `tern show <input>` resolves by id, then slug, then substring — so
-  `tern show gjoa` finds the gjoa thread.
+- `north show <input>` resolves by id, then slug, then substring — so
+  `north show gjoa` finds the gjoa thread.
 
 References in `part_of`/`depends_on`/`relates_to`/`superseded_by` are `@<id>`
 refs. Prose in the body can reference another thread however reads best
@@ -269,7 +269,7 @@ facts** along orthogonal axes:
 | activity (cycles)        | a `driver` set / a clock running *now* ⇒ active; else dormant       |
 | blocked (cycles)         | any `depends_on` target not yet terminal ⇒ blocked                  |
 
-The derived conditions you'll actually use (all `tern` projections):
+The derived conditions you'll actually use (all `north` projections):
 
 - **ready** = committed ∧ not blocked ∧ not active ∧ no outcome
 - **blocked** = a `depends_on` target is still open
@@ -311,7 +311,7 @@ Three independent dimensions:
   thread derive as active.**
 
 Person/agent handles are `@`-refs to real person nodes (nodes with a `display_name` — `name` is reserved by the engine).
-Don't invent a handle inline; the node must exist. `tern validate` rejects
+Don't invent a handle inline; the node must exist. `north validate` rejects
 refs that don't resolve.
 
 ### source vs proposed_by
@@ -369,7 +369,7 @@ Topic thread (migrated from tag `gjoa`). Threads relate_to this.
 
 To "tag" a thread, add `relates_to @topic-<name>`. To find everything in a
 group, query what `relates_to @topic-<name>`. To merge two topics (or fold an
-obvious topic into a real thread), use `tern merge <from> <to>` — the
+obvious topic into a real thread), use `north merge <from> <to>` — the
 rename-once interning means refs follow.
 
 Don't reach for a free-string tag; mint or reuse a `@topic-*` thread.
@@ -507,36 +507,36 @@ fine. The system handles both.
 
 ---
 
-## The CLI: `tern`
+## The CLI: `north`
 
-One binary. Run it via the tern wrapper: **`~/code/tern/bin/tern`**.
-The wrapper aims the Fram engine (`~/code/fram`) at tern's private data
-(`FRAM_THREADS`/`FRAM_LOG` under `~/.local/state/tern/`, projected from the
-canonical `tern-data/facts.log`) and sets capture provenance defaults.
+One binary. Run it via the north wrapper: **`~/code/north/bin/north`**.
+The wrapper aims the Fram engine (`~/code/fram`) at north's private data
+(`FRAM_THREADS`/`FRAM_LOG` under `~/.local/state/north/`, projected from the
+canonical `north-data/facts.log`) and sets capture provenance defaults.
 
-`los` is **gone entirely** — `los thread`/`los validate` retired (use `tern`),
-and time tracking is now **`tern clock`** (fact-native; see Clock management).
+`los` is **gone entirely** — `los thread`/`los validate` retired (use `north`),
+and time tracking is now **`north clock`** (fact-native; see Clock management).
 One CLI.
 
-Run `~/code/tern/bin/tern` with no args for the authoritative usage line;
+Run `~/code/north/bin/north` with no args for the authoritative usage line;
 don't trust an enumeration here over the binary. The surface:
 
 **Reads (instant off the warm daemon, ~1ms):**
 
 ```sh
-tern ready       # curated: top 15 work threads by leverage (--all = every ready thread)
-tern blocked     # waiting on a depends_on target
-tern next        # the recommended next pull
-tern agenda      # calendar projection: buckets by do_on (overdue/today/next N)
-tern board       # curated: active drivers + top-15 ready + counts (--all = full kanban; alias: plate)
-tern leverage    # high-leverage threads (most unblocks downstream)
-tern schema      # vocabulary census: subjects/facts by entity kind + predicate metadata
-tern show <id>   # one thread's facts + body; resolves id/slug/substring
-tern validate    # integrity check (see below)
-tern audit       # corpus-health report
-tern needs-review # belief-revision queue: judgments whose inputs moved
-tern tools       # TERN's curated tool surface (the MCP verbs) + the engine core
-tern schema-seed # derive predicate-metadata facts (--dry-run default | --execute)
+north ready       # curated: top 15 work threads by leverage (--all = every ready thread)
+north blocked     # waiting on a depends_on target
+north next        # the recommended next pull
+north agenda      # calendar projection: buckets by do_on (overdue/today/next N)
+north board       # curated: active drivers + top-15 ready + counts (--all = full kanban; alias: plate)
+north leverage    # high-leverage threads (most unblocks downstream)
+north schema      # vocabulary census: subjects/facts by entity kind + predicate metadata
+north show <id>   # one thread's facts + body; resolves id/slug/substring
+north validate    # integrity check (see below)
+north audit       # corpus-health report
+north needs-review # belief-revision queue: judgments whose inputs moved
+north tools       # NORTH's curated tool surface (the MCP verbs) + the engine core
+north schema-seed # derive predicate-metadata facts (--dry-run default | --execute)
 ```
 
 `needs-review` is the staleness view (a pure projection — it never auto-flips a
@@ -560,44 +560,44 @@ that also carry a `title` no longer drown the work graph. Bare `ready` is the to
 **Writes:**
 
 ```sh
-tern capture "<title>" [owner]              # mint a new thread (fact-first)
-tern tell   <id> <pred> <value>             # add/replace a fact, via the coordinator
-tern retract <id> <pred> <value>            # retract a fact, via the coordinator (untell = legacy alias)
-tern merge  <from> <to>                     # fold one node into another
-tern import                                 # fold file edits into the fact log
-tern export <out-dir>                       # regenerate files from the log
+north capture "<title>" [owner]              # mint a new thread (fact-first)
+north tell   <id> <pred> <value>             # add/replace a fact, via the coordinator
+north retract <id> <pred> <value>            # retract a fact, via the coordinator (untell = legacy alias)
+north merge  <from> <to>                     # fold one node into another
+north import                                 # fold file edits into the fact log
+north export <out-dir>                       # regenerate files from the log
 ```
 
 **Coordination / daemon:**
 
 ```sh
-tern doctor      # health of the coordinator + log (session-start handshake)
-tern up          # start/revive the coordinator on the canonical log
-tern watch       # event stream (change triggers; promotion prompts)
-tern listen <agent-id>   # arm the real-time interrupt listener, as a background
-                         # task; dormant until a peer pings you (alias: bin/tern-arm)
+north doctor      # health of the coordinator + log (session-start handshake)
+north up          # start/revive the coordinator on the canonical log
+north watch       # event stream (change triggers; promotion prompts)
+north listen <agent-id>   # arm the real-time interrupt listener, as a background
+                         # task; dormant until a peer pings you (alias: bin/north-arm)
 ```
 
 ### Writing safely under concurrent agents
 
-tern is fact-backed and **other agents may be editing concurrently**. The
+north is fact-backed and **other agents may be editing concurrently**. The
 rules (also in the global CLAUDE.md):
 
-1. **Session-start handshake:** run `tern doctor`. If DOWN/DEGRADED, run
-   `tern up` to start the coordinator on the canonical log.
-2. **New threads:** `tern capture "<title>"` (fact-first) — or create the
-   file and run `tern import`. Distinct files don't collide, so file-edit +
+1. **Session-start handshake:** run `north doctor`. If DOWN/DEGRADED, run
+   `north up` to start the coordinator on the canonical log.
+2. **New threads:** `north capture "<title>"` (fact-first) — or create the
+   file and run `north import`. Distinct files don't collide, so file-edit +
    `import` is safe for whole new threads.
 3. **Field changes on existing threads:** go through the coordinator with
-   `tern tell` / `retract` (serialized, rule-checked, retries on conflict).
-   **Do NOT use `tern set`** — it appends the log directly and races. (`set`
+   `north tell` / `retract` (serialized, rule-checked, retries on conflict).
+   **Do NOT use `north set`** — it appends the log directly and races. (`set`
    exists; it's for single-writer/offline situations only.)
-4. **Do NOT run `tern export` during concurrent work** — it regenerates
+4. **Do NOT run `north export` during concurrent work** — it regenerates
    `threads/` from the log and would clobber another agent's un-imported edits.
    (The engine refuses if files diverge, but don't rely on it.) `import` is
    idempotent and safe anytime.
 
-Reads are instant off the warm daemon (`tern serve`); writes serialize
+Reads are instant off the warm daemon (`north serve`); writes serialize
 through the coordinator.
 
 ### Concern liveness — decay, handoff, and reaping
@@ -620,12 +620,12 @@ an owner dies without running `concern done`:
    `<ago>` uses the lease-expiry lapse, or the concern's own declare-age when a
    pre-presence owner never held a lease.
 
-2. **Reactor auto-abandon (fact write).** The reactor (`cli/tern-reactor.clj`)
+2. **Reactor auto-abandon (fact write).** The reactor (`cli/north-reactor.clj`)
    sweeps on its cadence (every 5 min): a `building` concern whose owner has
    been lapsed **>24h** gets `reached=abandoned-stale` written through :7977
    (auditable, reversible — a later `landed` still wins). `likely-to-land` is
    **exempt** (it's a handoff). Abandoned concerns are retired from `concern ls`
-   (shown with `--all`). Test one-shot: `bb cli/tern-reactor.clj sweep-once
+   (shown with `--all`). Test one-shot: `bb cli/north-reactor.clj sweep-once
    [--dry-run] [--repo <repo>]`.
 
 3. **Stuck-fork reaping.** The same sweep finds `kind=lane` agents whose
@@ -634,7 +634,7 @@ an owner dies without running `concern done`:
    lane's coordinator (if any) over the fact feed. Zombie forks surface instead
    of lingering.
 
-The **activity heartbeat** that powers all of the above: the `tern-on-tooluse`
+The **activity heartbeat** that powers all of the above: the `north-on-tooluse`
 PostToolUse hook renews the owner's presence lease on tool calls, **throttled to
 once per 60s** (marker in `XDG_RUNTIME_DIR`). A renewal therefore *means*
 "this agent ran a tool recently" (IS-WORKING), so lease expiry is a real death
@@ -644,7 +644,7 @@ signal — not merely "never registered".
 
 ## Validation rules
 
-`tern validate` checks the graph, not a YAML schema:
+`north validate` checks the graph, not a YAML schema:
 
 - every file parses as facts (subject line + `predicate object` lines + body)
 - ids are unique and well-formed (`yyyy-MM-dd-HHmmss`)
@@ -665,21 +665,21 @@ after any batch of edits.
 If you are an AI (Claude or otherwise) editing this directory:
 
 1. **Read this file first.** Yes, again.
-2. **Run the handshake** (`tern doctor`, `tern up` if needed) before
+2. **Run the handshake** (`north doctor`, `north up` if needed) before
    coordinating threads.
 3. **Default `source ai`** for anything you originate, not `tom`. Add yourself
-   to `proposed_by` (`@claude`, `@claude-code`). The `bin/tern` wrapper
+   to `proposed_by` (`@claude`, `@claude-code`). The `bin/north` wrapper
    defaults capture provenance to Tom; when *you* originate, override via env:
-   `TERN_SOURCE=ai TERN_AUTHOR=claude-code TERN_DRIVER=claude-code
-   TERN_PROPOSED_BY=claude-code tern capture "..."` (lead stays Tom).
+   `NORTH_SOURCE=ai NORTH_AUTHOR=claude-code NORTH_DRIVER=claude-code
+   NORTH_PROPOSED_BY=claude-code north capture "..."` (lead stays Tom).
 4. **Default `created_by`** to your own handle, **`lead`** to `@tom_passarelli`,
    **`owner`** to `personal`, unless told otherwise.
 5. **A fresh capture is `committed`** by default. Omit `committed` only for
    speculative captures that need triage. **Never set a `driver` at birth** —
    making a thread active is a deliberate pickup Tom owns.
 6. **Add a `## Log` entry** noting that you created the thread and why.
-7. **Prefer the coordinator for field changes** — `tern tell`/`retract`, not
-   `tern set`. Run `tern validate` after a batch.
+7. **Prefer the coordinator for field changes** — `north tell`/`retract`, not
+   `north set`. Run `north validate` after a batch.
 8. **Do not invent predicates lightly.** Adding a predicate is cheap mechanically
    (no parser to touch), but the *bar is a real recurring fact*, surfaced across
    cases — raise it in conversation first. Same for handles: don't reference an
@@ -701,9 +701,9 @@ If you are an AI (Claude or otherwise) editing this directory:
 - **Free-string tags.** Relate to a `@topic-*` thread (`relates_to @topic-x`).
 - **Dangling refs.** Every `@`-ref must point at a node that exists; `validate`
   rejects otherwise.
-- **`tern set` under concurrency.** Use `tell`/`retract` through the
+- **`north set` under concurrency.** Use `tell`/`retract` through the
   coordinator.
-- **`tern export` during concurrent work.** It clobbers un-imported edits.
+- **`north export` during concurrent work.** It clobbers un-imported edits.
 - **A `project` field or `projects/` subfolder.** A project is a thread with
   `part_of` children.
 - **Treating the id as the creation date.** The id is an opaque collision-safe
@@ -732,7 +732,7 @@ actual work session — what an AI does when Tom starts *doing* something.
 
 2. **Activate on engagement, not on mention.** A committed-but-dormant thread Tom
    starts actually executing should become active by setting a `driver` — but
-   not silently. Offer it; `tern tell <id> driver @claude-code` (or his
+   not silently. Offer it; `north tell <id> driver @claude-code` (or his
    handle) is the act.
 
 3. **Small things go in the body, not as new threads.** A discrete to-do that
@@ -743,18 +743,18 @@ actual work session — what an AI does when Tom starts *doing* something.
 
 ## Clock management
 
-Time tracking is **`tern clock`** — fact-native, *in the graph*. There is
+Time tracking is **`north clock`** — fact-native, *in the graph*. There is
 **one time store**: a work session is a titleless entity
 (`session_of @thread` / `start_time` / `end_time`) that rolls up to the thread,
 so **estimate-vs-actual calibrates over time**. `los time` and the old JSON
 clock-in are both **gone**.
 
 ```sh
-tern clock start <thread-id>   # open a session (refuses if one's running)
-tern clock stop                # close it, report the duration
-tern clock status              # the running session + elapsed
-tern clock report              # est vs actual per thread + calibration %
-tern clock today | week        # logged time per thread over a date window
+north clock start <thread-id>   # open a session (refuses if one's running)
+north clock stop                # close it, report the duration
+north clock status              # the running session + elapsed
+north clock report              # est vs actual per thread + calibration %
+north clock today | week        # logged time per thread over a date window
 ```
 
 `actual` is *derived* (summed from sessions, never stored). `clock report`'s
@@ -768,15 +768,15 @@ Billing flows *out of* the sessions — Clockify is a derived sync target, not a
 parallel ledger:
 
 ```sh
-tern clock map <owner> <project-id>   # owner -> Clockify project (config)
-tern clock sync                        # push closed, billable sessions
-tern clock projects | workspaces       # list Clockify projects/workspaces
+north clock map <owner> <project-id>   # owner -> Clockify project (config)
+north clock sync                        # push closed, billable sessions
+north clock projects | workspaces       # list Clockify projects/workspaces
 ```
 
 A session is **billable** iff its thread's `owner` is mapped to a Clockify
 project (so `owner personal` is never billed). `sync` pushes closed, unsynced,
 billable sessions and writes the returned id back as a `clockify_id` fact, so
-it's idempotent. Mapping lives in `~/code/tern/time/projects.json`; the API
+it's idempotent. Mapping lives in `~/code/north/time/projects.json`; the API
 key comes from `$CLOCKIFY_SECRET_FILE` (wired by the wrapper). **Sync is
 on-demand only — never automatic** (it touches real client billing).
 
@@ -809,14 +809,14 @@ This section is when an AI should *act* on the clock (`clock start`/`stop`).
 
 ## What lives elsewhere
 
-- `~/code/tern/streams/raw/` — lossless transmission events (conversations,
+- `~/code/north/streams/raw/` — lossless transmission events (conversations,
   dictated thoughts, captured sessions).
-- `~/code/tern/streams/distillations/` — tiered AI compressions of raw
+- `~/code/north/streams/distillations/` — tiered AI compressions of raw
   streams. See `streams/CLAUDE.md`.
-- `~/code/tern/tern-data/facts.log` — the canonical fact graph (source
+- `~/code/north/north-data/facts.log` — the canonical fact graph (source
   of truth; `threads/` is its projection).
-- `~/code/tern` — the generic engine (public source of truth); `bin/tern`
-  is tern's consumer wrapper.
+- `~/code/north` — the generic engine (public source of truth); `bin/north`
+  is north's consumer wrapper.
 - `git log` — history of edits to threads.
 
 If something does not fit those or `threads/`, push back before inventing a new

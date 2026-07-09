@@ -12,7 +12,7 @@
 
 ;; shared coord substrate (Foundation Part B): send-op lives once in cli/coord.clj.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op tern.coord/send-op)
+(def send-op north.coord/send-op)
 
 (defn- driver-of [port thread]
   (:value (send-op port {:op :resolved :te thread :p "driver"})))

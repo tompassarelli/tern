@@ -1,4 +1,4 @@
-;; msg-cli.clj — messaging-as-facts (Tern gate-2, primitive 3) + command-as-facts.
+;; msg-cli.clj — messaging-as-facts (North gate-2, primitive 3) + command-as-facts.
 ;; A message = @msg:<id> facts (human mail); a COMMAND = @cmd:<id> facts (op/target/args
 ;; each a separate fact, NEVER an opaque {:op :args} body blob). ack = a fact (acked_by);
 ;; inbox/done/pending = DERIVED queries. The coordinator STORES + (with scoped-subscribe)
@@ -14,11 +14,11 @@
 ;; pending rule (move-C) live once in cli/coord.clj. append! = MULTI coexist; put! =
 ;; SINGLE last-writer-wins; pending-cmds = the single Datalog rule the reactor shares.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op tern.coord/send-op)
-(def append! tern.coord/append!)
-(def put!    tern.coord/put!)
-(def one     tern.coord/resolved)
-(def many    tern.coord/many)
+(def send-op north.coord/send-op)
+(def append! north.coord/append!)
+(def put!    north.coord/put!)
+(def one     north.coord/resolved)
+(def many    north.coord/many)
 
 (defn messages [port]      ; -> [[@msg-entity to-handle] ...]  (every entity carrying a `to`)
   (:ok (send-op port {:op :query
@@ -35,7 +35,7 @@
 
 ;; --- command-as-facts --------------------------------------------------------
 ;; A command is NOT an opaque {:op :args} EDN blob in one `body` cell (the old cargo-cult,
-;; whose parse-envelope parser was duplicated across this file + tern-listen.clj "MUST
+;; whose parse-envelope parser was duplicated across this file + north-listen.clj "MUST
 ;; stay in sync"). It is FACTS on @cmd:<id>: `op` + `target` (routing handle) + one fact
 ;; per arg, so the graph can query/supersede/attach-provenance to each, and the reactor
 ;; drives off fact-patterns (a Datalog rule), never a string parse.
@@ -66,7 +66,7 @@
 
 (defn parse-args
   "Read the <args-edn> map. The SDK's command_peer emits ref values (@id, @lease:x) RAW —
-   valid tern refs but not EDN (edn rejects a leading @), so quote bare @-tokens first;
+   valid north refs but not EDN (edn rejects a leading @), so quote bare @-tokens first;
    the @-string value is then stored as a fact and the engine's ref-shape makes it a link."
   [s]
   (try (edn/read-string (str/replace (str s) #"@[^\s,}\]]+" #(str \" % \")))
@@ -139,7 +139,7 @@
         (println (str "no facts on " e))))
 
     "cmds"        ; [target]  — list PENDING commands (no acked_by), optionally scoped to a target
-    (let [rows (sort (or (tern.coord/pending-cmds port) []))
+    (let [rows (sort (or (north.coord/pending-cmds port) []))
           [tgt] args]
       (println (format "%-24s %-10s %s" "CMD" "OP" "TARGET"))
       (doseq [[c op t] rows]

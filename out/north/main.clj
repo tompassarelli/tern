@@ -1,15 +1,15 @@
-(ns tern.main
+(ns north.main
   (:gen-class)
   (:require [fram.kernel :as k]
             [fram.fold :as fold]
             [fram.import :as imp]
             [fram.export :as exp]
-            [tern.projections :as proj]
-            [tern.validate :as val]
-            [tern.staleness :as stale]
-            [tern.clock :as clk]
-            [tern.audit :as audit]
-            [tern.clockify :as cf]
+            [north.projections :as proj]
+            [north.validate :as val]
+            [north.staleness :as stale]
+            [north.clock :as clk]
+            [north.audit :as audit]
+            [north.clockify :as cf]
             [clojure.string :as str]
             [fram.rt :as rt])
   (:import [java.util Random]
@@ -133,14 +133,14 @@
   c))
 
 (defn cmd-capture [^String threads-dir ^String log ^String title ^String owner]
-  (let [source (fram.rt/getenv-or "TERN_SOURCE" "self")
-   author (fram.rt/getenv-or "TERN_AUTHOR" "you")
-   lead (fram.rt/getenv-or "TERN_LEAD" "")
-   proposed (fram.rt/getenv-or "TERN_PROPOSED_BY" "")]
+  (let [source (fram.rt/getenv-or "NORTH_SOURCE" "self")
+   author (fram.rt/getenv-or "NORTH_AUTHOR" "you")
+   lead (fram.rt/getenv-or "NORTH_LEAD" "")
+   proposed (fram.rt/getenv-or "NORTH_PROPOSED_BY" "")]
   (cond
   (or (str/blank? title) (ctrl? title)) (println "usage: capture <title> [owner]   (title must be a non-empty single line)")
   (ctrl? owner) (println "capture: owner must be a single line")
-  (or (ctrl? source) (ctrl? author) (ctrl? lead) (ctrl? proposed)) (println "capture: TERN_SOURCE/AUTHOR/LEAD/PROPOSED_BY must each be a single line")
+  (or (ctrl? source) (ctrl? author) (ctrl? lead) (ctrl? proposed)) (println "capture: NORTH_SOURCE/AUTHOR/LEAD/PROPOSED_BY must each be a single line")
   :else (do
   (fram.rt/ensure-dir threads-dir)
   (let [id (uuidv7)
@@ -150,12 +150,12 @@
    te (str "@" id)
    path (str threads-dir "/" id "-" slug ".md")
    port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.") (let [facts (capture-facts te title owner source author lead proposed created-at today)
+  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `north up`.") (let [facts (capture-facts te title owner source author lead proposed created-at today)
    results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) facts)
    oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
   (if (= oks (count facts)) (do
   (fram.rt/spit-file path (exp/thread-md (:facts (fold/fold (fram.rt/read-log log))) te))
-  (println (str "captured -> " te "  " title "  [owner: " owner "]\n" "  file:      " path "\n" "  committed: " oks " facts via coordinator. Next: tern tell " id " <pred> <value>"))) (println (str "capture PARTIAL: only " oks "/" (count facts) " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files."))))))))))
+  (println (str "captured -> " te "  " title "  [owner: " owner "]\n" "  file:      " path "\n" "  committed: " oks " facts via coordinator. Next: north tell " id " <pred> <value>"))) (println (str "capture PARTIAL: only " oks "/" (count facts) " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files."))))))))))
 
 (defn- ^Boolean id-like? [^String bare]
   (and (not (str/blank? bare)) (str/blank? (str/replace bare #"[0-9a-f-]" "")) (or (str/includes? bare "-") (>= (count bare) 8))))
@@ -163,7 +163,7 @@
 (defn cmd-resolve [^String log ^String ref]
   (let [idx (live-idx log)
    r (resolve-ref idx ref)]
-  (if (and (= r ref) (id-like? (short-id ref)) (nil? (k/one-i idx (str "@" (short-id ref)) "title"))) (println (str "ERROR unresolved id-like ref " ref " — not a thread id, unique prefix, or handle" " (ambiguous/truncated? `tern show " (short-id ref) "` lists candidates)")) (println r))))
+  (if (and (= r ref) (id-like? (short-id ref)) (nil? (k/one-i idx (str "@" (short-id ref)) "title"))) (println (str "ERROR unresolved id-like ref " ref " — not a thread id, unique prefix, or handle" " (ambiguous/truncated? `north show " (short-id ref) "` lists candidates)")) (println r))))
 
 (defn cmd-audit [^String log]
   (let [idx (live-idx log)
@@ -191,7 +191,7 @@
   (doseq [te shown]
   (println (str "  " (short-id te) "  " (trunc (title-of idx te) 56))))
   (if (and (not all) (> (count rs) (count shown))) (do
-  (println (str "  … +" (- (count rs) (count shown)) " more · tern ready --all"))))))
+  (println (str "  … +" (- (count rs) (count shown)) " more · north ready --all"))))))
 
 (defn cmd-blocked [^String log]
   (let [idx (live-idx log)
@@ -278,7 +278,7 @@
   (and (> us 0) (< (- now-secs us) window-secs))))))))))
 
 (defn- driver-stale-window-secs []
-  (let [d (fram.rt/parse-int (fram.rt/getenv-or "TERN_DRIVER_STALE_DAYS" "14"))]
+  (let [d (fram.rt/parse-int (fram.rt/getenv-or "NORTH_DRIVER_STALE_DAYS" "14"))]
   (* (if (> d 0) d 14) 86400)))
 
 (defn- board-full [idx ^String today before? nonterm]
@@ -301,21 +301,21 @@
    ashow (vec (take 20 active))
    ritems (mapv (fn [te] (->LevItem te (proj/leverage-score idx te))) readyl)
    rranked (vec (take 15 (sort-by (fn [it] (- 0 (:score it))) ritems)))]
-  (println (str "BOARD — " (count threads) " open threads · " (count active) " active · " (count readyl) " ready · " (count blockedl) " blocked · " nconcern " concerns   (tern board --all for the full kanban)"))
+  (println (str "BOARD — " (count threads) " open threads · " (count active) " active · " (count readyl) " ready · " (count blockedl) " blocked · " nconcern " concerns   (north board --all for the full kanban)"))
   (if (not (empty? active)) (do
   (println (str "\n" (proj/condition-emoji idx "active") " ACTIVE — who's on what (" (count active) ")"))
   (doseq [te ashow]
   (println (str "  " (let [dl (driver-label idx te)]
   (if (str/blank? dl) "?" dl)) "  " (short-id te) "  " (trunc (title-of idx te) 44))))
   (if (> (count active) (count ashow)) (do
-  (println (str "  … +" (- (count active) (count ashow)) " more · tern board --all"))))))
+  (println (str "  … +" (- (count active) (count ashow)) " more · north board --all"))))))
   (if (> nparked 0) (do
-  (println (str "\n" nparked " parked driver(s) — stale, not shown (tern board --all)"))))
+  (println (str "\n" nparked " parked driver(s) — stale, not shown (north board --all)"))))
   (println (str "\n" (proj/condition-emoji idx "ready") " READY — top " (count rranked) " of " (count readyl) " by leverage"))
   (doseq [it rranked]
   (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))
   (if (> (count readyl) (count rranked)) (do
-  (println (str "  … +" (- (count readyl) (count rranked)) " more · tern board --all"))))))
+  (println (str "  … +" (- (count readyl) (count rranked)) " more · north board --all"))))))
 
 (defn cmd-board [^String log ^Boolean all]
   (let [idx (live-idx log)
@@ -443,7 +443,7 @@
   (nil? (k/one-i idx te "title")) (println (str "no such thread: " id))
   (some? run) (println (str "already clocked in on " (short-id (session-thread idx run)) " (session " (short-id run) ") — `clock stop` first"))
   :else (let [port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `tern up`") (let [sid (fresh-sid idx (fram.rt/now-id))
+  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up`") (let [sid (fresh-sid idx (fram.rt/now-id))
    ssub (str "@" sid)
    now (fram.rt/now-iso)
    r1 (tell-retry port "assert" ssub "session_of" te 5)
@@ -456,7 +456,7 @@
    port (fram.rt/coord-port)]
   (cond
   (nil? run) (println "not clocked in")
-  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `tern up` (still clocked in)")
+  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up` (still clocked in)")
   :else (let [now (fram.rt/now-iso)
    st (k/one-i idx run "start_time")
    te (session-thread idx run)
@@ -490,7 +490,7 @@
    port (fram.rt/coord-port)]
   (cond
   (empty? sessions) (println "nothing to sync — no closed, unsynced sessions")
-  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `tern up` (sync records clockify_id, so it must be up first)")
+  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up` (sync records clockify_id, so it must be up first)")
   :else (let [ws (cf/default-workspace)]
   (println (str "syncing " (count sessions) " session(s) to clockify (workspace " ws ")"))
   (doseq [s sessions]
@@ -578,23 +578,23 @@
 
 (defn- ^String safety-line [^Probe p]
   (if (safe? p) "healthy: tell/untell + warm reads are safe" (cond
-  (not (:up p)) (str "DEGRADED: coordinator DOWN on 127.0.0.1:" (:port p) " — run `tern up` (writes won't serialize)")
+  (not (:up p)) (str "DEGRADED: coordinator DOWN on 127.0.0.1:" (:port p) " — run `north up` (writes won't serialize)")
   (not (:serving p)) (str "DEGRADED: daemon not serving the canonical log — status: " (:status p))
-  :else (str "DEGRADED: daemon STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p) ") — the log changed out-of-band; restart it + `tern up`"))))
+  :else (str "DEGRADED: daemon STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p) ") — the log changed out-of-band; restart it + `north up`"))))
 
 (defn- ^String hygiene-line [^Probe p]
   (let [ns (count (:stale p))
    nh (count (:hand p))
    nb (count (:log-behind p))]
-  (if (and (= ns 0) (and (= nh 0) (= nb 0))) "" (str "hygiene: " (+ ns nb) " stale/lagging projection fact(s) — run `tern heal`" (if (> nh 0) (str "; " nh " hand-edited fact(s) — reconcile via tell/import") "")))))
+  (if (and (= ns 0) (and (= nh 0) (= nb 0))) "" (str "hygiene: " (+ ns nb) " stale/lagging projection fact(s) — run `north heal`" (if (> nh 0) (str "; " nh " hand-edited fact(s) — reconcile via tell/import") "")))))
 
 (defn cmd-doctor [^String threads-dir ^String log]
   (let [p (probe threads-dir log)]
-  (println "tern doctor")
+  (println "north doctor")
   (if (:up p) (do
   (println (str "  [ok]    coordinator UP on 127.0.0.1:" (:port p)))
   (if (:serving p) (println "  [ok]    serving the canonical log") (println (str "  [WARN]  daemon is NOT serving " log " — status: " (:status p))))
-  (if (:fresh p) (if (= (:daemon-v p) (:log-v p)) (println "  [ok]    daemon state matches the on-disk log") (println (str "  [ok]    daemon current with the log (loaded v" (:daemon-v p) " > log v" (:log-v p) " — in-memory lease txs, never flat-logged)"))) (println (str "  [WARN]  daemon is STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p) ") — the log changed out-of-band; restart: kill it + `tern up`")))) (println (str "  [DOWN]  no coordinator on 127.0.0.1:" (:port p) " — writes won't serialize. Run `tern up`.")))
+  (if (:fresh p) (if (= (:daemon-v p) (:log-v p)) (println "  [ok]    daemon state matches the on-disk log") (println (str "  [ok]    daemon current with the log (loaded v" (:daemon-v p) " > log v" (:log-v p) " — in-memory lease txs, never flat-logged)"))) (println (str "  [WARN]  daemon is STALE (loaded v" (:daemon-v p) " behind log v" (:log-v p) ") — the log changed out-of-band; restart: kill it + `north up`")))) (println (str "  [DOWN]  no coordinator on 127.0.0.1:" (:port p) " — writes won't serialize. Run `north up`.")))
   (if (safe? p) (println "  => healthy: tell/untell + warm reads are safe") (println "  => DEGRADED: fix the warnings above"))
   (println "  hygiene:")
   (let [ns (count (:stale p))
@@ -602,11 +602,11 @@
    nb (count (:log-behind p))]
   (if (and (= ns 0) (and (= nh 0) (= nb 0))) (println "    [ok]    files <-> fact log in sync") (do
   (if (> ns 0) (do
-  (println (str "    " ns " stale projection fact(s) — run `tern heal`"))))
+  (println (str "    " ns " stale projection fact(s) — run `north heal`"))))
   (if (> nh 0) (do
   (println (str "    " nh " genuinely-new file fact(s) (hand edits) — reconcile via tell or import"))))
   (if (> nb 0) (do
-  (println (str "    " nb " log fact(s) not yet in files — benign projection lag; run `tern heal`")))))))))
+  (println (str "    " nb " log fact(s) not yet in files — benign projection lag; run `north heal`")))))))))
 
 (defn- distinct-ids [xs]
   (reduce (fn [acc x] (if (k/vec-contains? acc x) acc (conj acc x))) [] xs))
@@ -744,7 +744,7 @@
   (println (str "schema-seed DRY-RUN — " (count seeds) " fact(s); nothing written."))
   (doseq [c seeds]
   (println (str "  tell " (:l c) " " (:p c) " " (:r c))))
-  (println "Run `tern schema-seed --execute` (coordinator session) to write.")) (let [idx (live-idx log)
+  (println "Run `north schema-seed --execute` (coordinator session) to write.")) (let [idx (live-idx log)
    subs (distinct-ids (mapv (fn [c] (:l c)) seeds))
    collisions (filterv (fn [s] (some? (k/one-i idx s "title"))) subs)]
   (if (not (empty? collisions)) (do
@@ -753,13 +753,13 @@
   (doseq [s collisions]
   (println (str "      " s "  (has a `title` fact — is a thread)")))
   (println "    No facts written. Rename the colliding thread(s) or exclude the pred(s).")) (let [port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `tern up`.") (let [results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) seeds)
+  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `north up`.") (let [results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) seeds)
    oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
   (println (str "schema-seed EXECUTED — " oks "/" (count seeds) " fact(s) committed via coordinator."))))))))))
 
 (defn cmd-tools []
   (do
-  (println "TERN — curated tool surface (the MCP verbs; bin/tern-mcp is authoritative):")
+  (println "NORTH — curated tool surface (the MCP verbs; bin/north-mcp is authoritative):")
   (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
   (println "  vocabulary : schema (census by kind) · schema-seed (declare predicate metadata)")
   (println "  read/write : show · capture · tell · retract · validate   (untell = legacy alias of retract)")
@@ -768,8 +768,8 @@
   (println "  view       : presentation")
   (println "")
   (println "Engine core underneath: fram = 10 tools (tell/retract/show/ask/validate + 5 graph-edit verbs).")
-  (println "Vocabulary is DATA, not tools: `tern show <pred>` reveals a predicate's metadata")
-  (println "(cardinality/value_kind/acyclic facts). Seed that metadata with `tern schema-seed`.")))
+  (println "Vocabulary is DATA, not tools: `north show <pred>` reveals a predicate's metadata")
+  (println "(cardinality/value_kind/acyclic facts). Seed that metadata with `north schema-seed`.")))
 
 (defrecord PredCount [pred n])
 
@@ -864,7 +864,7 @@
   (= sub "projects") (cf/cmd-projects)
   (= sub "workspaces") (cf/cmd-workspaces)
   :else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
-  :else (println "tern usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)"))))
+  :else (println "north usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)"))))
 
 (defn -main [& args]
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))

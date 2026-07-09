@@ -1,6 +1,1 @@
-#!/usr/bin/env bash
-# tern-mine — cognitive telemetry miner over Claude Code session transcripts.
-# Extracts verb votes (hallucinated tool names), retry loops, guard denials,
-# engine rejects, and doc re-reads; appends them as facts via the coordinator.
-#   tern-mine [--dry-run] [--full] [--root DIR] [--report FILE] [--limit N] [--verbose]
-exec bb "$HOME/code/tern/cli/tern-mine.clj" "${TERN_PORT:-7977}" "$@"
+north-mine

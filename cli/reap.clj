@@ -1,9 +1,9 @@
-;; reap.clj — PURE liveness-reap decisions, split from tern-reactor.clj's I/O so the
+;; reap.clj — PURE liveness-reap decisions, split from north-reactor.clj's I/O so the
 ;; verdict is unit-testable off in-memory facts (../reap_test.clj) with no live daemon.
 ;; The reactor GATHERS facts through the coordinator, then calls these; the test feeds
 ;; the same shapes directly. No coordinator, no clock, no atoms here — inputs in, verdict
-;; out. Loaded (not required) the same way tern-reactor.clj loads coord.clj.
-(ns tern.reap
+;; out. Loaded (not required) the same way north-reactor.clj loads coord.clj.
+(ns north.reap
   (:require [clojure.string :as str]))
 
 (def LANE-STALE-MS    (* 30 60 1000))      ; 30min silent + no outcome -> dead lane

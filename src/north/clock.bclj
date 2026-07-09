@@ -1,5 +1,5 @@
 #lang beagle/clj
-(ns tern.clock
+(ns north.clock
   "Fact-native time logging: a work session is an entity
      @<sessid>  session_of  @<thread>
      @<sessid>  start_time  <iso>
@@ -11,7 +11,7 @@
    never stored, consistent with the no-stored-derived model (D6).")
 
 (require fram.kernel :as k)
-(require tern.projections :as proj)
+(require north.projections :as proj)
 (require clojure.string :as str)
 
 ;; the single open session: has session_of + start_time, no end_time.

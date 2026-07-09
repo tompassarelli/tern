@@ -1,4 +1,4 @@
-;; lease-cli.clj — agent-side Tern lease helper (P0 shadow).
+;; lease-cli.clj — agent-side North lease helper (P0 shadow).
 ;; Speaks the daemon lease WIRE verbs (b619283): :acquire-lease / :release-lease / :fence-ok / :status.
 ;; This is the contract every agent session uses to take the build mutex over the socket
 ;; INSTEAD of dropping a per-agent BUILD-LOCK-<agent>.md lockfile.
@@ -12,7 +12,7 @@
 
 ;; shared coord substrate (Foundation Part B): send-op lives once in cli/coord.clj.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
-(def send-op tern.coord/send-op)
+(def send-op north.coord/send-op)
 
 (let [[port verb & args] *command-line-args*
       port (Integer/parseInt port)

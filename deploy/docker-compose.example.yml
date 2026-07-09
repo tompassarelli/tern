@@ -1,4 +1,4 @@
-# Example multi-tenant Tern topology: an authenticated gateway in front of one
+# Example multi-tenant North topology: an authenticated gateway in front of one
 # coordinator (+ its own facts.log) per tenant.
 #
 # ISOLATION MODEL (this is load-bearing — read it):
@@ -14,48 +14,48 @@
 # depth you can ALSO enable engine mTLS (FRAM_TLS_KEYSTORE/TRUSTSTORE/PASS) so the
 # coordinator itself rejects any client without a trusted cert.
 #
-# The tenant registry (/srv/tern/tenants.edn) gives each tenant a :coordinator-host
+# The tenant registry (/srv/north/tenants.edn) gives each tenant a :coordinator-host
 # of its service name, e.g.:
 #   {"acme"   {:tokens #{"<sha256>"} :coordinator-host "coordinator-acme"   :coordinator-port 7801}
 #    "globex" {:tokens #{"<sha256>"} :coordinator-host "coordinator-globex" :coordinator-port 7802}}
 #
 # Usage:
-#   docker build -t tern:latest ..
+#   docker build -t north:latest ..
 #   docker compose -f docker-compose.example.yml up -d
 #   # provision mints tokens; set :coordinator-host to the service name afterwards
 #   # (provision.sh defaults it to 127.0.0.1 — override in the registry for compose).
 
 services:
   coordinator-acme:
-    image: tern:latest
+    image: north:latest
     environment:
       FRAM_BIND: "0.0.0.0"          # reachable by the gateway on acme-net (only)
       FRAM_PORT: "7801"
-      FRAM_LOG: /srv/tern/tenants/acme/facts.log
-    volumes: ["/srv/tern:/srv/tern"]
+      FRAM_LOG: /srv/north/tenants/acme/facts.log
+    volumes: ["/srv/north:/srv/north"]
     networks: [acme-net]            # isolated: only the gateway also joins acme-net
     restart: unless-stopped         # NOTE: port intentionally NOT published to host
 
   coordinator-globex:
-    image: tern:latest
+    image: north:latest
     environment:
       FRAM_BIND: "0.0.0.0"
       FRAM_PORT: "7802"
-      FRAM_LOG: /srv/tern/tenants/globex/facts.log
-    volumes: ["/srv/tern:/srv/tern"]
+      FRAM_LOG: /srv/north/tenants/globex/facts.log
+    volumes: ["/srv/north:/srv/north"]
     networks: [globex-net]          # isolated: cannot reach coordinator-acme
     restart: unless-stopped
 
   gateway:
-    image: tern:latest
-    command: ["bash","-lc","exec bb -cp /opt/tern/out /opt/tern/deploy/gateway/gateway.clj"]
+    image: north:latest
+    command: ["bash","-lc","exec bb -cp /opt/north/out /opt/north/deploy/gateway/gateway.clj"]
     environment:
       GATEWAY_PORT: "8088"
-      GATEWAY_TENANTS: /srv/tern/tenants.edn
+      GATEWAY_TENANTS: /srv/north/tenants.edn
       # Optional SSRF allowlist — restrict where the gateway will forward:
       GATEWAY_ALLOWED_COORD_HOSTS: "coordinator-acme,coordinator-globex"
     ports: ["8088:8088"]            # the ONLY published port (front it with TLS)
-    volumes: ["/srv/tern:/srv/tern"]
+    volumes: ["/srv/north:/srv/north"]
     networks: [edge, acme-net, globex-net]   # bridges the edge to each tenant's net
     depends_on: [coordinator-acme, coordinator-globex]
     restart: unless-stopped
