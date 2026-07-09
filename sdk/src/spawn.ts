@@ -7,6 +7,7 @@ import { tokensOf, costOf, remaining } from "./budget";
 import { recordRun } from "./telemetry";
 import { notifyDeath } from "./death";
 import { inputChannel } from "./coordination";
+import { writeAgentFacts, goalFromPrompt } from "./identity";
 import { makeStruggleState, updateStruggle, checkStruggle, resetStruggle } from "./struggle";
 import { LADDER, tierIndexOf, decideEscalation, escalateInFlight } from "./ladder";
 
@@ -29,8 +30,16 @@ interface SpawnOptions {
 }
 
 export async function spawn(opts: SpawnOptions): Promise<string> {
-  const agentId = opts.agentId ?? `sdk-${Date.now().toString(36).slice(-8)}`;
+  const agentId = opts.agentId ?? `lane-${Date.now().toString(36).slice(-8)}`;
   const stream = new StreamWriter(agentId);
+  writeAgentFacts(agentId, {
+    kind: "lane",
+    role: opts.role ?? process.env.AGENT_ROLE,
+    model: opts.model ?? process.env.AGENT_MODEL,
+    effort: (opts.effort ?? process.env.AGENT_EFFORT) as string | undefined,
+    repo: process.cwd().split("/").pop(),
+    goal: goalFromPrompt(opts.prompt),
+  });
   const escalate = opts.escalate ?? process.env.AGENT_ESCALATE === "1";
   const tierBudgetUsd = opts.budgetUsd ?? (Number(process.env.AGENT_BUDGET_USD) || Infinity);
 

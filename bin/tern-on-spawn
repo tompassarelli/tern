@@ -14,7 +14,7 @@ evt="$(jget hook_event_name)"; [ -z "$evt" ] && evt="SessionStart"
 REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
 RN="$(basename "$REPO")"
 IDDIR="${XDG_RUNTIME_DIR:-/tmp}/tern-agent-ids"
-DERIVED="cc-$RN-${sid:0:8}"
+DERIVED="session-$RN-${sid:0:8}"
 
 # Identity, de-aliased. INVARIANT: one live actor == one id; an id is only
 # renewed/registered by the session that FIRST acquired it. An env pin
@@ -38,7 +38,7 @@ if [ -n "$pin" ]; then
   [ "$owned_by_other" = 0 ] && ID="$pin"             # legit: fresh/first acquirer
 fi
 [ -z "$ID" ] && ID="$DERIVED"                        # inherited pin, or no pin at all
-[ "$ID" = "cc-$RN-" ] && ID="cc-$RN-$RANDOM"         # no sid -> can't derive; randomize
+[ "$ID" = "session-$RN-" ] && ID="session-$RN-$RANDOM"         # no sid -> can't derive; randomize
 
 # pin identity for the session's lifetime: tooluse renews THIS id, whatever cwd later
 # tool calls run in. Without the pin, identity flapped per (cwd-repo x session) and the
@@ -52,6 +52,13 @@ fi
 # register presence — best-effort, bounded; must never wedge a spawn.
 # Canonical :7977 log (NOT the stranded :7978 daemon concern/roster/board never read).
 timeout 5 bb "$HOME/code/tern/cli/presence-cli.clj" "${TERN_PORT:-7977}" register "$ID" "$REPO" "$ID" >/dev/null 2>&1 || true
+
+# identity facts on @agent:<id> — ids stay meaningless; meaning lives in facts.
+# Best-effort + bounded: a fact write must never wedge a spawn.
+TERNBIN="$HOME/code/tern/bin/tern"
+timeout 4 "$TERNBIN" tell "agent:$ID" kind session >/dev/null 2>&1 || true
+timeout 4 "$TERNBIN" tell "agent:$ID" repo "$RN" >/dev/null 2>&1 || true
+timeout 4 "$TERNBIN" tell "agent:$ID" display_name "session@$RN ($ID)" >/dev/null 2>&1 || true
 
 CTX="$(cat <<EOF
 [tern coordination active — you are agent "$ID" in repo "$RN"]
