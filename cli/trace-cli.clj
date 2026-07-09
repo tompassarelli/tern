@@ -177,6 +177,7 @@
         (let [stale-concern (first (filter #(and (= (:status %) "building")) concerns))
               detail (str (cond online "live — not reaped"
                                 terminal? (str "lease lapsed" (when (= terminal-kind :died-unreported) " · reactor reaped"))
+                                (nil? l) "no lease (lapsed + reaped, or never leased) — awaiting reactor verdict"
                                 :else (str "lease lapsed " (ago lapse) " — awaiting reap"))
                           (when (and stale-concern (not online))
                             (ylw (str " · concern still " (:status stale-concern) " (STALE)"))))]
@@ -191,8 +192,10 @@
                 (str (red "F1 — API-death mid-lane.") " agent_death recorded. Remedy: re-dispatch the thread (idempotent); enable AGENT_ESCALATE=1 for chronic deaths; read the partial result first.")
                 (= terminal-kind :died-unreported)
                 (str (red "F3 — died with no self-reported signal; reactor reaped it (outcome=died-unreported).") " The lease/telemetry missed the death; trust the reactor verdict.")
-                (and (not terminal?) (not online) l)
-                (str (red "F2/F3 — offline with NO completion signal.") " If the transcript moved after the lease expiry → F2 (lapsed-but-alive): trust the transcript. Else the reactor will reap it as died-unreported within 30min.")
+                (and on-roster (not terminal?) (not online))
+                (str (red "F2/F3 — offline with NO completion signal.")
+                     (if l " Lease lapsed but still present:" " Lease gone entirely (expired + reaped, or never leased):")
+                     " if the transcript moved after the lease expiry → F2 (lapsed-but-alive): trust the transcript. Else it died silently — the reactor reaps it as died-unreported within 30min (confirm: `tern show @agent:" id "` for outcome=died-unreported).")
                 (and (= lineage :sdk-lane) (not idfull))
                 (red "F6 — SDK-lane missing identity facts: possible id-collision/aliasing, or writeAgentFacts failed. Check `tern show @agent:<id>` for contradictory repos/goals.")
                 (and (= terminal-kind :ran) online)
