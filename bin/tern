@@ -8,7 +8,7 @@
 export FRAM_THREADS="${FRAM_THREADS:-$HOME/.local/state/tern/threads}"
 export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/tern/facts.log}"
 export FRAM_TIME_DIR="${FRAM_TIME_DIR:-$HOME/.local/state/tern/time}"
-export FRAM_SINGLE_VALUED="${FRAM_SINGLE_VALUED:-title owner lead driver source part_of do_on valid_until estimate_hours created_at updated_at name display_name body created_by committed outcome abandoned superseded_by merged_into session_of start_time end_time clockify_id rate invoice_id invoice_state linear}"
+export FRAM_SINGLE_VALUED="${FRAM_SINGLE_VALUED:-title owner lead driver source part_of do_on valid_until estimate_hours created_at updated_at name display_name body created_by committed outcome abandoned superseded_by merged_into session_of start_time end_time clockify_id rate invoice_id invoice_state linear kind}"
 # Tern DECLARES its lifecycle vocab to the (now genericized) Fram kernel —
 # value-identical to the kernel default, so this is the explicit-config form of
 # what was previously baked in (Fram >= ec7ef90: FRAM_TERMINAL_PREDS/WITHDRAWN_PREDS).
@@ -25,7 +25,7 @@ FRAM="${FRAM_HOME:-$HOME/code/fram}"
 TERN="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
-  ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema-seed|tools|doctor|heal|boot|clock)
+  ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema|schema-seed|tools|doctor|heal|boot|clock)
     # `validate` runs tern's FULL check (engine-generic ++ tern work rules,
     # tern.validate) — the fram CLI `validate` is generic-only since the work
     # rules moved out of the kernel. The MCP validate tool shells through here too.

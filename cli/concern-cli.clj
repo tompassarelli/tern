@@ -42,6 +42,54 @@
 (def many     tern.coord/many)
 (def resolved tern.coord/resolved)
 (def online?  tern.coord/online?)   ; renewable-lease liveness — same rule as the presence roster
+(def lease-of tern.coord/lease-of)  ; raw lease {:holder :exp :epoch} — needed for lapse-age
+
+;; ---- liveness-derived concern DECAY (design 019f4418) -----------------------
+;; A concern's owner is judged live by the SAME renewable-lease rule the presence
+;; roster uses. When the owner's presence has LAPSED we don't hide or delete — we
+;; DECAY the render at read time (pure projection, no write): a building concern
+;; goes STALE (dim + "owner lapsed <ago>"); a likely-to-land concern instead
+;; renders as a HANDOFF (prominent) — it SURVIVES owner death because it is a
+;; signal to the next agent, not stranded WIP. Terminal reactor verdict
+;; `reached=abandoned-stale` (owner dead >24h) renders abandoned + hides by default.
+(def ^:private use-color? (some? (System/console)))   ; ANSI only on a real TTY; piped/captured stays plain
+(defn- dim  [] (if use-color? "\033[2m" ""))
+(defn- bold [] (if use-color? "\033[1m" ""))
+(defn- rst  [] (if use-color? "\033[0m" ""))
+
+(defn ago
+  "Humanize a lapse duration in ms -> \"<n>{s,m,h,d}\"; nil (no lease ever) -> \"?\"."
+  [ms]
+  (if (nil? ms) "?"
+      (let [s (quot ms 1000)]
+        (cond (< s 60)    (str s "s")
+              (< s 3600)  (str (quot s 60) "m")
+              (< s 86400) (str (quot s 3600) "h")
+              :else       (str (quot s 86400) "d")))))
+
+;; declare-time embedded in the id (@concern-<epoch-ms>-<hex>): the lapse lower bound
+;; when a dead owner never held a lease (pre-presence agents). Matches the reactor's rule.
+(defn concern-mint-ms [c]
+  (some-> (re-find #"concern-(\d{10,})" (str c)) second parse-long))
+
+(defn owner-liveness
+  "-> {:online bool :lapsed-ago-ms nil-or-ms} for a concern meta. An agent-less
+   concern can't lapse (nothing to renew) so it renders live. When an offline owner
+   never held a lease, the concern's own age is the staleness lower bound (so STALE
+   shows a real duration, not \"?\")."
+  [port m]
+  (let [a (:agent m)]
+    (if (str/blank? a)
+      {:online true :lapsed-ago-ms nil}
+      (let [h (if (str/starts-with? a "@") (subs a 1) a)
+            l (lease-of port (str "session:" h))
+            now (System/currentTimeMillis)]
+        (cond
+          (and l (> (:exp l) now)) {:online true  :lapsed-ago-ms nil}
+          l                        {:online false :lapsed-ago-ms (- now (:exp l))}
+          :else {:online false :lapsed-ago-ms (when-let [mm (concern-mint-ms (:id m))] (- now mm))})))))
+
+(defn with-liveness [port m] (merge m (owner-liveness port m)))
 
 ;; port coercion: coord/send-op does (int port), so every port must be a NUMBER, never a
 ;; string (env vars + the stored code_port fact arrive as strings).
@@ -72,6 +120,10 @@
       (->> reached (sort-by #(get maturity-idx % -1)) last)
       "building")))
 
+;; Terminal reactor verdict: owner dead >24h while still building. Off the maturity
+;; ladder (orthogonal to progress), so it flags the concern without shadowing status.
+(defn abandoned? [port c] (contains? (set (many port c "reached")) "abandoned-stale"))
+
 ;; ---- the @concern:<id> bridge subject (shared across both jurisdictions) ----
 (defn concern-subj [id] (str "@concern:" id))                       ; spine-id -> code-store subject
 (defn subj->id [subj] (if (str/starts-with? subj "@concern:") (subs subj 9) subj))
@@ -101,6 +153,7 @@
    :repo (resolved port c "repo")
    :intent (resolved port c "intent")
    :status (status-of port c)
+   :abandoned (abandoned? port c)
    :code-port (resolved port c "code_port")
    :touches (touches-of port c)})
 
@@ -108,6 +161,23 @@
   (format "  %-12s %-14s %-10s {%s}\n     ↳ %s  (%s)"
           (or (:agent m) "?") (or (:status m) "?") (or (:repo m) "?")
           (str/join " " (sort (:touches m))) (or (:intent m) "") (:id m)))
+
+;; Render one concern with liveness DECAY applied. m must carry :online/:lapsed-ago-ms
+;; (via with-liveness) + :abandoned. Live -> plain; lapsed building -> STALE (dim);
+;; lapsed likely-to-land -> HANDOFF (prominent); abandoned-stale -> retired (dim).
+(defn decorate [m]
+  (let [base (fmt m)]
+    (cond
+      (:abandoned m)
+        (str (dim) base "\n       (ABANDONED-STALE: owner dead >24h — auto-retired by reactor)" (rst))
+      (:online m) base
+      (= (:status m) "likely-to-land")
+        (str (bold) "» HANDOFF  " base
+             "\n       ⇒ owner lapsed " (ago (:lapsed-ago-ms m))
+             " — likely-to-land survives owner death; ADOPT this" (rst))
+      :else
+        (str (dim) base
+             "\n       (STALE: owner lapsed " (ago (:lapsed-ago-ms m)) ")" (rst)))))
 
 ;; ---- overlap surfaces -------------------------------------------------------
 ;; CODE-GRAPH path: ask the code daemon which peer concerns' blast CLOSURE intersects
@@ -125,11 +195,12 @@
                   vec)]
     (if (empty? hits)
       (println (str "  (none) — " none-msg " [code-graph blast join over " (count (:footprint resp)) " footprint node(s)]"))
-      (doseq [m hits]
-        (println (fmt m))
-        (when (= (:status m) "likely-to-land")
-          (println "       [likely-to-land] — build against this"))
-        (println (str "       SHARES (blast-closure): " (str/join " " (sort (:shared m)))))))))
+      (doseq [m0 hits]
+        (let [m (with-liveness spine m0)]
+          (println (decorate m))
+          (when (and (:online m) (= (:status m) "likely-to-land"))
+            (println "       [likely-to-land] — build against this"))
+          (println (str "       SHARES (blast-closure): " (str/join " " (sort (:shared m))))))))))
 
 ;; FALLBACK path (non-flipped repo): the path-string touches intersection.
 (defn surface-path [port c statuses none-msg]
@@ -142,11 +213,12 @@
                   (filter #(or (nil? statuses) (statuses (:status %)))))]
     (if (empty? hits)
       (println (str "  (none) — " none-msg " {" (str/join " " (sort mine)) "}"))
-      (doseq [m hits]
-        (println (fmt m))
-        (when (= (:status m) "likely-to-land")
-          (println "       [likely-to-land] — build against this"))
-        (println (str "       SHARES: " (str/join " " (sort (set/intersection mine (:touches m))))))))))
+      (doseq [m0 hits]
+        (let [m (with-liveness port m0)]
+          (println (decorate m))
+          (when (and (:online m) (= (:status m) "likely-to-land"))
+            (println "       [likely-to-land] — build against this"))
+          (println (str "       SHARES: " (str/join " " (sort (set/intersection mine (:touches m)))))))))))
 
 ;; the effective code port for THIS concern: its own stored code_port (set at declare,
 ;; so overlap/shape work from any cwd), else the ambient $TERN_CODE_PORT. nil => path.
@@ -216,34 +288,34 @@
     (let [[c] args]
       (overlap! port (norm-cid c) true))
 
-    ;; A concern is LIVE only while its owning agent is ONLINE in the presence roster
-    ;; (renewable-lease liveness — coord/online?). A crashed agent's concerns never got
-    ;; a `done`, so without this they linger forever; presence lapses on its own, so we
-    ;; gate on it. Nothing is deleted — `--all`/`--stale` shows them, marked STALE. An
-    ;; agent-less concern can't lapse, so it stays visible.
+    ;; Liveness-derived DECAY (design 019f4418): a lapsed owner's concern is NOT hidden
+    ;; — hiding is what made 17 dead-agent concerns invisibly linger AND let a stale one
+    ;; misroute a live lane. It is RENDERED, decayed at read time: building -> STALE (dim),
+    ;; likely-to-land -> HANDOFF (prominent, survives owner death as a signal). The reactor's
+    ;; terminal verdict `abandoned-stale` (owner dead >24h) retires the concern — hidden by
+    ;; default, shown with --all. Agent-less concerns can't lapse, so render live.
     "ls"
     (let [flags   (set (filter #(str/starts-with? % "--") args))
           show-all (boolean (or (flags "--all") (flags "--stale")))
           repo    (first (remove #(str/starts-with? % "--") args))
-          agent-online? (fn [m] (let [a (:agent m)]
-                                  (if (str/blank? a) true
-                                    (online? port (if (str/starts-with? a "@") (subs a 1) a)))))
           all-ms  (->> (all-concerns port) (map #(meta-of port %))
                        (remove #(= (:status %) "landed"))
                        (filter #(or (nil? repo) (= (:repo %) repo)))
-                       (map #(assoc % :online (agent-online? %)))
-                       (sort-by :repo))
-          live-ms (filter :online all-ms)
-          shown   (if show-all all-ms live-ms)
-          hidden  (- (count all-ms) (count live-ms))]
-      (println (str "ACTIVE CONCERNS" (when repo (str " in " repo))
-                    (when show-all " (incl. stale)") " — " (count shown)
-                    (when (and (not show-all) (pos? hidden))
-                      (str "  [" hidden " hidden: owning agent offline — `concern ls --all` to show]"))))
+                       (map #(with-liveness port %))
+                       (sort-by (juxt :repo #(str (:agent %)))))
+          active  (remove :abandoned all-ms)             ; abandoned-stale retired: hidden unless --all
+          shown   (if show-all all-ms active)
+          stale-ct   (count (filter #(and (not (:online %)) (not (:abandoned %))
+                                          (not= (:status %) "likely-to-land")) active))
+          handoff-ct (count (filter #(and (not (:online %)) (= (:status %) "likely-to-land")) active))
+          retired-ct (- (count all-ms) (count active))]
+      (println (str "ACTIVE CONCERNS" (when repo (str " in " repo)) " — " (count shown)
+                    (when (pos? stale-ct)   (str "  [" stale-ct " STALE: owner lapsed]"))
+                    (when (pos? handoff-ct) (str "  [" handoff-ct " HANDOFF: owner gone, likely-to-land]"))
+                    (when (and (pos? retired-ct) (not show-all))
+                      (str "  [" retired-ct " abandoned-stale retired — `concern ls --all` to show]"))))
       (doseq [m shown]
-        (println (fmt m))
-        (when (and show-all (not (:online m)))
-          (println "       (STALE: owning agent presence lapsed)"))))
+        (println (decorate m))))
 
     "status"
     (let [[c st] args

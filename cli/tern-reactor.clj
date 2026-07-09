@@ -32,9 +32,131 @@
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
          '[babashka.process :as proc])
 
-(def args *command-line-args*)
-(def port (Integer/parseInt (or (first args) (System/getenv "FRAM_PORT") "7977")))
-(def debounce-ms (Integer/parseInt (or (second args) "400")))
+;; shared coord substrate (write verbs + renewable-lease liveness) — the sweep judges
+;; owner death by the SAME lease rule presence-cli/concern-cli use, and writes its
+;; verdict through the coordinator (auditable facts, never a mutated cell).
+(load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
+
+;; `sweep-once` verb: one-shot reap for testing. `bb cli/tern-reactor.clj sweep-once
+;; [--dry-run] [--repo <repo>]`. Otherwise argv = [port debounce] for the reactor loop.
+(def raw-args   *command-line-args*)
+(def sweep-verb? (= (first raw-args) "sweep-once"))
+(def s-args     (if sweep-verb? (vec (rest raw-args)) (vec raw-args)))
+(def sweep-flags (set (filter #(str/starts-with? % "--") s-args)))
+(def dry-run?   (contains? sweep-flags "--dry-run"))
+(def sweep-repo (when sweep-verb?
+                  (let [pos (remove #(str/starts-with? % "--") s-args)
+                        i (.indexOf (vec s-args) "--repo")]
+                    (cond (>= i 0) (get s-args (inc i))
+                          (seq pos) (first pos)
+                          :else nil))))
+(def port (Integer/parseInt (or (when-not sweep-verb? (first s-args))
+                                 (System/getenv "FRAM_PORT") "7977")))
+(def debounce-ms (Integer/parseInt (or (when-not sweep-verb? (second s-args)) "400")))
+
+;; ---- LIVENESS-DERIVED REAPING (design 019f4418) -----------------------------
+;; Two terminal verdicts the reactor writes on its cadence (or via sweep-once):
+;;   1. a `building` concern whose owner has been LAPSED >24h  -> reached=abandoned-stale
+;;      (likely-to-land is EXEMPT — it survives owner death as a handoff signal).
+;;   2. a kind=lane agent LAPSED >30min with NO outcome fact   -> outcome=died-unreported,
+;;      display_name prefixed "✝ ", and if it carries a coordinator/supervisor, ping it.
+;; Every write goes through :7977 (coord/append!/put!), so the audit trail is a fact.
+(def CONCERN-STALE-MS (* 24 60 60 1000))   ; 24h
+(def LANE-STALE-MS    (* 30 60 1000))      ; 30min
+
+(defn q-col [body]
+  (->> (:ok (tern.coord/send-op port {:op :query
+              :query {:find "e" :rules [{:head {:rel "e" :args [{:var "e"}]} :body body}]}}))
+       (map first)))
+
+(defn strip-sigil [s pfx] (if (str/starts-with? s pfx) (subs s (count pfx)) s))
+
+;; declare-time is embedded in the id: @concern-<epoch-ms>-<hex>. A stale-age LOWER
+;; BOUND when the owner never held a lease at all (dead-agent concerns predate presence).
+(defn concern-mint-ms [c]
+  (some-> (re-find #"concern-(\d{10,})" (str c)) second parse-long))
+
+(defn owner-lapse-ms
+  "How long this concern's owner has been OFFLINE, in ms — or nil if the owner is
+   ONLINE (unexpired lease) or the concern is agent-less. When the owner holds an
+   expired lease the lapse is exact; when it never held a lease (a pre-presence dead
+   agent) the concern's own age is the staleness lower bound."
+  [c]
+  (let [a (tern.coord/resolved port c "agent")]
+    (when (and a (seq a))
+      (let [now (System/currentTimeMillis)
+            l   (tern.coord/lease-of port (str "session:" (strip-sigil a "@")))]
+        (cond
+          (and l (> (:exp l) now)) nil                          ; owner ONLINE
+          l                        (- now (:exp l))             ; expired lease -> exact lapse
+          :else (when-let [m (concern-mint-ms c)] (- now m))))))) ; no lease -> age lower bound
+
+(defn building-only?
+  "True iff the concern reached `building` and never progressed past it (and isn't
+   already abandoned). likely-to-land/landed are EXCLUDED — a handoff must survive."
+  [rs]
+  (and (contains? rs "building")
+       (not (rs "likely-to-land")) (not (rs "landed")) (not (rs "abandoned-stale"))))
+
+(defn sweep-concerns! [dry?]
+  (let [concerns (distinct (q-col [{:rel "triple" :args [{:var "e"} "kind" "concern"]}]))
+        hits (for [c concerns
+                   :let  [rs (set (tern.coord/many port c "reached"))]
+                   :when (building-only? rs)
+                   :let  [lapse (owner-lapse-ms c)]
+                   :when (and lapse (>= lapse CONCERN-STALE-MS)
+                              (or (nil? sweep-repo)
+                                  (= sweep-repo (tern.coord/resolved port c "repo"))))]
+               {:c c :lapse lapse :agent (tern.coord/resolved port c "agent")})]
+    (doseq [{:keys [c lapse agent]} hits]
+      (when-not dry? (tern.coord/append! port c "reached" "abandoned-stale"))
+      (println (str "[sweep] " (if dry? "WOULD abandon" "abandoned-stale") " " c
+                    "  owner " agent " lapsed " (long (/ lapse 3600000)) "h")))
+    (count hits)))
+
+(defn ping-coordinator [coord h]
+  (try
+    (proc/shell {:out :string :err :string :continue true}
+                "bb" (str (.getParent (io/file (System/getProperty "babashka.file"))) "/msg-cli.clj")
+                (str port) "send" "tern-reactor" coord "URGENT"
+                (str "lane " h " died unreported (presence lapsed >30min, no outcome) — reaped by reactor"))
+    (catch Throwable _ nil)))
+
+(defn sweep-lanes! [dry?]
+  (let [lanes (distinct (q-col [{:rel "triple" :args [{:var "e"} "kind" "lane"]}]))
+        now   (System/currentTimeMillis)
+        hits (for [e lanes
+                   :let  [h (strip-sigil e "@agent:")
+                          l (tern.coord/lease-of port (str "session:" h))
+                          outcome (tern.coord/many port e "outcome")]
+                   :when (and (empty? outcome) l (<= (:exp l) now)
+                              (>= (- now (:exp l)) LANE-STALE-MS))]
+               {:e e :h h :lapse (- now (:exp l))})]
+    (doseq [{:keys [e h lapse]} hits]
+      (when-not dry?
+        (tern.coord/put! port e "outcome" "died-unreported")
+        (let [dn (tern.coord/resolved port e "display_name")]
+          (when (and dn (not (str/starts-with? dn "✝ ")))
+            (tern.coord/put! port e "display_name" (str "✝ " dn))))       ; recompute the projected name
+        (let [coord (or (tern.coord/resolved port e "coordinator")
+                        (tern.coord/resolved port e "supervisor"))]
+          (when (and coord (seq coord)) (ping-coordinator coord h))))
+      (println (str "[sweep] " (if dry? "WOULD reap" "reaped") " lane " e
+                    "  lapsed " (long (/ lapse 60000)) "min -> outcome=died-unreported")))
+    (count hits)))
+
+(defn sweep! [dry?]
+  (let [nc (sweep-concerns! dry?) nl (sweep-lanes! dry?)]
+    (println (str "[sweep] " (when dry? "(dry-run) ") "concerns abandoned=" nc " lanes reaped=" nl))
+    (flush)
+    {:concerns nc :lanes nl}))
+
+(defn sweep-loop []
+  (loop []
+    (Thread/sleep (* 5 60 1000))                    ; 5-min cadence, first sweep after one interval
+    (try (sweep! false)
+         (catch Throwable t (println (str "[sweep] error: " (.getMessage t))) (flush)))
+    (recur)))
 
 ;; bin/tern is a sibling of this cli/ dir: <repo>/cli/tern-reactor.clj -> <repo>/bin/tern
 (def tern-bin
@@ -102,9 +224,11 @@
 
 (defn -main []
   (println (str "[reactor] coordinator auto-export: subscribe :" port
-                " (debounce " debounce-ms "ms) -> " tern-bin " heal"))
+                " (debounce " debounce-ms "ms) -> " tern-bin " heal"
+                " | liveness sweep every 5min"))
   (flush)
   (future (flusher))
+  (future (sweep-loop))       ; liveness-derived reaping on the reactor cadence
   (loop []
     (try (subscribe-once)
          (catch Throwable t
@@ -112,4 +236,6 @@
     (Thread/sleep 1000)               ; brief backoff, then reconnect (survives a bounce)
     (recur)))
 
-(-main)
+(if sweep-verb?
+  (do (sweep! dry-run?) (System/exit 0))
+  (-main))

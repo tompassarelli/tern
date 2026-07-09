@@ -28,10 +28,25 @@ fi
 [ -z "$ID" ] && ID="cc-$RN-${sid:0:8}"
 [ "$ID" = "cc-$RN-" ] && ID="cc-$RN-$RANDOM"
 
-# renew presence — the 30min lease "renew every ~3min" the docs promise but nothing did.
-# Every tool call refreshes it, so an ACTIVE agent stays online (its concerns stay visible);
-# a dead/idle session stops calling tools -> lease lapses -> its concerns auto-hide.
-timeout 5 bb "$HOME/code/tern/cli/presence-cli.clj" "${TERN_PORT:-7977}" register "$ID" "$REPO" "$ID" >/dev/null 2>&1 || true
+# renew presence = ACTIVITY HEARTBEAT. A renewal MEANS "this agent ran a tool just now"
+# (IS-WORKING), so the 30min lease expiring becomes a real death signal, not just
+# "never registered". THROTTLED: a bb spawn per tool call is the cost, and the lease is
+# 30min, so renewing more than once per 60s is pure waste — skip if the last renewal for
+# THIS id was <60s ago (marker in XDG_RUNTIME_DIR, keyed by id so agents don't collide).
+# Best-effort + bounded: any failure is swallowed, never breaks the tool call. The marker
+# is stamped only on a SUCCESSFUL renew, so a failed renew retries on the next tool call.
+RENEW_DIR="${XDG_RUNTIME_DIR:-/tmp}/tern-presence-renew"
+RENEW_MARK="$RENEW_DIR/$ID"
+now_s="$(date +%s 2>/dev/null || echo 0)"
+last_s=0
+[ -r "$RENEW_MARK" ] && last_s="$(cat "$RENEW_MARK" 2>/dev/null || echo 0)"
+case "$last_s" in ''|*[!0-9]*) last_s=0 ;; esac
+if [ "$now_s" -eq 0 ] || [ $(( now_s - last_s )) -ge 60 ]; then
+  if timeout 5 bb "$HOME/code/tern/cli/presence-cli.clj" "${TERN_PORT:-7977}" register "$ID" "$REPO" "$ID" >/dev/null 2>&1; then
+    mkdir -p "$RENEW_DIR" 2>/dev/null || true
+    printf '%s' "$now_s" > "$RENEW_MARK" 2>/dev/null || true
+  fi
+fi
 
 # peek + ack inbox — bounded; failure is silent (never wedge a tool call)
 MAIL="$(timeout 6 bb "$HOME/code/tern/cli/inbox-peek.clj" 7977 "$ID" 2>/dev/null || true)"

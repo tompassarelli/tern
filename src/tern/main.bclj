@@ -106,6 +106,61 @@
 (defn- trunc [s :- String n :- Int] :- String
   (if (> (count s) n) (str (subs s 0 (- n 1)) "…") s))
 
+;; --- entity KIND: the census classifier ------------------------------------
+;; Every subject rolls up to one census bucket. Precedence: an explicit `kind`
+;; fact (concern-cli/session writers stamp it; tern capture now stamps
+;; kind=thread) WINS; else a `title` means thread; else a subject-prefix
+;; heuristic; else the schema-as-facts predicate check; else other. The heuristic
+;; is a FALLBACK for the un-kinded legacy bulk — new entities self-identify, so it
+;; shrinks over time. Facts, not guesses, where the fact exists.
+(defn- kind-bucket [ek :- String] :- String
+  ;; canonicalize an explicit `kind` fact value into a census bucket; the
+  ;; run/session/lane telemetry kinds fold into the one loud session-telemetry blob.
+  (cond
+    [(= ek "concern") "concern"]
+    [(= ek "thread") "thread"]
+    [(= ek "mine") "mine"]
+    [(or (= ek "run") (or (= ek "session") (= ek "lane"))) "session-telemetry"]
+    [:else ek]))
+
+(defn- prefix-kind [idx :- k/Index te :- String bare :- String] :- String
+  (cond
+    [(str/starts-with? bare "concern-") "concern"]
+    [(str/starts-with? bare "agent:") "agent"]
+    [(str/starts-with? bare "msg:") "msg"]
+    [(str/starts-with? bare "topic-") "topic"]
+    [(str/starts-with? bare "mine:") "mine"]
+    [(or (str/starts-with? bare "session:")
+         (or (str/starts-with? bare "sess-")
+             (or (str/starts-with? bare "run-")
+                 (or (str/starts-with? bare "snapshot:")
+                     (or (str/starts-with? bare "arena-")
+                         (or (str/starts-with? bare "cc-")
+                             (str/starts-with? bare "cmd:")))))))
+     "session-telemetry"]
+    [(or (some? (k/one-i idx te "cardinality"))
+         (or (some? (k/one-i idx te "value_kind"))
+             (some? (k/one-i idx te "acyclic"))))
+     "predicate"]
+    [:else "other"]))
+
+(defn- kind-of [idx :- k/Index te :- String] :- String
+  (let [ek (k/one-i idx te "kind")]
+    (if (some? ek)
+      (kind-bucket ek)
+      (if (some? (k/one-i idx te "title"))
+        "thread"
+        (prefix-kind idx te (short-id te))))))
+
+;; The human label for a thread's driver: its display_name if the agent carries
+;; one, else the bare ref — board legibility (who's on what).
+(defn- driver-label [idx :- k/Index te :- String] :- String
+  (let [d (k/one-i idx te "driver")]
+    (if (nil? d)
+      ""
+      (let [dn (k/one-i idx d "display_name")]
+        (if (some? dn) dn (short-id d))))))
+
 (defrecord LevItem [te :- String score :- Int])
 (defrecord NextItem [te :- String score :- Int])
 (defrecord AgendaItem [te :- String do_on :- String])
@@ -173,6 +228,12 @@
   ;; pickup (`tell <id> driver @x`), never a capture default — a driver cell here is
   ;; exactly the "stray driver" pollution the-model warns about.
   (let [c (add-fact [] te "title" title)
+        ;; KIND AT CAPTURE (coordination-v2): every new thread self-identifies as
+        ;; kind=thread in the SAME coordinator write batch — so `tern schema` and any
+        ;; world-separation view can group by kind without a subject-prefix guess.
+        ;; single-valued (bin/tern FRAM_SINGLE_VALUED); mirrors concern-cli, which
+        ;; already stamps kind=concern. NO backfill of old subjects (reactor/migration).
+        c (add-fact c te "kind" "thread")
         ;; the-model §7: `personal` is the IMPLICIT owner default — store `owner`
         ;; only for a non-personal (billable/client) owner, so absence == personal.
         c (if (= owner "personal") c (add-fact c te "owner" owner))
@@ -286,13 +347,21 @@
       (do (doseq [p problems] (println (str "  " p)))
           (println (str (count problems) " violation(s)."))))))
 
-(defn cmd-ready [log :- String] :- Nil
+(defn cmd-ready [log :- String all :- Bool] :- Nil
   (let [idx (live-idx log)
         today (fram.rt/today-iso)
-        rs (proj/ready idx today fram.rt/str-lt?)]
-    (println (str "READY NOW — " (count rs)))
-    (doseq [te rs]
-      (println (str "  " (short-id te) "  " (trunc (title-of idx te) 56))))))
+        rs (proj/ready idx today fram.rt/str-lt?)
+        ;; rank by leverage so the top-15 default is the HIGH-SIGNAL slice, not an
+        ;; arbitrary prefix of subject order. --all prints the whole ranked list.
+        ranked (vec (sort-by (fn [te :- String] :- Int (- 0 (proj/leverage-score idx te))) rs))
+        shown (if all ranked (vec (take 15 ranked)))]
+    (if all
+      (println (str "READY NOW — " (count rs)))
+      (println (str "READY NOW — top " (count shown) " of " (count rs) " by leverage")))
+    (doseq [te shown]
+      (println (str "  " (short-id te) "  " (trunc (title-of idx te) 56))))
+    (when (and (not all) (> (count rs) (count shown)))
+      (println (str "  … +" (- (count rs) (count shown)) " more · tern ready --all")))))
 
 (defn cmd-blocked [log :- String] :- Nil
   (let [idx (live-idx log)
@@ -373,18 +442,53 @@
   (filterv (fn [te :- String] :- Bool (= (proj/condition-i idx te today before?) c)) nonterm))
 
 ;; board (kanban prior; `plate` kept as a hidden alias — vocabulary pass, thread 019f2032)
-(defn cmd-board [log :- String] :- Nil
-  (let [idx (live-idx log)
-        today (fram.rt/today-iso)
-        before? fram.rt/str-lt?
-        nonterm (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te)))
-                         (proj/work-thread-ids-i idx))]
+;; DEFAULT = SIGNAL: active drivers (who's on what) + top-15 ready by leverage +
+;; a counts line. The full per-condition kanban dump moved behind `--all` (chaos
+;; was the census diagnosis: the flat dump drowned the ~15 threads that matter).
+(defn- board-full [idx :- k/Index today :- String before? :- [String String -> Bool] nonterm :- (Vec String)] :- Nil
+  (do
     (println (str "BOARD — " (count nonterm) " open"))
     (board-group idx "active" (in-condition idx nonterm today before? "active"))
     (board-group idx "ready" (in-condition idx nonterm today before? "ready"))
     (board-group idx "blocked" (in-condition idx nonterm today before? "blocked"))
     (board-group idx "dormant" (in-condition idx nonterm today before? "dormant"))
     (board-group idx "draft" (in-condition idx nonterm today before? "draft"))))
+
+(defn- board-curated [idx :- k/Index today :- String before? :- [String String -> Bool] nonterm :- (Vec String)] :- Nil
+  (let [active (in-condition idx nonterm today before? "active")
+        readyl (in-condition idx nonterm today before? "ready")
+        blockedl (in-condition idx nonterm today before? "blocked")
+        ;; cheap concern count: subjects that classify as a concern (kind fact or
+        ;; concern- prefix). NOT stale-decayed — concern liveness/decay is the
+        ;; concern-lane's projection; the board reports the raw open count.
+        nconcern (count (filterv (fn [s :- String] :- Bool (= (kind-of idx s) "concern"))
+                                 (:subjects idx)))
+        ritems (mapv (fn [te :- String] :- LevItem (->LevItem te (proj/leverage-score idx te))) readyl)
+        rranked (vec (take 15 (sort-by (fn [it :- LevItem] :- Int (- 0 (:score it))) ritems)))]
+    (println (str "BOARD — " (count nonterm) " open · " (count active) " active · "
+                  (count readyl) " ready · " (count blockedl) " blocked · "
+                  nconcern " concerns   (tern board --all for the full kanban)"))
+    (when (not (empty? active))
+      (println (str "\n" (proj/condition-emoji idx "active") " ACTIVE — who's on what (" (count active) ")"))
+      (doseq [te active]
+        (println (str "  " (let [dl (driver-label idx te)] (if (str/blank? dl) "?" dl))
+                      "  " (short-id te) "  " (trunc (title-of idx te) 44)))))
+    (println (str "\n" (proj/condition-emoji idx "ready") " READY — top " (count rranked)
+                  " of " (count readyl) " by leverage"))
+    (doseq [it rranked]
+      (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))
+    (when (> (count readyl) (count rranked))
+      (println (str "  … +" (- (count readyl) (count rranked)) " more · tern board --all")))))
+
+(defn cmd-board [log :- String all :- Bool] :- Nil
+  (let [idx (live-idx log)
+        today (fram.rt/today-iso)
+        before? fram.rt/str-lt?
+        nonterm (filterv (fn [te :- String] :- Bool (not (proj/terminal-i? idx te)))
+                         (proj/work-thread-ids-i idx))]
+    (if all
+      (board-full idx today before? nonterm)
+      (board-curated idx today before? nonterm))))
 
 ;; --- structured (JSON) projections for the MCP edge --------------------------
 (defrecord JThread [id :- String title :- String condition :- String emoji :- String])
@@ -945,6 +1049,7 @@
   (do
     (println "TERN — curated tool surface (the MCP verbs; bin/tern-mcp is authoritative):")
     (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
+    (println "  vocabulary : schema (census by kind) · schema-seed (declare predicate metadata)")
     (println "  read/write : show · capture · tell · retract · validate   (untell = legacy alias of retract)")
     (println "  time       : clock start|stop|status|report")
     (println "  agents     : dispatch · spawn")
@@ -953,6 +1058,77 @@
     (println "Engine core underneath: fram = 10 tools (tell/retract/show/ask/validate + 5 graph-edit verbs).")
     (println "Vocabulary is DATA, not tools: `tern show <pred>` reveals a predicate's metadata")
     (println "(cardinality/value_kind/acyclic facts). Seed that metadata with `tern schema-seed`.")))
+
+;; --- schema: the vocabulary census (READ side; schema-seed is the WRITE side) --
+;; "What schemas exist in tern?" answered as a standing tool: subjects + live-fact
+;; counts grouped by entity kind (kind-of), top predicates per kind, and the
+;; declared predicate metadata (cardinality/value_kind/acyclic — schema-as-facts).
+;; ONE fold (live-facts) then pure map-reduce; sorted by fact count so the biggest
+;; blobs — the session/run telemetry bulk — name themselves loudly with numbers.
+(defrecord PredCount [pred :- String n :- Int])
+(defrecord KindStat [kind :- String subjects :- Int facts :- Int preds :- (Vec PredCount)])
+
+;; composite-key sep for the (kind, pred) tally — neither kind nor pred contains it.
+(def ^:private KP-SEP :- String "")
+
+(defn- census [idx :- k/Index facts :- (Vec k/Fact)] :- (Vec KindStat)
+  (let [subj-list (:subjects idx)
+        ;; subject -> kind (computed ONCE per subject, then reused per fact)
+        skind (reduce (fn [m :- (Map String String) s :- String] :- (Map String String)
+                        (assoc m s (kind-of idx s)))
+                      {} subj-list)
+        ;; kind -> subject count
+        ksub (reduce (fn [m :- (Map String Int) s :- String] :- (Map String Int)
+                       (let [kd (get skind s "other")]
+                         (assoc m kd (+ 1 (get m kd 0)))))
+                     {} subj-list)
+        ;; kind -> fact count
+        kfacts (reduce (fn [m :- (Map String Int) c :- k/Fact] :- (Map String Int)
+                         (let [kd (get skind (:l c) "other")]
+                           (assoc m kd (+ 1 (get m kd 0)))))
+                       {} facts)
+        ;; (kind KP-SEP pred) -> fact count  (flat map; nested Map-of-Map avoided)
+        kpreds (reduce (fn [m :- (Map String Int) c :- k/Fact] :- (Map String Int)
+                         (let [kd (get skind (:l c) "other")
+                               kk (str kd KP-SEP (:p c))]
+                           (assoc m kk (+ 1 (get m kk 0)))))
+                       {} facts)
+        kp-keys (vec (keys kpreds))
+        stats (mapv (fn [kd :- String] :- KindStat
+                      (let [pfx (str kd KP-SEP)
+                            off (+ (count kd) 1)
+                            plist (mapv (fn [kk :- String] :- PredCount
+                                          (->PredCount (subs kk off) (get kpreds kk 0)))
+                                        (filterv (fn [kk :- String] :- Bool (str/starts-with? kk pfx)) kp-keys))
+                            ptop (vec (take 8 (sort-by (fn [pc :- PredCount] :- Int (- 0 (:n pc))) plist)))]
+                        (->KindStat kd (get ksub kd 0) (get kfacts kd 0) ptop)))
+                    (vec (keys ksub)))]
+    (vec (sort-by (fn [ks :- KindStat] :- Int (- 0 (:facts ks))) stats))))
+
+(defn cmd-schema [log :- String] :- Nil
+  (let [facts (live-facts log)
+        idx (k/build-index facts)
+        stats (census idx facts)]
+    (println (str "SCHEMA — vocabulary census: " (count (:subjects idx)) " subjects / "
+                  (count facts) " live facts, grouped by entity kind (top predicates each)"))
+    (doseq [ks stats]
+      (println (str "\n" (:kind ks) "  —  " (:subjects ks) " subjects · " (:facts ks) " facts"))
+      (doseq [pc (:preds ks)]
+        (println (str "    " (:pred pc) "  " (:n pc)))))
+    ;; PREDICATE METADATA — schema-as-facts: cardinality/value_kind/acyclic where declared.
+    (let [pred-subs (vec (sort-by (fn [x :- String] :- String x)
+                                  (filterv (fn [s :- String] :- Bool
+                                             (or (some? (k/one-i idx s "cardinality"))
+                                                 (or (some? (k/one-i idx s "value_kind"))
+                                                     (some? (k/one-i idx s "acyclic")))))
+                                           (:subjects idx))))]
+      (println (str "\nPREDICATE METADATA — " (count pred-subs)
+                    " predicate(s) with declared schema-as-facts (blank => env/legacy default)"))
+      (doseq [s pred-subs]
+        (let [card (let [c (k/one-i idx s "cardinality")] (if (some? c) c "multi"))
+              vk (let [v (k/one-i idx s "value_kind")] (if (some? v) v "literal"))
+              acy (if (some? (k/one-i idx s "acyclic")) " acyclic" "")]
+          (println (str "    " (short-id s) "  cardinality=" card " value_kind=" vk acy)))))))
 
 ;; --- dispatch (life verbs; engine verbs are routed to fram by the wrapper) ---
 (defn- has-flag? [args :- (Vec String) f :- String] :- Bool
@@ -965,13 +1141,14 @@
        (if (>= (count args) 2)
          (cmd-capture threads-dir log (nth args 1) (if (>= (count args) 3) (nth args 2) "personal"))
          (println "usage: capture <title> [owner]"))]
-      [(= cmd "ready")    (cmd-ready log)]
+      [(= cmd "ready")    (cmd-ready log (has-flag? args "--all"))]
       [(= cmd "blocked")  (cmd-blocked log)]
       [(= cmd "leverage") (cmd-leverage log)]
       [(= cmd "next")     (cmd-next log)]
       [(= cmd "agenda")   (cmd-agenda log)]
-      [(= cmd "board")    (cmd-board log)]
-      [(= cmd "plate")    (cmd-board log)]   ; hidden alias — works, not listed in usage
+      [(= cmd "board")    (cmd-board log (has-flag? args "--all"))]
+      [(= cmd "plate")    (cmd-board log (has-flag? args "--all"))]   ; hidden alias — works, not listed in usage
+      [(= cmd "schema")   (cmd-schema log)]
       [(= cmd "needs-review") (cmd-needs-review log)]
       [(= cmd "audit")    (cmd-audit log)]
       [(= cmd "resolve")
@@ -1007,7 +1184,7 @@
            [(= sub "projects")   (cf/cmd-projects)]
            [(= sub "workspaces") (cf/cmd-workspaces)]
            [:else (println "usage: clock start <id> | stop | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")]))]
-      [:else (println "tern usage: capture <title> [owner] | ready | blocked | leverage | next | agenda | board | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)")])))
+      [:else (println "tern usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)")])))
 
 (defn -main [& args] :- Nil
   (run (vec args) (fram.rt/threads-dir) (fram.rt/log-path)))
