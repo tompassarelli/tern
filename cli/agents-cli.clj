@@ -115,7 +115,9 @@
         (println (bold (str (count live) " live agents")))
         (doseq [a live]
           (let [dn (get-in af [(:id a) "display_name"])
-                label (if dn (str (format "%-40s" dn) (dim (str " (" (:id a) ")")))
+                ;; display_name already ends with "(id)" — only append when absent
+                label (if dn (str (format "%-40s" dn)
+                                  (when-not (str/includes? dn (:id a)) (dim (str " (" (:id a) ")"))))
                           (format "%-22s" (:id a)))]
             (println (str "  " (grn "●") " " label
                           (dim (str "  ttl " (:expires a)))
