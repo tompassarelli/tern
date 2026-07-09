@@ -36,6 +36,9 @@
 ;; owner death by the SAME lease rule presence-cli/concern-cli use, and writes its
 ;; verdict through the coordinator (auditable facts, never a mutated cell).
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
+;; PURE reap decisions (verdict off in-memory facts) — split out so reap_test.clj can
+;; drive the join/lapse/verdict logic with no live daemon. Sibling of coord.clj.
+(load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/reap.clj"))
 
 ;; `sweep-once` verb: one-shot reap for testing. `bb cli/tern-reactor.clj sweep-once
 ;; [--dry-run] [--repo <repo>]`. Otherwise argv = [port debounce] for the reactor loop.
@@ -61,8 +64,8 @@
 ;;   2. a kind=lane agent LAPSED >30min with NO outcome fact   -> outcome=died-unreported,
 ;;      display_name prefixed "✝ ", and if it carries a coordinator/supervisor, ping it.
 ;; Every write goes through :7977 (coord/append!/put!), so the audit trail is a fact.
-(def CONCERN-STALE-MS (* 24 60 60 1000))   ; 24h
-(def LANE-STALE-MS    (* 30 60 1000))      ; 30min
+(def CONCERN-STALE-MS tern.reap/CONCERN-STALE-MS)   ; 24h
+(def LANE-STALE-MS    tern.reap/LANE-STALE-MS)      ; 30min
 
 (defn q-col [body]
   (->> (:ok (tern.coord/send-op port {:op :query
@@ -122,16 +125,38 @@
                 (str "lane " h " died unreported (presence lapsed >30min, no outcome) — reaped by reactor"))
     (catch Throwable _ nil)))
 
+;; ---- impure GATHER for the reap verdict (pure logic lives in tern.reap) ------------
+;; The lane's own outcome is NOT authoritative: recordRun lands `outcome ran` on
+;; @run-<h>-<ts> with `agent <h>`, so a clean lane's @agent:<h> outcome is empty. Join
+;; through the agent fact and cross-ref @swarm agent_death before judging a lane silent.
+(defn subjects-tagged-agent
+  "Every subject carrying an `agent <h>` fact (runs land here; the session too)."
+  [h]
+  (distinct (q-col [{:rel "triple" :args [{:var "e"} "agent" h]}])))
+
+(defn lane-resolved?* [h]
+  (tern.reap/lane-resolved?
+    h
+    (map #(tern.coord/many port % "outcome") (subjects-tagged-agent h))
+    (tern.coord/many port "@swarm" "agent_death")))
+
+(defn spawned-ms
+  "@agent:<id> spawned_at (ISO) -> epoch ms, or nil (the leaseless-dead staleness axis)."
+  [e]
+  (when-let [ts (tern.coord/resolved port e "spawned_at")]
+    (try (.toEpochMilli (java.time.Instant/parse ts)) (catch Throwable _ nil))))
+
 (defn sweep-lanes! [dry?]
   (let [lanes (distinct (q-col [{:rel "triple" :args [{:var "e"} "kind" "lane"]}]))
         now   (System/currentTimeMillis)
         hits (for [e lanes
-                   :let  [h (strip-sigil e "@agent:")
-                          l (tern.coord/lease-of port (str "session:" h))
-                          outcome (tern.coord/many port e "outcome")]
-                   :when (and (empty? outcome) l (<= (:exp l) now)
-                              (>= (- now (:exp l)) LANE-STALE-MS))]
-               {:e e :h h :lapse (- now (:exp l))})]
+                   :let  [h        (strip-sigil e "@agent:")
+                          lane-oc  (tern.coord/many port e "outcome")
+                          l        (tern.coord/lease-of port (str "session:" h))
+                          lease-exp (:exp l)
+                          sp       (spawned-ms e)]
+                   :when (tern.reap/reap-lane? now lane-oc (lane-resolved?* h) lease-exp sp)]
+               {:e e :h h :lapse (tern.reap/lane-lapse-ms now lease-exp sp)})]
     (doseq [{:keys [e h lapse]} hits]
       (when-not dry?
         (tern.coord/put! port e "outcome" "died-unreported")

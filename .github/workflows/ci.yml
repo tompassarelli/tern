@@ -52,6 +52,7 @@ jobs:
           CP="out:../fram/out"
           bb -cp "$CP" clock_test.clj
           bb -cp "$CP" staleness_test.clj
+          bb reap_test.clj      # reactor reap verdict (daemon-free; guards the @run-join false positive)
           # Fram no longer ships a facts.log, so generate one (and exercise the
           # current log format) before the lifecycle test — otherwise it skips.
           ( cd ../fram && bin/fram import )
