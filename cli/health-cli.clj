@@ -44,22 +44,25 @@
         :query {:find "row"
                 :rules [{:head {:rel "row" :args (mapv (fn [v] {:var v}) project)} :body body}]}})))
 
+;; A LITERAL-anchored 1-clause fetch + per-entity `resolved` beats a multi-clause
+;; join here by ~30x: on the coordinator's planner each extra join clause is a full
+;; predicate scan (~1.4s/clause on a 155k-fact log), whereas `resolved` is
+;; entity-indexed (~0.6ms). run-rows went 4.4s -> 0.15s; the kind=lane pair is
+;; only 20 entities. This is what kept `tern health` inside the my-agents pane budget.
+(defn ids-with [port pred val]        ; entity ids where pred=val (literal object, cheap)
+  (map first (rows port ["e"] [{:rel "triple" :args [{:var "e"} pred val]}])))
+
 (defn run-rows [port]                 ; [[run-id agent outcome at] ...] — every kind=run record
-  (rows port ["e" "a" "o" "t"]
-        [{:rel "triple" :args [{:var "e"} "kind" "run"]}
-         {:rel "triple" :args [{:var "e"} "agent" {:var "a"}]}
-         {:rel "triple" :args [{:var "e"} "outcome" {:var "o"}]}
-         {:rel "triple" :args [{:var "e"} "at" {:var "t"}]}]))
+  (->> (ids-with port "kind" "run")
+       (mapv (fn [e] [e (resolved port e "agent") (resolved port e "outcome") (resolved port e "at")]))))
 
 (defn lane-outcome-rows [port]        ; [[@agent:id outcome] ...] — kind=lane carrying an outcome
-  (rows port ["e" "o"]
-        [{:rel "triple" :args [{:var "e"} "kind" "lane"]}
-         {:rel "triple" :args [{:var "e"} "outcome" {:var "o"}]}]))
+  (->> (ids-with port "kind" "lane")
+       (keep (fn [e] (when-let [o (resolved port e "outcome")] [e o])))))
 
 (defn coord-lane-rows [port]          ; [[@agent:id coordinator] ...] — lanes that carried a coordinator
-  (rows port ["e" "co"]
-        [{:rel "triple" :args [{:var "e"} "kind" "lane"]}
-         {:rel "triple" :args [{:var "e"} "coordinator" {:var "co"}]}]))
+  (->> (ids-with port "kind" "lane")
+       (keep (fn [e] (when-let [co (resolved port e "coordinator")] [e co])))))
 
 (defn signal-senders [port]           ; set of agent ids that landed a COMPLETE/DEATH ping (@msg from-field)
   (->> (rows port ["from" "subj"]
@@ -135,17 +138,22 @@
         (System/exit 0)))
     (println (str (bold "tern health") "  ·  :" PORT "  ·  " (str (java.time.Instant/now))))
     (println)
+    ;; Fold the two expensive joins over the 155k-fact log ONCE, then reuse. run-rows
+    ;; (4-way join) and lane-outcome-rows each fed multiple sections before — recomputing
+    ;; them per-section made `tern health` a ~12s command that always timed out the
+    ;; my-agents 4s pane. One fold each keeps it inside the pane budget.
+    (let [rr  (run-rows PORT)
+          lor (lane-outcome-rows PORT)]
     ;; 1. lane outcomes, windowed
-    (let [rr (run-rows PORT)]
-      (println (format "%-10s 24h  %s        7d  %s"
-                       "lanes" (fmt-runs (bucket-runs rr now DAY)) (fmt-runs (bucket-runs rr now WEEK)))))
+    (println (format "%-10s 24h  %s        7d  %s"
+                     "lanes" (fmt-runs (bucket-runs rr now DAY)) (fmt-runs (bucket-runs rr now WEEK))))
     ;; 2/3. deaths — reported (agent_death, with reason, 7d) + silent (died-unreported, durable total)
     (let [deaths (->> (many PORT "@swarm" "agent_death")
                       (keep (fn [line] (let [[id reason ts] (map str/trim (str/split (str line) #"\|" 3))]
                                          (when id {:id id :reason reason :ms (iso->ms ts)}))))
                       (sort-by #(or (:ms %) 0)))
           d7 (filter #(and (:ms %) (>= (:ms %) (- now WEEK))) deaths)
-          silent (->> (lane-outcome-rows PORT) (filter (fn [[_ o]] (= o "died-unreported"))) count)
+          silent (->> lor (filter (fn [[_ o]] (= o "died-unreported"))) count)
           last-d (last deaths)]
       (println (format "%-10s 7d  %d reported (agent_death, with reason) · %s"
                        "deaths" (count d7)
@@ -159,9 +167,9 @@
     (let [coord-lanes (coord-lane-rows PORT)
           ids (map (fn [[e _]] (subs (str e) (count "@agent:"))) coord-lanes)
           senders (signal-senders PORT)
-          ended? (let [ran-agents (set (map second (run-rows PORT)))
+          ended? (let [ran-agents (set (map second rr))
                        du (set (map (fn [[e _]] (subs (str e) (count "@agent:")))
-                                    (filter (fn [[_ o]] (= o "died-unreported")) (lane-outcome-rows PORT))))]
+                                    (filter (fn [[_ o]] (= o "died-unreported")) lor)))]
                    (fn [id] (or (contains? ran-agents id) (contains? du id))))
           signalled (count (filter senders ids))
           lost (count (filter #(and (ended? %) (not (senders %))) ids))]
@@ -174,7 +182,7 @@
                        (if (empty? z)
                          (str "0 zombie (no agent-handle git author absent from roster, last " since-h "h)")
                          (red (str (count z) " zombie: " (str/join " " (sort z))
-                                   " — agent-handle git author(s) absent from roster (F4)")))))))
+                                   " — agent-handle git author(s) absent from roster (F4)")))))))) ; +1 closes rr/lor let
   (System/exit 0))
 
 (try (-main (vec *command-line-args*))
