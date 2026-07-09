@@ -524,12 +524,13 @@ don't trust an enumeration here over the binary. The surface:
 **Reads (instant off the warm daemon, ~1ms):**
 
 ```sh
-tern ready       # committed, not blocked, not active, not done — do-able now
+tern ready       # curated: top 15 work threads by leverage (--all = every ready thread)
 tern blocked     # waiting on a depends_on target
 tern next        # the recommended next pull
 tern agenda      # calendar projection: buckets by do_on (overdue/today/next N)
-tern board       # everything open — the kanban board, bucketed by derived condition (alias: plate)
+tern board       # curated: active drivers + top-15 ready + counts (--all = full kanban; alias: plate)
 tern leverage    # high-leverage threads (most unblocks downstream)
+tern schema      # vocabulary census: subjects/facts by entity kind + predicate metadata
 tern show <id>   # one thread's facts + body; resolves id/slug/substring
 tern validate    # integrity check (see below)
 tern audit       # corpus-health report
@@ -548,6 +549,13 @@ structure (deps/estimate/driver/relations) and are ready to `commit`.
 same way a "project" is just a thread with children. `board` (alias: `plate`) is
 the replacement for the old per-state lists: it buckets threads by *derived*
 condition.
+
+`board` and `ready` **default to signal, not the full dump.** Bare `board` shows
+the active drivers (who's on what, rendered by `display_name`), the top ~15 ready
+threads by leverage, and a counts line (open/active/ready/blocked + open-concern
+count); it scopes to `kind thread`, so the ~200 concerns and telemetry subjects
+that also carry a `title` no longer drown the work graph. Bare `ready` is the top
+15 by leverage. `--all` on either restores the complete unscoped dump unchanged.
 
 **Writes:**
 
