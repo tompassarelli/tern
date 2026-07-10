@@ -49,10 +49,9 @@ north — your one card. Type a command to do the thing next to it.
     web  http://127.0.0.1:8088         the browser cockpit (stakeholder view)
 
   HAND OFF WORK   (starts a new lane — your own channel never blocks)
-    /request "<thing>"                 chat: fork a fresh, self-triaging lane
-    /offload                           chat: hand off carrying this conversation's context
-    north request "<thing>"            shell: same as /request, from a terminal
-    north fork "<task>" [--context <file>]   shell: managed fork, pings back when done
+    /delegate "<thing>"                chat: delegate; context is a parameter
+                                       (context:all carries this chat · context:none fresh)
+    north delegate "<task>" [--context <file>]   shell: delegate; --context attaches a brief
 
   DRIVE AGENTS
     north agents                       who's live now + heartbeat
@@ -100,7 +99,7 @@ CARD
     exec bb "$NORTH/cli/config-cli.clj" "${@:2}" ;;
   up)
     exec "$FRAM/bin/fram-up" "${@:2}" ;;
-  agents|spawn|request|fork|watch|steer|retask)
+  agents|spawn|delegate|request|fork|req|watch|steer|retask)
     # Agent verbs — agents are a north concern (spawn/presence/facts live here).
     # Implementation: cli/agents-cli.clj (ported from the convoy cockpit 2026-07-09).
     exec bb "$NORTH/cli/agents-cli.clj" "$@" ;;

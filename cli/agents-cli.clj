@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; agents-cli.clj — north's agent verbs: spawn · request · fork · agents · watch · tell · retask.
+;; agents-cli.clj — north's agent verbs: spawn · delegate · agents · watch · tell · retask.
 ;; Agents are a NORTH concern (spawns run on the north substrate, register presence,
 ;; write facts); this file is their CLI home. bin/north routes the verbs here.
 ;; Ported from the convoy cockpit 2026-07-09 when the ownership rule moved the
@@ -162,31 +162,15 @@
             (println (grn "spawned") (bold aid))
             (println "watch:" (cyn (str "north watch " aid)))))))))
 
-;; req = fork-everything intake: self-triaging opus-high handler + ping-back.
-(defn cmd-request [args]
-  (let [notify (or (second (drop-while #(not= "--notify" %) args))
-                   (System/getenv "NORTH_NOTIFY"))
-        text (str/join " " (remove #(or (#{"--notify" "--dry-run"} %)
-                                        (= % notify)) args))
-        dry? (some #{"--dry-run"} args)
-        contract (str "Your first act is triage. If this request is execute/implement-shaped "
-                      "and beneath your tier, sub-spawn it at the right gaffer dials and "
-                      "supervise; if it is your shape, do it yourself; if it decomposes, fan "
-                      "out sub-spawns in parallel (escalation is wired — prefer routing down). "
-                      "Strictly synchronous; commit checkpoints; never push unless asked; "
-                      "report to docs/private/.")]
-    (if (str/blank? text)
-      (println (red "usage:") "north request \"<request>\" [--notify <peer>]")
-      (cmd-spawn (cond-> ["integrator" (str "REQUEST: " text "\n\nOPERATING CONTRACT: " contract)]
-                   dry?   (conj "--dry-run")
-                   notify (into ["--notify" notify]))))))
-
-;; fork = context-carrying handoff: like request, but PREPENDS a parent-context
-;; brief so the lane inherits where the coordinator left off (files, decisions,
-;; constraints). Same integrator dials, same OPERATING CONTRACT, full lifecycle
-;; (id mint + identity facts + presence + completion/death ping) — the managed
-;; answer to the harness-native /fork's zombie forks (workflow-map pattern F/F4).
-(defn cmd-fork [args]
+;; delegate = the ONE delegation verb; the CONTEXT DIAL is a parameter, not a
+;; separate verb. `--context <file>` attaches a composed brief so the lane inherits
+;; where the coordinator left off (files, decisions, constraints); without it, a
+;; fresh right-sized lane takes the task with no baggage. (ASYMMETRY: context:all —
+;; a session composing its OWN brief live — is chat-only; the shell can only attach
+;; a pre-composed file.) Self-triaging integrator dials, full lifecycle (id mint +
+;; identity facts + presence + completion/death ping). Merges the retired
+;; request + fork verbs (2026-07-10).
+(defn cmd-delegate [args]
   (let [notify (or (second (drop-while #(not= "--notify" %) args))
                    (System/getenv "NORTH_NOTIFY"))
         ctx-file (second (drop-while #(not= "--context" %) args))
@@ -200,18 +184,20 @@
                   (println (red "context file not found:") ctx-file)
                   (System/exit 1))
                 (str/trim (slurp f))))
-        contract (str (if ctx "You carry the coordinator's context (above) — continue the work, "
-                              "You are a managed fork — take the task forward. ")
-                      (when ctx "Do not re-discover what the brief already states. ")
-                      "If it decomposes, fan out sub-spawns at the "
-                      "right gaffer dials and supervise (escalation is wired). "
+        contract (str (if ctx "You carry the coordinator's context (above) — continue the work; "
+                              "You are a fresh managed lane — take the task forward. ")
+                      (when ctx "do not re-discover what the brief already states. ")
+                      "Your first act is triage: if this is execute/implement-shaped and beneath "
+                      "your tier, sub-spawn it at the right gaffer dials and supervise; if it is "
+                      "your shape, do it yourself; if it decomposes, fan out sub-spawns in "
+                      "parallel (escalation is wired — prefer routing down). "
                       "Strictly synchronous; commit checkpoints; never push unless asked; "
                       "report to docs/private/.")
         brief (str (when ctx (str "CONTEXT BRIEF:\n" ctx "\n\n"))
-                   "FORK TASK: " text
+                   "DELEGATE TASK: " text
                    "\n\nOPERATING CONTRACT: " contract)]
     (if (str/blank? text)
-      (println (red "usage:") "north fork \"<task>\" [--context <file>] [--notify <peer>]")
+      (println (red "usage:") "north delegate \"<task>\" [--context <file>] [--notify <peer>]")
       (cmd-spawn (cond-> ["integrator" brief]
                    dry?   (conj "--dry-run")
                    notify (into ["--notify" notify]))))))
@@ -270,12 +256,14 @@
   (case cmd
     "agents"  (cmd-agents args)
     "spawn"   (cmd-spawn args)
-    "request" (cmd-request args)
-    ;; renamed 2026-07-09 (user: full word, pairs with /request) — teach, don't alias
-    "req"     (do (println "renamed: north request") (System/exit 1))
-    "fork"    (cmd-fork args)
+    "delegate" (cmd-delegate args)
+    ;; delegation unified to ONE verb 2026-07-10 (context is a parameter, not a
+    ;; separate verb) — request/fork/req teach, don't alias (slash-command precedent).
+    "request" (do (println "renamed: north delegate") (System/exit 1))
+    "fork"    (do (println "renamed: north delegate") (System/exit 1))
+    "req"     (do (println "renamed: north delegate") (System/exit 1))
     "watch"   (cmd-watch args)
     "steer"   (cmd-tell-agent args)
     "retask"  (cmd-retask args)
-    (do (println "usage: north {agents|spawn|request|fork|watch|steer|retask} ...")
+    (do (println "usage: north {agents|spawn|delegate|watch|steer|retask} ...")
         (System/exit 1))))
