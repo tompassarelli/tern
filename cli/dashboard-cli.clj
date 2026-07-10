@@ -122,7 +122,7 @@
 
 ;; ---- concerns: active, grouped by repo --------------------------------------
 (defn concern-rows []
-  (let [r (run [(str NORTH "/bin/concern") "ls" "--all"] :timeout 3000)]
+  (let [r (run [(str NORTH "/bin/concern") "ls" "--all"] :timeout 8000)  ;; decay projection probes owner leases — 2s+ warm; 3s flaked under load]
     (if (or (:timeout r) (not (:out r)))
       {:err "concern probe unavailable"}
       {:concerns
