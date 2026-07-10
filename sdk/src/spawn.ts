@@ -9,7 +9,7 @@ import { notifyDeath } from "./death";
 import { inputChannel } from "./coordination";
 import { writeAgentFacts, goalFromPrompt } from "./identity";
 import { makeStruggleState, updateStruggle, checkStruggle, resetStruggle } from "./struggle";
-import { LADDER, tierIndexOf, decideEscalation, escalateInFlight } from "./ladder";
+import { activeLadder, tierIndexOf, decideEscalation, escalateInFlight } from "./ladder";
 
 interface SpawnOptions {
   prompt: string;
@@ -47,8 +47,11 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   // escalate-not-kill (thread 019f1194-ca57): a struggling agent climbs the LADDER
   // in-flight (setModel on the live streaming-input query) instead of being killed at
   // a turn cap. Opt-in via opts.escalate / AGENT_ESCALATE; off => behaves as before.
+  // Snapshot the active ladder once per run (includes the Fable rung iff the window is
+  // open); tier indices below resolve against THIS array, matching decideEscalation.
+  const ladder = activeLadder();
   let tier = escalate ? tierIndexOf(opts.model, opts.effort) : -1; // -1 = fixed model (legacy)
-  const rung = () => (tier >= 0 ? LADDER[tier] : { model: opts.model, effort: opts.effort });
+  const rung = () => (tier >= 0 ? ladder[tier] : { model: opts.model, effort: opts.effort });
   const st = makeStruggleState();
   const ch = inputChannel(opts.prompt); // streaming-input mode -> unlocks q.setModel()
 
@@ -95,7 +98,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
         if (d.kind === "escalate") {
           const from = `${rung().model}/${rung().effort}`;
           tier = d.toTier;
-          await escalateInFlight(q, ch, LADDER[tier], trigger);
+          await escalateInFlight(q, ch, ladder[tier], trigger);
           escalations.push({ from, to: `${rung().model}/${rung().effort}`, reason: trigger, atCost: runCost });
           resetStruggle(st);
           tierStartCost = runCost;
@@ -120,7 +123,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
         if (d.kind === "escalate") {
           const from = `${rung().model}/${rung().effort}`;
           tier = d.toTier;
-          await escalateInFlight(q, ch, LADDER[tier], "empty_result");
+          await escalateInFlight(q, ch, ladder[tier], "empty_result");
           escalations.push({ from, to: `${rung().model}/${rung().effort}`, reason: "empty_result", atCost: runCost });
           resetStruggle(st);
           tierStartCost = runCost;

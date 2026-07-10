@@ -121,23 +121,42 @@
     :desc "Dispatch an agent for a thread. Reads thread facts to derive posture (unplanned/atomic/composite), then spawns via Claude Agent SDK. The thread must exist (use capture first). Returns the agent ID."
     :schema {:type "object"
              :properties {:id {:type "string" :description "Thread ID to dispatch (e.g. 2026-06-27-193317)"}
-                          :model {:type "string" :description "Model tier: opus, sonnet, haiku (default: sonnet)"}
+                          :model {:type "string" :description "Model tier: opus, sonnet, haiku, fable (default: sonnet). fable routes only inside the owner-ordered window (until 2026-07-12T16:00Z); orchestrator forks use it, workers escalate to it above opus/xhigh."}
                           :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}
                           :role {:type "string" :description "Praxis role block: executor|implementer|integrator|designer|researcher (optional)"}
-                          :posture {:type "string" :description "Praxis posture block: explore|deliver|preserve (optional)"}}
+                          :posture {:type "string" :description "Praxis posture block: explore|deliver|preserve (optional)"}
+                          :coordinator {:type "string" :description "Calling session's north id — the spawned lane pings it on completion/death and records a `coordinator` fact for it. Omit and it's inherited from the caller's AGENT_ID / NORTH_AGENT_ID env; pass it explicitly from an interactive session (no such env), e.g. the id from your 'you are agent \"…\"' context."}}
              :required ["id"]}}
    {:name "spawn"
     :desc "Spawn an ad-hoc agent with a prompt (no pre-existing thread needed). For thread-driven work, prefer capture + dispatch instead. Returns the agent ID."
     :schema {:type "object"
              :properties {:prompt {:type "string" :description "The task prompt for the agent"}
-                          :model {:type "string" :description "Model tier: opus, sonnet, haiku (default: sonnet)"}
+                          :model {:type "string" :description "Model tier: opus, sonnet, haiku, fable (default: sonnet). fable routes only inside the owner-ordered window (until 2026-07-12T16:00Z); orchestrator forks use it, workers escalate to it above opus/xhigh."}
                           :effort {:type "string" :description "Reasoning effort: low, medium, high, xhigh (default: high)"}
                           :role {:type "string" :description "Praxis role block: executor|implementer|integrator|designer|researcher (optional)"}
-                          :posture {:type "string" :description "Praxis posture block: explore|deliver|preserve (optional)"}}
+                          :posture {:type "string" :description "Praxis posture block: explore|deliver|preserve (optional)"}
+                          :coordinator {:type "string" :description "Calling session's north id — the spawned lane pings it on completion/death and records a `coordinator` fact for it. Omit and it's inherited from the caller's AGENT_ID / NORTH_AGENT_ID env; pass it explicitly from an interactive session (no such env), e.g. the id from your 'you are agent \"…\"' context."}}
              :required ["prompt"]}}])
 
+;; Attribution (routing-overhaul PART 1): the spawned lane inherits AGENT_COORDINATOR
+;; so it records a `coordinator` fact + pings that id on completion/death — otherwise
+;; every MCP-spawned lane shows coordinator "(none)" and audits can't attribute fan-out.
+;; The host session's north id is NOT in this server's env (north-mcp registers env:{}),
+;; so resolve it in priority order:
+;;   1. explicit `coordinator` arg — an interactive session passes its "you are agent …" id;
+;;   2. the CALLER's AGENT_ID — for a sub-spawn, this is the parent LANE's own id (its MCP
+;;      server inherits {...process.env} incl. AGENT_ID), so sub-delegation attributes to
+;;      the immediate parent, not a leaked top-of-tree pin;
+;;   3. NORTH_AGENT_ID — a pinned session id (last, so an inherited pin never beats #2).
+;; Captured from `env` BEFORE cmd-env reassigns AGENT_ID to the new lane.
+(defn resolve-coordinator [env args]
+  (or (not-empty (get args "coordinator"))
+      (not-empty (get env "AGENT_ID"))
+      (not-empty (System/getenv "NORTH_AGENT_ID"))))
+
 (defn call-sdk [nm args]
-  (let [env (into {} (System/getenv))]
+  (let [env (into {} (System/getenv))
+        coordinator (resolve-coordinator env args)]
     (case nm
       "dispatch"
       (let [id (get args "id")
@@ -147,16 +166,18 @@
             posture (get args "posture")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
-                      model   (assoc "AGENT_MODEL" model)
-                      effort  (assoc "AGENT_EFFORT" effort)
-                      role    (assoc "AGENT_ROLE" role)
-                      posture (assoc "AGENT_POSTURE" posture))]
+                      model       (assoc "AGENT_MODEL" model)
+                      effort      (assoc "AGENT_EFFORT" effort)
+                      role        (assoc "AGENT_ROLE" role)
+                      posture     (assoc "AGENT_POSTURE" posture)
+                      coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))]
           (.mkdirs (.getParentFile log))
           (proc/process {:env cmd-env :out log :err log}
                         bun "run" (str sdk-dir "/dispatch.ts") id))
         {:content [{:type "text" :text (str "dispatched @agent:" agent-id " for thread @" id
                                             (when model (str " model=" model))
+                                            (when coordinator (str " coordinator=" coordinator))
                                             "\nAgent is running in the background. "
                                             "Watch via web client (:8088) or `show` the thread.")}]})
 
@@ -168,16 +189,18 @@
             posture (get args "posture")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
-                      model   (assoc "AGENT_MODEL" model)
-                      effort  (assoc "AGENT_EFFORT" effort)
-                      role    (assoc "AGENT_ROLE" role)
-                      posture (assoc "AGENT_POSTURE" posture))]
+                      model       (assoc "AGENT_MODEL" model)
+                      effort      (assoc "AGENT_EFFORT" effort)
+                      role        (assoc "AGENT_ROLE" role)
+                      posture     (assoc "AGENT_POSTURE" posture)
+                      coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))]
           (.mkdirs (.getParentFile log))
           (proc/process {:env cmd-env :out log :err log}
                         bun "run" (str sdk-dir "/spawn.ts") prompt))
         {:content [{:type "text" :text (str "spawned @agent:" agent-id
                                             (when model (str " model=" model))
+                                            (when coordinator (str " coordinator=" coordinator))
                                             "\nAgent is running in the background. "
                                             "Watch via web client (:8088).")}]}))))
 

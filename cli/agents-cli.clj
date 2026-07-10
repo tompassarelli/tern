@@ -40,18 +40,51 @@
 (defn echo-cmd [& parts] (println (dim (str "» " (str/join " " parts)))))
 
 ;; ---- gaffer dial table (parse the canonical block; never fork doctrine) -----
+;; `fable` joins the model alternation for the owner-ordered window (routing-overhaul
+;; PART 3) so a Fable row parses if one ever lands; the live Fable routing is the
+;; date-gated synthetic-roles override below, NOT a doctrine dial-table row.
 (defn dial-table []
   (when (.exists (io/file DIAL-TABLE))
     (->> (slurp DIAL-TABLE) str/split-lines
          (keep (fn [ln]
                  (when-let [[_ role model effort trole posture]
                             (re-matches
-                             #"\s+([a-z]+)\s+(sonnet|opus|haiku)\s+(low|medium|high|xhigh|max)\s+(\S+)\s+(\S+)\s*"
+                             #"\s+([a-z]+)\s+(sonnet|opus|haiku|fable)\s+(low|medium|high|xhigh|max)\s+(\S+)\s+(\S+)\s*"
                              ln)]
                    [role {:model model :effort effort
                           :north-role (when-not (#{"—" "-"} trole) trole)
                           :posture posture}])))
          (into {}))))
+
+;; ---- Fable window — mechanical, owner-ordered, auto-expiring (routing-overhaul PART 3)
+;; Cutoff 2026-07-13T00:00 Asia/Shanghai (system tz) = 2026-07-12T16:00:00Z. The Clojure
+;; twin of sdk/src/fable-window.ts; NORTH_FABLE_NOW (ISO-8601 instant) overrides "now" so
+;; the gate is testable without touching the system clock. After the cutoff this flips
+;; with zero code change: orchestrator dials fall back to opus/xhigh.
+(def FABLE-WINDOW-END (java.time.Instant/parse "2026-07-12T16:00:00Z"))
+(defn fable-window-open?
+  ([] (fable-window-open?
+       (or (some-> (System/getenv "NORTH_FABLE_NOW") java.time.Instant/parse)
+           (java.time.Instant/now))))
+  ([now] (.isBefore now FABLE-WINDOW-END)))
+
+;; Two-tier synthetic roles (routing-overhaul PART 2/3) — NOT gaffer squad roles, so
+;; not in the dial table: they resolve the TIER, date-gated.
+;;   orchestrator — the decompose-and-fan-out fork. Window: fable/high; after: opus/xhigh.
+;;     No north-role/posture: its contract rides in the delegate brief, not a worker block
+;;     (a worker posture block would inject the interned "don't sub-delegate" clause and
+;;     contradict the orchestrator's mandate to fan out).
+;;   worker — the interned default when a fan-out subtask has no sharper shape. Window
+;;     floor rises to opus/xhigh; after: opus/high. Carries the deliver posture (hence the
+;;     interned clause). Sharper shapes still route to the gaffer squad roles as usual.
+(defn synthetic-roles []
+  (let [open? (fable-window-open?)]
+    {"orchestrator" {:model (if open? "fable" "opus")
+                     :effort (if open? "high" "xhigh")
+                     :north-role nil :posture nil}
+     "worker"       {:model "opus"
+                     :effort (if open? "xhigh" "high")
+                     :north-role "integrator" :posture "deliver"}}))
 
 ;; ---- agent identity facts (one log scan; single-valued predicates) ----------
 (defn agent-facts []
@@ -127,9 +160,10 @@
   (let [dry? (some #{"--dry-run"} args)
         notify (second (drop-while #(not= "--notify" %) args))
         [role prompt] (remove #(or (#{"--dry-run" "--notify"} %) (= % notify)) args)
-        dt (dial-table)]
+        ;; gaffer squad roles from the canonical table + the date-gated two-tier synthetic
+        ;; roles (orchestrator/worker); synthetics win a name clash (there are none).
+        dt (merge (or (dial-table) {}) (synthetic-roles))]
     (cond
-      (nil? dt) (println (red "gaffer dial table not found:") DIAL-TABLE)
       (or (nil? role) (nil? prompt))
       (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--notify <peer>] [--dry-run]")
           (println "roles:" (str/join " " (sort (keys dt)))))
@@ -168,9 +202,10 @@
 ;; without it, a fresh right-sized lane takes the task with no baggage. (ASYMMETRY:
 ;; the chat /delegate carries the session BY DEFAULT (mechanical fork) — a shell can
 ;; carry ITSELF forward; the shell has no session to fork, so it attaches a
-;; pre-composed file instead.) Self-triaging integrator dials, full lifecycle (id
-;; mint + identity facts + presence + completion/death ping). Merges the retired
-;; request + fork verbs (2026-07-10).
+;; pre-composed file instead.) Spawns the ORCHESTRATOR tier (two-tier law:
+;; date-gated fable/opus dials, no worker role/posture — its contract rides in
+;; the brief), full lifecycle (id mint + identity facts + presence +
+;; completion/death ping). Merges the retired request + fork verbs (2026-07-10).
 (defn cmd-delegate [args]
   (let [notify (or (second (drop-while #(not= "--notify" %) args))
                    (System/getenv "NORTH_NOTIFY"))
@@ -188,18 +223,22 @@
         contract (str (if ctx "You carry the coordinator's context (above) — continue the work; "
                               "You are a fresh managed lane — take the task forward. ")
                       (when ctx "do not re-discover what the brief already states. ")
-                      "Your first act is triage: if this is execute/implement-shaped and beneath "
-                      "your tier, sub-spawn it at the right gaffer dials and supervise; if it is "
-                      "your shape, do it yourself; if it decomposes, fan out sub-spawns in "
-                      "parallel (escalation is wired — prefer routing down). "
-                      "Strictly synchronous; commit checkpoints; never push unless asked; "
-                      "report to docs/private/.")
+                      "Decide your TIER by the task's shape — there is no third tier below you. "
+                      "DECOMPOSES (>=2 independent subtasks) => you are the ORCHESTRATOR: fan out "
+                      "one sub-spawn per subtask, in parallel, THIS turn, at the right gaffer dials; "
+                      "do NOT execute subtasks yourself (read/analyze, spawn, steer, verify, "
+                      "integrate); own the seams and verify workers' load-bearing claims. "
+                      "ATOMIC => you are the INTERNED WORKER: own it end-to-end and do NOT "
+                      "sub-delegate, except spawning ONE verifier for your own deliverable "
+                      "(no worker spawns workers). Escalation is wired (struggling workers climb "
+                      "the ladder). Strictly synchronous; commit checkpoints; never push unless "
+                      "asked; report to docs/private/.")
         brief (str (when ctx (str "CONTEXT BRIEF:\n" ctx "\n\n"))
                    "DELEGATE TASK: " text
                    "\n\nOPERATING CONTRACT: " contract)]
     (if (str/blank? text)
       (println (red "usage:") "north delegate \"<task>\" [--context <file>] [--notify <peer>]")
-      (cmd-spawn (cond-> ["integrator" brief]
+      (cmd-spawn (cond-> ["orchestrator" brief]
                    dry?   (conj "--dry-run")
                    notify (into ["--notify" notify]))))))
 

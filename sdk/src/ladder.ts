@@ -2,28 +2,46 @@
 // agent climbs ONE rung — a smarter model and/or higher effort — IN-FLIGHT (no
 // respawn, no context re-serialization), instead of being killed at a turn cap.
 //
-// v1 ceiling is opus/high. The opus/max rung is deferred: applyFlagSettings only
-// accepts Settings.effortLevel which caps at "xhigh" (sdk.d.ts), so "max" effort
-// can't be set mid-run — that rung needs an Option-B interrupt+resume, a follow-up.
+// Ceiling is opus/xhigh (raised from opus/high): applyFlagSettings accepts
+// Settings.effortLevel up to "xhigh" (sdk.d.ts), so xhigh IS settable mid-run — only
+// "max" effort needs the deferred Option-B interrupt+resume. The Fable rung sits ABOVE
+// opus/xhigh and is present ONLY inside the owner-ordered window (fable-window.ts): a
+// lane escalates to Fable exactly when opus/xhigh demonstrably spins. fable/high is
+// also <= xhigh effort, so setModel + applyFlagSettings apply it cleanly in-flight.
 import type { Effort } from "./harness";
 import { resolveModel } from "./harness";
 import { remaining, costOf } from "./budget";
+import { fableWindowOpen } from "./fable-window";
 
-export const LADDER: Array<{ model: string; effort: Effort }> = [
+const BASE_LADDER: Array<{ model: string; effort: Effort }> = [
   { model: "haiku", effort: "low" },     // 0 cheap baseline
   { model: "haiku", effort: "high" },    // 1 haiku ceiling
   { model: "sonnet", effort: "medium" }, // 2 default start / first model jump
   { model: "sonnet", effort: "high" },   // 3 workhorse
   { model: "sonnet", effort: "xhigh" },  // 4 sonnet ceiling
-  { model: "opus", effort: "high" },     // 5 judgment — v1 in-flight ceiling
+  { model: "opus", effort: "high" },     // 5 judgment
+  { model: "opus", effort: "xhigh" },    // 6 opus ceiling (standing in-flight top)
 ];
+
+const FABLE_RUNG: { model: string; effort: Effort } = { model: "fable", effort: "high" };
+
+// The ladder in effect NOW: base ramp, plus the Fable rung while the window is open.
+// Date-dependent, computed per call so the rung vanishes the instant the window closes —
+// the mechanical half of the gate (fable-window.ts is the other).
+export function activeLadder(): Array<{ model: string; effort: Effort }> {
+  return fableWindowOpen() ? [...BASE_LADDER, FABLE_RUNG] : BASE_LADDER;
+}
+
+// Back-compat: the base ramp as a constant (for importers indexing a fixed tier).
+export const LADDER = BASE_LADDER;
 
 // Default starting rung when escalation is on but no model is pinned: sonnet/medium.
 export const DEFAULT_START_TIER = 2;
 
 export function tierIndexOf(model?: string, effort?: Effort): number {
   if (!model) return DEFAULT_START_TIER;
-  const i = LADDER.findIndex((t) => t.model === model && (!effort || t.effort === effort));
+  const ladder = activeLadder();
+  const i = ladder.findIndex((t) => t.model === model && (!effort || t.effort === effort));
   return i >= 0 ? i : DEFAULT_START_TIER;
 }
 
@@ -39,10 +57,12 @@ export type EscDecision =
   | { kind: "budget_exhausted" };
 
 // Can we climb? Ceiling -> struggle_ceiling; can't afford the next tier -> budget_exhausted.
+// Uses the ACTIVE ladder so the Fable rung is a real climb target while the window is open.
 export async function decideEscalation(tier: number): Promise<EscDecision> {
-  if (tier >= LADDER.length - 1) return { kind: "struggle_ceiling" };
+  const ladder = activeLadder();
+  if (tier >= ladder.length - 1) return { kind: "struggle_ceiling" };
   const next = tier + 1;
-  if ((await remaining()) < estTierFloor(LADDER[next])) return { kind: "budget_exhausted" };
+  if ((await remaining()) < estTierFloor(ladder[next])) return { kind: "budget_exhausted" };
   return { kind: "escalate", toTier: next };
 }
 

@@ -79,9 +79,15 @@ const PRICING: Record<string, { in: number; out: number; cacheR: number; cacheW:
   opus: { in: 15, out: 75, cacheR: 1.5, cacheW: 18.75 },
   sonnet: { in: 3, out: 15, cacheR: 0.3, cacheW: 3.75 },
   haiku: { in: 0.8, out: 4, cacheR: 0.08, cacheW: 1 },
+  // Fable (routing-overhaul PART 3): premium tier. Billing is Max-plan, not API credits —
+  // these are only the in-run affordability estimate. Priced at the opus floor so the
+  // escalate-to-fable gate stays CONSERVATIVE (won't climb to Fable on a thin budget);
+  // approximate, pending published per-Mtok numbers.
+  fable: { in: 15, out: 75, cacheR: 1.5, cacheW: 18.75 },
 };
 function priceFor(model?: string) {
   const m = (model ?? "").toLowerCase();
+  if (m.includes("fable")) return PRICING.fable;
   if (m.includes("opus")) return PRICING.opus;
   if (m.includes("haiku")) return PRICING.haiku;
   return PRICING.sonnet; // default / sonnet tier

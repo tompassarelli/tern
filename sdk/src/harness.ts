@@ -32,6 +32,7 @@ const MODEL_MAP: Record<string, string> = {
   opus: "claude-opus-4-8",
   sonnet: "claude-sonnet-4-6",
   haiku: "claude-haiku-4-5-20251001",
+  fable: "claude-fable-5", // Mythos-class; routing-overhaul PART 3 (owner-ordered window)
 };
 export function resolveModel(m?: string): string | undefined {
   return m ? MODEL_MAP[m] ?? m : undefined;
