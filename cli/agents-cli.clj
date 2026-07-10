@@ -228,9 +228,17 @@
                       "one sub-spawn per subtask, in parallel, THIS turn, at the right gaffer dials; "
                       "do NOT execute subtasks yourself (read/analyze, spawn, steer, verify, "
                       "integrate); own the seams and verify workers' load-bearing claims. "
+                      "Decompose by the STOP-RULE: split only while further subdivision buys "
+                      "independence, certainty, or verifiability more than it costs integration; "
+                      "a subtask is TERMINAL (stop) when it has clear objective, bounded scope, "
+                      "known inputs/outputs, and a verification path — give each sub-spawn that "
+                      "LOCAL contract. YOU own the REDUCTION: child outputs return to and "
+                      "reconcile in you, never flat fan-in; over-parallelize exploration, "
+                      "converge execution; width and sequential waves are open, depth stays two. "
                       "ATOMIC => you are the INTERNED WORKER: own it end-to-end and do NOT "
                       "sub-delegate, except spawning ONE verifier for your own deliverable "
-                      "(no worker spawns workers). Escalation is wired (struggling workers climb "
+                      "(no worker spawns workers); your deliverable returns UP to your "
+                      "orchestrator. Escalation is wired (struggling workers climb "
                       "the ladder). Strictly synchronous; commit checkpoints; never push unless "
                       "asked; report to docs/private/.")
         brief (str (when ctx (str "CONTEXT BRIEF:\n" ctx "\n\n"))
