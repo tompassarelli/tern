@@ -148,7 +148,10 @@
       fetch fetchHandler
       websocket (object
         open (=> (ws) (.add clients ws))
-        close (=> (ws) (.delete clients ws))
+        ;; `(.delete clients ws)` mis-emits as `clients.delete$(ws)` — the JS
+        ;; emitter over-escapes the `delete` method name as a reserved word
+        ;; (GAP-LIST). Bracket-call keeps `this` bound: clients["delete"](ws).
+        close (=> (ws) ((bracket clients "delete") ws))
         message (=> (ws msg) 0)))))
     (.log console (tpl "north web (bjs) → http://localhost:" PORT "  static:" STATIC_DIR))
     (return server))))

@@ -187,9 +187,10 @@
   (let [h (d/dget body "handle") text (d/dget body "text")]
     (if (or (nil? h) (nil? text) (= text ""))
       {"http" 400 "body" {"error" "handle + text required"}}
-      (let [resolved (js/await (threads/resolve (at h) (fram/agents-port)))
+      ;; agents-port is a def VALUE (7977), not a getter — reference, don't call.
+      (let [resolved (js/await (threads/resolve (at h) fram/agents-port))
             handle (if (.startsWith resolved "@") (.slice resolved 1) resolved)
-            r (js/await (fram/assert! (fram/agents-port) (str "@session:" handle) "steer" text))]
+            r (js/await (fram/assert! fram/agents-port (str "@session:" handle) "steer" text))]
         (write-http r))))))
 
 ;; ISO-8601 now — js/quote (Date).
