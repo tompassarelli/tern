@@ -571,20 +571,51 @@ north export <out-dir>                       # regenerate files from the log
 **Coordination / daemon:**
 
 ```sh
-north doctor      # health of the coordinator + log (session-start handshake)
+north coord-doctor # the coordinator SAFETY handshake: tell/untell safe? daemon
+                   # state matches the on-disk log? (the raw engine check)
+north doctor      # the cockpit health sweep — leads with coord-doctor, then
+                  # daemons, rev skew, env hygiene, guard hooks (see Cockpit)
 north up          # start/revive the coordinator on the canonical log
 north watch       # event stream (change triggers; promotion prompts)
 north listen <agent-id>   # arm the real-time interrupt listener, as a background
                          # task; dormant until a peer pings you (alias: bin/north-arm)
 ```
 
+**Cockpit — see and drive the stack:**
+
+```sh
+north             # THE CARD: one screen of every significant incantation, grouped
+                  # "type this → do this" (north help is the same screen)
+north dashboard   # the cockpit: live agents, concerns by repo, board counts,
+                  # daemon health, condensed `north health`, profile rung per layer
+north doctor      # is everything healthy (the health sweep above)
+```
+
+`north dashboard` and `north doctor` folded in from convoy (2026-07-10). The
+**division of labor** the fold preserves: **gaffer answers WHO does the work**
+(role → model/effort dials, doctrine injected at SessionStart); **north's cockpit
+answers HOW you see and drive it** (dashboard, spawn, watch, steer, profile). The
+cockpit NEVER re-derives doctrine — `north spawn` parses gaffer's generated dial
+table (`~/code/gaffer/docs/adapters/north.md`, the canonical block) at runtime, so
+a dial change in gaffer is a dial change here with no edit.
+
+**Ownership rule** (2026-07-09): a cockpit verb earns its place ONLY when it
+COMPOSES multiple tools (`dashboard`, `doctor`, `profile`, `spawn` = gaffer dials
+× north SDK) or fixes a hostile invocation (`watch`, `steer`, `retask` over raw
+`msg-cli`/`tail`). If ONE tool already owns the concern, the cockpit TEACHES that
+tool's command — it never re-badges it. `north board` is typed as `north board`,
+not wrapped. Every composed call PRINTS the primitive it runs (the `»` line):
+teach the tool, don't hide it. State beyond `~/.cache/north/*` is never owned; no
+new daemons.
+
 ### Writing safely under concurrent agents
 
 north is fact-backed and **other agents may be editing concurrently**. The
 rules (also in the global CLAUDE.md):
 
-1. **Session-start handshake:** run `north doctor`. If DOWN/DEGRADED, run
-   `north up` to start the coordinator on the canonical log.
+1. **Session-start handshake:** run `north coord-doctor` (the fast coordinator
+   safety check; `north doctor` runs it too, inside the full cockpit sweep). If
+   DOWN/DEGRADED, run `north up` to start the coordinator on the canonical log.
 2. **New threads:** `north capture "<title>"` (fact-first) — or create the
    file and run `north import`. Distinct files don't collide, so file-edit +
    `import` is safe for whole new threads.
@@ -665,7 +696,7 @@ after any batch of edits.
 If you are an AI (Claude or otherwise) editing this directory:
 
 1. **Read this file first.** Yes, again.
-2. **Run the handshake** (`north doctor`, `north up` if needed) before
+2. **Run the handshake** (`north coord-doctor`, `north up` if needed) before
    coordinating threads.
 3. **Default `source ai`** for anything you originate, not `tom`. Add yourself
    to `proposed_by` (`@claude`, `@claude-code`). The `bin/north` wrapper

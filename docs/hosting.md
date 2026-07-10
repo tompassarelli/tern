@@ -117,7 +117,7 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
   + the gateway unit; both `Restart=on-failure`. Or one container per coordinator.
 - **Upgrades:** pull the repos (or a new image tag) and restart; the log format is
   stable and forward-only.
-- **Health:** gateway `GET /healthz`; coordinator liveness via `north doctor` /
+- **Health:** gateway `GET /healthz`; coordinator liveness via `north coord-doctor` /
   an `{:op :status}` RPC.
 
 ---

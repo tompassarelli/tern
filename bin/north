@@ -25,11 +25,73 @@ FRAM="${FRAM_HOME:-$HOME/code/fram}"
 NORTH="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
-  ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema|schema-seed|tools|doctor|heal|boot|clock)
+  ""|help|-h|--help)
+    # THE CARD — one screen, grouped, "type this → do this". Bare `north` and
+    # `north help` are the same implementation (help IS the card verb, not an
+    # alias). Every line below is a command that actually works; verify before
+    # adding. Kept honest by hand, not generated.
+    cat <<'CARD'
+north — your one card. Type a command to do the thing next to it.
+
+  GET HELP
+    north                              this card
+    north <verb> --help                most verbs print their own usage
+
+  SEE WHAT'S GOING ON
+    north dashboard                    the cockpit: agents, concerns, board, health, profile
+    north board                        every open thread   (--all for the full kanban)
+    north ready                        unblocked work, ordered by leverage
+    north agenda                       what's dated / overdue today
+    north health                       coordination rollup: lanes ran/died, stale concerns
+    north trace <id>                   diagnose one agent's lifecycle
+    north dials                        routing analytics — is the right model/effort in use
+    north schema                       the fact vocabulary in use
+    web  http://127.0.0.1:8088         the browser cockpit (stakeholder view)
+
+  HAND OFF WORK   (starts a new lane — your own channel never blocks)
+    /request "<thing>"                 chat: fork a fresh, self-triaging lane
+    /offload                           chat: hand off carrying this conversation's context
+    north request "<thing>"            shell: same as /request, from a terminal
+    north fork "<task>" [--context <file>]   shell: managed fork, pings back when done
+
+  DRIVE AGENTS
+    north agents                       who's live now + heartbeat
+    north watch <id>                   tail an agent's transcript
+    north steer <id> "<msg>"           inject a message into a running agent
+    north retask <id> "<goal>"         redirect a running agent's goal
+    north spawn <role> "<prompt>"      spawn at a gaffer role's model/effort
+                                       roles: analyst designer executor implementer
+                                              integrator judge researcher verifier
+    (agents dispatch via MCP)          in-harness agents call mcp__north__dispatch / spawn
+
+  LIFE   (capture thoughts, track work + time)
+    north capture "<thought>"          turn a thought into a thread
+    north show <id>                    read one thread's facts
+    north tell <id> <pred> <val>       assert a fact   (north retract … to remove)
+    north clock start|stop             log real time against a thread
+
+  SETTINGS & HEALTH
+    my-agent-config                    posture toggles: dispatch, caveman, coord, guards
+    north doctor                       is everything healthy — daemons, rev skew, env, hooks
+CARD
+    exit 0 ;;
+  ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema|schema-seed|tools|heal|boot|clock)
     # `validate` runs north's FULL check (engine-generic ++ north work rules,
     # north.validate) — the fram CLI `validate` is generic-only since the work
     # rules moved out of the kernel. The MCP validate tool shells through here too.
     exec bb -cp "$NORTH/out:$FRAM/out" -m north.main "$@" ;;
+  coord-doctor)
+    # Engine-level coordinator SAFETY handshake + log-hygiene diff (north.main
+    # cmd-doctor): tell/untell safe? daemon state matches on-disk log? This is the
+    # raw primitive the cockpit `north doctor` leads with. Renamed from the old bare
+    # `north doctor` (2026-07-10) when the convoy cockpit doctor folded in.
+    exec bb -cp "$NORTH/out:$FRAM/out" -m north.main doctor "${@:2}" ;;
+  dashboard|doctor)
+    # The cockpit (ported from convoy/bin/my-agents, 2026-07-10): `dashboard` =
+    # what is happening (agents/concerns/board/daemons/health/profile); `doctor` =
+    # is everything healthy (coordinator handshake + daemons/health/rev-skew/env/
+    # guard-hooks). Both teach the primitive they wrap. cli/dashboard-cli.clj.
+    exec bb "$NORTH/cli/dashboard-cli.clj" "$@" ;;
   up)
     exec "$FRAM/bin/fram-up" "${@:2}" ;;
   agents|spawn|request|fork|watch|steer|retask)
