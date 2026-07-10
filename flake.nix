@@ -76,7 +76,11 @@
             runHook preInstall
             mkdir -p $out/bin $out/out
             cp -r out/. $out/out/
-            cp bin/north bin/north-mcp $out/bin/
+            # bb-verb CLIs (agents/watch/trace/health/dials/dashboard/config/...)
+            # route through $root/cli — without this every non-engine verb dies
+            # on the packaged binary with "File does not exist: .../cli/*.clj".
+            cp -r cli $out/cli
+            cp bin/north bin/north-mcp bin/concern $out/bin/
 
             wrapProgram $out/bin/north \
               --prefix PATH : ${runtimePath} \
