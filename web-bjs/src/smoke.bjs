@@ -1,0 +1,18 @@
+#lang beagle/js
+(ns smoke)
+(require north.fram :as fram)
+
+(defn run [] :- (Promise Nil)
+  (let [ag (js/await (fram/agents 7977))]
+    (println (str "agents: " (count ag)))
+    (let [r (js/await (fram/resolved 7977 "@ui" "emoji_active"))]
+      (println (str "resolved emoji_active: " r)))
+    (let [trips (js/await (fram/all-triples 7977))]
+      (println (str "triples: " (count trips))))
+    (let [tok (js/await (fram/agent-tokens 7977))]
+      (println (str "token-handles: " (count (keys tok)))))))
+
+(js/quote
+  (export (async function main () (return (await (run))))))
+
+(js/quote (main))

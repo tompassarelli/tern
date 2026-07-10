@@ -1,0 +1,217 @@
+#lang beagle/js
+(ns north.fram)
+
+;; Server-side client for the fram fact-graph daemon (:7977), TCP line protocol:
+;; one EDN op per connection, JSON reply. Port of web/lib/north/fram.ex.
+;;
+;; SIMPLIFICATION vs the Elixir original: every op is sent with `:fmt :json`, so
+;; the reply is always JSON and decodes with JSON.parse — the EDN decoder and the
+;; old-daemon EDN fallback are dropped (the live coordinator speaks JSON). The
+;; 1.6MB all_triples read needs no socket-buffer sizing: userland accumulates
+;; chunks until the daemon closes the connection (one request per connection).
+
+(declare-extern Bun Any)
+(declare-extern JSON Any)
+(declare-extern TextDecoder Any)
+
+;; ---- low-level I/O (js/quote — inherently callback-shaped) ------------------
+;; Open a socket, write one op line, accumulate the reply, resolve the raw line
+;; on close. Never rejects: connect failure / socket error resolve to null.
+(js/quote
+  (export (async function framRequestRaw (port op)
+    (return (new Promise (=> (resolve)
+      (const chunks (array))
+      (const decoder (new TextDecoder))
+      (const settle (=> (v) (resolve v)))
+      (const cp (.connect Bun (object
+        hostname "127.0.0.1"
+        port port
+        socket (object
+          open (=> (socket) (.write socket (tpl "" op "\n")))
+          data (=> (socket chunk) (.push chunks (.decode decoder chunk (object stream true))))
+          close (=> (socket) (settle (.join chunks "")))
+          error (=> (socket err) (settle null))))))
+      ((bracket cp "catch") (=> (err) (settle null))))))))
+  ;; JSON.parse yielding null on a malformed line instead of throwing.
+  (export (function safeParse (s)
+    (try (return (.parse JSON s))
+      (catch e (return null)))))
+  ;; numeric parse helpers (JS Number semantics)
+  (export (function parseIntSafe (v)
+    (const n (parseInt (String v) 10))
+    (return (? (isNaN n) 0 n))))
+  (export (function parseFloatSafe (v)
+    (const n (parseFloat (String v)))
+    (return (? (isNaN n) 0 n))))
+  ;; lexical >= for ISO-8601 strings (Beagle >= is numeric).
+  (export (function strGte (a b)
+    (return (>= a b)))))
+
+(declare-extern framRequestRaw [Int String -> (Promise String)])
+(declare-extern safeParse [String -> Any])
+(declare-extern parseIntSafe [Any -> Int])
+(declare-extern parseFloatSafe [Any -> Float])
+(declare-extern strGte [String String -> Bool])
+
+;; ---- ports ------------------------------------------------------------------
+
+(js/export (def board-port :- Int 7977))
+(js/export (def agents-port :- Int 7977))
+
+(js/export (defn port-for [(graph :- String)] :- Int
+  (cond
+    (= graph "code") 7979
+    (= graph "attention") 7980
+    :else 7977)))
+
+;; ---- generic query ----------------------------------------------------------
+;; Append ` :fmt :json` before the op's closing brace, send, JSON-decode. nil on
+;; any transport/parse failure — callers pattern-match on nil like the Elixir.
+(defn as-json [(op :- String)] :- String
+  (str (.slice op 0 -1) " :fmt :json}"))
+
+(defn query [(port :- Int) (op :- String)] :- (Promise Any)
+  (let [line (js/await (framRequestRaw port (as-json op)))]
+    (if (nil? line) nil (safeParse line))))
+
+;; ---- writes (OCC: read version → assert/retract with :base → retry) --------
+
+(defn esc [(s :- String)] :- String
+  (.replaceAll (.replaceAll s "\\" "\\\\") "\"" "\\\""))
+
+(defrecord WriteResult [(status :- String) (value :- Any) (reason :- String)])
+
+(defn version [(port :- Int)] :- (Promise Any)
+  (let [resp (js/await (query port "{:op :version}"))]
+    (if (nil? resp) nil (.-version resp))))
+
+(defn rejected? [(resp :- Any)] :- Bool
+  (or (some? (.-reject resp)) (some? (.-conflict resp))))
+
+(defn occ [(port :- Int) (op :- String) (te :- String) (p :- String) (r :- String) (tries :- Int)] :- (Promise WriteResult)
+  (if (<= tries 0)
+    (->WriteResult "conflict" nil "tries_exhausted")
+    (let [v (js/await (version port))]
+      (if (nil? v)
+        (->WriteResult "error" nil "nodaemon")
+        (let [edn (str "{:op :" op " :te \"" (esc te) "\" :p \"" (esc p) "\" :r \"" (esc r) "\" :base " v "}")
+              resp (js/await (query port edn))]
+          (cond
+            (nil? resp) (->WriteResult "error" nil "no_response")
+            (some? (.-ok resp)) (->WriteResult "ok" (.-ok resp) "")
+            (some? (.-version resp)) (->WriteResult "ok" (.-version resp) "")
+            (rejected? resp) (js/await (occ port op te p r (- tries 1)))
+            :else (->WriteResult "ok" resp "")))))))
+
+(js/export (defn assert! [(port :- Int) (te :- String) (p :- String) (r :- String)] :- (Promise WriteResult)
+  (occ port "assert" te p r 5)))
+
+(js/export (defn retract! [(port :- Int) (te :- String) (p :- String) (r :- String)] :- (Promise WriteResult)
+  (occ port "retract" te p r 5)))
+
+;; ---- EDN op builders --------------------------------------------------------
+
+(def roster-op :- String
+  "{:op :query :query {:find \"s\" :rules [{:head {:rel \"s\" :args [{:var \"e\"} {:var \"h\"}]} :body [{:rel \"triple\" :args [{:var \"e\"} \"agent\" {:var \"h\"}]}]}]}}")
+
+(def costs-op :- String
+  "{:op :query :query {:find \"r\" :rules [{:head {:rel \"r\" :args [{:var \"run\"} {:var \"a\"} {:var \"c\"}]} :body [{:rel \"triple\" :args [{:var \"run\"} \"agent\" {:var \"a\"}]} {:rel \"triple\" :args [{:var \"run\"} \"cost_usd\" {:var \"c\"}]}]}]}}")
+
+(def all-triples-op :- String
+  "{:op :query :query {:find \"t\" :rules [{:head {:rel \"t\" :args [{:var \"s\"} {:var \"p\"} {:var \"o\"}]} :body [{:rel \"triple\" :args [{:var \"s\"} {:var \"p\"} {:var \"o\"}]}]}]}}")
+
+(defn resolved-op [(te :- String) (pred :- String)] :- String
+  (str "{:op :resolved :te \"" te "\" :p \"" pred "\"}"))
+
+;; ---- accessors (mirror fram.ex) --------------------------------------------
+
+(defn to-s [(v :- Any)] :- String (str v))
+
+;; [[session_entity, handle], ...] — one row per live @session:* handle, deduped.
+(js/export (defn agents [(port :- Int)] :- (Promise Any)
+  (let [resp (js/await (query port roster-op))]
+    (if (or (nil? resp) (nil? (.-ok resp)))
+      []
+      (let [sess (filterv (fn [row] (.startsWith (nth row 0) "@session:")) (.-ok resp))
+            m (reduce (fn [acc row] (assoc acc (nth row 1) row)) {} sess)]
+        (vals m))))))
+
+;; {handle => summed cost_usd} across all @run:* records.
+(js/export (defn agent-costs [(port :- Int)] :- (Promise Any)
+  (let [resp (js/await (query port costs-op))]
+    (if (or (nil? resp) (nil? (.-ok resp)))
+      {}
+      (reduce (fn [acc row]
+                (let [a (nth row 1) c (parseFloatSafe (nth row 2))]
+                  (assoc acc a (+ (get acc a 0.0) c))))
+              {} (.-ok resp))))))
+
+;; Single resolved value for entity+predicate, or nil.
+(js/export (defn resolved [(port :- Int) (te :- String) (pred :- String)] :- (Promise Any)
+  (let [resp (js/await (query port (resolved-op te pred)))]
+    (if (or (nil? resp) (nil? (.-value resp))) nil (to-s (.-value resp))))))
+
+;; All resolved values for entity+predicate, as JS array of strings.
+(js/export (defn resolved-many [(port :- Int) (te :- String) (pred :- String)] :- (Promise Any)
+  (let [resp (js/await (query port (resolved-op te pred)))]
+    (if (or (nil? resp) (nil? (.-values resp)))
+      []
+      (.map (.-values resp) (fn [v] (to-s v)))))))
+
+;; Latest resolved value: values is oldest→newest, so last is current; else :value.
+(js/export (defn latest [(port :- Int) (te :- String) (pred :- String)] :- (Promise Any)
+  (let [resp (js/await (query port (resolved-op te pred)))]
+    (if (nil? resp)
+      nil
+      (let [vs (.-values resp)]
+        (cond
+          (and (some? vs) (> (.-length vs) 0)) (to-s (nth vs (- (.-length vs) 1)))
+          (some? (.-value resp)) (to-s (.-value resp))
+          :else nil))))))
+
+;; Every [s,p,o] triple (strings). The 1.6MB hot read.
+(js/export (defn all-triples [(port :- Int)] :- (Promise Any)
+  (let [resp (js/await (query port all-triples-op))]
+    (if (or (nil? resp) (nil? (.-ok resp)))
+      []
+      (.map (.-ok resp) (fn [row]
+        [(to-s (nth row 0)) (to-s (nth row 1)) (to-s (nth row 2))]))))))
+
+;; ---- token usage fold -------------------------------------------------------
+
+(defn token-pred? [(p :- String)] :- Bool
+  (or (= p "input_tokens") (= p "output_tokens")
+      (= p "cache_create_tokens") (= p "cache_read_tokens")))
+
+(defn run-tot [(r :- Any)] :- Int
+  (+ (parseIntSafe (get r "input_tokens" "0"))
+     (+ (parseIntSafe (get r "output_tokens" "0"))
+        (+ (parseIntSafe (get r "cache_create_tokens" "0"))
+           (parseIntSafe (get r "cache_read_tokens" "0"))))))
+
+(defn fold-run [(out :- Any) (r :- Any)] :- Any
+  (let [h (get r "agent")]
+    (if (nil? h)
+      out
+      (let [tot (run-tot r)
+            ctx (parseIntSafe (get r "input_tokens" "0"))
+            ended (get r "ended_at" "")
+            prev (get out h)]
+        (if (nil? prev)
+          (assoc out h {"context" ctx "total" tot "ended" ended})
+          (let [newer (strGte ended (get prev "ended" ""))]
+            (assoc out h {"context" (if newer ctx (get prev "context"))
+                          "total"   (+ (get prev "total") tot)
+                          "ended"   (if newer ended (get prev "ended"))})))))))
+
+;; Per-handle token usage: {handle => {context: latest_input_tokens, total: sum}}.
+(js/export (defn agent-tokens [(port :- Int)] :- (Promise Any)
+  (let [trips (js/await (all-triples port))
+        runs (reduce (fn [acc t]
+                       (let [s (nth t 0) p (nth t 1) o (nth t 2)]
+                         (if (and (.startsWith s "@run:")
+                                  (or (= p "agent") (= p "ended_at") (token-pred? p)))
+                           (assoc acc s (assoc (get acc s {}) p o))
+                           acc)))
+                     {} trips)]
+    (reduce fold-run {} (vals runs)))))
