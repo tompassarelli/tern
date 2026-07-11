@@ -244,8 +244,11 @@
                       "sub-delegate, except spawning ONE verifier for your own deliverable "
                       "(no worker spawns workers); your deliverable returns UP to your "
                       "orchestrator. Escalation is wired (struggling workers climb "
-                      "the ladder). Strictly synchronous; commit checkpoints; never push unless "
-                      "asked; report to docs/private/.")
+                      "the ladder). Strictly synchronous — and STAY ALIVE: ending a turn = "
+                      "process EXIT; NEVER end a turn while your workers still run or to "
+                      "'await pings' (a real orchestrator died this way) — hold the turn, "
+                      "poll with short sleeps, reconcile every child before moving on. "
+                      "Commit checkpoints; never push unless asked; report to docs/private/.")
         brief (str (when ctx (str "CONTEXT BRIEF:\n" ctx "\n\n"))
                    "DELEGATE TASK: " text
                    "\n\nOPERATING CONTRACT: " contract)]
