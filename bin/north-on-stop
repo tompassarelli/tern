@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# north-on-stop — Claude Code Stop hook. THE BULLETPROOF GUARD.
+# Refuses to let a session END ITS TURN while it has delegated work in flight but
+# NO listener armed to catch the worker's completion/death ping. This is the
+# mechanical fix for "delegated, ended turn, worker reported into a dead inbox,
+# session went silent until a human poked it" (2026-07-11).
+#
+# BLOCK iff: this session stamped a delegation marker (north-mark-delegated on a
+#            spawn/dispatch tool) AND no `north-listen` process is running for its id.
+# ALLOW otherwise. FAIL OPEN on any error/timeout/missing-data — a Stop hook that
+# fails closed would wedge EVERY session, so every uncertain path allows the stop.
+#
+# stop_hook_active guard: if we already blocked once and the model is looping,
+# don't re-block (belt-and-suspenders against a wedge).
+set -uo pipefail
+IN="$(cat 2>/dev/null || true)"
+jget() { printf '%s' "$IN" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+
+# If a prior Stop-block is already active (model re-invoked to satisfy us), allow —
+# never trap a turn in a block loop.
+case "$IN" in *'"stop_hook_active"'*[Tt]rue*) exit 0 ;; esac
+
+cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
+sid="$(jget session_id)"
+REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
+RN="$(basename "$REPO")"
+CACHE="${XDG_RUNTIME_DIR:-/tmp}/north-agent-ids/$sid"
+ID=""
+[ -n "$sid" ] && [ -r "$CACHE" ] && ID="$(cat "$CACHE" 2>/dev/null || true)"
+[ -z "$ID" ] && ID="${NORTH_AGENT_ID:-${TERN_AGENT_ID:-}}"
+[ -z "$ID" ] && ID="cc-$RN-${sid:0:8}"
+[ -z "$ID" ] && exit 0   # can't derive id → fail open
+
+MARK="${XDG_RUNTIME_DIR:-/tmp}/north-delegated/$ID"
+[ -f "$MARK" ] || exit 0   # never delegated this session → nothing to guard
+
+# Listener armed? north-arm execs `bb .../north-listen.clj <port> <id> --once`.
+if pgrep -f "north-listen.clj .* $ID( |$)" >/dev/null 2>&1 || pgrep -f "north-listen.clj [0-9]* $ID" >/dev/null 2>&1; then
+  exit 0   # a listener is dormant on the socket → the worker's ping WILL wake us
+fi
+
+# Delegated + no listener → BLOCK the stop. Reason is shown to the model.
+reason="You delegated work this session but no north listener is armed. If you end your turn now, a spawned worker's completion/death ping lands in a dead inbox and this session goes SILENT until a human pokes it. Arm the listener as a BACKGROUND task before yielding:  ~/code/north/bin/north-arm ${ID}  (run_in_background). When it fires, handle the mail and re-arm. If every delegated worker is already reconciled and you truly want to stop, clear the marker:  rm ${MARK}"
+# JSON block form (preferred). Escape the reason for JSON.
+esc="$(printf '%s' "$reason" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+printf '{"decision":"block","reason":"%s"}\n' "$esc"
+exit 0

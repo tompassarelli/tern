@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# north-mark-delegated — Claude Code PostToolUse hook for spawn/dispatch tools.
+# When this session spawns a worker (mcp__north__spawn / mcp__north__dispatch /
+# Task / Agent), stamp a per-session marker so the Stop hook (north-on-stop) knows
+# this session has delegated work and must keep a listener armed to catch the
+# worker's completion/death ping. WHY: the supervisor ends its turn after
+# delegating (correct — never blocks), but a yielded turn only gets re-woken by an
+# ARMED background listener; without one, a worker's ping lands in a dead inbox and
+# the session goes silent until a human pokes it (the 2026-07-11 failure).
+# Best-effort, jq-free, always exits 0 — must NEVER break a tool call.
+set -uo pipefail
+IN="$(cat 2>/dev/null || true)"
+jget() { printf '%s' "$IN" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
+sid="$(jget session_id)"
+REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
+RN="$(basename "$REPO")"
+
+# Identity — same resolution order as north-on-tooluse (session cache → env → derived)
+# so the marker key matches the id the listener/inbox use.
+CACHE="${XDG_RUNTIME_DIR:-/tmp}/north-agent-ids/$sid"
+ID=""
+[ -n "$sid" ] && [ -r "$CACHE" ] && ID="$(cat "$CACHE" 2>/dev/null || true)"
+[ -z "$ID" ] && ID="${NORTH_AGENT_ID:-${TERN_AGENT_ID:-}}"
+[ -z "$ID" ] && ID="cc-$RN-${sid:0:8}"
+
+MARKDIR="${XDG_RUNTIME_DIR:-/tmp}/north-delegated"
+mkdir -p "$MARKDIR" 2>/dev/null || true
+printf '%s' "$(date +%s 2>/dev/null || echo 0)" > "$MARKDIR/$ID" 2>/dev/null || true
+exit 0
