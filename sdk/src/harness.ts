@@ -16,6 +16,7 @@ import { z } from "zod";
 import { execFile, execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { resolveGuard, evaluateGuards } from "./authoring-guards";
 
 // sdk/src/harness.ts -> repo root (~/code/north).
 const REPO = resolve(import.meta.dir, "../..");
@@ -286,6 +287,46 @@ export function cavemanAppendix(mode?: string): string {
   return "";
 }
 
+// SDK worker authoring-guard parity (see authoring-guards.ts for the WHY). The SDK
+// never loads ~/.claude/settings.json, so we re-run the SAME PreToolUse guard scripts
+// the interactive matchers run and translate their output into HookJSONOutput.
+// PARITY SOURCE: ~/code/nixos-config/dotfiles/claude/settings.json (PreToolUse). These
+// lists are the POST-parity target — a parallel lane is adding north-clock-guard to
+// the interactive Bash matcher; keep both in lockstep with settings.json.
+//   Edit|Write|MultiEdit -> code-upstream, firn, north-clock
+//   Bash                 -> tripwire, firn, north-clock
+// Resolved (existence-checked) ONCE at module load — a missing script is dropped
+// silently so the SDK stays portable on a machine without the nixos-config checkout.
+const EDIT_GUARDS = ["code-upstream-guard.sh", "firn-guard.sh", "north-clock-guard.sh"]
+  .map(resolveGuard)
+  .filter((p): p is string => p !== null);
+const BASH_GUARDS = ["tripwire-guard.sh", "firn-guard.sh", "north-clock-guard.sh"]
+  .map(resolveGuard)
+  .filter((p): p is string => p !== null);
+
+// One matcher's callback: run its guard chain (first deny wins) over the hook input,
+// translate to HookJSONOutput. A deny blocks THIS tool call (permissionDecision:deny)
+// but does NOT halt the agent (`continue` stays default-true) — the worker sees the
+// reason and can clock in + retry, exactly like the interactive deny. Fail-open on any
+// internal error so a broken guard never bricks a worker.
+async function guardHook(scripts: string[], input: unknown) {
+  try {
+    const d = await evaluateGuards(scripts, input);
+    if (d.decision === "deny") {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse" as const,
+          permissionDecision: "deny" as const,
+          permissionDecisionReason: d.reason,
+        },
+      };
+    }
+  } catch {
+    /* fail-open */
+  }
+  return { continue: true };
+}
+
 // The single Options builder. dispatch.ts + spawn.ts both route through here.
 export function harnessOptions(o: HarnessOpts): Options {
   registerPresence(o.self);
@@ -300,9 +341,16 @@ export function harnessOptions(o: HarnessOpts): Options {
     permissionMode: "acceptEdits",
     systemPrompt: withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT) + globalLawsAppendix() + praxisAppendix(o.model, o.role, o.posture) + cavemanAppendix(o.caveman) + esoAppendix(),
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
-    // Presence heartbeat: renew the lease on tool activity (F2). Fire-and-forget +
-    // never block/fail the tool call; always continue.
     hooks: {
+      // PreToolUse authoring-guard parity — the fix for worker edits running with
+      // ZERO guards (north-clock-guard never fired for a worker edit). Matchers +
+      // guard chains mirror settings.json; first deny in a chain blocks the tool.
+      PreToolUse: [
+        { matcher: "Edit|Write|MultiEdit", hooks: [async (input: unknown) => guardHook(EDIT_GUARDS, input)] },
+        { matcher: "Bash", hooks: [async (input: unknown) => guardHook(BASH_GUARDS, input)] },
+      ],
+      // Presence heartbeat: renew the lease on tool activity (F2). Fire-and-forget +
+      // never block/fail the tool call; always continue. PRESERVED exactly.
       PostToolUse: [{ hooks: [async () => { renewPresence(o.self); return { continue: true }; }] }],
     },
   } as Options;
