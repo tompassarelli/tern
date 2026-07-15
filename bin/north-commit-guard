@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# north-commit-guard — git pre-commit backstop that blocks BILLABLE client
+# commits when no north clock is running for that client.
+# ============================================================================
+# The PreToolUse north-clock-guard only covers tool-mediated edits in
+# interactive sessions; SDK workers and raw Bash writes bypass it. Git commit
+# is the ONE choke point every surface passes through, so a pre-commit hook is
+# a surface-INDEPENDENT backstop (~120 client commits shipped one week, many
+# with no clock running).
+#
+#   repo top NOT under */code/client/<client>/     -> exit 0 (not billable)
+#   an open north clock owned by <client> exists    -> exit 0 (allow)
+#   otherwise                                        -> exit 1 (REFUSE + recipe)
+#   log unreadable / no python3 / north absent       -> FAIL-OPEN (never lock you out)
+#
+# CONFIDENTIALITY: fully generic. <client> is derived at RUNTIME from the
+# repo's own path (the segment after code/client/). No client name, path, or
+# code is baked in — this file is safe to commit to a public repo.
+#
+# An "open session" is read straight from the fram fact log: a subject with
+# session_of + start_time and NO end_time (retractions replayed to final
+# state). ALLOW iff ANY open session's thread has owner=<client> (multiple
+# concurrent open sessions are legal — per-agent clocks).
+#
+# Deliberate bypasses: `git commit --no-verify`, or CLAUDE_NO_AUTHORING_HOOKS=1.
+# Persistent kill-switch: `north config guards off` (shared authoring-killswitch).
+# ============================================================================
+set -uo pipefail
+
+# ---- Kill-switch: shared semantics with the PreToolUse guards. Sourced by its
+# absolute nixos-config path (this hook runs from a client repo, not from
+# nixos-config, so dirname tricks don't apply). Fail-open if the lib is gone.
+KILLSWITCH="$HOME/code/nixos-config/dotfiles/claude/hooks/lib/authoring-killswitch.sh"
+if [ -r "$KILLSWITCH" ]; then
+  # shellcheck disable=SC1090
+  . "$KILLSWITCH" 2>/dev/null || true
+  type authoring_guards_off >/dev/null 2>&1 && authoring_guards_off && exit 0
+fi
+
+# ---- Repo top + billability gate. Only */code/client/<client>/* is billable.
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -z "$REPO" ] && exit 0                                   # not a git repo -> nothing to gate
+
+# Extract <client> = the path component immediately after code/client/.
+CLIENT="$(printf '%s\n' "$REPO" | sed -n 's#.*/code/client/\([^/][^/]*\).*#\1#p')"
+[ -z "$CLIENT" ] && exit 0                                 # not under code/client/ -> not billable
+
+# ---- north present? (fail-open if the substrate isn't installed)
+NORTH="$HOME/code/north/bin/north"
+[ -x "$NORTH" ] || exit 0
+
+# ---- python3 present? (parser needs it; fail-open otherwise)
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# ---- Resolve the fram log. FRAM_LOG wins; else first existing of the brief's
+# documented default (claims.log) then the live name (facts.log). A default
+# pointing at a nonexistent file would make the backstop silently fail-open
+# forever, so we resolve to a log that actually exists.
+resolve_log() {
+  if [ -n "${FRAM_LOG:-}" ]; then printf '%s' "$FRAM_LOG"; return; fi
+  for c in "$HOME/.local/state/north/claims.log" "$HOME/.local/state/north/facts.log"; do
+    [ -r "$c" ] && { printf '%s' "$c"; return; }
+  done
+  printf '%s' "$HOME/.local/state/north/claims.log"        # documented default (may be absent)
+}
+LOG="$(resolve_log)"
+[ -r "$LOG" ] || exit 0                                    # unreadable log -> fail-open
+
+# ---- Parse the log for an open session owned by <client>.
+# Prints one of:  ALLOW  |  DENY\t<owners-open-csv>\t<n_open>  |  FAILOPEN
+DECISION="$(FRAM_LOG="$LOG" python3 - "$LOG" "$CLIENT" <<'PY' 2>/dev/null || printf 'FAILOPEN'
+import re, sys
+log, client = sys.argv[1], sys.argv[2]
+# Flat EDN maps, one per line: {:tx N :op "assert" :l "@s" :p "pred" :r "val" ...}
+op_re = re.compile(r':op\s+"([^"]*)"')
+l_re  = re.compile(r':l\s+"([^"]*)"')
+p_re  = re.compile(r':p\s+"([^"]*)"')
+r_re  = re.compile(r':r\s+"([^"]*)"')     # only string-valued :r (session_of/times/owner all are)
+TRACK = {"session_of", "start_time", "end_time", "owner"}
+# Final state per (subject,predicate): last line in tx order wins (assert->value, retract->absent).
+state = {}
+try:
+    with open(log, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not ('session_of' in line or 'start_time' in line
+                    or 'end_time' in line or 'owner' in line):
+                continue
+            mp = p_re.search(line)
+            if not mp or mp.group(1) not in TRACK:
+                continue
+            ml, mo = l_re.search(line), op_re.search(line)
+            if not ml or not mo:
+                continue
+            subj, pred, op = ml.group(1), mp.group(1), mo.group(1)
+            mr = r_re.search(line)
+            val = mr.group(1) if mr else None
+            state[(subj, pred)] = (op, val)
+except OSError:
+    print("FAILOPEN"); sys.exit(0)
+
+def present(subj, pred):
+    v = state.get((subj, pred))
+    return v is not None and v[0] == "assert"
+
+def value(subj, pred):
+    v = state.get((subj, pred))
+    return v[1] if (v and v[0] == "assert") else None
+
+# Open sessions: session_of + start_time present, end_time NOT present.
+open_owners = []            # owners of every open session's thread (None if thread has no owner)
+allow = False
+seen = set()
+for (subj, pred) in list(state.keys()):
+    if pred != "session_of" or subj in seen:
+        continue
+    seen.add(subj)
+    if not present(subj, "session_of") or not present(subj, "start_time"):
+        continue
+    if present(subj, "end_time"):
+        continue
+    thread = value(subj, "session_of")          # e.g. "@019f..."
+    owner = value(thread, "owner") if thread else None
+    open_owners.append(owner or "?")
+    if owner == client:
+        allow = True
+
+if allow:
+    print("ALLOW")
+else:
+    owners = ",".join(sorted(set(open_owners))) if open_owners else ""
+    print("DENY\t%s\t%d" % (owners, len(open_owners)))
+PY
+)"
+
+DECISION="${DECISION%$'\n'}"
+case "$DECISION" in
+  ALLOW)    exit 0 ;;
+  FAILOPEN|"") exit 0 ;;                                   # parse failure -> fail-open
+  DENY*)    : ;;                                           # fall through to REFUSE
+  *)        exit 0 ;;                                      # unknown shape -> fail-open
+esac
+
+# ---- REFUSE. Build the clock-in recipe: derive the Linear ticket from the
+# branch (<client>-NNN -> <CLIENT>-NNN, same trick as north-clock-guard.sh) and locate
+# its thread in the log if present.
+OPEN_OWNERS="$(printf '%s' "$DECISION" | cut -f2)"
+N_OPEN="$(printf '%s' "$DECISION" | cut -f3)"
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+TICKET="$(printf '%s' "$BRANCH" | grep -oiE "${CLIENT}-[0-9]+" | head -1 | tr '[:lower:]' '[:upper:]' || true)"
+
+if [ -n "$TICKET" ]; then
+  TID="$(sed -n "s/.*:l \"\(@[0-9a-f-]*\)\".*\"linear\".*\"$TICKET\".*/\1/p" "$LOG" 2>/dev/null | tail -1)"
+  if [ -n "$TID" ]; then
+    HINT="Thread for $TICKET exists — clock in:  $NORTH clock start ${TID#@}"
+  else
+    HINT="No thread for $TICKET yet:  $NORTH capture \"$TICKET <title>\" $CLIENT   then   $NORTH clock start <id>"
+  fi
+else
+  HINT="Find/create the thread:  $NORTH ready  (or  $NORTH capture \"<title>\" $CLIENT ),  then  $NORTH clock start <id>"
+fi
+
+if [ "${N_OPEN:-0}" != "0" ] && [ -n "$OPEN_OWNERS" ]; then
+  MISMATCH="Open clock(s) exist but none owned by '$CLIENT' (open owners: $OPEN_OWNERS)."
+else
+  MISMATCH="No open north clock at all."
+fi
+
+# stderr so git surfaces it on the failed commit.
+cat >&2 <<EOF
+
+  ✗ north-commit-guard: BILLABLE client commit blocked (client: $CLIENT).
+    $MISMATCH
+    Client work is never committed untracked — this backstop exists because
+    ~120 client commits once shipped in a week, many with no clock running.
+
+    Clock in, then re-commit:
+      $HINT
+
+    Deliberate bypass (use knowingly):
+      git commit --no-verify          # skip this hook for one commit
+      CLAUDE_NO_AUTHORING_HOOKS=1 ...  # skip authoring guards for the session
+    Persistent: north config guards off
+
+EOF
+exit 1

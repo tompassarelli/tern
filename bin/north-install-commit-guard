@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# north-install-commit-guard <repo-path> [--uninstall]
+# ============================================================================
+# Installs north-commit-guard as a git pre-commit hook in <repo-path>.
+# Idempotent: re-running is a no-op. Preserves any pre-existing pre-commit hook
+# by CHAINING — the existing hook is moved to pre-commit.local and our managed
+# hook execs it after the guard passes (guard first; a guard failure aborts the
+# commit before the local hook runs).
+#
+#   --uninstall   remove our managed hook; restore a chained pre-commit.local.
+#
+# The installed hook calls north-commit-guard by ABSOLUTE path and
+# existence-checks it, so if the guard script is ever moved/deleted the hook
+# fails OPEN (commits proceed) rather than breaking every commit in the repo.
+# ============================================================================
+set -uo pipefail
+
+MARKER=">>> north-commit-guard managed hook >>>"
+GUARD="$HOME/code/north/bin/north-commit-guard"
+
+die() { printf 'north-install-commit-guard: %s\n' "$1" >&2; exit 1; }
+
+REPO=""
+UNINSTALL=0
+for a in "$@"; do
+  case "$a" in
+    --uninstall) UNINSTALL=1 ;;
+    -*)          die "unknown flag: $a" ;;
+    *)           REPO="$a" ;;
+  esac
+done
+[ -n "$REPO" ] || die "usage: north-install-commit-guard <repo-path> [--uninstall]"
+
+GITDIR="$(git -C "$REPO" rev-parse --git-dir 2>/dev/null || true)"
+[ -n "$GITDIR" ] || die "not a git repository: $REPO"
+case "$GITDIR" in /*) : ;; *) GITDIR="$REPO/$GITDIR" ;; esac   # normalize to absolute
+HOOKS="$GITDIR/hooks"
+HOOK="$HOOKS/pre-commit"
+LOCAL="$HOOKS/pre-commit.local"
+
+is_ours() { [ -f "$1" ] && grep -qF "$MARKER" "$1" 2>/dev/null; }
+
+write_hook() {
+  cat > "$HOOK" <<EOF
+#!/usr/bin/env bash
+# $MARKER
+# Managed by north-install-commit-guard — do not edit. A pre-existing hook,
+# if any, was preserved as pre-commit.local and runs after the guard passes.
+set -uo pipefail
+GUARD="$GUARD"
+[ -x "\$GUARD" ] && { "\$GUARD" || exit \$?; }   # guard absent -> fail-open
+LOCAL="\$(dirname "\$0")/pre-commit.local"
+[ -x "\$LOCAL" ] && exec "\$LOCAL" "\$@"
+exit 0
+# <<< north-commit-guard managed hook <<<
+EOF
+  chmod +x "$HOOK"
+}
+
+# ---- Uninstall --------------------------------------------------------------
+if [ "$UNINSTALL" = 1 ]; then
+  if is_ours "$HOOK"; then
+    rm -f "$HOOK"
+    if [ -f "$LOCAL" ]; then
+      mv "$LOCAL" "$HOOK"; chmod +x "$HOOK"
+      printf 'uninstalled; restored chained pre-commit.local -> pre-commit (%s)\n' "$HOOK"
+    else
+      printf 'uninstalled managed pre-commit hook (%s)\n' "$HOOK"
+    fi
+  elif [ -e "$HOOK" ]; then
+    printf 'no-op: pre-commit exists but is NOT ours — left untouched (%s)\n' "$HOOK"
+  else
+    printf 'no-op: no managed hook to remove (%s)\n' "$HOOK"
+  fi
+  exit 0
+fi
+
+# ---- Install ----------------------------------------------------------------
+mkdir -p "$HOOKS"
+
+if is_ours "$HOOK"; then
+  printf 'no-op: managed pre-commit hook already installed (%s)\n' "$HOOK"
+  exit 0
+fi
+
+if [ -e "$HOOK" ]; then
+  # Foreign hook present — chain it. Refuse to clobber an existing .local.
+  if [ -e "$LOCAL" ]; then
+    die "both pre-commit and pre-commit.local exist and neither is ours — resolve manually: $HOOKS"
+  fi
+  mv "$HOOK" "$LOCAL"; chmod +x "$LOCAL"
+  write_hook
+  printf 'installed; chained pre-existing hook -> pre-commit.local (%s)\n' "$HOOK"
+else
+  write_hook
+  printf 'installed managed pre-commit hook (%s)\n' "$HOOK"
+fi
+exit 0
