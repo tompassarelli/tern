@@ -28,7 +28,7 @@ CACHE="${XDG_RUNTIME_DIR:-/tmp}/north-agent-ids/$sid"
 ID=""
 [ -n "$sid" ] && [ -r "$CACHE" ] && ID="$(cat "$CACHE" 2>/dev/null || true)"
 [ -z "$ID" ] && ID="${NORTH_AGENT_ID:-}"
-[ -z "$ID" ] && ID="cc-$RN-${sid:0:8}"
+[ -z "$ID" ] && ID="session-$RN-${sid:0:8}"
 [ -z "$ID" ] && exit 0   # can't derive id → fail open
 
 MARK="${XDG_RUNTIME_DIR:-/tmp}/north-delegated/$ID"

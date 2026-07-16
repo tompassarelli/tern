@@ -5,7 +5,8 @@
 # env but carries the subagent's OWN session_id). Both spawn + tooluse preferred the
 # env pin over the per-session cache, so every subagent aliased the parent id — the
 # roster, concern ledger, and peer-mail inbox all attributed several workstreams to
-# one name, and mail was answered by whichever actor peeked first (cc-fram-d5523b3b).
+# one name, and mail was answered by whichever actor peeked first (cc-fram-d5523b3b,
+# under the incident-era cc- prefix; spawn-derived ids are session-* since rename 2a).
 #
 # INVARIANT under test: one live actor == one id. A given id is renewed/registered
 # ONLY by the session that first acquired it. An env pin is honored only when no OTHER
@@ -68,25 +69,25 @@ run_hook() {
 }
 cache_of() { cat "$CACHE/$1" 2>/dev/null || true; }
 
-PARENT="d5523b3b-47bb-446d-b5ae-f08ff8c0eba4"   # -> cc-fram-d5523b3b (the incident id)
-SUB="aaaa1111-0000-4000-8000-000000000001"      # -> cc-fram-aaaa1111
-SUB2="bbbb2222-0000-4000-8000-000000000002"     # -> cc-fram-bbbb2222
+PARENT="d5523b3b-47bb-446d-b5ae-f08ff8c0eba4"   # -> session-fram-d5523b3b (the incident id)
+SUB="aaaa1111-0000-4000-8000-000000000001"      # -> session-fram-aaaa1111
+SUB2="bbbb2222-0000-4000-8000-000000000002"     # -> session-fram-bbbb2222
 FRESH="cccc3333-0000-4000-8000-000000000003"
 NOCACHE="dddd4444-0000-4000-8000-000000000004"
 
 echo "== 1. parent SessionStart (no env pin) acquires its derived id =="
 reg="$(run_hook "$SPAWN" "$PARENT" SessionStart)"
-eq "parent registers cc-fram-d5523b3b" "cc-fram-d5523b3b" "$reg"
-eq "parent cache file == its id"        "cc-fram-d5523b3b" "$(cache_of "$PARENT")"
+eq "parent registers session-fram-d5523b3b" "session-fram-d5523b3b" "$reg"
+eq "parent cache file == its id"        "session-fram-d5523b3b" "$(cache_of "$PARENT")"
 
 echo "== 2. subagent SubagentSessionStart w/ INHERITED env pin gets its OWN id =="
-# parent already owns cc-fram-d5523b3b (case 1 seeded the cache); the subagent
-# inherits NORTH_AGENT_ID=cc-fram-d5523b3b but has its own session_id.
-reg="$(run_hook "$SPAWN" "$SUB" SubagentSessionStart "cc-fram-d5523b3b")"
-ne "subagent does NOT alias parent id"  "cc-fram-d5523b3b" "$reg"
-eq "subagent gets own derived id"       "cc-fram-aaaa1111" "$reg"
-eq "subagent cache file == own id"      "cc-fram-aaaa1111" "$(cache_of "$SUB")"
-eq "parent cache untouched"             "cc-fram-d5523b3b" "$(cache_of "$PARENT")"
+# parent already owns session-fram-d5523b3b (case 1 seeded the cache); the subagent
+# inherits NORTH_AGENT_ID=session-fram-d5523b3b but has its own session_id.
+reg="$(run_hook "$SPAWN" "$SUB" SubagentSessionStart "session-fram-d5523b3b")"
+ne "subagent does NOT alias parent id"  "session-fram-d5523b3b" "$reg"
+eq "subagent gets own derived id"       "session-fram-aaaa1111" "$reg"
+eq "subagent cache file == own id"      "session-fram-aaaa1111" "$(cache_of "$SUB")"
+eq "parent cache untouched"             "session-fram-d5523b3b" "$(cache_of "$PARENT")"
 
 echo "== 3. dispatch-style fresh process: env pin, NO prior owner -> keeps pin =="
 reg="$(run_hook "$SPAWN" "$FRESH" SessionStart "sdk-custom-xyz")"
@@ -94,24 +95,24 @@ eq "fresh process keeps its env pin"    "sdk-custom-xyz" "$reg"
 eq "fresh cache file == pinned id"      "sdk-custom-xyz" "$(cache_of "$FRESH")"
 
 echo "== 4. tooluse renews the CACHE id even when env pin is set (cache > env) =="
-# subagent SUB has cache=cc-fram-aaaa1111 but still inherits the parent env pin.
-reg="$(run_hook "$TOOLUSE" "$SUB" PostToolUse "cc-fram-d5523b3b")"
-eq "tooluse renews cached subagent id"  "cc-fram-aaaa1111" "$reg"
-ne "tooluse ignores inherited env pin"  "cc-fram-d5523b3b" "$reg"
+# subagent SUB has cache=session-fram-aaaa1111 but still inherits the parent env pin.
+reg="$(run_hook "$TOOLUSE" "$SUB" PostToolUse "session-fram-d5523b3b")"
+eq "tooluse renews cached subagent id"  "session-fram-aaaa1111" "$reg"
+ne "tooluse ignores inherited env pin"  "session-fram-d5523b3b" "$reg"
 
 echo "== 5. tooluse env FALLBACK when no cache (SDK-dispatched, spawn hook unfired) =="
 reg="$(run_hook "$TOOLUSE" "$NOCACHE" PostToolUse "sdk-fallback")"
 eq "tooluse falls back to env pin"      "sdk-fallback" "$reg"
 
 echo "== 6. concurrent siblings both inherit pin -> both derive DISTINCT ids =="
-# parent owns cc-fram-d5523b3b; two siblings spawn with the inherited pin.
-r1="$(run_hook "$SPAWN" "$SUB"  SubagentSessionStart "cc-fram-d5523b3b")"
-r2="$(run_hook "$SPAWN" "$SUB2" SubagentSessionStart "cc-fram-d5523b3b")"
-ne "sibling A not aliased to parent"    "cc-fram-d5523b3b" "$r1"
-ne "sibling B not aliased to parent"    "cc-fram-d5523b3b" "$r2"
+# parent owns session-fram-d5523b3b; two siblings spawn with the inherited pin.
+r1="$(run_hook "$SPAWN" "$SUB"  SubagentSessionStart "session-fram-d5523b3b")"
+r2="$(run_hook "$SPAWN" "$SUB2" SubagentSessionStart "session-fram-d5523b3b")"
+ne "sibling A not aliased to parent"    "session-fram-d5523b3b" "$r1"
+ne "sibling B not aliased to parent"    "session-fram-d5523b3b" "$r2"
 ne "siblings not aliased to each other" "$r1" "$r2"
-eq "sibling A own id"                   "cc-fram-aaaa1111" "$r1"
-eq "sibling B own id"                   "cc-fram-bbbb2222" "$r2"
+eq "sibling A own id"                   "session-fram-aaaa1111" "$r1"
+eq "sibling B own id"                   "session-fram-bbbb2222" "$r2"
 
 echo
 echo "identity-alias-test: $PASS passed, $FAIL failed"
