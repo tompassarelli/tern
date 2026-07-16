@@ -228,13 +228,87 @@
                      (flush)
                      :ran))))
 
+;; ---- AGENT STREAM-LOG ROTATION (durable-but-untidy GC) ----------------------
+;; north-data/agents/*.log are per-agent SDK stream logs — hundreds of files,
+;; unbounded, off-graph. Two BOUNDED hygiene ops, piggybacked on the sweep and gated
+;; exactly like the reaper — the JANITOR never declares death, it only prunes what the
+;; REAPER already marked terminal:
+;;   (a) DELETE a log whose agent has a terminal outcome fact AND mtime >30d. An agent
+;;       with NO outcome is NEVER touched, regardless of age — a silent-but-alive or
+;;       not-yet-reaped agent's trail must survive for the reaper/audit to judge death.
+;;   (b) CAP any single log at 5MB, keeping the TAIL (recent turns are the useful end;
+;;       the stale head is dropped). Independent of outcome — a runaway log is bounded
+;;       even while its agent is live.
+;; The expensive terminal-outcome query is gated behind the cheap mtime filter, so a
+;; fleet of young logs costs zero coordinator round-trips. --dry-run prints WOULD-prune/
+;; WOULD-cap without writing. Dir override NORTH_AGENT_LOGS_DIR (tests only), mirroring
+;; TRIPWIRE_LOG_DIR / sweep-repo.
+(def AGENT-LOG-STALE-MS (* 30 24 60 60 1000))    ; 30 days terminal -> prunable
+(def AGENT-LOG-CAP-BYTES (* 5 1024 1024))        ; 5 MB tail cap
+(def agent-logs-dir
+  (or (System/getenv "NORTH_AGENT_LOGS_DIR")
+      ;; <parent-of-repo>/north-data/agents — north-data is a SIBLING of the north repo.
+      (-> (io/file (System/getProperty "babashka.file"))
+          .getParentFile .getParentFile .getParentFile
+          (io/file "north-data" "agents") .getPath)))
+
+(defn cap-log-tail!
+  "If f exceeds AGENT-LOG-CAP-BYTES, rewrite it to its last CAP bytes, dropping the
+   partial leading line. Byte-exact (no charset round-trip). Returns bytes trimmed, or 0
+   if under cap / dry-run. Atomic via .tmp + rename."
+  [^java.io.File f dry?]
+  (let [len (.length f)]
+    (if (<= len AGENT-LOG-CAP-BYTES)
+      0
+      (let [trim (- len AGENT-LOG-CAP-BYTES)]
+        (when-not dry?
+          (let [buf (byte-array AGENT-LOG-CAP-BYTES)]
+            (with-open [raf (java.io.RandomAccessFile. f "r")]
+              (.seek raf trim)
+              (.readFully raf buf))
+            (let [nl    (loop [i 0] (cond (>= i (alength buf)) -1
+                                          (= (aget buf i) (byte 10)) i
+                                          :else (recur (inc i))))
+                  start (if (>= nl 0) (inc nl) 0)
+                  tmp   (io/file (str (.getPath f) ".tmp"))]
+              (with-open [os (io/output-stream tmp)]
+                (.write os buf start (- (alength buf) start)))
+              (.renameTo tmp f))))
+        trim))))
+
+(defn sweep-agent-logs! [dry?]
+  (let [dir  (io/file agent-logs-dir)
+        now  (System/currentTimeMillis)
+        logs (when (.isDirectory dir)
+               (filter #(and (.isFile ^java.io.File %) (str/ends-with? (.getName ^java.io.File %) ".log"))
+                       (.listFiles dir)))
+        deleted (atom 0) capped (atom 0)]
+    (doseq [^java.io.File f logs]
+      (let [age (- now (.lastModified f))]
+        (if (and (>= age AGENT-LOG-STALE-MS)
+                 ;; expensive terminal-outcome join — reached ONLY for >30d logs
+                 (lane-resolved?* (str/replace (.getName f) #"\.log$" "")))
+          (do (when-not dry? (.delete f))
+              (swap! deleted inc)
+              (println (str "[sweep] " (if dry? "WOULD delete" "deleted") " log " (.getName f)
+                            "  age " (long (/ age 86400000)) "d (agent resolved)")))
+          (let [trimmed (cap-log-tail! f dry?)]
+            (when (pos? trimmed)
+              (swap! capped inc)
+              (println (str "[sweep] " (if dry? "WOULD cap" "capped") " log " (.getName f)
+                            "  -" (long (/ trimmed 1048576)) "MB (tail kept)")))))))
+    {:deleted @deleted :capped @capped}))
+
 (defn sweep! [dry?]
   (let [nc (sweep-concerns! dry?) nl (sweep-lanes! dry?)
+        al (sweep-agent-logs! dry?)
         ca (maybe-clock-audit! dry?)]
     (println (str "[sweep] " (when dry? "(dry-run) ") "concerns abandoned=" nc
-                  " lanes reaped=" nl " clock-audit=" (name ca)))
+                  " lanes reaped=" nl
+                  " logs deleted=" (:deleted al) " capped=" (:capped al)
+                  " clock-audit=" (name ca)))
     (flush)
-    {:concerns nc :lanes nl :clock-audit ca}))
+    {:concerns nc :lanes nl :agent-logs al :clock-audit ca}))
 
 (defn sweep-loop []
   (loop []
