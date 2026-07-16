@@ -5,6 +5,15 @@
 // Writes shell to the installed `north tell` (the proven serialized OCC path) and
 // are NON-FATAL: a facts failure must never kill a spawn.
 import { execFileSync } from "node:child_process";
+import { resolve } from "node:path";
+
+// NORTH_BIN override mirrors death.ts/clock.ts/children.ts/watchdog.ts, so the whole
+// coordinator-writing surface resolves the SAME engine — and a hermetic test that points
+// NORTH_BIN at a fake redirects identity writes too. A bare `north` on PATH ignored that
+// seam, so identity tells escaped the fake, hit the real CLI (~3.7s/call against a dead
+// port) and wrote test agents into the production graph.
+const REPO = resolve(import.meta.dir, "..", "..");
+const northBin = () => process.env.NORTH_BIN ?? `${REPO}/bin/north`;
 
 export interface AgentIdentity {
   kind: "lane" | "session" | "cron";
@@ -32,7 +41,7 @@ export function renderDisplayName(id: string, f: AgentIdentity): string {
 }
 
 function tell(subject: string, pred: string, value: string) {
-  execFileSync("north", ["tell", subject, pred, value], { stdio: "ignore", timeout: 10_000 });
+  execFileSync(northBin(), ["tell", subject, pred, value], { stdio: "ignore", timeout: 10_000 });
 }
 
 export function writeAgentFacts(agentId: string, f: AgentIdentity): void {
