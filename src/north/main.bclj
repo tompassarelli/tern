@@ -1071,37 +1071,100 @@
                acc))
            [] scan)))
 
-(defn cmd-heal [threads-dir :- String log :- String] :- Nil
-  (let [p (probe threads-dir log)]
+;; The normal projection pass: re-render every thread file whose .md diverges
+;; from the log (superseded/lagging diff ∪ broken-head). Writes only .md files —
+;; the log is never touched. Shared by bare `heal` and `heal --adopt`'s tail.
+(defn- heal-project [threads-dir :- String p :- Probe] :- Nil
+  (let [files (fram.rt/list-md threads-dir)
+        ids (mapv (fn [te :- String] :- String (short-id te)) (k/thread-ids-i (:idx p)))
+        scan (scan-files threads-dir files ids)
+        ;; targets are BARE ids: superseded/lagging (diff) ∪ broken-head files.
+        diff-ids (mapv (fn [te :- String] :- String (short-id te)) (heal-targets p))
+        targets (distinct-ids (vec (concat diff-ids (broken-head-ids scan (:idx p)))))]
+    (if (empty? targets)
+      (println "heal: nothing to do — every thread file already matches the log.")
+      (do
+        (doseq [id targets]
+          (let [te (str "@" id)
+                title (let [t (k/one-i (:idx p) te "title")] (if (some? t) t "untitled"))
+                existing (path-of scan id)
+                path (if (str/blank? existing)
+                       (str threads-dir "/" id "-" (fram.rt/slugify title) ".md")
+                       existing)]
+            (fram.rt/spit-file path (exp/thread-md (:log-facts p) te))
+            (println (str "  re-rendered " id "  " (trunc title 52)))))
+        (println (str "heal: re-rendered " (count targets)
+                      " thread file(s) from the log. Log untouched."))))))
+
+(defrecord AdoptResult [adopted :- Int skipped :- Int failed :- Int dropped :- Int])
+
+;; A blank predicate or blank value is never a real hand edit — it's a corpus
+;; PARSE ARTIFACT (a stray line the importer split into `("" "")`). Asserting it
+;; would strand a phantom in the log that no projection can render (eternal
+;; log-behind). capture's `add-fact` guards the same way; adopt mirrors it.
+(defn- adoptable? [c :- k/Fact] :- Bool
+  (and (not (str/blank? (:p c))) (not (str/blank? (:r c)))))
+
+;; Absorb each file-ahead HAND-edited fact into the log THROUGH the coordinator
+;; (the serialized `tell` path — same rule-checks as any tell, never a raw log
+;; append). Multiline `body` values ride pr-str/edn intact over the wire. Three
+;; guards: (1) a blank pred/value is DROPPED (parse artifact, never assert junk);
+;; (2) a single-valued fact the log has SINCE superseded (a newer coordinator
+;; value) is SKIPPED — the log wins; never overwrite coordinator history with a
+;; stale file line; (3) everything else is asserted. `live` is re-read at call
+;; time so a supersession that landed AFTER the probe is still caught (safe under
+;; concurrent writers).
+(defn- adopt-hand-facts [port :- Int live :- k/Index hand :- (Vec k/Fact)] :- AdoptResult
+  (reduce
+   (fn [acc :- AdoptResult c :- k/Fact] :- AdoptResult
+     (cond
+       [(not (adoptable? c))
+        (do
+          (println (str "  drop (parse artifact) " (short-id (:l c)) "  pred=<" (:p c) "> val=<" (trunc (:r c) 40) ">"))
+          (->AdoptResult (:adopted acc) (:skipped acc) (:failed acc) (+ (:dropped acc) 1)))]
+       [(and (k/single? (:p c))
+             (let [v (k/one-i live (:l c) (:p c))] (and (some? v) (not (= v (:r c))))))
+        (do
+          (println (str "  skip (log won) " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 56)))
+          (->AdoptResult (:adopted acc) (+ (:skipped acc) 1) (:failed acc) (:dropped acc)))]
+       [:else
+        (let [r (tell-retry port "assert" (:l c) (:p c) (:r c) 5)]
+          (if (str/starts-with? r "ok:")
+            (do
+              (println (str "  adopted " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 56)))
+              (->AdoptResult (+ (:adopted acc) 1) (:skipped acc) (:failed acc) (:dropped acc)))
+            (do
+              (println (str "  FAILED  " (short-id (:l c)) "  " (:p c) "  -> " r))
+              (->AdoptResult (:adopted acc) (:skipped acc) (+ (:failed acc) 1) (:dropped acc)))))]))
+   (->AdoptResult 0 0 0 0)
+   hand))
+
+(defn cmd-heal [threads-dir :- String log :- String adopt :- Bool] :- Nil
+  (let [p (probe threads-dir log)
+        has-hand (not (empty? (:hand p)))]
     (cond
-      ;; Fail closed: a genuine hand edit is a human decision — never overwrite it.
-      [(not (empty? (:hand p)))
+      ;; Bare heal fails closed: a genuine hand edit is a human decision. This IS
+      ;; the dry run — it lists what `--adopt` would absorb, and touches nothing.
+      [(and has-hand (not adopt))
        (do
          (println (str "heal REFUSED — " (count (:hand p)) " genuinely-new file fact(s) not in the log "
-                       "(hand edits). A human decides: adopt via `tell`, or bulk `import`. Nothing was touched:"))
+                       "(hand edits). A human decides: adopt via `heal --adopt` (or `tell`/bulk `import`). "
+                       "Nothing was touched:"))
          (doseq [c (:hand p)]
            (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72)))))]
       [:else
-       (let [files (fram.rt/list-md threads-dir)
-             ids (mapv (fn [te :- String] :- String (short-id te)) (k/thread-ids-i (:idx p)))
-             scan (scan-files threads-dir files ids)
-             ;; targets are BARE ids: superseded/lagging (diff) ∪ broken-head files.
-             diff-ids (mapv (fn [te :- String] :- String (short-id te)) (heal-targets p))
-             targets (distinct-ids (vec (concat diff-ids (broken-head-ids scan (:idx p)))))]
-         (if (empty? targets)
-           (println "heal: nothing to do — every thread file already matches the log.")
-           (do
-             (doseq [id targets]
-               (let [te (str "@" id)
-                     title (let [t (k/one-i (:idx p) te "title")] (if (some? t) t "untitled"))
-                     existing (path-of scan id)
-                     path (if (str/blank? existing)
-                            (str threads-dir "/" id "-" (fram.rt/slugify title) ".md")
-                            existing)]
-                 (fram.rt/spit-file path (exp/thread-md (:log-facts p) te))
-                 (println (str "  re-rendered " id "  " (trunc title 52)))))
-             (println (str "heal: re-rendered " (count targets)
-                           " thread file(s) from the log. Log untouched.")))))])))
+       (if (and adopt has-hand)
+         ;; ADOPT: absorb the hand facts via the coordinator, then re-probe (the
+         ;; log now carries them) and run the normal projection pass to render.
+         (let [port (fram.rt/coord-port)]
+           (if (< (fram.rt/coord-version port) 0)
+             (println "no coordinator on 127.0.0.1:7977 — adopt needs the daemon to serialize writes. Run `north up`.")
+             (let [res (adopt-hand-facts port (live-idx log) (:hand p))]
+               (println (str "heal --adopt: " (:adopted res) " adopted, " (:skipped res)
+                             " skipped (log won), " (:dropped res) " dropped (parse artifact), "
+                             (:failed res) " failed via coordinator."))
+               (heal-project threads-dir (probe threads-dir log)))))
+         (heal-project threads-dir p))])))
 
 ;; --- boot: the one-screen session-start view --------------------------------
 (defrecord EntryPoint [te :- String note :- String created :- String])
@@ -1451,7 +1514,7 @@
       [(= cmd "schema-seed") (cmd-schema-seed log (has-flag? args "--execute"))]
       [(= cmd "tools")    (cmd-tools)]
       [(= cmd "doctor")   (cmd-doctor threads-dir log)]
-      [(= cmd "heal")     (cmd-heal threads-dir log)]
+      [(= cmd "heal")     (cmd-heal threads-dir log (has-flag? args "--adopt"))]
       [(= cmd "boot")     (cmd-boot threads-dir log)]
       [(= cmd "json")
        (cmd-json log (if (> (count args) 1) (nth args 1) "")

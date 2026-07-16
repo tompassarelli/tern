@@ -705,14 +705,8 @@
 (defn- broken-head-ids [scan idx]
   (distinct-ids (reduce (fn [acc fi] (if (and (not (str/blank? (:owner fi))) (and (not (= (:head fi) (str "@" (:owner fi)))) (some? (k/one-i idx (str "@" (:owner fi)) "title")))) (conj acc (:owner fi)) acc)) [] scan)))
 
-(defn cmd-heal [^String threads-dir ^String log]
-  (let [p (probe threads-dir log)]
-  (cond
-  (not (empty? (:hand p))) (do
-  (println (str "heal REFUSED — " (count (:hand p)) " genuinely-new file fact(s) not in the log " "(hand edits). A human decides: adopt via `tell`, or bulk `import`. Nothing was touched:"))
-  (doseq [c (:hand p)]
-  (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72)))))
-  :else (let [files (fram.rt/list-md threads-dir)
+(defn- heal-project [^String threads-dir ^Probe p]
+  (let [files (fram.rt/list-md threads-dir)
    ids (mapv (fn [te] (short-id te)) (k/thread-ids-i (:idx p)))
    scan (scan-files threads-dir files ids)
    diff-ids (mapv (fn [te] (short-id te)) (heal-targets p))
@@ -726,7 +720,49 @@
    path (if (str/blank? existing) (str threads-dir "/" id "-" (fram.rt/slugify title) ".md") existing)]
   (fram.rt/spit-file path (exp/thread-md (:log-facts p) te))
   (println (str "  re-rendered " id "  " (trunc title 52)))))
-  (println (str "heal: re-rendered " (count targets) " thread file(s) from the log. Log untouched."))))))))
+  (println (str "heal: re-rendered " (count targets) " thread file(s) from the log. Log untouched."))))))
+
+(defrecord AdoptResult [adopted skipped failed dropped])
+
+(defn adoptresult-adopted [r] (:adopted r))
+
+(defn adoptresult-skipped [r] (:skipped r))
+
+(defn adoptresult-failed [r] (:failed r))
+
+(defn adoptresult-dropped [r] (:dropped r))
+
+(defn- ^Boolean adoptable? [c]
+  (and (not (str/blank? (:p c))) (not (str/blank? (:r c)))))
+
+(defn- ^AdoptResult adopt-hand-facts [port live hand]
+  (reduce (fn [acc c] (cond
+  (not (adoptable? c)) (do
+  (println (str "  drop (parse artifact) " (short-id (:l c)) "  pred=<" (:p c) "> val=<" (trunc (:r c) 40) ">"))
+  (->AdoptResult (:adopted acc) (:skipped acc) (:failed acc) (+ (:dropped acc) 1)))
+  (and (k/single? (:p c)) (let [v (k/one-i live (:l c) (:p c))]
+  (and (some? v) (not (= v (:r c)))))) (do
+  (println (str "  skip (log won) " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 56)))
+  (->AdoptResult (:adopted acc) (+ (:skipped acc) 1) (:failed acc) (:dropped acc)))
+  :else (let [r (tell-retry port "assert" (:l c) (:p c) (:r c) 5)]
+  (if (str/starts-with? r "ok:") (do
+  (println (str "  adopted " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 56)))
+  (->AdoptResult (+ (:adopted acc) 1) (:skipped acc) (:failed acc) (:dropped acc))) (do
+  (println (str "  FAILED  " (short-id (:l c)) "  " (:p c) "  -> " r))
+  (->AdoptResult (:adopted acc) (:skipped acc) (+ (:failed acc) 1) (:dropped acc))))))) (->AdoptResult 0 0 0 0) hand))
+
+(defn cmd-heal [^String threads-dir ^String log ^Boolean adopt]
+  (let [p (probe threads-dir log)
+   has-hand (not (empty? (:hand p)))]
+  (cond
+  (and has-hand (not adopt)) (do
+  (println (str "heal REFUSED — " (count (:hand p)) " genuinely-new file fact(s) not in the log " "(hand edits). A human decides: adopt via `heal --adopt` (or `tell`/bulk `import`). " "Nothing was touched:"))
+  (doseq [c (:hand p)]
+  (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72)))))
+  :else (if (and adopt has-hand) (let [port (fram.rt/coord-port)]
+  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — adopt needs the daemon to serialize writes. Run `north up`.") (let [res (adopt-hand-facts port (live-idx log) (:hand p))]
+  (println (str "heal --adopt: " (:adopted res) " adopted, " (:skipped res) " skipped (log won), " (:dropped res) " dropped (parse artifact), " (:failed res) " failed via coordinator."))
+  (heal-project threads-dir (probe threads-dir log))))) (heal-project threads-dir p)))))
 
 (defrecord EntryPoint [te note created])
 
@@ -978,7 +1014,7 @@
   (= cmd "schema-seed") (cmd-schema-seed log (has-flag? args "--execute"))
   (= cmd "tools") (cmd-tools)
   (= cmd "doctor") (cmd-doctor threads-dir log)
-  (= cmd "heal") (cmd-heal threads-dir log)
+  (= cmd "heal") (cmd-heal threads-dir log (has-flag? args "--adopt"))
   (= cmd "boot") (cmd-boot threads-dir log)
   (= cmd "json") (cmd-json log (if (> (count args) 1) (nth args 1) "") (if (> (count args) 2) (nth args 2) "") (has-flag? args "--all"))
   (= cmd "clock") (let [sub (if (> (count args) 1) (nth args 1) "status")]
