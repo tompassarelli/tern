@@ -20,6 +20,8 @@ export interface RunRecord {
   model?: string; // opus | sonnet | haiku
   effort?: string; // low | medium | high | xhigh | max
   role?: string; // executor | implementer | integrator | designer | researcher | ...
+  provider?: string; // anthropic | openai
+  providerReason?: string; // explainable auto/explicit routing decision
   outcome: string; // "ran" | "error" | "budget_exceeded" | "budget_exhausted" | "struggle_ceiling"
   // escalate-not-kill (thread 019f1194-ca57) — present only on escalation-enabled runs.
   // Option A yields ONE @run row per spawn with an internal escalation chain, NOT one
@@ -48,6 +50,8 @@ export function recordRun(rec: RunRecord): void {
   if (rec.model) facts.push(["model", rec.model]);
   if (rec.effort) facts.push(["effort", rec.effort]);
   if (rec.role) facts.push(["role", rec.role]);
+  if (rec.provider) facts.push(["provider", rec.provider]);
+  if (rec.providerReason) facts.push(["provider_reason", rec.providerReason]);
   if (rec.costUsd != null) facts.push(["cost_usd", rec.costUsd.toFixed(4)]);
   if (rec.numTurns != null) facts.push(["num_turns", String(rec.numTurns)]);
   if (rec.errorCount != null) facts.push(["error_count", String(rec.errorCount)]);
@@ -61,7 +65,7 @@ export function recordRun(rec: RunRecord): void {
   for (const [p, v] of facts) {
     // async + ignored: never let telemetry add latency to, or break, the run.
     try {
-      execFile("north", ["tell", id, p, v], () => {});
+      execFile(process.env.NORTH_BIN ?? "north", ["tell", id, p, v], () => {});
     } catch {
       /* swallow */
     }

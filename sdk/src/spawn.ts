@@ -1,4 +1,3 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { resolve as pathResolve } from "node:path";
 const REPO_ROOT = pathResolve(import.meta.dir, "..", "..");
 import { StreamWriter } from "./stream-writer";
@@ -14,6 +13,9 @@ import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchd
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import { liveChildren, notifyEarlyExitChildren } from "./children";
 import { clockStart, clockFinalize } from "./clock";
+import { routedQuery, selectProvider, type ProviderPreference } from "./providers";
+import type { AgentQuery } from "./providers/types";
+import { resolveTier, type SemanticTier } from "./providers/catalog";
 
 interface SpawnOptions {
   prompt: string;
@@ -30,7 +32,9 @@ interface SpawnOptions {
   thread?: string; // billable thread — when set, auto-clock this spawn like dispatch (bare id); ad-hoc spawns (no thread) never clock
   caveman?: "off" | "lite" | "full"; // per-spawn terse-output dial; overrides ambient AGENT_CAVEMAN
   coordinator?: string; // spawning coordinator handle -> gets a direct peer ping on death
-  queryFn?: typeof query; // injection seam for tests; defaults to the real SDK query()
+  provider?: ProviderPreference;
+  tier?: SemanticTier;
+  queryFn?: (args: any) => AgentQuery; // injection seam for tests; bypasses provider selection
   // Known limitation: on escalate path the system prompt is built once at the starting tier,
   // so a mid-flight model change does not swap the model-delta block.
 }
@@ -38,6 +42,10 @@ interface SpawnOptions {
 export async function spawn(opts: SpawnOptions): Promise<string> {
   const agentId = opts.agentId ?? `lane-${Date.now().toString(36).slice(-8)}`;
   const stream = new StreamWriter(agentId);
+  const routing = selectProvider(opts.provider);
+  const resolved = resolveTier(routing.provider, opts.tier ?? process.env.AGENT_TIER as SemanticTier | undefined, opts.model, opts.effort);
+  opts.model = resolved.model;
+  opts.effort = resolved.effort;
   writeAgentFacts(agentId, {
     kind: "lane",
     role: opts.role ?? process.env.AGENT_ROLE,
@@ -65,7 +73,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     console.warn(`[spawn] @agent:${agentId} escalation ON but no budget_total — no spend floor; ` +
       `it stops only at the ladder ceiling. Set: north tell @swarm budget_total <usd>`);
   }
-  console.log(`[spawn] @agent:${agentId} starting${escalate ? ` (escalate @ tier ${tier} ${rung().model}/${rung().effort})` : ""}`);
+  console.log(`[spawn] @agent:${agentId} starting provider=${routing.provider}${resolved.tier ? ` tier=${resolved.tier}` : ""} (${routing.reason})${escalate ? ` (escalate @ tier ${tier} ${rung().model}/${rung().effort})` : ""}`);
 
   // Auto-clock only when this spawn carries a billable thread — ad-hoc spawns
   // aren't billable by default. Same per-agent treatment as dispatch.
@@ -76,7 +84,8 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   const escalations: Array<{ from: string; to: string; reason: string; atCost: number }> = [];
   const end = (oc: string) => { outcome = oc; try { ch.end(); } catch { /* already closed */ } };
 
-  const q = (opts.queryFn ?? query)({
+  const queryFn = opts.queryFn ?? ((args: any) => routedQuery(routing, args));
+  const q = queryFn({
     prompt: ch.stream(),
     options: harnessOptions({
       self: agentId,
@@ -131,7 +140,8 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
         if (d.kind === "escalate") {
           const from = `${rung().model}/${rung().effort}`;
           tier = d.toTier;
-          await escalateInFlight(q, ch, ladder[tier], trigger);
+          if (!q.setModel) { end("provider_escalation_unsupported"); break; }
+          await escalateInFlight(q as any, ch, ladder[tier], trigger);
           escalations.push({ from, to: `${rung().model}/${rung().effort}`, reason: trigger, atCost: runCost });
           resetStruggle(st);
           tierStartCost = runCost;
@@ -156,7 +166,8 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
         if (d.kind === "escalate") {
           const from = `${rung().model}/${rung().effort}`;
           tier = d.toTier;
-          await escalateInFlight(q, ch, ladder[tier], "empty_result");
+          if (!q.setModel) { end("provider_escalation_unsupported"); break; }
+          await escalateInFlight(q as any, ch, ladder[tier], "empty_result");
           escalations.push({ from, to: `${rung().model}/${rung().effort}`, reason: "empty_result", atCost: runCost });
           resetStruggle(st);
           tierStartCost = runCost;
@@ -233,6 +244,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     model: rung().model ?? opts.model ?? process.env.AGENT_MODEL,
     effort: rung().effort ?? opts.effort ?? process.env.AGENT_EFFORT,
     role: opts.role ?? process.env.AGENT_ROLE,
+    provider: routing.provider, providerReason: routing.reason,
     tokens: tokensOf(resultMsg), durationMs: resultMsg?.duration_ms ?? 0, outcome,
     costUsd: resultMsg?.total_cost_usd ?? runCost, numTurns: resultMsg?.num_turns ?? 0,
     errorCount: st.totalErrors, escalationTier: tier,
@@ -275,6 +287,8 @@ if (import.meta.main) {
     agentId: process.env.AGENT_ID,
     model: process.env.AGENT_MODEL,
     effort: process.env.AGENT_EFFORT as Effort | undefined,
+    provider: process.env.AGENT_PROVIDER as ProviderPreference | undefined,
+    tier: process.env.AGENT_TIER as SemanticTier | undefined,
   })
     .then((result) => console.log(result))
     .catch((err) => {

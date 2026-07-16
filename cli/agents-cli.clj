@@ -47,11 +47,11 @@
   (when (.exists (io/file DIAL-TABLE))
     (->> (slurp DIAL-TABLE) str/split-lines
          (keep (fn [ln]
-                 (when-let [[_ role model effort trole posture]
+                 (when-let [[_ role tier model effort trole posture]
                             (re-matches
-                             #"\s+([a-z]+)\s+(sonnet|opus|haiku|fable)\s+(low|medium|high|xhigh|max)\s+(\S+)\s+(\S+)\s*"
+                             #"\s+([a-z]+)\s+(economy|standard|senior|frontier)\s+(sonnet|opus|haiku|fable)/(low|medium|high|xhigh|max)\s+(\S+)\s+(\S+)\s*"
                              ln)]
-                   [role {:model model :effort effort
+                   [role {:tier tier :model model :effort effort
                           :north-role (when-not (#{"—" "-"} trole) trole)
                           :posture posture}])))
          (into {}))))
@@ -159,21 +159,23 @@
 (defn cmd-spawn [args]
   (let [dry? (some #{"--dry-run"} args)
         notify (second (drop-while #(not= "--notify" %) args))
-        [role prompt] (remove #(or (#{"--dry-run" "--notify"} %) (= % notify)) args)
+        provider (second (drop-while #(not= "--provider" %) args))
+        [role prompt] (remove #(or (#{"--dry-run" "--notify" "--provider"} %) (= % notify) (= % provider)) args)
         ;; gaffer squad roles from the canonical table + the date-gated two-tier synthetic
         ;; roles (orchestrator/worker); synthetics win a name clash (there are none).
         dt (merge (or (dial-table) {}) (synthetic-roles))]
     (cond
       (or (nil? role) (nil? prompt))
-      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--notify <peer>] [--dry-run]")
+      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--provider auto|anthropic|openai] [--notify <peer>] [--dry-run]")
           (println "roles:" (str/join " " (sort (keys dt)))))
       (not (dt role))
       (do (println (red (str "unknown role: " role)))
           (println "roles:" (str/join " " (sort (keys dt)))))
       :else
-      (let [{:keys [model effort north-role posture]} (dt role)
+      (let [{:keys [tier model effort north-role posture]} (dt role)
             aid (str "lane-" (subs (str (java.util.UUID/randomUUID)) 0 8))
-            env (cond-> {"AGENT_ID" aid "AGENT_MODEL" model "AGENT_EFFORT" effort}
+            env (cond-> {"AGENT_ID" aid "AGENT_TIER" tier "AGENT_MODEL" model "AGENT_EFFORT" effort}
+                  provider   (assoc "AGENT_PROVIDER" provider)
                   north-role (assoc "AGENT_ROLE" north-role)
                   posture   (assoc "AGENT_POSTURE" posture)
                   notify    (assoc "AGENT_COORDINATOR" notify))

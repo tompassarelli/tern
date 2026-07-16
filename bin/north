@@ -59,6 +59,7 @@ north — your one card. Type a command to do the thing next to it.
     north steer <id> "<msg>"           inject a message into a running agent
     north retask <id> "<goal>"         redirect a running agent's goal
     north spawn <role> "<prompt>"      spawn at a gaffer role's model/effort
+      --provider auto|anthropic|openai  select or auto-route the worker provider
                                        roles: analyst designer executor implementer
                                               integrator judge researcher verifier
     (agents dispatch via MCP)          in-harness agents call mcp__north__dispatch / spawn
@@ -72,6 +73,7 @@ north — your one card. Type a command to do the thing next to it.
 
   SETTINGS & HEALTH
     north config                       posture toggles: dispatch, caveman, coord, guards
+    north providers                    provider readiness and auto-route decision
     north doctor                       is everything healthy — daemons, rev skew, env, hooks
 CARD
     exit 0 ;;
@@ -103,6 +105,8 @@ CARD
     # 2026-07-10: north is the settings surface. State stays at
     # ~/.claude/my-config.state (guard hooks read it live). cli/config-cli.clj.
     exec bb "$NORTH/cli/config-cli.clj" "${@:2}" ;;
+  providers)
+    exec bun run "$NORTH/sdk/src/providers-cli.ts" "${@:2}" ;;
   up)
     exec "$FRAM/bin/fram-up" "${@:2}" ;;
   agents|spawn|delegate|request|fork|req|watch|steer|retask)

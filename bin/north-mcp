@@ -104,13 +104,15 @@
 
 (def sdk-tools
   [{:name "dispatch"
-    :desc "Dispatch an agent for a thread (must exist — capture first). Reads thread facts to derive posture, spawns via Claude Agent SDK. Returns the agent ID."
+    :desc "Dispatch an agent for a thread (must exist — capture first). North derives posture and routes to an available provider. Returns the agent ID."
     :schema {:type "object"
              :properties {:id {:type "string" :description "Thread ID to dispatch (e.g. 2026-06-27-193317)"}
                           :model {:type "string" :description "opus|sonnet|haiku|fable (default sonnet)"}
                           :effort {:type "string" :description "low|medium|high|xhigh (default high)"}
                           :role {:type "string" :description "executor|implementer|integrator|designer|researcher"}
                           :posture {:type "string" :description "explore|deliver|preserve"}
+                          :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
+                          :tier {:type "string" :enum ["economy" "standard" "senior" "frontier"] :description "Provider-neutral capability tier"}
                           :coordinator {:type "string" :description "Caller's north id; the lane pings it on done/death + records a `coordinator` fact. Omit to inherit from AGENT_ID/NORTH_AGENT_ID env; pass explicitly from an interactive session."}}
              :required ["id"]}}
    {:name "spawn"
@@ -121,6 +123,8 @@
                           :effort {:type "string" :description "low|medium|high|xhigh (default high)"}
                           :role {:type "string" :description "executor|implementer|integrator|designer|researcher"}
                           :posture {:type "string" :description "explore|deliver|preserve"}
+                          :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
+                          :tier {:type "string" :enum ["economy" "standard" "senior" "frontier"] :description "Provider-neutral capability tier"}
                           :caveman {:type "string" :enum ["off" "lite" "full"] :description "Terse-output dial (default ambient AGENT_CAVEMAN)"}
                           :coordinator {:type "string" :description "Caller's north id; see dispatch.coordinator"}}
              :required ["prompt"]}}])
@@ -151,12 +155,16 @@
             effort (get args "effort")
             role (get args "role")
             posture (get args "posture")
+            provider (get args "provider")
+            tier (get args "tier")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
                       model       (assoc "AGENT_MODEL" model)
                       effort      (assoc "AGENT_EFFORT" effort)
                       role        (assoc "AGENT_ROLE" role)
                       posture     (assoc "AGENT_POSTURE" posture)
+                      provider    (assoc "AGENT_PROVIDER" provider)
+                      tier        (assoc "AGENT_TIER" tier)
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))]
           (.mkdirs (.getParentFile log))
@@ -174,6 +182,8 @@
             effort (get args "effort")
             role (get args "role")
             posture (get args "posture")
+            provider (get args "provider")
+            tier (get args "tier")
             caveman (get args "caveman")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
@@ -181,6 +191,8 @@
                       effort      (assoc "AGENT_EFFORT" effort)
                       role        (assoc "AGENT_ROLE" role)
                       posture     (assoc "AGENT_POSTURE" posture)
+                      provider    (assoc "AGENT_PROVIDER" provider)
+                      tier        (assoc "AGENT_TIER" tier)
                       caveman     (assoc "AGENT_CAVEMAN" caveman)
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))]

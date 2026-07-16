@@ -185,7 +185,7 @@ function esoAppendix(): string {
     "  val1\\tval2\\tval3   ← one tab-delimited row per record (strings with tabs/newlines use JSON quoting)";
 }
 
-// AGENT_LAWS=on|off — appends the user's global CLAUDE.md to every spawned agent.
+// AGENT_LAWS=on|off — appends the user's provider-neutral global AGENTS.md to every spawned agent.
 // A custom-string systemPrompt bypasses the SDK's claude_code preset, which is the
 // only path that injects CLAUDE.md — so without this, workers get NONE of the
 // global laws interactive sessions live under. Read per spawn (~/.claude/CLAUDE.md
@@ -194,9 +194,16 @@ function esoAppendix(): string {
 function globalLawsAppendix(): string {
   if ((process.env.AGENT_LAWS ?? "on") !== "on") return "";
   try {
-    const laws = readFileSync(`${process.env.HOME}/.claude/CLAUDE.md`, "utf8").trim();
+    const candidates = [
+      `${process.env.HOME}/.codex/AGENTS.md`,
+      `${process.env.HOME}/.agents/AGENTS.md`,
+      `${process.env.HOME}/.claude/CLAUDE.md`, // migration fallback
+    ];
+    const path = candidates.find((p) => { try { readFileSync(p); return true; } catch { return false; } });
+    if (!path) return "";
+    const laws = readFileSync(path, "utf8").trim();
     return laws
-      ? "\n\n## Global laws — the user's ~/.claude/CLAUDE.md (binds every agent, spawned or interactive)\n\n" + laws
+      ? `\n\n## Global laws — ${path} (binds every provider and agent)\n\n` + laws
       : "";
   } catch {
     return "";

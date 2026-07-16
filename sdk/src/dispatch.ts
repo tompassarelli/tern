@@ -1,4 +1,3 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { getThreadFacts, getChildren } from "./north-client";
 import { derivePosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
@@ -11,6 +10,8 @@ import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchd
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import { liveChildren, notifyEarlyExitChildren } from "./children";
 import { clockStart, clockFinalize } from "./clock";
+import { routedQuery, selectProvider, type ProviderPreference } from "./providers";
+import { resolveTier, type SemanticTier } from "./providers/catalog";
 
 const PLAN_TOOLS = ["Read", "Grep", "Glob", "Bash"];
 const EXEC_TOOLS = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
@@ -59,9 +60,12 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
     process.env.AGENT_ID ??
     `sdk-${threadId.replace(/[^a-z0-9]/gi, "").slice(-12)}`;
   const stream = new StreamWriter(agentId);
+  const routing = selectProvider(process.env.AGENT_PROVIDER as ProviderPreference | undefined);
+  const resolved = resolveTier(routing.provider, process.env.AGENT_TIER as SemanticTier | undefined,
+    process.env.AGENT_MODEL, process.env.AGENT_EFFORT as Effort | undefined);
 
   console.log(`[dispatch] @${threadId} — ${posture.title}`);
-  console.log(`[dispatch] posture: ${postureLabel}, tools: ${tools.join(",")}`);
+  console.log(`[dispatch] posture: ${postureLabel}, provider: ${routing.provider} (${routing.reason}), tools: ${tools.join(",")}`);
 
   // Auto-clock (per-agent): open a session on this thread as THIS worker, so its
   // billable time attributes to the thread it actually worked — not one global
@@ -95,13 +99,13 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   // peer ping to the coordinator); finally -> ALWAYS stop the feed, close the channel, and
   // record the run so the coordinator learns of the death instead of noticing silence.
   try {
-    const q = query({
+    const q = routedQuery(routing, {
       prompt: ch.stream(),
       options: harnessOptions({
         self: agentId,
         extraTools: tools,
-        model: process.env.AGENT_MODEL,
-        effort: process.env.AGENT_EFFORT as Effort | undefined,
+        model: resolved.model,
+        effort: resolved.effort,
         systemPrompt: `You are a north worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
       }),
     });
@@ -183,8 +187,9 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   // Spend is no longer charged to a counter here; it is summed from the @run
   // cost_usd fact this run records below (remaining() folds Σ over @run costs).
   recordRun({ thread: threadId, agent: agentId, tokens: tokensOf(resultMsg),
-              model: process.env.AGENT_MODEL, effort: process.env.AGENT_EFFORT,
+              model: resolved.model, effort: resolved.effort,
               role: process.env.AGENT_ROLE,
+              provider: routing.provider, providerReason: routing.reason,
               durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome });
   console.log(`\n[dispatch] @${threadId} ${outcome === "died" ? "DIED" : "complete"}`);
   return { threadId, posture: postureLabel, result };
