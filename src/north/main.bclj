@@ -580,7 +580,7 @@
 ;; was the census diagnosis: the flat dump drowned the ~15 threads that matter).
 (defn- board-full [idx :- k/Index today :- String before? :- [String String -> Bool] nonterm :- (Vec String)] :- Nil
   (do
-    (println (str "BOARD — " (count nonterm) " open"))
+    (println (str "THREADS — " (count nonterm) " open"))
     (board-group idx "active" (in-condition idx nonterm today before? "active"))
     (board-group idx "ready" (in-condition idx nonterm today before? "ready"))
     (board-group idx "blocked" (in-condition idx nonterm today before? "blocked"))
@@ -611,9 +611,9 @@
         ashow (vec (take 20 active))
         ritems (mapv (fn [te :- String] :- LevItem (->LevItem te (proj/leverage-score idx te))) readyl)
         rranked (vec (take 15 (sort-by (fn [it :- LevItem] :- Int (- 0 (:score it))) ritems)))]
-    (println (str "BOARD — " (count threads) " open threads · " (count active) " active · "
+    (println (str "THREADS — " (count threads) " open threads · " (count active) " active · "
                   (count readyl) " ready · " (count blockedl) " blocked · "
-                  nconcern " concerns   (north board --all for the full kanban)"))
+                  nconcern " concerns   (north threads --all for the full kanban)"))
     ;; self-teaching legend: the counts above are derived conditions, not obvious labels —
     ;; spell out what each word means so "open" vs "ready" needs no outside explanation.
     (println "  open = not done · active = being driven now · ready = committed + unblocked, start anytime · blocked = waiting on a dependency")
@@ -623,15 +623,16 @@
         (println (str "  " (let [dl (driver-label idx te)] (if (str/blank? dl) "?" dl))
                       "  " (short-id te) "  " (trunc (title-of idx te) 44))))
       (when (> (count active) (count ashow))
-        (println (str "  … +" (- (count active) (count ashow)) " more · north board --all"))))
+        (println (str "  … +" (- (count active) (count ashow)) " more · north threads --all"))))
     (when (> nparked 0)
-      (println (str "\n" nparked " parked driver(s) — stale, not shown (north board --all)")))
+      (println (str "\n" nparked " parked driver(s) — stale, not shown (north threads --all)")))
     (println (str "\n" (proj/condition-emoji idx "ready") " READY — top " (count rranked)
                   " of " (count readyl) " by leverage"))
     (doseq [it rranked]
       (println (str "  unblocks " (:score it) "  " (short-id (:te it)) "  " (trunc (title-of idx (:te it)) 44))))
     (when (> (count readyl) (count rranked))
-      (println (str "  … +" (- (count readyl) (count rranked)) " more · north board --all")))))
+      (println (str "  … +" (- (count readyl) (count rranked)) " more · north threads --all")))
+    (println "  machinery/agents/daemons → north dashboard")))
 
 (defn cmd-board [log :- String all :- Bool] :- Nil
   (let [idx (live-idx log)

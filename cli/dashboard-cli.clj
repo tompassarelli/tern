@@ -157,12 +157,12 @@
 
 ;; ---- board / ready counts ---------------------------------------------------
 (defn board-counts []
-  ;; The curated `north board` header carries all counts on one line
-  ;; ("BOARD — N open threads · N active · N ready · N blocked · N concerns"),
+  ;; The curated `north threads` header carries all counts on one line
+  ;; ("THREADS — N open threads · N active · N ready · N blocked · N concerns"),
   ;; so one shell-out covers what used to need board+ready.
-  (let [b (run [(str NORTH "/bin/north") "board"] :timeout 4000)
+  (let [b (run [(str NORTH "/bin/north") "threads"] :timeout 4000)
         grab (fn [re] (when (:out b) (some-> (re-find re (:out b)) second)))]
-    {:open   (grab #"BOARD\s+—\s+(\d+)\s+open")
+    {:open   (grab #"THREADS\s+—\s+(\d+)\s+open")
      :active (grab #"(\d+)\s+active")
      :ready  (grab #"(\d+)\s+ready")
      :err    (when-not (:ok b) "board unavailable")}))
@@ -342,7 +342,7 @@
             (println (str "  " (cyn (format "%-10s" repo)) " " n))))))
     (println)
     ;; board summary
-    (println (bold "board"))
+    (println (bold "board") (dim "» north threads"))
     (if (:err bc)
       (println "  " (ylw (:err bc)))
       (println (str "  " (or (:open bc) "?") " open"
