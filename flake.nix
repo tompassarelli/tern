@@ -93,7 +93,10 @@
           pname = "north";
           version = "0.1.0";
           src = self;
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          # Babashka must be present while patchShebangs runs. Otherwise the
+          # copied `#!/usr/bin/env bb` survives into `.north-mcp-wrapped`, where
+          # the Nix build sandbox has no `/usr/bin/env` to execute.
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.babashka ];
           dontConfigure = true;
           dontBuild = true;
           installPhase = ''
@@ -109,6 +112,13 @@
             cp -r sdk/src $out/sdk/src
             cp bin/north bin/north-mcp bin/concern $out/bin/
             patchShebangs $out/bin
+
+            # The Linear route is spread across these load-bearing runtime
+            # modules. Catch untracked/omitted flake sources before producing a
+            # package whose `north linear` verb points at a missing entrypoint.
+            for f in cli.ts north-state.ts app-server-broker.ts; do
+              test -f "$out/sdk/src/integrations/linear/$f"
+            done
 
             wrapProgram $out/bin/north \
               --prefix PATH : ${runtimePath} \
@@ -152,6 +162,11 @@ EOF
               --provider openai --dry-run > "$smoke/spawn.out"
             grep -q 'grade=mid tier=standard' "$smoke/spawn.out"
             grep -q 'AGENT_ROLE=implementer' "$smoke/spawn.out"
+            printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | \
+              $out/bin/north-mcp > "$smoke/north-mcp-tools.json"
+            ${pkgs.jq}/bin/jq -e \
+              '([.result.tools[] | select(.name | startswith("linear_")) | .name] | sort) == ["linear_get", "linear_import", "linear_plan", "linear_sync"]' \
+              "$smoke/north-mcp-tools.json" > /dev/null
             printf '{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":4102444800}}}\n' | \
               HOME="$smoke/home" NORTH_PROVIDER_OBSERVATIONS="$smoke/ingested.json" \
               $out/bin/north provider-observe claude-statusline

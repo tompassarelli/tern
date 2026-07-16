@@ -14,6 +14,14 @@ afterEach(() => {
 
 function toolSchemas() {
   return {
+    list_issues: {
+      name: "list_issues",
+      inputSchema: {
+        type: "object", properties: { query: { type: "string" }, limit: { type: "number" }, cursor: { type: "string" } },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
     get_issue: {
       name: "get_issue",
       inputSchema: {
@@ -31,6 +39,23 @@ function toolSchemas() {
           labels: { type: "array", items: { type: "string" } },
         },
         additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    list_comments: {
+      name: "list_comments",
+      inputSchema: {
+        type: "object", properties: { issueId: { type: "string" }, limit: { type: "number" }, cursor: { type: "string" } },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    save_comment: {
+      name: "save_comment",
+      inputSchema: {
+        type: "object",
+        properties: { id: { type: "string" }, issueId: { type: "string" }, body: { type: "string" } },
+        required: ["body"], additionalProperties: false,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
@@ -110,6 +135,14 @@ test("requires an unambiguous capability match unless a server is explicit", asy
   const explicit = await openLinearGateway(explicitHarness.broker, { server: "linear-b" });
   expect(explicit.server).toBe("linear-b");
   await explicit.close();
+});
+
+test("accepts save_issue without the unused team field", async () => {
+  const server = linearServer();
+  delete (server.tools.save_issue.inputSchema.properties as Record<string, unknown>).team;
+  const gateway = await openLinearGateway(harness({ servers: [server] }).broker);
+  expect(gateway.server).toBe("linear-mcp-test");
+  await gateway.close();
 });
 
 test("fails closed on OAuth and tool schema/annotation drift", async () => {

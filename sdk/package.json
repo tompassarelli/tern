@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dispatch": "bun run src/dispatch.ts",
-    "check": "bun build src/dispatch.ts --no-bundle > /dev/null && bun build src/spawn.ts --no-bundle > /dev/null"
+    "check": "bun build src/dispatch.ts --no-bundle > /dev/null && bun build src/spawn.ts --no-bundle > /dev/null && bun build src/integrations/linear/cli.ts --no-bundle > /dev/null"
   },
   "devDependencies": {
     "@types/bun": "latest"

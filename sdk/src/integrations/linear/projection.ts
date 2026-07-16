@@ -8,8 +8,11 @@ import {
   normalizeText,
   normalizeThreadId,
   sha256Canonical,
+  sha256Text,
 } from "./normalize";
 import type {
+  LinearBootstrapDescriptionAdoption,
+  LinearBootstrapDescriptionEvidence,
   LinearCommentMutationPlan,
   LinearRemoteComment,
   LinearSyncFields,
@@ -127,6 +130,44 @@ export function replaceManagedLinearDescription(
   if (!description) return managed;
   const separator = description.endsWith("\n\n") ? "" : description.endsWith("\n") ? "\n" : "\n\n";
   return `${description}${separator}${managed}`;
+}
+
+/**
+ * Adopt an import's unchanged raw description into one managed block. The raw
+ * body is consumed by that block, not retained as duplicate unmanaged prose.
+ */
+export function planBootstrapLinearDescriptionAdoption(input: {
+  description: string | null | undefined;
+  threadId: string;
+  fields: LinearSyncFields;
+  evidence: LinearBootstrapDescriptionEvidence;
+}): LinearBootstrapDescriptionAdoption {
+  const description = input.description ?? "";
+  const rawDescriptionHash = sha256Text(description);
+  try {
+    const managed = parseManagedLinearDescription(description, input.threadId);
+    if (managed) {
+      return { state: "conflict", diagnostic: "Linear description already contains a North-managed block", rawDescriptionHash };
+    }
+    assertNoReservedNorthMarker("Linear bootstrap description", description);
+  } catch (error) {
+    return {
+      state: "conflict",
+      diagnostic: error instanceof Error ? error.message : String(error),
+      rawDescriptionHash,
+    };
+  }
+  if (!/^[0-9a-f]{64}$/.test(input.evidence.importedRawDescriptionHash)) {
+    return { state: "conflict", diagnostic: "imported Linear description hash is invalid", rawDescriptionHash };
+  }
+  if (rawDescriptionHash !== input.evidence.importedRawDescriptionHash) {
+    return { state: "conflict", diagnostic: "Linear description changed after import", rawDescriptionHash };
+  }
+  return {
+    state: "adopt",
+    description: renderManagedLinearBlock(input.threadId, input.fields),
+    rawDescriptionHash,
+  };
 }
 
 function extractField(block: string, name: ManagedFieldName): string {

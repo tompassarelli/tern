@@ -90,6 +90,7 @@ north — your one card. Type a command to do the thing next to it.
     north tell <id> <pred> <val>       assert a fact   (north retract … to remove)
     north clock start|stop             log real time against a thread
     north clock audit                  commits-vs-clock coverage drift report
+    north linear get|import|plan|sync  mechanical Linear bridge (sync is plan-only unless --apply)
 
   SETTINGS & HEALTH
     north config                       posture + routing policy in one report
@@ -135,6 +136,10 @@ CARD
     exec bb "$NORTH/cli/config-cli.clj" "${@:2}" ;;
   providers)
     exec bun run "$NORTH/sdk/src/providers-cli.ts" "${@:2}" ;;
+  linear)
+    # Zero-turn Linear adapter over Codex app-server MCP. `sync` defaults to a
+    # read-only plan; only an explicit `sync <thread> --apply` writes remotely.
+    exec bun run "$NORTH/sdk/src/integrations/linear/cli.ts" "${@:2}" ;;
   provider-observe)
     # Hidden machine-ingestion surface. Interactive adapters feed provider
     # telemetry here; it is intentionally silent and best-effort.

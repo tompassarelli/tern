@@ -43,6 +43,15 @@
 
 ;; tool name -> {desc, schema, argv}. argv maps the JSON arguments map (string
 ;; keys) to the engine argument vector.
+(def read-external-annotations
+  {:readOnlyHint true :destructiveHint false :idempotentHint true :openWorldHint true})
+(def local-write-annotations
+  {:readOnlyHint false :destructiveHint false :idempotentHint true :openWorldHint true})
+(def remote-write-annotations
+  {:readOnlyHint false :destructiveHint true :idempotentHint false :openWorldHint true})
+(def server-property
+  {:type "string" :minLength 1 :description "Optional configured Linear MCP server name"})
+
 (def tools
   [{:name "ready"        :desc "Threads doable now (committed, unblocked, not active, not done). Default: kind=thread, top-15 by leverage. Pass all=true for the full unscoped list. Returns JSON [{id,title,condition,emoji}]."
     :schema {:type "object" :properties {:all {:type "boolean" :description "return every ready thread, unscoped (default false: kind=thread top-15 by leverage)"}}}
@@ -96,7 +105,45 @@
     :schema {:type "object" :properties {:full {:type "boolean" :description "return every thread (default false: summary + top-N logged)"}}}
     :argv (fn [_] ["json" "clock-report"])}
    {:name "presentation" :desc "The effective emoji map (condition -> glyph), engine defaults + user overrides. Returns JSON {active,ready,blocked,draft}."
-    :schema {:type "object" :properties {}} :argv (fn [_] ["json" "presentation"])}])
+    :schema {:type "object" :properties {}} :argv (fn [_] ["json" "presentation"])}
+   {:name "linear_get"
+    :desc "Read one Linear issue mechanically through North. Returns the CLI JSON unchanged; does not start a model turn."
+    :schema {:type "object"
+             :properties {:issue {:type "string" :minLength 1}
+                          :server server-property}
+             :required ["issue"] :additionalProperties false}
+    :annotations read-external-annotations
+    :argv (fn [a] (cond-> ["linear" "get" (get a "issue")]
+                    (get a "server") (conj "--server" (get a "server"))))}
+   {:name "linear_import"
+    :desc "Import one Linear issue into North mechanically. Mutates only North's local graph and is idempotent by persisted North-Linear link identity."
+    :schema {:type "object"
+             :properties {:issue {:type "string" :minLength 1}
+                          :server server-property}
+             :required ["issue"] :additionalProperties false}
+    :annotations local-write-annotations
+    :argv (fn [a] (cond-> ["linear" "import" (get a "issue")]
+                    (get a "server") (conj "--server" (get a "server"))))}
+   {:name "linear_plan"
+    :desc "Compute a read-only North-to-Linear synchronization plan for one thread. Returns JSON and performs no writes."
+    :schema {:type "object"
+             :properties {:thread {:type "string" :minLength 1}
+                          :server server-property}
+             :required ["thread"] :additionalProperties false}
+    :annotations read-external-annotations
+    :argv (fn [a] (cond-> ["linear" "plan" (get a "thread")]
+                    (get a "server") (conj "--server" (get a "server"))))}
+   {:name "linear_sync"
+    :desc "Plan synchronization for one North thread. Remote writes occur only when apply=true; the default is read-only."
+    :schema {:type "object"
+             :properties {:thread {:type "string" :minLength 1}
+                          :apply {:type "boolean" :description "Apply the plan to Linear (default false)"}
+                          :server server-property}
+             :required ["thread"] :additionalProperties false}
+    :annotations remote-write-annotations
+    :argv (fn [a] (cond-> ["linear" "sync" (get a "thread")]
+                    (true? (get a "apply")) (conj "--apply")
+                    (get a "server") (conj "--server" (get a "server"))))}])
 
 ;; --- SDK agent tools (dispatch/spawn) — shell out to bun, not the engine ----
 (def sdk-dir (str (.getParent (io/file (str here))) "/sdk/src"))
@@ -322,6 +369,16 @@
     "capture"      (slim-capture text)
     text))
 
+(def max-tool-error-chars 8192)
+(defn bound-tool-error [text]
+  (if (<= (count text) max-tool-error-chars)
+    text
+    (let [marker "\n... tool error truncated ...\n"
+          available (- max-tool-error-chars (count marker))
+          head (quot available 2)
+          tail (- available head)]
+      (str (subs text 0 head) marker (subs text (- (count text) tail))))))
+
 (defn call-tool [nm args]
   (if-let [st (find-sdk-tool nm)]
     (call-sdk nm (or args {}))
@@ -330,14 +387,20 @@
             {:keys [out err exit]} (apply proc/sh engine argv)
             errs (str/trim (or err ""))
             raw (str/trim (str out (when (seq errs) (str "\n[stderr] " errs))))
-            text (if (zero? exit) (slim-output nm (or args {}) raw) raw)]
+            text (if (zero? exit)
+                   (slim-output nm (or args {}) raw)
+                   (bound-tool-error raw))]
         {:content [{:type "text" :text (if (str/blank? text) (str "(done; exit " exit ")") text)}]
          :isError (not (zero? exit))})
       {:content [{:type "text" :text (str "unknown tool: " nm)}] :isError true})))
 
+(defn tool-descriptor [t]
+  (cond-> {:name (:name t) :description (:desc t) :inputSchema (:schema t)}
+    (:annotations t) (assoc :annotations (:annotations t))))
+
 (defn tools-list []
-  {:tools (into (mapv (fn [t] {:name (:name t) :description (:desc t) :inputSchema (:schema t)}) tools)
-                (mapv (fn [t] {:name (:name t) :description (:desc t) :inputSchema (:schema t)}) sdk-tools))})
+  {:tools (into (mapv tool-descriptor tools)
+                (mapv tool-descriptor sdk-tools))})
 
 (defn on-initialize [params]
   {:protocolVersion (get params "protocolVersion" "2025-06-18")

@@ -52,17 +52,25 @@ function requireNonempty(name: string, value: Nullable<string>): string {
 }
 
 export function normalizeLinearIdentity(value: LinearIssueReference): LinearIssueIdentity {
-  const issueId = requireNonempty("issue UUID", value.issueId).toLowerCase();
-  if (!UUID.test(issueId)) throw new Error(`Linear issueId must be a UUID, received ${JSON.stringify(value.issueId)}`);
-  return {
-    workspaceId: requireNonempty("workspaceId", value.workspaceId),
-    issueId,
-  };
+  if (value.identityKind === "linear-uuid") {
+    const issueId = requireNonempty("issue UUID", value.issueId).toLowerCase();
+    if (!UUID.test(issueId)) throw new Error(`Linear issueId must be a UUID, received ${JSON.stringify(value.issueId)}`);
+    return { identityKind: "linear-uuid", workspaceId: requireNonempty("workspaceId", value.workspaceId), issueId };
+  }
+  if (value.identityKind === "mcp-bootstrap-v1") {
+    const fingerprint = requireNonempty("connector fingerprint", value.fingerprint).toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(fingerprint))
+      throw new Error(`Linear connector fingerprint must be 64 lowercase hex characters, received ${JSON.stringify(value.fingerprint)}`);
+    return { identityKind: "mcp-bootstrap-v1", connector: requireNonempty("connector", value.connector), fingerprint };
+  }
+  throw new Error(`unknown Linear identity kind: ${String((value as { identityKind?: unknown }).identityKind)}`);
 }
 
 export function linearIdentityKey(value: LinearIssueReference): string {
   const identity = normalizeLinearIdentity(value);
-  return `linear:${encodeURIComponent(identity.workspaceId)}:${identity.issueId}`;
+  return identity.identityKind === "linear-uuid"
+    ? `linear:uuid:${encodeURIComponent(identity.workspaceId)}:${identity.issueId}`
+    : `linear:mcp-bootstrap-v1:${encodeURIComponent(identity.connector)}:${identity.fingerprint}`;
 }
 
 export function sameLinearIdentity(left: LinearIssueReference, right: LinearIssueReference): boolean {
@@ -95,7 +103,7 @@ function canonicalize(value: unknown): unknown {
   if (typeof value === "object") {
     return Object.fromEntries(Object.entries(value as Record<string, unknown>)
       .filter(([, item]) => item !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right, "en"))
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
       .map(([key, item]) => [key, canonicalize(item)]));
   }
   throw new Error(`canonical JSON does not support ${typeof value}`);
@@ -107,4 +115,9 @@ export function canonicalJson(value: unknown): string {
 
 export function sha256Canonical(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+/** Hash exact UTF-8 text bytes. Unlike canonical JSON hashing, line endings remain significant. */
+export function sha256Text(value: Nullable<string>): string {
+  return createHash("sha256").update(value ?? "", "utf8").digest("hex");
 }

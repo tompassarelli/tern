@@ -1,16 +1,31 @@
 export type Nullable<T> = T | null | undefined;
 
-export interface LinearIssueIdentity {
+export interface LinearUuidIdentity {
+  identityKind: "linear-uuid";
+  /** Native Linear workspace UUID. */
   workspaceId: string;
+  /** Native immutable Linear issue UUID. */
   issueId: string;
 }
 
-export interface LinearIssueReference extends LinearIssueIdentity {
+export interface LinearMcpBootstrapIdentity {
+  identityKind: "mcp-bootstrap-v1";
+  /** Configured MCP server name: the connector namespace, not a Linear workspace UUID. */
+  connector: string;
+  /** SHA-256 of connector + createdAt + initial key; never sent to Linear. */
+  fingerprint: string;
+}
+
+export type LinearIssueIdentity = LinearUuidIdentity | LinearMcpBootstrapIdentity;
+
+interface LinearMutableReferenceMetadata {
   /** Human-facing and mutable (for example, MSA-123). Never part of identity. */
   identifier?: Nullable<string>;
   /** Mutable team/broker scope metadata. A team transfer must not relink the issue. */
   scopeId?: Nullable<string>;
 }
+
+export type LinearIssueReference = LinearIssueIdentity & LinearMutableReferenceMetadata;
 
 export type NorthLifecycleCategory =
   | "speculative"
@@ -71,18 +86,11 @@ export interface LinearRemoteComment {
   body: Nullable<string>;
 }
 
-export interface LinearIssueSnapshot extends LinearIssueReference {
+export type LinearIssueSnapshot = LinearIssueReference & {
   title: Nullable<string>;
   description?: Nullable<string>;
   comments?: Nullable<readonly LinearRemoteComment[]>;
-}
-
-export interface LinearSyncBaseline {
-  identity: LinearIssueIdentity;
-  threadId: string;
-  fields: LinearSyncFields;
-  hash: string;
-}
+};
 
 /** Linear is a projection: remote edits to these fields are drift, not authority. */
 export const NORTH_OWNED_LINEAR_FIELDS = [
@@ -90,6 +98,27 @@ export const NORTH_OWNED_LINEAR_FIELDS = [
 ] as const satisfies readonly (keyof LinearSyncFields)[];
 
 export type LinearSyncField = typeof NORTH_OWNED_LINEAR_FIELDS[number];
+
+export type LinearSyncFieldHashes = {
+  readonly [Field in LinearSyncField]: string;
+};
+
+/** Serialized synchronization state. Field content remains in North, never duplicated here. */
+export interface LinearSyncBaseline {
+  identity: LinearIssueIdentity;
+  threadId: string;
+  fieldHashes: LinearSyncFieldHashes;
+  hash: string;
+}
+
+export interface LinearBootstrapDescriptionEvidence {
+  /** SHA-256 of the exact imported description bytes, including original line endings. */
+  importedRawDescriptionHash: string;
+}
+
+export type LinearBootstrapDescriptionAdoption =
+  | { state: "adopt"; description: string; rawDescriptionHash: string }
+  | { state: "conflict"; diagnostic: string; rawDescriptionHash: string };
 
 export type LinearFieldReconciliationCategory =
   | "unchanged"

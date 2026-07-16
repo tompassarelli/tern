@@ -1,11 +1,15 @@
 import { expect, test } from "bun:test";
-import { linearIdentityKey, sameLinearIdentity } from "../src/integrations/linear/normalize";
+import {
+  linearIdentityKey, sameLinearIdentity, sha256Canonical, sha256Text,
+} from "../src/integrations/linear/normalize";
 import {
   parseManagedLinearDescription,
   projectNorthThread,
   replaceManagedLinearDescription,
 } from "../src/integrations/linear/projection";
-import { createLinearSyncBaseline, reconcileLinearIssue } from "../src/integrations/linear/reconcile";
+import {
+  createLinearSyncBaseline, reconcileLinearIssue, validateLinearSyncBaseline,
+} from "../src/integrations/linear/reconcile";
 import type {
   LinearIssueSnapshot,
   LinearThreadProjection,
@@ -13,6 +17,7 @@ import type {
 } from "../src/integrations/linear/types";
 
 const identity = {
+  identityKind: "linear-uuid" as const,
   workspaceId: "workspace-a",
   scopeId: "team-msa",
   issueId: "4D36E96E-E325-41CE-BFC0-8A6E548D41C8",
@@ -35,7 +40,9 @@ function source(overrides: Partial<NorthThreadSyncSource> = {}): NorthThreadSync
   };
 }
 
-function remoteFrom(projection: LinearThreadProjection, overrides: Partial<LinearIssueSnapshot> = {}): LinearIssueSnapshot {
+type LinearUuidSnapshot = Extract<LinearIssueSnapshot, { identityKind: "linear-uuid" }>;
+
+function remoteFrom(projection: LinearThreadProjection, overrides: Partial<LinearUuidSnapshot> = {}): LinearIssueSnapshot {
   return {
     ...identity,
     title: projection.fields.title,
@@ -66,6 +73,45 @@ test("normalization makes projection and payload hashes stable", () => {
   const planTwo = reconcileLinearIssue({ baseline, local: second, remote }).plan;
   expect(planOne?.hash).toBe(planTwo?.hash);
   expect(planOne?.issue).toEqual(planTwo?.issue);
+});
+
+test("serialized baselines contain only identity and normalized per-field hashes", () => {
+  const projection = projectNorthThread(source({
+    title: "Sensitive title", body: "Sensitive body", doneWhen: ["private criterion"], progress: [],
+  }));
+  const baseline = createLinearSyncBaseline(identity, projection.threadId, projection.fields);
+  expect(Object.keys(baseline.fieldHashes).sort()).toEqual([
+    "barEvidence", "body", "doneWhen", "lifecycle", "repos", "title",
+  ]);
+  expect(baseline.fieldHashes.title).toBe(sha256Canonical("Sensitive title"));
+  const serialized = JSON.stringify(baseline);
+  expect(serialized).not.toContain("Sensitive title");
+  expect(serialized).not.toContain("Sensitive body");
+  expect(serialized).not.toContain("private criterion");
+  expect(serialized).not.toContain('"fields"');
+});
+
+test("missing or tampered baseline field hashes fail before reconciliation", () => {
+  const local = projectNorthThread(source({ progress: [] }));
+  const baseline = createLinearSyncBaseline(identity, local.threadId, local.fields);
+  const remote = remoteFrom(local, { comments: [] });
+  const missing = JSON.parse(JSON.stringify(baseline));
+  delete missing.fieldHashes.body;
+  expect(() => reconcileLinearIssue({ baseline: missing, local, remote }))
+    .toThrow("baseline body hash is invalid");
+  const tampered = { ...baseline, fieldHashes: { ...baseline.fieldHashes, title: "0".repeat(64) } };
+  expect(() => reconcileLinearIssue({ baseline: tampered, local, remote }))
+    .toThrow("baseline hash does not match its contents");
+});
+
+test("baseline integrity validator round-trips valid state and rejects tampering directly", () => {
+  const local = projectNorthThread(source({ progress: [] }));
+  const baseline = createLinearSyncBaseline(identity, local.threadId, local.fields);
+  expect(validateLinearSyncBaseline(JSON.parse(JSON.stringify(baseline)))).toEqual(baseline);
+  expect(() => validateLinearSyncBaseline({
+    ...baseline,
+    fieldHashes: { ...baseline.fieldHashes, body: "f".repeat(64) },
+  })).toThrow("baseline hash does not match its contents");
 });
 
 test("managed description replacement preserves all unmanaged text", () => {
@@ -125,8 +171,80 @@ test("matching changes converge and advance the baseline without a write", () =>
   expect(result.state).toBe("in-sync");
   expect(result.fields.find(({ field }) => field === "title")?.category).toBe("converged");
   expect(result.plan).toBeNull();
-  expect(result.nextBaseline?.fields.title).toBe("After");
+  expect(result.nextBaseline?.fieldHashes.title).toBe(sha256Canonical("After"));
   expect(result.nextBaseline?.hash).not.toBe(baseline.hash);
+});
+
+test("unchanged imported raw description adopts into exactly one managed block", () => {
+  const raw = "Imported body\r\nsecond line";
+  const local = projectNorthThread(source({ body: raw, progress: [], doneWhen: [] }));
+  const baseline = createLinearSyncBaseline(identity, local.threadId, local.fields);
+  const result = reconcileLinearIssue({
+    baseline,
+    local,
+    remote: { ...identity, title: local.fields.title, description: raw, comments: [] },
+    bootstrap: { importedRawDescriptionHash: sha256Text(raw) },
+  });
+  expect(result.state).toBe("local-ahead");
+  expect(result.conflicts).toEqual([]);
+  expect(result.plan?.issue.description).toBeDefined();
+  expect(result.plan?.issue.description?.match(/<!-- north:thread:/g)).toHaveLength(1);
+  expect(result.plan?.issue.description?.match(/Imported body/g)).toHaveLength(1);
+  expect(parseManagedLinearDescription(result.plan?.issue.description, local.threadId)?.body)
+    .toBe("Imported body\nsecond line");
+  const converged = reconcileLinearIssue({
+    baseline: result.plan!.expectedBaseline,
+    local,
+    remote: { ...identity, title: local.fields.title, description: result.plan!.issue.description, comments: [] },
+    bootstrap: { importedRawDescriptionHash: sha256Text(raw) },
+  });
+  expect(converged.state).toBe("in-sync");
+  expect(converged.plan).toBeNull();
+});
+
+test("bootstrap adoption carries a current North body after local post-import edits", () => {
+  const importedRaw = "Imported body";
+  const imported = projectNorthThread(source({ body: importedRaw, progress: [] }));
+  const local = projectNorthThread(source({ body: "North revised body", progress: [] }));
+  const baseline = createLinearSyncBaseline(identity, imported.threadId, imported.fields);
+  const result = reconcileLinearIssue({
+    baseline,
+    local,
+    remote: { ...identity, title: imported.fields.title, description: importedRaw, comments: [] },
+    bootstrap: { importedRawDescriptionHash: sha256Text(importedRaw) },
+  });
+  expect(result.state).toBe("local-ahead");
+  expect(result.fields.find(({ field }) => field === "body")?.category).toBe("local-change");
+  expect(result.conflicts).toEqual([]);
+  expect(parseManagedLinearDescription(result.plan?.issue.description, local.threadId)?.body).toBe("North revised body");
+  expect(result.plan?.issue.description).not.toContain(importedRaw);
+});
+
+test("bootstrap adoption conflicts on changed raw bytes and reserved or malformed markers", () => {
+  const raw = "Imported body\r\nsecond line";
+  const local = projectNorthThread(source({ body: raw, progress: [] }));
+  const baseline = createLinearSyncBaseline(identity, local.threadId, local.fields);
+  const reconcile = (description: string, imported = raw) => reconcileLinearIssue({
+    baseline,
+    local,
+    remote: { ...identity, title: local.fields.title, description, comments: [] },
+    bootstrap: { importedRawDescriptionHash: sha256Text(imported) },
+  });
+
+  const lineEndingDrift = reconcile("Imported body\nsecond line");
+  expect(lineEndingDrift.plan).toBeNull();
+  expect(lineEndingDrift.conflicts.some(({ field }) => field === "body")).toBe(true);
+  expect(lineEndingDrift.diagnostics[0]).toContain("changed after import");
+
+  const reserved = "Imported body <!-- north:foreign -->";
+  const reservedResult = reconcile(reserved, reserved);
+  expect(reservedResult.plan).toBeNull();
+  expect(reservedResult.diagnostics[0]).toContain("reserved managed-marker namespace");
+
+  const malformed = `<!-- north:thread:${local.threadId} -->\nunterminated`;
+  const malformedResult = reconcile(malformed, malformed);
+  expect(malformedResult.plan).toBeNull();
+  expect(malformedResult.diagnostics[0]).toContain("unclosed North-managed Linear block");
 });
 
 test("divergent edits conflict instead of using timestamps or emitting a partial write", () => {

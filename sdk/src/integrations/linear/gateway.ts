@@ -4,11 +4,17 @@ import type {
 } from "./mcp-broker";
 
 export const LINEAR_READ_TOOL = "get_issue";
+export const LINEAR_LIST_ISSUES_TOOL = "list_issues";
 export const LINEAR_WRITE_TOOL = "save_issue";
+export const LINEAR_LIST_COMMENTS_TOOL = "list_comments";
+export const LINEAR_SAVE_COMMENT_TOOL = "save_comment";
 
 export type LinearCallEnvelope =
   | { access: "read"; method: typeof LINEAR_READ_TOOL; arguments: Record<string, unknown> }
-  | { access: "write"; method: typeof LINEAR_WRITE_TOOL; arguments: Record<string, unknown> };
+  | { access: "read"; method: typeof LINEAR_LIST_ISSUES_TOOL; arguments: Record<string, unknown> }
+  | { access: "read"; method: typeof LINEAR_LIST_COMMENTS_TOOL; arguments: Record<string, unknown> }
+  | { access: "write"; method: typeof LINEAR_WRITE_TOOL; arguments: Record<string, unknown> }
+  | { access: "write"; method: typeof LINEAR_SAVE_COMMENT_TOOL; arguments: Record<string, unknown> };
 
 export interface LinearGatewayOptions extends McpBrokerOpenOptions {
   server?: string;
@@ -18,7 +24,10 @@ export interface LinearGateway {
   readonly server: string;
   call(envelope: LinearCallEnvelope): Promise<unknown>;
   readIssue(arguments_: Record<string, unknown>): Promise<unknown>;
+  listIssues(arguments_: Record<string, unknown>): Promise<unknown>;
   writeIssue(arguments_: Record<string, unknown>): Promise<unknown>;
+  listComments(arguments_: Record<string, unknown>): Promise<unknown>;
+  writeComment(arguments_: Record<string, unknown>): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -44,8 +53,12 @@ function gateLinearCapabilities(server: McpServerInventory): void {
   if (server.authStatus !== "oAuth")
     throw new Error(`Linear MCP server ${server.name} is not OAuth-ready (auth: ${server.authStatus})`);
   const read = server.tools[LINEAR_READ_TOOL];
+  const listIssues = server.tools[LINEAR_LIST_ISSUES_TOOL];
   const write = server.tools[LINEAR_WRITE_TOOL];
-  if (!read || !write) throw new Error(`Linear MCP server ${server.name} lacks get_issue/save_issue capabilities`);
+  const listComments = server.tools[LINEAR_LIST_COMMENTS_TOOL];
+  const saveComment = server.tools[LINEAR_SAVE_COMMENT_TOOL];
+  if (!read || !listIssues || !write || !listComments || !saveComment)
+    throw new Error(`Linear MCP server ${server.name} lacks list/get/save issue and comment sync capabilities`);
 
   const readSchema = schemaObject(read);
   const readProperties = readSchema.properties as Record<string, unknown>;
@@ -55,18 +68,46 @@ function gateLinearCapabilities(server: McpServerInventory): void {
       || read.annotations?.idempotentHint !== true || read.annotations?.openWorldHint !== false)
     throw new Error(`Linear MCP tool ${LINEAR_READ_TOOL} lacks safe read annotations`);
 
+  const listIssuesSchema = schemaObject(listIssues);
+  const listIssuesProperties = listIssuesSchema.properties as Record<string, unknown>;
+  if (!propertyAllowsString(listIssuesProperties.query))
+    throw new Error(`Linear MCP tool ${LINEAR_LIST_ISSUES_TOOL} lacks expected string field query`);
+  if (listIssues.annotations?.readOnlyHint !== true || listIssues.annotations?.destructiveHint !== false
+      || listIssues.annotations?.idempotentHint !== true || listIssues.annotations?.openWorldHint !== false)
+    throw new Error(`Linear MCP tool ${LINEAR_LIST_ISSUES_TOOL} lacks safe read annotations`);
+
   const writeSchema = schemaObject(write);
   const writeProperties = writeSchema.properties as Record<string, unknown>;
-  for (const property of ["id", "title", "description", "team"])
+  for (const property of ["id", "title", "description"])
     if (!propertyAllowsString(writeProperties[property]))
       throw new Error(`Linear MCP tool ${LINEAR_WRITE_TOOL} lacks expected string field ${property}`);
   if (write.annotations?.readOnlyHint !== false || write.annotations?.destructiveHint !== true
       || write.annotations?.idempotentHint !== false || write.annotations?.openWorldHint !== false)
     throw new Error(`Linear MCP tool ${LINEAR_WRITE_TOOL} lacks explicit write annotations`);
+
+  const commentsSchema = schemaObject(listComments);
+  const commentsProperties = commentsSchema.properties as Record<string, unknown>;
+  if (!propertyAllowsString(commentsProperties.issueId))
+    throw new Error(`Linear MCP tool ${LINEAR_LIST_COMMENTS_TOOL} lacks expected string field issueId`);
+  if (listComments.annotations?.readOnlyHint !== true || listComments.annotations?.destructiveHint !== false
+      || listComments.annotations?.idempotentHint !== true || listComments.annotations?.openWorldHint !== false)
+    throw new Error(`Linear MCP tool ${LINEAR_LIST_COMMENTS_TOOL} lacks safe read annotations`);
+
+  const commentWriteSchema = schemaObject(saveComment);
+  const commentWriteProperties = commentWriteSchema.properties as Record<string, unknown>;
+  for (const property of ["id", "issueId", "body"])
+    if (!propertyAllowsString(commentWriteProperties[property]))
+      throw new Error(`Linear MCP tool ${LINEAR_SAVE_COMMENT_TOOL} lacks expected string field ${property}`);
+  if (!Array.isArray(commentWriteSchema.required) || !commentWriteSchema.required.includes("body"))
+    throw new Error(`Linear MCP tool ${LINEAR_SAVE_COMMENT_TOOL} no longer requires body`);
+  if (saveComment.annotations?.readOnlyHint !== false || saveComment.annotations?.destructiveHint !== true
+      || saveComment.annotations?.idempotentHint !== false || saveComment.annotations?.openWorldHint !== false)
+    throw new Error(`Linear MCP tool ${LINEAR_SAVE_COMMENT_TOOL} lacks explicit write annotations`);
 }
 
 function supportsLinear(server: McpServerInventory): boolean {
-  return Boolean(server.tools[LINEAR_READ_TOOL] && server.tools[LINEAR_WRITE_TOOL]);
+  return Boolean(server.tools[LINEAR_READ_TOOL] && server.tools[LINEAR_LIST_ISSUES_TOOL] && server.tools[LINEAR_WRITE_TOOL]
+    && server.tools[LINEAR_LIST_COMMENTS_TOOL] && server.tools[LINEAR_SAVE_COMMENT_TOOL]);
 }
 
 export function discoverLinearServer(servers: readonly McpServerInventory[], explicit?: string): McpServerInventory {
@@ -79,7 +120,7 @@ export function discoverLinearServer(servers: readonly McpServerInventory[], exp
   const candidates = servers.filter(supportsLinear);
   if (candidates.length !== 1) {
     const names = candidates.map(({ name }) => name).sort().join(", ") || "none";
-    throw new Error(`Expected exactly one Linear MCP server with get_issue/save_issue; found ${candidates.length} (${names})`);
+    throw new Error(`Expected exactly one Linear MCP server with issue/comment sync capabilities; found ${candidates.length} (${names})`);
   }
   gateLinearCapabilities(candidates[0]);
   return candidates[0];
@@ -160,7 +201,8 @@ class ConnectedLinearGateway implements LinearGateway {
   ) { this.server = inventory.name; }
 
   async call(envelope: LinearCallEnvelope): Promise<unknown> {
-    const expected = envelope.method === LINEAR_READ_TOOL ? "read" : "write";
+    const expected = envelope.method === LINEAR_READ_TOOL || envelope.method === LINEAR_LIST_ISSUES_TOOL
+      || envelope.method === LINEAR_LIST_COMMENTS_TOOL ? "read" : "write";
     if (envelope.access !== expected)
       throw new Error(`Linear MCP ${envelope.method} must be called through explicit ${expected} access`);
     const tool = this.inventory.tools[envelope.method];
@@ -178,8 +220,20 @@ class ConnectedLinearGateway implements LinearGateway {
     return this.call({ access: "read", method: LINEAR_READ_TOOL, arguments: arguments_ });
   }
 
+  listIssues(arguments_: Record<string, unknown>): Promise<unknown> {
+    return this.call({ access: "read", method: LINEAR_LIST_ISSUES_TOOL, arguments: arguments_ });
+  }
+
   writeIssue(arguments_: Record<string, unknown>): Promise<unknown> {
     return this.call({ access: "write", method: LINEAR_WRITE_TOOL, arguments: arguments_ });
+  }
+
+  listComments(arguments_: Record<string, unknown>): Promise<unknown> {
+    return this.call({ access: "read", method: LINEAR_LIST_COMMENTS_TOOL, arguments: arguments_ });
+  }
+
+  writeComment(arguments_: Record<string, unknown>): Promise<unknown> {
+    return this.call({ access: "write", method: LINEAR_SAVE_COMMENT_TOOL, arguments: arguments_ });
   }
 
   close(): Promise<void> { return this.session.close(); }
