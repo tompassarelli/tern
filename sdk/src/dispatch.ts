@@ -9,6 +9,7 @@ import { notifyDeath } from "./death";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import { liveChildren, notifyEarlyExitChildren } from "./children";
+import { writeAgentOutcome } from "./identity";
 import { clockStart, clockFinalize } from "./clock";
 import {
   refreshCodexEntitlementIfStale, routedQuery, selectProvider, shouldRefreshCodexEntitlement,
@@ -193,6 +194,11 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   // Close the auto-clock: a crash (died/stalled) orphan-closes (end_time + flag);
   // any other terminal (clean, turn-cap, budget) stops the session normally.
   clockFinalize(agentId, outcome);
+
+  // Record the terminal outcome ON the lane entity (SYNC, before exit) so the reactor's
+  // presence-lapse sweep never reaps a completed dispatch as died-unreported. Mirrors the
+  // spawn.ts finalize — same reap-avoidance seam, same reason.
+  writeAgentOutcome(agentId, outcome);
 
   // Spend is no longer charged to a counter here; it is summed from the @run
   // cost_usd fact this run records below (remaining() folds Σ over @run costs).

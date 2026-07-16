@@ -6,7 +6,7 @@ import { tokensOf, costOf, remaining } from "./budget";
 import { recordRun } from "./telemetry";
 import { notifyDeath } from "./death";
 import { inputChannel } from "./coordination";
-import { writeAgentFacts, goalFromPrompt } from "./identity";
+import { writeAgentFacts, writeAgentOutcome, goalFromPrompt } from "./identity";
 import { makeStruggleState, updateStruggle, checkStruggle, resetStruggle } from "./struggle";
 import { activeLadder, tierIndexOf, decideEscalation, escalateInFlight } from "./ladder";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
@@ -250,6 +250,11 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
 
   // Close the auto-clock (only if this spawn opened one): crash -> orphan-close, else stop.
   if (opts.thread) clockFinalize(agentId, outcome);
+
+  // Record the terminal outcome ON the lane entity (SYNC, before exit) so the reactor's
+  // presence-lapse sweep never reaps a completed lane as died-unreported. `outcome` is
+  // final here (all terminal paths — ran/died/stalled/capped/budget — have settled it).
+  writeAgentOutcome(agentId, outcome);
 
   recordRun({
     thread: "(ad-hoc)", agent: agentId, posture: "spawn",

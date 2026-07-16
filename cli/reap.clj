@@ -11,10 +11,13 @@
 
 (defn lane-resolved?
   "RESOLVED (never reap) iff a terminal fact exists for lane <h> — even though it may
-   live on a DIFFERENT subject than @agent:<h>. recordRun (sdk/src/spawn.ts) lands the
-   outcome on @run-<h>-<ts> carrying `agent`=<h>, NOT on the lane, so a clean-finishing
-   lane has an EMPTY @agent:<h> outcome — its missing lane outcome is NOT proof of death.
-   Join through agent=<h>: `tagged-outcomes` = the outcome-seq of EACH subject carrying
+   live on a DIFFERENT subject than @agent:<h>. The PRIMARY signal is the lane's own
+   outcome: the spawn/dispatch finalize writes `outcome` on @agent:<h> SYNCHRONOUSLY
+   (sdk/src/identity.ts writeAgentOutcome) at every terminal path, so reap-lane?'s
+   empty-outcome guard already excludes a reported terminal. This join is the SECONDARY
+   net: recordRun ALSO lands the outcome on @run-<h>-<ts> carrying `agent`=<h> (async,
+   best-effort), so even if the lane write were lost the run trail resolves it. Join
+   through agent=<h>: `tagged-outcomes` = the outcome-seq of EACH subject carrying
    agent=<h> (runs + session); `deaths` = @swarm agent_death lines (`<id> | reason | ts`)."
   [h tagged-outcomes deaths]
   (boolean (or (some seq tagged-outcomes)

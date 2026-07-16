@@ -1,7 +1,11 @@
 import { appendFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
-const STREAM_DIR =
+// Resolved at CONSTRUCTION (not module load) so a NORTH_STREAM_DIR override applies
+// regardless of import order — the same lesson identity.ts/death.ts encode for NORTH_BIN.
+// In production the value is fixed for the process; only tests that redirect it mid-run
+// (each to its own temp dir) rely on the lazy read, which keeps them isolation-safe.
+const streamDir = () =>
   process.env.NORTH_STREAM_DIR ??
   join(process.env.HOME ?? "", "code/agent-data");
 
@@ -11,7 +15,7 @@ export class StreamWriter {
   private path: string;
 
   constructor(agentId: string) {
-    this.path = join(STREAM_DIR, `agent-${agentId}.stream.jsonl`);
+    this.path = join(streamDir(), `agent-${agentId}.stream.jsonl`);
     writeFileSync(this.path, "");
   }
 

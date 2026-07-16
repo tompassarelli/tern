@@ -68,6 +68,25 @@ export function writeAgentFacts(agentId: string, f: AgentIdentity): void {
   }
 }
 
+// Terminal-outcome fact on the agent entity ITSELF (@agent:<id>). The reactor's
+// died-unreported sweep (cli/reap.clj reap-lane?) reaps a lane whose @agent outcome is
+// EMPTY and whose presence lapsed >30min. A lane that reaches its finalize KNOWS its
+// outcome, so writing it here is the exact line between a REPORTED terminal (any outcome —
+// ran/died/stalled/capped) and a SILENT hard-kill (finally never ran → no outcome anywhere
+// → correctly reaped). recordRun's @run write is async fire-and-forget and races process
+// exit, so it cannot carry liveness; this write is SYNCHRONOUS (execFileSync) + NORTH_BIN-
+// honoring like writeAgentFacts, so it lands before the process exits. Non-fatal by
+// design: a failed outcome write must never break the finalize (a lane with no outcome is
+// still correctly reaped — fail-safe).
+export function writeAgentOutcome(agentId: string, outcome: string): void {
+  if (!outcome) return;
+  try {
+    tell(`agent:${agentId}`, "outcome", outcome); // north tell @-prefixes the bare id -> @agent:<id>
+  } catch {
+    // non-fatal; presence-lapse reap still catches a truly silent death
+  }
+}
+
 // First sentence (or first 100 chars) of a spawn prompt — the goal fact seed.
 export function goalFromPrompt(prompt: string): string {
   const firstLine = prompt.split("\n", 1)[0] ?? "";
