@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # north-clock-audit — drift detector: git commits in client repos vs clock coverage.
-# Read-only. Lists every commit not covered by a clock session for its client.
+# Read-only by default. Lists every commit not covered by a clock session for its client.
 # Exit 1 if any uncovered commit (cron/CI-able), 0 if all covered.
-#   north-clock-audit [--repo <path>]... [--since YYYY-MM-DD] [--until YYYY-MM-DD]
+#   north-clock-audit [--repo <path>]... [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--persist]
+# --persist writes ONE kind=clock_audit_run summary entity per run (drift telemetry);
+# without it NOTHING is written — safe for cron/CI that only wants the exit code.
 # FRAM_LOG defaults to the live north fact log (facts.log — the file `north clock`
 # writes; the older `claims.log` name in the brief is stale).
 set -euo pipefail

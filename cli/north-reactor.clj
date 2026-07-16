@@ -184,11 +184,57 @@
                     "  lapsed " (long (/ lapse 60000)) "min -> outcome=died-unreported")))
     (count hits)))
 
+;; ---- DAILY CLOCK-AUDIT TICK (drift telemetry) -------------------------------
+;; The clock-audit output evaporates; a drift TREND is exactly the telemetry the
+;; billing failure mode needs. Piggyback the 5-min sweep with a once-per-day gate:
+;; state is the LAST clock_audit_run's run_at (a fact, never a loose state file), so
+;; the gate is self-describing and survives a reactor restart. --dry-run reports WOULD
+;; without writing, keeping sweep-once --dry-run clean.
+(def CLOCK-AUDIT-INTERVAL-MS (* 24 60 60 1000))         ; once per day
+(def clock-audit-bin
+  (-> (io/file (System/getProperty "babashka.file"))
+      .getParentFile .getParentFile (io/file "bin" "north-clock-audit") .getPath))
+
+(defn last-clock-audit-ms
+  "Newest kind=clock_audit_run run_at as epoch-ms, or nil if none exists yet."
+  []
+  (let [runs (distinct (q-col [{:rel "triple" :args [{:var "e"} "kind" "clock_audit_run"]}]))
+        ms   (->> runs
+                  (keep #(north.coord/resolved port % "run_at"))
+                  (keep (fn [ts] (try (.toEpochMilli (java.time.Instant/parse ts))
+                                      (catch Throwable _ nil)))))]
+    (when (seq ms) (reduce max ms))))
+
+(defn maybe-clock-audit!
+  "Run clock-audit --persist at most once per day. Returns :ran / :would / :skip.
+   clock-audit exits 1 on uncovered commits — :continue true so drift never crashes
+   the reactor. Best-effort: a failure is logged, not fatal."
+  [dry?]
+  (let [last (last-clock-audit-ms)
+        due? (or (nil? last) (>= (- (System/currentTimeMillis) last) CLOCK-AUDIT-INTERVAL-MS))]
+    (cond
+      (not due?) :skip
+      dry?       (do (println (str "[sweep] WOULD run clock-audit --persist"
+                                   (when last (str " (last " (long (/ (- (System/currentTimeMillis) last) 3600000)) "h ago)"))))
+                     :would)
+      :else      (do (try
+                       (let [r (proc/shell {:out :string :err :string :continue true}
+                                           clock-audit-bin "--persist")]
+                         (println (str "[sweep] clock-audit --persist exit=" (:exit r)))
+                         (when (seq (str/trim (str (:err r))))
+                           (println (str "[sweep] clock-audit stderr: " (str/trim (str (:err r)))))))
+                       (catch Throwable t
+                         (println (str "[sweep] clock-audit error: " (.getMessage t)))))
+                     (flush)
+                     :ran))))
+
 (defn sweep! [dry?]
-  (let [nc (sweep-concerns! dry?) nl (sweep-lanes! dry?)]
-    (println (str "[sweep] " (when dry? "(dry-run) ") "concerns abandoned=" nc " lanes reaped=" nl))
+  (let [nc (sweep-concerns! dry?) nl (sweep-lanes! dry?)
+        ca (maybe-clock-audit! dry?)]
+    (println (str "[sweep] " (when dry? "(dry-run) ") "concerns abandoned=" nc
+                  " lanes reaped=" nl " clock-audit=" (name ca)))
     (flush)
-    {:concerns nc :lanes nl}))
+    {:concerns nc :lanes nl :clock-audit ca}))
 
 (defn sweep-loop []
   (loop []

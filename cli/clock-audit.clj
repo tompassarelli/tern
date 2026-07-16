@@ -16,10 +16,14 @@
 ;; CONFIDENTIALITY: no client names/paths are hardcoded here — clients are derived
 ;; at runtime from repo paths. Only runtime OUTPUT may show them.
 ;;
-;; Usage: clock-audit [--repo <path>]... [--since YYYY-MM-DD] [--until YYYY-MM-DD]
-;;   --repo   repeatable; default: every git repo matching ~/code/client/*/*/.git
-;;   --since  default: Monday of the current week
-;;   --until  default: today (inclusive)
+;; Usage: clock-audit [--repo <path>]... [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--persist]
+;;   --repo    repeatable; default: every git repo matching ~/code/client/*/*/.git
+;;   --since   default: Monday of the current week
+;;   --until   default: today (inclusive)
+;;   --persist after auditing, write ONE kind=clock_audit_run summary entity through
+;;             the coordinator (drift telemetry — a trend over time, not per-commit spam).
+;;             DEFAULT is read-only (no flag, no write) — safe in CI/cron pipelines that
+;;             only want the exit code. The daily reactor tick passes --persist.
 ;; Exit: 0 if every commit covered, 1 if any uncovered (cron/CI-able).
 (ns clock-audit
   (:require [fram.kernel :as k]
@@ -167,9 +171,48 @@
                        (fmt-dur rclk) (count commits) ncov nunc pct)))
     {:covered ncov :uncovered nunc :total (count commits)}))
 
+;; ---- persistence (the ONE write path) --------------------------------------
+;; --persist mints ONE titleless kind=clock_audit_run entity per run so a drift
+;; TREND survives (the telemetry the billing failure mode needs — a 22h unbilled
+;; reconstruction motivated the clock stack; the audit's own output evaporates).
+;; Mirrors the guard_denial / recordRun idiom: kind-at-birth, minimal predicates,
+;; titleless subject (queryable via fram show/ask, invisible to the work board).
+;; The write path is DELIBERATELY one function — if this telemetry later moves
+;; worlds, re-aim the coordinator target HERE and nowhere else.
+(defn- repo-root []
+  ;; cli/clock-audit.clj -> cli -> repo root; bin/north lives under it.
+  (-> (System/getProperty "babashka.file") fs/parent fs/parent))
+
+(defn- repo-label [repo]
+  ;; client/repo tail (runtime output may name clients; the graph is local) or basename.
+  (or (second (str/split (str repo) #"/code/client/")) (str (fs/file-name repo))))
+
+(defn- persist-run!
+  "Write one run summary through the coordinator (`north tell`, serialized+rule-checked).
+   ≤1KB: run_at, window, uncovered_count, and one repo_summary per repo. Best-effort —
+   a telemetry write failure WARNS but never changes the drift exit code."
+  [since-d until-d total-uncovered results]
+  (let [subj  (str "clock-audit-" (Long/toString (System/currentTimeMillis) 36))
+        bin   (str (fs/path (repo-root) "bin" "north"))
+        base  [["kind" "clock_audit_run"]
+               ["run_at" (str (Instant/now))]          ; UTC ISO (…Z) — parseable both sides
+               ["window" (str since-d ".." until-d)]
+               ["uncovered_count" (str total-uncovered)]]
+        facts (concat base
+                      (for [{:keys [repo uncovered]} results]
+                        ["repo_summary" (format "%s: %d uncovered" (repo-label repo) uncovered)]))]
+    (doseq [[p v] facts]
+      (let [{:keys [exit err]} (proc/sh bin "tell" subj p v)]
+        (when-not (zero? exit)
+          (binding [*out* *err*]
+            (println (format "clock-audit: persist WARN — tell %s failed: %s"
+                             p (str/trim (str err))))))))
+    (println (format "persisted %s  (%d fact(s))" subj (count facts)))
+    subj))
+
 ;; ---- main ------------------------------------------------------------------
-(let [{:keys [repo since until]}
-      (cli/parse-opts *command-line-args* {:coerce {:repo []}})
+(let [{:keys [repo since until persist]}
+      (cli/parse-opts *command-line-args* {:coerce {:repo [] :persist :boolean}})
       home   (System/getenv "HOME")
       repos  (if (seq repo)
                (mapv #(-> (fs/canonicalize %) str) repo)
@@ -182,11 +225,13 @@
       sessions (load-sessions)]
   (println (format "== clock audit ==  %s .. %s  (%d repo(s))  [±%dm grace]"
                    since-d until-d (count repos) (quot GRACE 60)))
-  (let [results (mapv #(print-repo (audit-repo % sessions lo hi)) repos)
+  (let [results (mapv #(let [a (audit-repo % sessions lo hi)]
+                         (assoc (print-repo a) :repo (:repo a))) repos)
         C (reduce + (map :covered results))
         U (reduce + (map :uncovered results))
         T (reduce + (map :total results))
         pct (if (pos? T) (int (Math/round (* 100.0 (/ C (double T))))) 100)]
     (println)
     (println (format "== SUMMARY ==  %d/%d commits covered  (%d%%)  %d uncovered" C T pct U))
+    (when persist (persist-run! since-d until-d U results))
     (System/exit (if (pos? U) 1 0))))
