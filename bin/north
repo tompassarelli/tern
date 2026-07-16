@@ -56,7 +56,7 @@ north — your one card. Type a command to do the thing next to it.
 
   SEE WHAT'S GOING ON
     north dashboard                    the cockpit: agents, concerns, board, health, profile
-    north board                        open threads by state: active/ready/blocked  (--all = full kanban)
+    north threads                      thread-kind overview: active/ready/blocked  (--all = everything; aliases: board, plate)
     north ready                        committed + unblocked work, start anytime, ranked by leverage
     north agenda                       what's dated / overdue today
     north health                       coordination rollup: lanes ran/died, stale concerns
@@ -100,6 +100,13 @@ CARD
     # bin/north-clock-audit); every other clock verb is engine-side in north.main.
     if [ "${2:-}" = "audit" ]; then exec "$NORTH/bin/north-clock-audit" "${@:3}"; fi
     exec bb -cp "$NORTH/out:$FRAM/out" -m north.main "$@" ;;
+  threads)
+    # Kind-scoped noun command: the THREAD-kind overview (threads are one kind
+    # among several in the store — see `north schema`; people/concerns/runs are
+    # not threads). Same projection the kanban-metaphor aliases render: active
+    # drivers + top-ready by leverage + counts. `board`/`plate` = legacy aliases.
+    # Future kinds follow the pattern (`north people` when a person registry lands).
+    exec bb -cp "$NORTH/out:$FRAM/out" -m north.main board "${@:2}" ;;
   ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema|schema-seed|tools|heal|boot)
     # `validate` runs north's FULL check (engine-generic ++ north work rules,
     # north.validate) — the fram CLI `validate` is generic-only since the work
