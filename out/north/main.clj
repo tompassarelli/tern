@@ -401,14 +401,29 @@
   (let [c (proj/condition-i idx te today before?)]
   (->JThread (short-id te) (title-of idx te) c (proj/condition-emoji idx c))))
 
-(defn cmd-json [^String log ^String what ^String arg]
+(defn- ready-curated-tes [idx ^String today before? ^Boolean all?]
+  (let [raw (proj/ready idx today before?)
+   rs (if all? raw (filterv (fn [te] (= (kind-of idx te) "thread")) raw))
+   ranked (vec (sort-by (fn [te] (- 0 (proj/leverage-score idx te))) rs))]
+  (if all? ranked (vec (take 15 ranked)))))
+
+(defn- board-curated-tes [idx ^String today before? ^Boolean all?]
+  (let [nonterm (filterv (fn [te] (not (proj/terminal-i? idx te))) (proj/work-thread-ids-i idx))]
+  (if all? nonterm (let [threads (filterv (fn [te] (= (kind-of idx te) "thread")) nonterm)
+   now-secs (fram.rt/iso-to-seconds (fram.rt/now-iso))
+   window-secs (driver-stale-window-secs)
+   active (filterv (fn [te] (driver-live? idx te now-secs window-secs)) (in-condition idx threads today before? "active"))
+   ready (vec (take 15 (sort-by (fn [te] (- 0 (proj/leverage-score idx te))) (in-condition idx threads today before? "ready"))))]
+  (vec (concat active ready))))))
+
+(defn cmd-json [^String log ^String what ^String arg ^Boolean all?]
   (let [facts (live-facts log)
    idx (k/build-index facts)
    today (fram.rt/today-iso)
    before? fram.rt/str-lt?]
   (cond
-  (or (= what "board") (= what "plate")) (println (fram.rt/to-json (mapv (fn [te] (jthread idx te today before?)) (filterv (fn [te] (not (proj/terminal-i? idx te))) (proj/work-thread-ids-i idx)))))
-  (= what "ready") (println (fram.rt/to-json (mapv (fn [te] (jthread idx te today before?)) (proj/ready idx today before?))))
+  (or (= what "board") (= what "plate")) (println (fram.rt/to-json (mapv (fn [te] (jthread idx te today before?)) (board-curated-tes idx today before? all?))))
+  (= what "ready") (println (fram.rt/to-json (mapv (fn [te] (jthread idx te today before?)) (ready-curated-tes idx today before? all?))))
   (= what "blocked") (println (fram.rt/to-json (mapv (fn [te] (jthread idx te today before?)) (filterv (fn [te] (= (proj/condition-i idx te today before?) "blocked")) (proj/work-thread-ids-i idx)))))
   (= what "needs-review") (let [as (fram.rt/read-log log)
    cidx (k/build-index (:facts (fold/fold as)))
@@ -965,7 +980,7 @@
   (= cmd "doctor") (cmd-doctor threads-dir log)
   (= cmd "heal") (cmd-heal threads-dir log)
   (= cmd "boot") (cmd-boot threads-dir log)
-  (= cmd "json") (cmd-json log (if (> (count args) 1) (nth args 1) "") (if (> (count args) 2) (nth args 2) ""))
+  (= cmd "json") (cmd-json log (if (> (count args) 1) (nth args 1) "") (if (> (count args) 2) (nth args 2) "") (has-flag? args "--all"))
   (= cmd "clock") (let [sub (if (> (count args) 1) (nth args 1) "status")]
   (cond
   (= sub "start") (if (>= (count args) 3) (cmd-clock-start log (nth args 2)) (println "usage: clock start <thread-id>"))

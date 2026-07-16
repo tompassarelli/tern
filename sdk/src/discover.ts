@@ -25,7 +25,9 @@ interface ReadyThread {
 // Unblocked, committed, undriven work off the fact graph.
 function readyThreads(): ReadyThread[] {
   try {
-    const rows = JSON.parse(execSync("north json ready", { encoding: "utf8", timeout: 8000 }).trim());
+    // --all: discovery needs the FULL ready set to pick from, not the curated
+    // top-15 slice the JSON default now returns (parity with the MCP/CLI edge).
+    const rows = JSON.parse(execSync("north json ready --all", { encoding: "utf8", timeout: 8000 }).trim());
     return Array.isArray(rows) ? rows : [];
   } catch {
     return [];

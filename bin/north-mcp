@@ -44,14 +44,17 @@
 ;; tool name -> {desc, schema, argv}. argv maps the JSON arguments map (string
 ;; keys) to the engine argument vector.
 (def tools
-  [{:name "ready"        :desc "Threads doable now (committed, unblocked, not active, not done). Returns JSON [{id,title,condition}]."
-    :schema {:type "object" :properties {}} :argv (fn [_] ["json" "ready"])}
+  [{:name "ready"        :desc "Threads doable now (committed, unblocked, not active, not done). Default: kind=thread, top-15 by leverage. Pass all=true for the full unscoped list. Returns JSON [{id,title,condition,emoji}]."
+    :schema {:type "object" :properties {:all {:type "boolean" :description "return every ready thread, unscoped (default false: kind=thread top-15 by leverage)"}}}
+    :argv (fn [a] (if (get a "all") ["json" "ready" "--all"] ["json" "ready"]))}
    {:name "next"         :desc "The recommended next thread(s) to pull."
     :schema {:type "object" :properties {}} :argv (fn [_] ["next"])}
-   {:name "board"        :desc "Everything open, bucketed by derived condition (kanban view). Returns JSON [{id,title,condition}] where condition is active/ready/blocked/draft."
-    :schema {:type "object" :properties {}} :argv (fn [_] ["json" "board"])}
-   {:name "plate"        :desc "Alias of `board` — everything open, bucketed by derived condition. Prefer `board`."
-    :schema {:type "object" :properties {}} :argv (fn [_] ["json" "board"])}
+   {:name "board"        :desc "Open work, kanban view. Default: the curated slice (kind=thread; live-active + top-15 ready by leverage) — parity with the CLI board. Pass all=true for every open thread unscoped. Returns JSON [{id,title,condition,emoji}] where condition is active/ready/blocked/draft."
+    :schema {:type "object" :properties {:all {:type "boolean" :description "return every open thread, unscoped (default false: curated active + top-15 ready)"}}}
+    :argv (fn [a] (if (get a "all") ["json" "board" "--all"] ["json" "board"]))}
+   {:name "plate"        :desc "Alias of `board` — curated open-work slice by default; all=true for the full dump. Prefer `board`."
+    :schema {:type "object" :properties {:all {:type "boolean" :description "return every open thread, unscoped"}}}
+    :argv (fn [a] (if (get a "all") ["json" "board" "--all"] ["json" "board"]))}
    {:name "blocked"      :desc "Threads waiting on an unresolved dependency. Returns JSON [{id,title,condition}]."
     :schema {:type "object" :properties {}} :argv (fn [_] ["json" "blocked"])}
    {:name "agenda"       :desc "Calendar view: threads bucketed by do_on (overdue/today/upcoming)."
