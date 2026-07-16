@@ -29,6 +29,14 @@ test("pure merge preserves other targets and keeps the newest target/provider ob
   expect(merged.observations).toEqual([newClaude, codex]);
 });
 
+test("future timestamp poisoning is discarded instead of shadowing a current observation", () => {
+  const poisoned = { ...observation("claude", "anthropic", "2099-01-01T00:00:00Z"), state: "exhausted" as const };
+  const current = { ...observation("claude", "anthropic", "2026-07-16T12:00:00Z"), state: "plenty" as const };
+  const merged = mergeProviderUsageObservations({ version: 1, observations: [poisoned] }, current,
+    new Date("2026-07-16T12:01:00Z"));
+  expect(merged.observations).toEqual([current]);
+});
+
 test("atomic writer creates parents, writes restrictive mode, and leaves no artifacts", async () => {
   const path = destination();
   const result = await writeProviderUsageObservations(observation("codex", "openai", "2026-07-16T11:00:00Z"), path);
@@ -51,6 +59,19 @@ test("concurrent writers serialize merge without losing providers or targets", a
   expect(stored.observations).toHaveLength(20);
   expect(new Set(stored.observations.map((item: ProviderUsageObservation) => item.targetId)).size).toBe(20);
 });
+
+test("100 repeated concurrent batches never lose a resolved write", async () => {
+  for (let repetition = 0; repetition < 100; repetition++) {
+    const path = destination();
+    await Promise.all(Array.from({ length: 20 }, (_, index) => writeProviderUsageObservations(
+      observation(`target-${index}`, index % 2 ? "anthropic" : "openai",
+        `2026-07-16T11:${String(index).padStart(2, "0")}:00Z`),
+      path,
+    )));
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    expect(stored.observations, `lost a write in repetition ${repetition + 1}`).toHaveLength(20);
+  }
+}, 40_000);
 
 test("concurrent writes to one target retain the chronologically latest observation", async () => {
   const path = destination();

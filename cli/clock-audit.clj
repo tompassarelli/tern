@@ -40,9 +40,6 @@
 (def ^:private GRACE 900)                                ; ±15 min, in seconds
 (def ^:private US "")                              ; git field separator
 
-(def ^:private LOG (or (System/getenv "FRAM_LOG")
-                       (str (System/getenv "HOME") "/.local/state/north/facts.log")))
-
 ;; session/thread times are stored two ways: a UTC instant ("…Z", synthetic
 ;; backfills) or a zone-less local ISO (the live clock, fram.rt/now-iso). The
 ;; engine's own tolerant parser resolves both to an absolute epoch-second (Z/offset
@@ -79,7 +76,7 @@
 
 ;; ---- sessions from the fact log --------------------------------------------
 (defn- load-sessions []
-  (let [facts (:facts (fold/fold (rt/read-log LOG)))
+  (let [facts (:facts (fold/fold (rt/read-configured-logs)))
         idx   (k/build-index facts)
         one   (fn [s p] (k/one-i idx s p))]
     (->> (:subjects idx)

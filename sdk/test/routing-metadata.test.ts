@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { canonicalRole, routingMetadataFromEnv, validateRoutingMetadata } from "../src/routing-metadata";
-import { runFacts } from "../src/telemetry";
+import { newRunId, runFacts } from "../src/telemetry";
 
 const ENV_KEYS = ["AGENT_TASK_GRADE", "AGENT_DOMAIN_REQUIREMENTS", "AGENT_TOPOLOGY", "AGENT_COMPOSITION"];
 afterEach(() => { for (const key of ENV_KEYS) delete process.env[key]; });
@@ -42,6 +42,8 @@ test("run telemetry records requested routing, composition, and outcome together
     requestedProvider: "auto", requestedTier: "frontier", requestedEffort: "max",
     allocationMode: "reserved", entitlementPressure: "low", fallbackCount: 1,
     fallbackPath: ["anthropic", "openai"],
+    envelopeScopes: ["month:2026-07", "project:north"], envelopeRetries: 1,
+    envelopeAdvisories: ["session/default envelope not enforceable: no stable session id"],
     routingMetadata: { taskGrade: "research-grade", domainRequirements: ["computer-science"], topology: "worker",
       composition: { kind: "preset", id: "research-scientist", promotionCandidate: false } },
   }, "2026-07-16T00:00:00.000Z");
@@ -52,9 +54,17 @@ test("run telemetry records requested routing, composition, and outcome together
   expect(facts).toContainEqual(["entitlement_pressure", "low"]);
   expect(facts).toContainEqual(["fallback_count", "1"]);
   expect(facts).toContainEqual(["fallback_path", "anthropic -> openai"]);
+  expect(facts).toContainEqual(["envelope_scope", "month:2026-07"]);
+  expect(facts).toContainEqual(["envelope_scope", "project:north"]);
+  expect(facts).toContainEqual(["envelope_retries", "1"]);
+  expect(facts).toContainEqual(["envelope_advisory", "session/default envelope not enforceable: no stable session id"]);
   expect(facts).toContainEqual(["task_grade", "research-grade"]);
   expect(facts).toContainEqual(["domain_requirement", "computer-science"]);
   expect(facts).toContainEqual(["topology", "worker"]);
   expect(facts).toContainEqual(["composition_id", "research-scientist"]);
   expect(facts).toContainEqual(["promotion_candidate", "false"]);
+});
+
+test("run ids remain distinct when the wall clock does not advance", () => {
+  expect(newRunId("same-agent")).not.toBe(newRunId("same-agent"));
 });

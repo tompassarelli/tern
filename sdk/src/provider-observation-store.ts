@@ -1,17 +1,12 @@
-import {
-  chmod, mkdir, open, readFile, rename, rm, stat, unlink, writeFile,
-} from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
-  DEFAULT_PROVIDER_OBSERVATIONS_PATH,
+  DEFAULT_PROVIDER_OBSERVATIONS_PATH, OBSERVATION_CLOCK_SKEW_MS,
   parseProviderUsageObservations,
 } from "./resource-policy";
 import type { ProviderUsageObservation, ProviderUsageObservationStore } from "./providers/types";
-
-const LOCK_STALE_MS = 30_000;
-const LOCK_WAIT_MS = 20;
-const LOCK_ATTEMPTS = 250;
+import { withFileLease } from "./file-lease";
 
 function observationKey({ targetId, provider }: ProviderUsageObservation): string {
   return `${targetId}\u0000${provider}`;
@@ -21,9 +16,11 @@ function observationKey({ targetId, provider }: ProviderUsageObservation): strin
 export function mergeProviderUsageObservations(
   existing: ProviderUsageObservationStore | undefined,
   incoming: ProviderUsageObservation | ProviderUsageObservation[],
+  now = new Date(),
 ): ProviderUsageObservationStore {
   const newest = new Map<string, ProviderUsageObservation>();
   for (const observation of [...(existing?.observations ?? []), ...([incoming].flat())]) {
+    if (Date.parse(observation.observedAt) > now.getTime() + OBSERVATION_CLOCK_SKEW_MS) continue;
     const key = observationKey(observation);
     const previous = newest.get(key);
     if (!previous || Date.parse(observation.observedAt) >= Date.parse(previous.observedAt))
@@ -34,32 +31,6 @@ export function mergeProviderUsageObservations(
     observations: [...newest.values()].sort((left, right) =>
       left.targetId.localeCompare(right.targetId) || left.provider.localeCompare(right.provider)),
   };
-}
-
-async function delay(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function acquireLock(path: string): Promise<Awaited<ReturnType<typeof open>>> {
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
-    try {
-      return await open(path, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        const info = await stat(path);
-        if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-          await unlink(path);
-          continue;
-        }
-      } catch (inspectError) {
-        if ((inspectError as NodeJS.ErrnoException).code === "ENOENT") continue;
-        throw inspectError;
-      }
-      await delay(LOCK_WAIT_MS);
-    }
-  }
-  throw new Error(`timed out waiting for North provider observation store lock ${path}`);
 }
 
 async function readExisting(path: string): Promise<ProviderUsageObservationStore | undefined> {
@@ -89,18 +60,15 @@ export async function writeProviderUsageObservations(
   const directory = dirname(path);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const lockPath = `${path}.lock`;
-  const lock = await acquireLock(lockPath);
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
+  return withFileLease(lockPath, async () => {
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
     const merged = mergeProviderUsageObservations(await readExisting(path), validatedIncoming.observations);
     await writeFile(temporary, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     await chmod(temporary, 0o600);
     await rename(temporary, path);
     await chmod(path, 0o600);
     return merged;
-  } finally {
-    await rm(temporary, { force: true });
-    await lock.close();
-    await rm(lockPath, { force: true });
-  }
+    } finally { await rm(temporary, { force: true }); }
+  });
 }

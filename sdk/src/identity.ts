@@ -44,8 +44,33 @@ function tell(subject: string, pred: string, value: string) {
   execFileSync(northBin(), ["tell", subject, pred, value], { stdio: "ignore", timeout: 10_000 });
 }
 
+/**
+ * A deterministic lane id may be reused sequentially (dispatch ids are derived
+ * from thread ids). Remove the prior generation's terminal marker before
+ * publishing the new identity, otherwise a hard death in the new generation is
+ * hidden forever by the old outcome. Simultaneous reuse remains unsupported:
+ * callers must not run two live generations under one agent id concurrently.
+ */
+export function clearAgentOutcome(agentId: string): void {
+  const subject = `agent:${agentId}`;
+  try {
+    const raw = execFileSync(northBin(), ["json", "show", subject], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000,
+    });
+    const facts = JSON.parse(raw) as Array<{ predicate?: string; value?: string }>;
+    for (const fact of facts) {
+      if (fact.predicate === "outcome" && fact.value)
+        execFileSync(northBin(), ["retract", subject, "outcome", fact.value], { stdio: "ignore", timeout: 10_000 });
+    }
+  } catch {
+    // Non-fatal like identity writes. A failed clear leaves the conservative
+    // terminal marker in place rather than blocking the worker from starting.
+  }
+}
+
 export function writeAgentFacts(agentId: string, f: AgentIdentity): void {
   const subject = `agent:${agentId}`; // north tell @-prefixes bare ids
+  clearAgentOutcome(agentId);
   const facts: Array<[string, string | undefined]> = [
     ["kind", f.kind],
     ["role", f.role],

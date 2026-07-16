@@ -1,6 +1,6 @@
 import { anthropicProvider } from "./anthropic";
 import { openaiProvider } from "./openai";
-import type { AgentProvider, ProviderId, ProviderPreference, RoutingDecision } from "./types";
+import { ProviderRetrySafeError, type AgentProvider, type ProviderId, type ProviderPreference, type RoutingDecision } from "./types";
 import type { AgentQuery } from "./types";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { resolveTier, type SemanticTier } from "./catalog";
@@ -22,8 +22,6 @@ const providers: Record<ProviderId, AgentProvider> = {
 };
 
 export function providerFor(id: ProviderId): AgentProvider { return providers[id]; }
-
-const RETRYABLE_PROVIDER_ERROR = /usage.?limit|rate.?limit|quota|capacity|overload|exhausted|entitlement|auth(?:entication|orization)?|unauthorized|forbidden|log(?:ged)?\s?in|sign.?in|429|401|403/i;
 
 function replayablePrompt(prompt: string | AsyncIterable<any>): string | AsyncIterable<any> {
   if (typeof prompt === "string") return prompt;
@@ -61,13 +59,18 @@ export function routedQuery(
   args: { prompt: string | AsyncIterable<any>; options: Options },
   tier?: SemanticTier,
   providerRegistry: Record<ProviderId, AgentProvider> = providers,
+  beforeFallback?: () => Promise<void>,
 ): AgentQuery {
   let active: AgentQuery | undefined;
   const prompt = replayablePrompt(args.prompt);
   const optionsFor = (provider: ProviderId): Options => {
-    if (provider === decision.fallbackPath[0]) return args.options;
-    const resolved = resolveTier(provider, tier);
-    return { ...args.options, model: resolved.model, effort: resolved.effort };
+    const resolved = provider === decision.fallbackPath[0] ? undefined : resolveTier(provider, tier);
+    const options = resolved
+      ? { ...args.options, model: resolved.model, effort: resolved.effort }
+      : args.options;
+    decision.resolvedModel = options.model;
+    decision.resolvedEffort = options.effort;
+    return options;
   };
   return {
     interrupt: async () => { await active?.interrupt?.(); },
@@ -88,7 +91,8 @@ export function routedQuery(
         } catch (err: any) {
           const message = String(err?.message ?? err);
           const fallback = decision.fallbackProviders[0];
-          if (decision.requested === "auto" && emitted === 0 && fallback && RETRYABLE_PROVIDER_ERROR.test(message)) {
+          if (decision.requested === "auto" && emitted === 0 && fallback && err instanceof ProviderRetrySafeError) {
+            await beforeFallback?.();
             decision.fallbackProviders.shift();
             const previous = decision.provider;
             decision.provider = fallback;
@@ -104,4 +108,5 @@ export function routedQuery(
     },
   };
 }
+export { ProviderRetrySafeError } from "./types";
 export type { AgentProvider, AllocationMode, EntitlementPressure, ProviderId, ProviderPreference, ResourcePolicy, RoutingDecision } from "./types";

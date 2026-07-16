@@ -20,8 +20,13 @@ import {
 import type { AgentQuery } from "./providers/types";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
 import { canonicalRole, routingMetadataFromEnv, validateRoutingMetadata, type RoutingMetadata } from "./routing-metadata";
+import { applyGafferStaffing } from "./gaffer-staffing";
+import {
+  admitResourceEnvelope, completeResourceEnvelope, envelopeContextFromEnv,
+  reserveResourceEnvelopeRetry, ResourceEnvelopeExceededError, type EnvelopeAdmission,
+} from "./resource-envelopes";
 
-interface SpawnOptions {
+export interface SpawnOptions {
   prompt: string;
   agentId?: string;
   model?: string;
@@ -39,16 +44,42 @@ interface SpawnOptions {
   provider?: ProviderPreference;
   tier?: SemanticTier;
   routingMetadata?: RoutingMetadata;
+  project?: string;
+  sessionId?: string;
   queryFn?: (args: any) => AgentQuery; // injection seam for tests; bypasses provider selection
   // Known limitation: on escalate path the system prompt is built once at the starting tier,
   // so a mid-flight model change does not swap the model-delta block.
 }
 
-export async function spawn(opts: SpawnOptions): Promise<string> {
+function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetadata: RoutingMetadata } {
+  const requestedMetadata = opts.routingMetadata ? validateRoutingMetadata(opts.routingMetadata) : routingMetadataFromEnv();
+  // The public spawn dials are part of the composition request, not a second
+  // overlay after staffing. Merge them first so a role-only request can hydrate
+  // from Gaffer while every explicitly supplied axis wins independently.
+  const explicitMetadata = validateRoutingMetadata({
+    ...requestedMetadata,
+    ...(opts.role != null ? { role: opts.role } : {}),
+    ...(opts.tier != null ? { tier: opts.tier } : {}),
+    ...(opts.effort != null ? { reasoning: opts.effort } : {}),
+    ...(opts.posture != null ? { posture: opts.posture as RoutingMetadata["posture"] } : {}),
+  });
+  const routingMetadata = validateRoutingMetadata(applyGafferStaffing(explicitMetadata));
+  return {
+    ...opts,
+    routingMetadata,
+    role: canonicalRole(routingMetadata.role),
+    tier: routingMetadata.tier,
+    effort: routingMetadata.reasoning as Effort | undefined,
+    posture: routingMetadata.posture,
+  };
+}
+
+async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata }, envelopeAdmission?: EnvelopeAdmission): Promise<string> {
+  // Composition is deliberately complete before admission and stays immutable
+  // through routing, identity, provider execution, and terminal telemetry.
+  const routingMetadata = opts.routingMetadata;
   const requested = { provider: opts.provider ?? process.env.AGENT_PROVIDER, tier: opts.tier ?? process.env.AGENT_TIER,
     model: opts.model ?? process.env.AGENT_MODEL, effort: opts.effort ?? process.env.AGENT_EFFORT };
-  const routingMetadata = opts.routingMetadata ? validateRoutingMetadata(opts.routingMetadata) : routingMetadataFromEnv();
-  opts.role = canonicalRole(opts.role ?? process.env.AGENT_ROLE);
   const agentId = opts.agentId ?? `lane-${Date.now().toString(36).slice(-8)}`;
   const stream = new StreamWriter(agentId);
   const requestedTier = opts.tier ?? process.env.AGENT_TIER as SemanticTier | undefined;
@@ -98,7 +129,9 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   const escalations: Array<{ from: string; to: string; reason: string; atCost: number }> = [];
   const end = (oc: string) => { outcome = oc; try { ch.end(); } catch { /* already closed */ } };
 
-  const queryFn = opts.queryFn ?? ((args: any) => routedQuery(routing, args, requestedTier));
+  const queryFn = opts.queryFn ?? ((args: any) => routedQuery(
+    routing, args, requestedTier, undefined, () => reserveResourceEnvelopeRetry(envelopeAdmission),
+  ));
   const q = queryFn({
     prompt: ch.stream(),
     options: harnessOptions({
@@ -232,8 +265,13 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       { thread: undefined, coordinator: coordHandle });
   }
   } catch (err) {
-    outcome = "died";
-    notifyDeath(agentId, err, { thread: undefined, coordinator: opts.coordinator ?? process.env.AGENT_COORDINATOR });
+    if (err instanceof ResourceEnvelopeExceededError) {
+      outcome = "resource_envelope_exceeded";
+      console.error(`[envelope] @agent:${agentId} ${err.message}`);
+    } else {
+      outcome = "died";
+      notifyDeath(agentId, err, { thread: undefined, coordinator: opts.coordinator ?? process.env.AGENT_COORDINATOR });
+    }
   } finally {
     end(outcome); // idempotent: close the channel so the query + any leak unwinds
   }
@@ -257,17 +295,20 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   writeAgentOutcome(agentId, outcome);
 
   recordRun({
-    thread: "(ad-hoc)", agent: agentId, posture: "spawn",
+    thread: opts.thread ?? "(ad-hoc)", agent: agentId, posture: "spawn",
     // Effective FINAL dial (rung() reflects any in-flight escalation); env-fallback
     // mirrors the identity write so a bare AGENT_MODEL spawn is still attributed.
-    model: rung().model ?? opts.model ?? process.env.AGENT_MODEL,
-    effort: rung().effort ?? opts.effort ?? process.env.AGENT_EFFORT,
+    model: routing.fallbackCount > 0 ? routing.resolvedModel : (rung().model ?? opts.model ?? process.env.AGENT_MODEL),
+    effort: routing.fallbackCount > 0 ? routing.resolvedEffort : (rung().effort ?? opts.effort ?? process.env.AGENT_EFFORT),
     role: opts.role,
     provider: routing.provider, providerReason: routing.reason,
     requestedProvider: requested.provider, requestedTier: requested.tier,
     requestedModel: requested.model, requestedEffort: requested.effort,
     allocationMode: routing.allocationMode, entitlementPressure: routing.entitlementPressure,
     fallbackCount: routing.fallbackCount, fallbackPath: routing.fallbackPath,
+    envelopeScopes: envelopeAdmission?.scopes.map(({ id }) => id),
+    envelopeRetries: envelopeAdmission?.retries,
+    envelopeAdvisories: envelopeAdmission?.advisories,
     routingMetadata,
     tokens: tokensOf(resultMsg), durationMs: resultMsg?.duration_ms ?? 0, outcome,
     costUsd: resultMsg?.total_cost_usd ?? runCost, numTurns: resultMsg?.num_turns ?? 0,
@@ -290,6 +331,23 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   console.log(`[spawn] @agent:${agentId} complete (${outcome}` +
     `${escalations.length ? `, ${escalations.length} escalation(s) -> ${rung().model}/${rung().effort}` : ""})`);
   return result;
+}
+
+export async function spawn(opts: SpawnOptions): Promise<string> {
+  const composed = composeSpawnOptions(opts);
+  const context = envelopeContextFromEnv();
+  const requestedTier = composed.tier;
+  const agentId = composed.agentId ?? `lane-${Date.now().toString(36).slice(-8)}`;
+  // Pin the generated id so admission, telemetry, and the provider run name the
+  // same lane. Admission completes before entitlement refresh or provider query.
+  composed.agentId = agentId;
+  const admission = await admitResourceEnvelope({
+    agentId, tier: requestedTier, project: composed.project ?? context.project,
+    sessionId: composed.sessionId ?? context.sessionId,
+  });
+  for (const advisory of admission?.advisories ?? []) console.warn(`[envelope] advisory: ${advisory}`);
+  try { return await runSpawn(composed, admission); }
+  finally { await completeResourceEnvelope(admission); }
 }
 
 // Spawn multiple agents in parallel — the core win over the bash swarm.

@@ -21,10 +21,10 @@ function usedPercent(value: number | undefined): number | undefined {
   return value <= 1 ? value * 100 : value;
 }
 
-function state(info: RateLimitInfo, percent: number | undefined): EntitlementPressure {
+function state(info: RateLimitInfo, percent: number | undefined): EntitlementPressure | undefined {
   if (info.status === "rejected") return "exhausted";
   if (info.status === "allowed_warning") return "low";
-  if (percent === undefined) return "plenty";
+  if (percent === undefined) return undefined;
   if (percent >= 100) return "exhausted";
   if (percent >= 80) return "low";
   if (percent >= 50) return "normal";
@@ -51,9 +51,10 @@ export function observationFromAnthropicRateLimit(
       }],
     };
   }
+  const normalizedState = state(info, percent);
   return {
     ...common,
-    state: state(info, percent),
+    ...(normalizedState === undefined ? { state: "unknown" as const } : { state: normalizedState }),
     ...(resetsAt ? { until: resetsAt } : {}),
   };
 }

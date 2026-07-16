@@ -127,6 +127,26 @@ test("stale cached observation refreshes and persists the replacement", async ()
   expect(JSON.parse(readFileSync(storePath, "utf8")).observations).toEqual([replacement]);
 });
 
+test("twenty parallel stale refreshes single-flight one entitlement probe", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-codex-refresh-"));
+  temporary.push(directory);
+  const storePath = join(directory, "observations.json");
+  const now = new Date("2026-07-16T12:00:00Z");
+  const replacement = { targetId: "codex-primary", provider: "openai" as const,
+    observedAt: now.toISOString(), state: "normal" as const };
+  let probes = 0;
+  const observe = async ({ storePath: destination }: { storePath?: string }) => {
+    probes++;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await writeProviderUsageObservations(replacement, destination);
+    return replacement;
+  };
+  const results = await Promise.all(Array.from({ length: 20 }, () =>
+    refreshCodexEntitlementIfStale({ storePath, targetId: "codex-primary", now, observe })));
+  expect(probes).toBe(1);
+  expect(results.every((result) => result?.observedAt === replacement.observedAt)).toBe(true);
+});
+
 test("refresh failure falls back to cached or unknown with a diagnostic", async () => {
   const directory = mkdtempSync(join(tmpdir(), "north-codex-refresh-"));
   temporary.push(directory);

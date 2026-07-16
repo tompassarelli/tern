@@ -32,14 +32,11 @@
 (def ^:private CMD (first args))
 (def ^:private NORTH (or (System/getenv "NORTH_HOME")
                         (str (System/getenv "HOME") "/code/north")))
-(def ^:private LOG (or (System/getenv "FRAM_LOG")
-                       (str (System/getenv "HOME") "/.local/state/north/facts.log")))
-
 (defn- strip-at [s] (if (and s (str/starts-with? s "@")) (subs s 1) s))
 (defn- tell! [id pred val]
   (p/shell {:dir NORTH :out :string :err :string} (str NORTH "/bin/north") "tell" id pred val))
 
-(let [facts (:facts (fold/fold (rt/read-log LOG)))
+(let [facts (:facts (fold/fold (rt/read-configured-logs)))
       idx    (k/build-index facts)
       allsub (:subjects idx)
       one    (fn [s p] (k/one-i idx s p))

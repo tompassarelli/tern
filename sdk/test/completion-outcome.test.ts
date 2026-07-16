@@ -19,6 +19,8 @@ let log: string;
 const MANAGED_ENV = [
   "PATH", "NORTH_BIN", "NORTH_PORT", "NORTH_STREAM_DIR", "AGENT_LAWS", "AGENT_PRAXIS",
   "AGENT_ID", "NORTH_AGENT_ID", "AGENT_COORDINATOR", "AGENT_MODEL", "AGENT_ROLE", "AGENT_EFFORT",
+  "AGENT_TIER", "AGENT_REASONING", "AGENT_POSTURE", "AGENT_TOPOLOGY", "AGENT_TASK_GRADE",
+  "AGENT_DOMAIN_REQUIREMENTS", "AGENT_COMPOSITION", "NORTH_FABLE_NOW",
   "NORTH_ROUTING_POLICY", "NORTH_ENVELOPE_ACCOUNTING",
   "NORTH_PROVIDER_OBSERVATIONS", "NORTH_ALLOCATION_MODE", "NORTH_PROVIDER_ORDER",
   "NORTH_PROVIDER_WEIGHTS", "NORTH_RESERVED_FRONTIER_PROVIDER",
@@ -55,6 +57,13 @@ beforeAll(() => {
   delete process.env.AGENT_MODEL;
   delete process.env.AGENT_ROLE;
   delete process.env.AGENT_EFFORT;
+  delete process.env.AGENT_TIER;
+  delete process.env.AGENT_REASONING;
+  delete process.env.AGENT_POSTURE;
+  delete process.env.AGENT_TOPOLOGY;
+  delete process.env.AGENT_TASK_GRADE;
+  delete process.env.AGENT_DOMAIN_REQUIREMENTS;
+  delete process.env.AGENT_COMPOSITION;
   process.env.AGENT_COORDINATOR = TEST_COORDINATOR;
 });
 
@@ -106,4 +115,91 @@ test("a lane that dies mid-stream records outcome=died ON the lane entity (repor
   const logged = readFileSync(log, "utf8");
   expect(logged).toContain("tell agent:test-done-died outcome died");
   expect(logged).toContain("tell @swarm agent_death"); // death path still fires
+});
+
+async function waitForLog(needle: string): Promise<string> {
+  for (let i = 0; i < 100; i++) {
+    const value = existsSync(log) ? readFileSync(log, "utf8") : "";
+    if (value.includes(needle)) return value;
+    await Bun.sleep(10);
+  }
+  throw new Error(`timed out waiting for telemetry fact: ${needle}`);
+}
+
+test("public spawn composes explicit axes before Gaffer hydration", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+  process.env.NORTH_FABLE_NOW = "2026-07-20T07:00:00Z";
+  let queryOptions: any;
+  const queryFn: any = (args: any) => {
+    queryOptions = args.options;
+    return (async function* () {
+      yield { type: "result", subtype: "success", result: "composed", duration_ms: 1, num_turns: 1 };
+    })();
+  };
+
+  await spawn({
+    prompt: "exercise the real composition boundary", agentId: "test-composed-integrator",
+    role: "integrator", tier: "economy", effort: "low", posture: "preserve",
+    routingMetadata: { topology: "orchestrator" }, provider: "anthropic", queryFn,
+  });
+
+  expect(queryOptions.model).toBe("claude-sonnet-4-6");
+  expect(queryOptions.effort).toBe("low");
+  const logged = await waitForLog("topology orchestrator");
+  for (const fact of [
+    "requested_role integrator", "task_grade senior", "topology orchestrator",
+    "routing_tier economy", "requested_reasoning low", "routing_posture preserve",
+  ]) expect(logged).toContain(fact);
+});
+
+test("public role-only integrator spawn hydrates the complete Gaffer recipe", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+  process.env.NORTH_FABLE_NOW = "2026-07-20T07:00:00Z";
+  let queryOptions: any;
+  const queryFn: any = (args: any) => {
+    queryOptions = args.options;
+    return (async function* () {
+      yield { type: "result", subtype: "success", result: "integrated", duration_ms: 1, num_turns: 1 };
+    })();
+  };
+
+  await spawn({
+    prompt: "hydrate a role-only request", agentId: "test-role-only-integrator",
+    role: "integrator", provider: "anthropic", queryFn,
+  });
+
+  expect(queryOptions.model).toBe("claude-opus-4-8");
+  expect(queryOptions.effort).toBe("high");
+  const logged = await waitForLog("requested_role integrator");
+  for (const fact of [
+    "task_grade senior", "topology worker", "routing_tier senior",
+    "requested_reasoning high", "routing_posture deliver",
+  ]) expect(logged).toContain(fact);
+});
+
+test("recipe-hydrated Anthropic frontier promotes to Fable without losing requested reasoning", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
+  let queryOptions: any;
+  const queryFn: any = (args: any) => {
+    queryOptions = args.options;
+    return (async function* () {
+      yield { type: "result", subtype: "success", result: "frontier", duration_ms: 1, num_turns: 1 };
+    })();
+  };
+
+  await spawn({
+    prompt: "frontier recipe", agentId: "test-fable-designer",
+    role: "designer", provider: "anthropic", queryFn,
+  });
+
+  expect(queryOptions.model).toBe("claude-fable-5");
+  expect(queryOptions.effort).toBe("high");
+  const logged = await waitForLog("requested_reasoning xhigh");
+  expect(logged).toContain("requested_role designer");
+  expect(logged).toContain("routing_tier frontier");
+  expect(logged).toContain("effort high");
 });

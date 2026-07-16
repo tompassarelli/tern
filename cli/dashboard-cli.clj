@@ -25,6 +25,8 @@
 (def MYCONFIG (str HOME "/.claude/my-config.state"))
 (def CACHE-DIR (str HOME "/.cache/north"))
 (def PORT "7977")
+(def CACHE-SCOPE (str (hash (str (or (System/getenv "FRAM_LOG") "default") "|"
+                                (or (System/getenv "FRAM_TELEMETRY_LOG") "") "|" PORT))))
 
 ;; ---- ANSI (respect NO_COLOR / non-tty) --------------------------------------
 (def color? (and (nil? (System/getenv "NO_COLOR"))
@@ -67,18 +69,25 @@
   "Cached value from CACHE-DIR/name if written within ttl-ms, else nil. Never throws."
   [name ttl-ms]
   (try
-    (let [f (io/file CACHE-DIR name)]
+    (let [f (io/file CACHE-DIR (str CACHE-SCOPE "-" name))]
       (when (.exists f)
         (let [{:keys [ts val]} (edn/read-string (slurp f))]
-          (when (and ts (< (- (System/currentTimeMillis) ts) ttl-ms)) val))))
+          (let [age (- (System/currentTimeMillis) (or ts 0))]
+            (when (and ts (>= age 0) (< age ttl-ms)) val)))))
     (catch Exception _ nil)))
 
 (defn cache-put!
   "Persist val under CACHE-DIR/name with a timestamp; returns val. Never throws."
   [name val]
   (try
-    (.mkdirs (io/file CACHE-DIR))
-    (spit (io/file CACHE-DIR name) (pr-str {:ts (System/currentTimeMillis) :val val}))
+    (let [dir (io/file CACHE-DIR)
+          f (io/file dir (str CACHE-SCOPE "-" name))]
+      (.mkdirs dir)
+      (.setReadable dir false false) (.setWritable dir false false) (.setExecutable dir false false)
+      (.setReadable dir true true) (.setWritable dir true true) (.setExecutable dir true true)
+      (spit f (pr-str {:ts (System/currentTimeMillis) :val val}))
+      (.setReadable f false false) (.setWritable f false false) (.setExecutable f false false)
+      (.setReadable f true true) (.setWritable f true true))
     (catch Exception _ nil))
   val)
 
@@ -145,7 +154,7 @@
   []
   (or (cache-get "concerns.edn" 90000)
       (let [r (run [(str NORTH "/bin/concern") "ls" "--all"] :timeout 30000)]
-        (if (or (:timeout r) (not (:out r)))
+        (if (or (:timeout r) (not (:ok r)))
           {:err "concern probe unavailable"}
           (cache-put! "concerns.edn"
             {:concerns
@@ -453,9 +462,10 @@
                       (when wired (dim "  · wired in settings.json"))))))))
 
 ;; ---- dispatch ---------------------------------------------------------------
-(let [[cmd & args] *command-line-args*]
-  (case cmd
-    (nil "dashboard") (cmd-dashboard args)
-    "doctor"          (cmd-doctor args)
-    (do (binding [*out* *err*] (println (red (str "dashboard-cli: unknown command: " cmd))))
-        (System/exit 2))))
+(when-not (= (System/getenv "NORTH_DASHBOARD_LIB") "1")
+  (let [[cmd & args] *command-line-args*]
+    (case cmd
+      (nil "dashboard") (cmd-dashboard args)
+      "doctor"          (cmd-doctor args)
+      (do (binding [*out* *err*] (println (red (str "dashboard-cli: unknown command: " cmd))))
+          (System/exit 2)))))

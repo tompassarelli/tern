@@ -651,6 +651,7 @@
 (defrecord JPresentation [active :- String ready :- String blocked :- String draft :- String])
 (defrecord JReview [id :- String title :- String pred :- String detail :- String])
 (defrecord JFact [predicate :- String value :- String])
+(defrecord JAgentFact [id :- String predicate :- String value :- String])
 (defrecord JClockRow [id :- String title :- String est_h :- Int actual_sec :- Int done :- Bool])
 (defrecord JCalib [pct :- Int sample :- Int])
 (defrecord JClockReport [rows :- (Vec JClockRow) calibration :- JCalib])
@@ -734,11 +735,16 @@
        (println (fram.rt/to-json
                  (mapv (fn [c :- k/Fact] :- JFact (->JFact (:p c) (:r c)))
                        (k/q-by-l facts (str "@" arg)))))]
+      [(= what "agents")
+       (println (fram.rt/to-json
+                 (mapv (fn [c :- k/Fact] :- JAgentFact
+                         (->JAgentFact (subs (:l c) (count "@agent:")) (:p c) (:r c)))
+                       (filterv (fn [c :- k/Fact] :- Bool (str/starts-with? (:l c) "@agent:")) facts))))]
       [(= what "presentation")
        (println (fram.rt/to-json
                  (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready")
                                   (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))]
-      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|presentation")])))
+      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|agents|presentation")])))
 
 (defn cmd-needs-review [log :- String] :- Nil
   (let [as (fram.rt/read-log log)
@@ -1207,7 +1213,7 @@
       ;; Bare heal fails closed on GENUINE hand edits (a human decides). Tombstones
       ;; are NOT hand edits — they fall through to heal-project and re-render away.
       ;; This IS the dry run — it lists what `--adopt` would absorb, touches nothing.
-      [(and has-hand (not adopt))
+      [(and has-hand (not (or adopt resurrect)))
        (do
          (println (str "heal REFUSED — " (count (:hand p)) " genuinely-new file fact(s) not in the log "
                        "(hand edits). A human decides: adopt via `heal --adopt` (or `tell`/bulk `import`). "
@@ -1216,7 +1222,7 @@
            (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72))))
          (report-tombstoned (:tombstoned p)))]
       [:else
-       (if (and adopt has-adoptable)
+       (if (and (or adopt resurrect) has-adoptable)
          ;; ADOPT: absorb genuine (+ --resurrect'd) hand facts via the coordinator,
          ;; then re-probe (the log now carries them) and run the projection pass.
          ;; Tombstones NOT resurrected are reported + re-rendered away, never adopted.

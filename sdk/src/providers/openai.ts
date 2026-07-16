@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { AgentProvider, AgentQuery, ProviderAvailability } from "./types";
+import { ProviderRetrySafeError, type AgentProvider, type AgentQuery, type ProviderAvailability } from "./types";
 import { probeOpenAI } from "../provider-routing";
 
 function command(): string { return process.env.NORTH_CODEX_BIN ?? "codex"; }
@@ -29,11 +29,24 @@ function modelForCodex(model?: string): string | undefined {
   return model;
 }
 
+function waitForClose(child: ChildProcessWithoutNullStreams): Promise<number | null> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(child.exitCode);
+  return new Promise((resolve) => child.once("close", resolve));
+}
+
 class CodexQuery implements AgentQuery {
   private child?: ChildProcessWithoutNullStreams;
   constructor(private prompt: string | AsyncIterable<any>, private options: any) {}
 
-  async interrupt(): Promise<void> { this.child?.kill("SIGTERM"); }
+  async interrupt(): Promise<void> {
+    const child = this.child;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, 1_000);
+      child.once("close", () => { clearTimeout(timer); resolve(); });
+    });
+  }
 
   async *[Symbol.asyncIterator](): AsyncIterator<any> {
     const task = await initialPrompt(this.prompt);
@@ -48,25 +61,52 @@ class CodexQuery implements AgentQuery {
     args.push("-");
     const child = spawn(command(), args, { cwd: this.options.cwd ?? process.cwd(), env: process.env, stdio: ["pipe", "pipe", "pipe"] });
     this.child = child;
+    const launched = new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    child.stdin.on("error", () => { /* child process error is classified below */ });
+    try { await launched; }
+    catch (error) {
+      this.child = undefined;
+      throw new ProviderRetrySafeError(
+        `codex executable unavailable: ${(error as Error).message}`, { cause: error },
+      );
+    }
     child.stdin.end(prompt);
     let result = "";
     let usage: any = {};
     const stderr: string[] = [];
+    let accepted = false;
     child.stderr.on("data", (b) => stderr.push(String(b)));
-    for await (const line of createInterface({ input: child.stdout })) {
-      if (!line.trim()) continue;
-      let event: any;
-      try { event = JSON.parse(line); } catch { continue; }
-      if (event.type === "item.completed" && event.item?.type === "agent_message") {
-        const text = event.item.text ?? "";
-        result = text || result;
-        if (text) yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+    try {
+      for await (const line of createInterface({ input: child.stdout })) {
+        if (!line.trim()) continue;
+        let event: any;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type !== "error") accepted = true;
+        if (event.type === "item.completed" && event.item?.type === "agent_message") {
+          const text = event.item.text ?? "";
+          result = text || result;
+          if (text) yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+        }
+        if (event.type === "turn.completed") usage = event.usage ?? usage;
+        if (event.type === "error") throw new Error(event.message ?? JSON.stringify(event));
       }
-      if (event.type === "turn.completed") usage = event.usage ?? usage;
-      if (event.type === "error") throw new Error(event.message ?? JSON.stringify(event));
+      const code = await waitForClose(child);
+      if (code !== 0) {
+        const error = `codex exec exited ${code}: ${stderr.join("").trim()}`;
+        if (!accepted) throw new ProviderRetrySafeError(error);
+        throw new Error(error);
+      }
+    } catch (error) {
+      await this.interrupt();
+      if (!accepted && (error as NodeJS.ErrnoException).code === "ENOENT")
+        throw new ProviderRetrySafeError(`codex executable unavailable: ${(error as Error).message}`, { cause: error });
+      throw error;
+    } finally {
+      this.child = undefined;
     }
-    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
-    if (code !== 0) throw new Error(`codex exec exited ${code}: ${stderr.join("").trim()}`);
     yield {
       type: "result", subtype: "success", result,
       duration_ms: 0, num_turns: 1,

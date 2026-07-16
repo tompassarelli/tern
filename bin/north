@@ -77,10 +77,11 @@ north — your one card. Type a command to do the thing next to it.
     north watch <id>                   tail an agent's transcript
     north steer <id> "<msg>"           inject a message into a running agent
     north retask <id> "<goal>"         redirect a running agent's goal
-    north spawn <role> "<prompt>"      spawn at a gaffer role's model/effort
+    north spawn <role> "<prompt>"      compose from Gaffer's staffing catalog
       --provider auto|anthropic|openai  select or auto-route the worker provider
-                                       roles: analyst designer executor implementer
-                                              integrator judge researcher verifier
+      --taskGrade/--domain/--topology   independently override staffing axes
+      --tier/--reasoning/--posture      capability, deliberation, and posture
+      --rationale "why"                 required for a bespoke role
     (agents dispatch via MCP)          in-harness agents call mcp__north__dispatch / spawn
 
   LIFE   (capture thoughts, track work + time)
@@ -134,6 +135,10 @@ CARD
     exec bb "$NORTH/cli/config-cli.clj" "${@:2}" ;;
   providers)
     exec bun run "$NORTH/sdk/src/providers-cli.ts" "${@:2}" ;;
+  provider-observe)
+    # Hidden machine-ingestion surface. Interactive adapters feed provider
+    # telemetry here; it is intentionally silent and best-effort.
+    exec bun run "$NORTH/sdk/src/provider-observations-cli.ts" "${@:2}" ;;
   up)
     exec "$FRAM/bin/fram-up" "${@:2}" ;;
   agents|spawn|delegate|request|fork|req|watch|steer|retask)

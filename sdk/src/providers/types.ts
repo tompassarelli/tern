@@ -72,6 +72,8 @@ export interface ResourcePolicy {
 
 export interface ProviderAvailability {
   provider: ProviderId;
+  installed?: boolean;
+  authenticated?: boolean;
   available: boolean;
   reason: "ready" | "command_missing" | "authentication_missing" | "disabled" | "unknown";
   detail?: string;
@@ -84,6 +86,19 @@ export interface AgentQuery {
   [Symbol.asyncIterator](): AsyncIterator<any>;
   interrupt?(): Promise<void>;
   setModel?(model: string): Promise<void> | void;
+}
+
+/**
+ * A provider may raise this only when it can prove the request was not accepted
+ * and no externally observable tool/model side effect occurred. North never
+ * infers retry safety from error text or from an empty output stream.
+ */
+export class ProviderRetrySafeError extends Error {
+  readonly retrySafeBeforeAcceptance = true;
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ProviderRetrySafeError";
+  }
 }
 
 export interface AgentProvider {
@@ -103,4 +118,7 @@ export interface RoutingDecision {
   allocationMode: AllocationMode;
   entitlementPressure: EntitlementPressure;
   entitlementPressures: Partial<Record<ProviderId, EntitlementPressure>>;
+  /** Actual model/effort used by the currently active provider route. */
+  resolvedModel?: string;
+  resolvedEffort?: string;
 }

@@ -16,7 +16,12 @@ import {
   type ProviderPreference,
 } from "./providers";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
-import { canonicalRole, routingMetadataFromEnv } from "./routing-metadata";
+import { routingMetadataFromEnv, validateRoutingMetadata } from "./routing-metadata";
+import { applyGafferStaffing } from "./gaffer-staffing";
+import {
+  admitResourceEnvelope, completeResourceEnvelope, envelopeContextFromEnv,
+  reserveResourceEnvelopeRetry, ResourceEnvelopeExceededError, type EnvelopeAdmission,
+} from "./resource-envelopes";
 
 const PLAN_TOOLS = ["Read", "Grep", "Glob", "Bash"];
 const EXEC_TOOLS = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
@@ -28,9 +33,13 @@ interface DispatchResult {
   result: string;
 }
 
-export async function dispatch(threadId: string): Promise<DispatchResult> {
-  const routingMetadata = routingMetadataFromEnv();
-  const role = canonicalRole(process.env.AGENT_ROLE);
+async function runDispatch(
+  threadId: string,
+  envelopeAdmission?: EnvelopeAdmission,
+  hydratedMetadata?: ReturnType<typeof routingMetadataFromEnv>,
+): Promise<DispatchResult> {
+  const routingMetadata = hydratedMetadata ?? validateRoutingMetadata(applyGafferStaffing(routingMetadataFromEnv()));
+  const role = routingMetadata.role;
   const facts = getThreadFacts(threadId);
   if (!facts.length) {
     throw new Error(`Thread @${threadId} not found or has no facts`);
@@ -67,13 +76,13 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
     process.env.AGENT_ID ??
     `sdk-${threadId.replace(/[^a-z0-9]/gi, "").slice(-12)}`;
   const stream = new StreamWriter(agentId);
-  const requestedTier = process.env.AGENT_TIER as SemanticTier | undefined;
+  const requestedTier = routingMetadata.tier ?? process.env.AGENT_TIER as SemanticTier | undefined;
   const providerPreference = process.env.AGENT_PROVIDER as ProviderPreference | undefined ?? "auto";
   if (shouldRefreshCodexEntitlement(providerPreference)) await refreshCodexEntitlementIfStale();
   const routing = selectProvider(providerPreference, undefined,
     { tier: requestedTier, stableKey: agentId });
   const resolved = resolveTier(routing.provider, requestedTier,
-    process.env.AGENT_MODEL, process.env.AGENT_EFFORT as Effort | undefined);
+    process.env.AGENT_MODEL, (routingMetadata.reasoning ?? process.env.AGENT_EFFORT) as Effort | undefined);
 
   console.log(`[dispatch] @${threadId} — ${posture.title}`);
   console.log(`[dispatch] posture: ${postureLabel}, provider: ${routing.provider} (${routing.reason}), tools: ${tools.join(",")}`);
@@ -117,9 +126,11 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
         extraTools: tools,
         model: resolved.model,
         effort: resolved.effort,
+        role,
+        posture: routingMetadata.posture,
         systemPrompt: `You are a north worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
       }),
-    }, requestedTier);
+    }, requestedTier, undefined, () => reserveResourceEnvelopeRetry(envelopeAdmission));
     const watched = withStallWatchdog((q as AsyncIterable<any>)[Symbol.asyncIterator](), {
       stallMs: window,
       onStall: (mins) => notifyStall(agentId, mins, { coordinator: coordHandle }),
@@ -177,8 +188,13 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
         { thread: threadId, coordinator: coordHandle });
     }
   } catch (err) {
-    outcome = "died";
-    notifyDeath(agentId, err, { thread: threadId, coordinator: process.env.AGENT_COORDINATOR });
+    if (err instanceof ResourceEnvelopeExceededError) {
+      outcome = "resource_envelope_exceeded";
+      console.error(`[envelope] @agent:${agentId} ${err.message}`);
+    } else {
+      outcome = "died";
+      notifyDeath(agentId, err, { thread: threadId, coordinator: process.env.AGENT_COORDINATOR });
+    }
   } finally {
     stopFeed();
     try { ch.end(); } catch { /* already closed */ }
@@ -203,21 +219,42 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   // Spend is no longer charged to a counter here; it is summed from the @run
   // cost_usd fact this run records below (remaining() folds Σ over @run costs).
   recordRun({ thread: threadId, agent: agentId, tokens: tokensOf(resultMsg),
-              model: resolved.model, effort: resolved.effort,
+              model: routing.resolvedModel ?? resolved.model, effort: routing.resolvedEffort ?? resolved.effort,
               role,
               provider: routing.provider, providerReason: routing.reason,
               requestedProvider: process.env.AGENT_PROVIDER,
-              requestedTier: process.env.AGENT_TIER,
+              requestedTier,
               requestedModel: process.env.AGENT_MODEL,
-              requestedEffort: process.env.AGENT_EFFORT,
+              requestedEffort: routingMetadata.reasoning ?? process.env.AGENT_EFFORT,
               allocationMode: routing.allocationMode,
               entitlementPressure: routing.entitlementPressure,
               fallbackCount: routing.fallbackCount,
               fallbackPath: routing.fallbackPath,
+              envelopeScopes: envelopeAdmission?.scopes.map(({ id }) => id),
+              envelopeRetries: envelopeAdmission?.retries,
+              envelopeAdvisories: envelopeAdmission?.advisories,
               routingMetadata,
               durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome });
   console.log(`\n[dispatch] @${threadId} ${outcome === "died" ? "DIED" : "complete"}`);
   return { threadId, posture: postureLabel, result };
+}
+
+export async function dispatch(threadId: string): Promise<DispatchResult> {
+  // Avoid charging an admission for an unknown or already-completed thread.
+  const facts = getThreadFacts(threadId);
+  if (!facts.length) return runDispatch(threadId);
+  const preflight = derivePosture(facts, getChildren(threadId).length > 0);
+  if (preflight.hasOutcome) return runDispatch(threadId);
+  const agentId = process.env.AGENT_ID ?? `sdk-${threadId.replace(/[^a-z0-9]/gi, "").slice(-12)}`;
+  const routingMetadata = validateRoutingMetadata(applyGafferStaffing(routingMetadataFromEnv()));
+  const context = envelopeContextFromEnv();
+  const admission = await admitResourceEnvelope({
+    agentId, tier: routingMetadata.tier ?? process.env.AGENT_TIER as SemanticTier | undefined,
+    project: context.project, sessionId: context.sessionId,
+  });
+  for (const advisory of admission?.advisories ?? []) console.warn(`[envelope] advisory: ${advisory}`);
+  try { return await runDispatch(threadId, admission, routingMetadata); }
+  finally { await completeResourceEnvelope(admission); }
 }
 
 export async function dispatchParallel(

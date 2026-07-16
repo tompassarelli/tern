@@ -642,9 +642,12 @@ north doctor      # is everything healthy (the health sweep above)
 **division of labor** the fold preserves: **gaffer answers WHO does the work**
 (role → model/effort dials, doctrine injected at SessionStart); **north's cockpit
 answers HOW you see and drive it** (dashboard, spawn, watch, steer, profile). The
-cockpit NEVER re-derives doctrine — `north spawn` parses gaffer's generated dial
-table (`~/code/gaffer/docs/adapters/north.md`, the canonical block) at runtime, so
-a dial change in gaffer is a dial change here with no edit.
+cockpit NEVER re-derives doctrine — `north spawn` reads Gaffer's canonical
+machine staffing catalog (`~/code/gaffer/staffing/catalog.json`) at runtime.
+Generated agent markdown and `~/code/gaffer/docs/adapters/north.md` remain
+provider-adapter artifacts, never North's metadata source. Explicit spawn axes
+override their catalog defaults independently, so a staffing change in Gaffer is
+a staffing change here with no North edit.
 
 **Ownership rule** (2026-07-09): a cockpit verb earns its place ONLY when it
 COMPOSES multiple tools (`dashboard`, `doctor`, `profile`, `spawn` = gaffer dials

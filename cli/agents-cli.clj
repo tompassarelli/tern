@@ -12,10 +12,12 @@
          '[cheshire.core :as json])
 
 (def HOME (System/getenv "HOME"))
-(def NORTH (str HOME "/code/north"))
-(def GAFFER (str HOME "/code/gaffer"))
+(def NORTH (or (System/getenv "NORTH_HOME")
+               (some-> *file* io/file .getCanonicalFile .getParentFile .getParentFile str)))
+(def GAFFER (or (System/getenv "GAFFER_HOME") (str HOME "/code/gaffer")))
 (def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
-(def GAFFER-AGENTS (str GAFFER "/agents"))
+(def GAFFER-STAFFING (or (System/getenv "GAFFER_STAFFING_CATALOG")
+                         (str GAFFER "/staffing/catalog.json")))
 (def PORT (or (System/getenv "NORTH_PORT") "7977"))
 
 (def color? (and (nil? (System/getenv "NO_COLOR"))
@@ -40,72 +42,61 @@
 
 (defn echo-cmd [& parts] (println (dim (str "» " (str/join " " parts)))))
 
-;; ---- gaffer routing metadata (generated agent files are canonical) ----------
-(defn- agent-routing [f]
-  (let [text (slurp f)
-        payload (some-> (re-find #"<!-- GAFFER_ROUTING (\{.*\}) -->" text) second)]
-    (when payload
-      (let [routing (json/parse-string payload true)]
-        [(str/replace (.getName f) #"\.md$" "")
-         (assoc routing :gaffer-preset true)]))))
+;; ---- gaffer staffing catalog (canonical; generated markdown is adapter-only) -
+(defn gaffer-catalog []
+  (let [f (io/file GAFFER-STAFFING)]
+    (when (.isFile f) (json/parse-string (slurp f) true))))
 
 (defn gaffer-routing []
-  (let [dir (io/file GAFFER-AGENTS)]
-    (when (.isDirectory dir)
-      (->> (.listFiles dir)
-           (filter #(and (.isFile %) (str/ends-with? (.getName %) ".md")))
-           (keep agent-routing)
-           (into {})))))
+  (when-let [{:keys [recipes aliases defaults]} (gaffer-catalog)]
+      (let [
+            preset (fn [r]
+                     (let [name (:name r)]
+                       [name (-> (merge defaults r)
+                                 (assoc :role name :gaffer-preset true
+                                        :composition {:kind "preset" :id name}))]))
+            roles (into {} (map preset recipes))]
+        (reduce (fn [acc {:keys [name target]}]
+                  (if-let [r (get roles target)]
+                    (assoc acc name (assoc r :role target))
+                    acc))
+                roles aliases))))
 
 ;; ---- Fable window — mechanical, owner-ordered, auto-expiring (routing-overhaul PART 3)
-;; Cutoff 2026-07-13T00:00 Asia/Shanghai (system tz) = 2026-07-12T16:00:00Z. The Clojure
+;; Promotion ends 2026-07-19T23:59:59 PDT (UTC-7); clean exclusive cutoff is
+;; 2026-07-20T07:00:00Z (= 2026-07-20 15:00 Asia/Taipei). The Clojure
 ;; twin of sdk/src/fable-window.ts; NORTH_FABLE_NOW (ISO-8601 instant) overrides "now" so
 ;; the gate is testable without touching the system clock. After the cutoff this flips
 ;; with zero code change: orchestrator dials fall back to opus/xhigh.
-(def FABLE-WINDOW-END (java.time.Instant/parse "2026-07-12T16:00:00Z"))
+(def FABLE-WINDOW-END (java.time.Instant/parse "2026-07-20T07:00:00Z"))
 (defn fable-window-open?
   ([] (fable-window-open?
        (or (some-> (System/getenv "NORTH_FABLE_NOW") java.time.Instant/parse)
            (java.time.Instant/now))))
   ([now] (.isBefore now FABLE-WINDOW-END)))
 
-;; Two-tier synthetic roles (routing-overhaul PART 2/3) — NOT gaffer squad roles, so
-;; not in the dial table: they resolve the TIER, date-gated.
-;;   orchestrator — the decompose-and-fan-out fork. Window: fable/high; after: opus/xhigh.
+;; Two-tier synthetic roles are semantic orchestration shapes, never provider
+;; model aliases. Provider adapters resolve these tiers independently.
+;;   orchestrator — the decompose-and-fan-out fork: frontier/orchestrator.
 ;;     No north-role/posture: its contract rides in the delegate brief, not a worker block
 ;;     (a worker posture block would inject the interned "don't sub-delegate" clause and
 ;;     contradict the orchestrator's mandate to fan out).
-;;   worker — the interned default when a fan-out subtask has no sharper shape. Window
-;;     floor rises to opus/xhigh; after: opus/high. Carries the deliver posture (hence the
+;;   worker — the interned default when a fan-out subtask has no sharper shape. Senior
+;;     implementation floor. Carries the deliver posture (hence the
 ;;     interned clause). Sharper shapes still route to the gaffer squad roles as usual.
 (defn synthetic-roles []
-  (let [open? (fable-window-open?)]
-    {"orchestrator" {:model (if open? "fable" "opus")
-                     :effort (if open? "high" "xhigh")
-                     :posture nil}
-     "worker"       {:model "opus"
-                     :effort (if open? "xhigh" "high")
-                     :role "integrator"
-                     :posture "deliver"}}))
+  {"orchestrator" {:tier "frontier" :topology "orchestrator" :semantic true :posture nil}
+   "worker"       {:tier "senior" :reasoning "high" :topology "worker"
+                   :role "integrator" :semantic true :posture "deliver"}})
 
 ;; ---- agent identity facts (one log scan; single-valued predicates) ----------
 (defn agent-facts []
-  (let [log-path (str HOME "/.local/state/north/facts.log")]
-    (when (.exists (io/file log-path))
+  (let [r (run [(str NORTH "/bin/north") "json" "agents"] :timeout 10000)]
+    (if-not (:ok r) {}
       (try
-        (->> (str/split-lines (slurp log-path))
-             (filter #(str/includes? % "\"@agent:"))
-             (keep (fn [ln]
-                     (when-let [[_ subj] (re-find #":l\s+\"(@agent:[^\"]+)\"" ln)]
-                       (let [id   (subs subj (count "@agent:"))
-                             op   (some-> (re-find #":op\s+\"([^\"]+)\"" ln) second)
-                             pred (some-> (re-find #":p\s+\"([^\"]+)\"" ln) second)
-                             val  (some-> (re-find #":r\s+\"((?:[^\"\\\\]|\\\\.)*)\"" ln) second)]
-                         (when (and op pred) {:id id :op op :pred pred :val (or val "")})))))
-             (reduce (fn [acc {:keys [id op pred val]}]
-                       (if (= op "assert") (assoc-in acc [id pred] val)
-                           (update acc id dissoc pred)))
-                     {}))
+        (reduce (fn [acc {:keys [id predicate value]}]
+                  (assoc-in acc [id predicate] value))
+                {} (json/parse-string (:out r) true))
         (catch Exception _ {})))))
 
 (defn current-repo []
@@ -158,49 +149,101 @@
                           (dim (str "  ttl " (:expires a)))
                           (when (:focus a) (str "  " (:focus a)))))))))))
 
+(def spawn-flags
+  {"--notify" :notify "--provider" :provider "--taskGrade" :taskGrade "--task-grade" :taskGrade
+   "--domain" :domain "--topology" :topology "--tier" :tier "--reasoning" :reasoning
+   "--deliberation" :reasoning "--posture" :posture "--composition" :composition
+   "--rationale" :rationale "--nearest" :nearest})
+
+(defn- parse-spawn-args [args]
+  (loop [xs args positionals [] opts {:domains []}]
+    (if-let [x (first xs)]
+      (cond
+        (= x "--dry-run") (recur (rest xs) positionals (assoc opts :dry? true))
+        (= x "--nominate") (recur (rest xs) positionals (assoc opts :nominate? true))
+        (spawn-flags x) (let [v (second xs)]
+                          (when (or (nil? v) (str/starts-with? v "--"))
+                            (println (red (str x " requires a value"))) (System/exit 1))
+                          (recur (nnext xs) positionals
+                                 (if (= :domain (spawn-flags x))
+                                   (update opts :domains into (remove str/blank? (map str/trim (str/split v #","))))
+                                   (assoc opts (spawn-flags x) v))))
+        (str/starts-with? x "--") (do (println (red (str "unknown spawn option: " x))) (System/exit 1))
+        :else (recur (rest xs) (conj positionals x) opts))
+      (assoc opts :positionals positionals))))
+
 (defn cmd-spawn [args]
-  (let [dry? (some #{"--dry-run"} args)
-        notify (second (drop-while #(not= "--notify" %) args))
-        provider (second (drop-while #(not= "--provider" %) args))
-        [invoked-role prompt] (remove #(or (#{"--dry-run" "--notify" "--provider"} %) (= % notify) (= % provider)) args)
-        ;; gaffer presets from generated metadata + the date-gated two-tier synthetic
+  (let [{:keys [dry? nominate? notify provider taskGrade domains topology tier reasoning posture composition rationale nearest positionals]}
+        (parse-spawn-args args)
+        [invoked-role prompt & extra] positionals
+        ;; Gaffer presets from staffing/catalog.json + date-gated two-tier synthetic
         ;; roles (orchestrator/worker); synthetics win a name clash (there are none).
-        dt (merge (or (gaffer-routing) {}) (synthetic-roles))]
+        catalog (gaffer-catalog)
+        dt (merge (or (gaffer-routing) {}) (synthetic-roles))
+        supplied-composition (when composition
+                               (try (json/parse-string composition true)
+                                    (catch Exception _
+                                      (println (red "--composition must be valid JSON")) (System/exit 1))))
+        canonical (get dt invoked-role)
+        bespoke-reason (or rationale (:bespokeReason supplied-composition))
+        nearest-role (or nearest (:nearestPreset supplied-composition))
+        nearest-template (get dt nearest-role)
+        bespoke? (and invoked-role (nil? canonical))
+        base (or canonical nearest-template (:defaults catalog))]
     (cond
-      (or (nil? invoked-role) (nil? prompt))
-      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--provider auto|anthropic|openai] [--notify <peer>] [--dry-run]")
+      (or (nil? invoked-role) (nil? prompt) (seq extra))
+      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--taskGrade G] [--domain D] [--topology T] [--tier T] [--reasoning R] [--posture P] [--composition JSON] [--rationale WHY] [--provider P] [--notify PEER] [--dry-run]")
           (println "roles:" (str/join " " (sort (keys dt)))))
-      (not (dt invoked-role))
-      (do (println (red (str "unknown role: " invoked-role)))
+      (and bespoke? (str/blank? bespoke-reason))
+      (do (println (red (str "bespoke role " invoked-role " requires --rationale or composition.bespokeReason")))
           (println "roles:" (str/join " " (sort (keys dt)))))
+      (and nearest (nil? nearest-template))
+      (println (red (str "unknown nearest preset: " nearest)))
       :else
-      (let [{:keys [gaffer-preset taskGrade tier model effort role posture composition]} (dt invoked-role)
+      (let [{preset-grade :taskGrade preset-tier :tier model :model synthetic-effort :effort synthetic-reasoning :reasoning
+             preset-role :role preset-posture :posture preset-topology :topology preset-composition :composition
+             preset-deliberation :deliberation gaffer-preset :gaffer-preset semantic :semantic} base
+            taskGrade (or taskGrade preset-grade)
+            tier (or tier preset-tier)
+            topology (or topology preset-topology)
+            role (cond bespoke? invoked-role gaffer-preset (or preset-role invoked-role) :else preset-role)
+            posture (or posture preset-posture (when (or gaffer-preset bespoke?) (:posture (:defaults catalog))))
+            reasoning (or reasoning preset-deliberation synthetic-reasoning synthetic-effort)
+            composition (or supplied-composition preset-composition
+                            (when bespoke?
+                              (cond-> {:kind "bespoke" :id invoked-role
+                                       :bespokeReason bespoke-reason :promotionCandidate (boolean nominate?)}
+                                nearest-role (assoc :nearestPreset nearest-role))))
             aid (str "lane-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             env (cond-> {"AGENT_ID" aid}
                   taskGrade  (assoc "AGENT_TASK_GRADE" taskGrade)
+                  (seq domains) (assoc "AGENT_DOMAIN_REQUIREMENTS" (json/generate-string (vec (distinct domains))))
+                  topology   (assoc "AGENT_TOPOLOGY" topology)
                   tier       (assoc "AGENT_TIER" tier)
                   role       (assoc "AGENT_ROLE" role)
                   posture    (assoc "AGENT_POSTURE" posture)
                   composition (assoc "AGENT_COMPOSITION" (json/generate-string composition))
-                  (and (not gaffer-preset) model)  (assoc "AGENT_MODEL" model)
-                  (and (not gaffer-preset) effort) (assoc "AGENT_EFFORT" effort)
+                  (and (not semantic) (not gaffer-preset) model)  (assoc "AGENT_MODEL" model)
+                  reasoning (assoc "AGENT_REASONING" reasoning "AGENT_EFFORT" reasoning)
                   provider   (assoc "AGENT_PROVIDER" provider)
                   notify    (assoc "AGENT_COORDINATOR" notify))
             spawn-ts (str NORTH "/sdk/src/spawn.ts")
             envs (str/join " " (map (fn [[k v]] (str k "=" v)) (sort env)))]
         (println (dim "# gaffer dials for role") (bold invoked-role) (dim "->")
-                 (str "grade=" taskGrade " tier=" tier
-                      (when-not gaffer-preset (str " model=" model " effort=" effort))
+                 (str "grade=" taskGrade " tier=" tier " reasoning=" reasoning
+                      (when (and (not semantic) (not gaffer-preset)) (str " model=" model))
                       (when role (str " role=" role))
-                      (when posture (str " posture=" posture))))
+                      (when posture (str " posture=" posture))
+                      (when topology (str " topology=" topology))
+                      (when (seq domains) (str " domains=" (str/join "," domains)))))
         (echo-cmd envs "bun run" spawn-ts (str "\"" prompt "\""))
         (if dry?
           (let [dn (render-display-name aid
                                         (cond-> {"role" (or role invoked-role)
                                                  "repo" (or (current-repo) "?")
                                                  "goal" (str/trim prompt)}
-                                          gaffer-preset (assoc "tier" tier)
-                                          (not gaffer-preset) (assoc "model" model "effort" effort)))]
+                                          (or gaffer-preset semantic) (assoc "tier" tier)
+                                          (and (not semantic) (not gaffer-preset)) (assoc "model" model "effort" reasoning)))]
             (println (ylw "[dry-run]") "not executed. agent-id would be" (bold aid))
             (println (str "  display_name: " (bold dn))))
           (let [log (io/file AGENT-LOGDIR (str aid ".log"))]
@@ -322,18 +365,18 @@
               (println (str/trim (str (:out r) (:err r))))))))))
 
 ;; ---- dispatch ------------------------------------------------------------------
-(let [[cmd & args] *command-line-args*]
-  (case cmd
-    "agents"  (cmd-agents args)
-    "spawn"   (cmd-spawn args)
-    "delegate" (cmd-delegate args)
-    ;; delegation unified to ONE verb 2026-07-10 (context is a parameter, not a
-    ;; separate verb) — request/fork/req teach, don't alias (slash-command precedent).
-    "request" (do (println "renamed: north delegate") (System/exit 1))
-    "fork"    (do (println "renamed: north delegate") (System/exit 1))
-    "req"     (do (println "renamed: north delegate") (System/exit 1))
-    "watch"   (cmd-watch args)
-    "steer"   (cmd-tell-agent args)
-    "retask"  (cmd-retask args)
-    (do (println "usage: north {agents|spawn|delegate|watch|steer|retask} ...")
-        (System/exit 1))))
+(when-not (= (System/getenv "NORTH_AGENTS_LIB") "1")
+  (let [[cmd & args] *command-line-args*]
+    (case cmd
+      "agents"  (cmd-agents args)
+      "spawn"   (cmd-spawn args)
+      "delegate" (cmd-delegate args)
+      ;; delegation unified to ONE verb; request/fork/req teach, don't alias.
+      "request" (do (println "renamed: north delegate") (System/exit 1))
+      "fork"    (do (println "renamed: north delegate") (System/exit 1))
+      "req"     (do (println "renamed: north delegate") (System/exit 1))
+      "watch"   (cmd-watch args)
+      "steer"   (cmd-tell-agent args)
+      "retask"  (cmd-retask args)
+      (do (println "usage: north {agents|spawn|delegate|watch|steer|retask} ...")
+          (System/exit 1)))))

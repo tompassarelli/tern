@@ -74,24 +74,49 @@ export function resourcePolicyFromEnv(
 }
 
 export function probeAnthropic(): ProviderAvailability {
-  if (process.env.NORTH_DISABLE_ANTHROPIC === "1")
-    return { provider: "anthropic", available: false, reason: "disabled" };
-  return { provider: "anthropic", available: true, reason: "ready" };
+  const disabled = process.env.NORTH_DISABLE_ANTHROPIC === "1";
+  const command = process.env.NORTH_CLAUDE_BIN ?? "claude";
+  const version = spawnSync(command, ["--version"], { encoding: "utf8", timeout: 3000 });
+  if (version.error || version.status !== 0) return {
+    provider: "anthropic", installed: false, authenticated: false, available: false,
+    reason: disabled ? "disabled" : "command_missing", detail: version.error?.message ?? version.stderr,
+  };
+  const auth = spawnSync(command, ["auth", "status", "--json"], { encoding: "utf8", timeout: 3000 });
+  let loggedIn = false;
+  try {
+    const status = JSON.parse(auth.stdout || "{}");
+    loggedIn = status.loggedIn === true || status.authenticated === true || status.status === "logged_in";
+  } catch { /* malformed output is not authenticated */ }
+  if (auth.error || auth.status !== 0 || !loggedIn) return {
+    provider: "anthropic", installed: true, authenticated: false, available: false,
+    reason: disabled ? "disabled" : "authentication_missing", detail: auth.error?.message ?? (auth.stderr.trim() || "Claude Code is not logged in"),
+  };
+  return { provider: "anthropic", installed: true, authenticated: true, available: !disabled,
+    reason: disabled ? "disabled" : "ready", detail: version.stdout.trim() };
 }
 
 export function probeOpenAI(): ProviderAvailability {
-  if (process.env.NORTH_DISABLE_OPENAI === "1")
-    return { provider: "openai", available: false, reason: "disabled" };
+  const disabled = process.env.NORTH_DISABLE_OPENAI === "1";
   const command = process.env.NORTH_CODEX_BIN ?? "codex";
   const result = spawnSync(command, ["--version"], { encoding: "utf8", timeout: 3000 });
   if (result.error || result.status !== 0)
     return {
       provider: "openai",
+      installed: false,
+      authenticated: false,
       available: false,
-      reason: "command_missing",
+      reason: disabled ? "disabled" : "command_missing",
       detail: result.error?.message ?? result.stderr,
-    };
-  return { provider: "openai", available: true, reason: "ready", detail: result.stdout.trim() };
+  };
+  const auth = spawnSync(command, ["login", "status"], { encoding: "utf8", timeout: 3000 });
+  const authText = [auth.stdout.trim(), auth.stderr.trim()].filter(Boolean).join("\n");
+  const loggedIn = auth.status === 0 && authText === "Logged in using ChatGPT";
+  if (auth.error || !loggedIn) return {
+    provider: "openai", installed: true, authenticated: false, available: false,
+    reason: disabled ? "disabled" : "authentication_missing", detail: auth.error?.message ?? (auth.stderr.trim() || auth.stdout.trim() || "Codex is not logged in"),
+  };
+  return { provider: "openai", installed: true, authenticated: true, available: !disabled,
+    reason: disabled ? "disabled" : "ready", detail: result.stdout.trim() };
 }
 
 function stableHash(value: string): number {
@@ -113,7 +138,7 @@ const pressureWeight: Record<EntitlementPressure, number> = {
 
 function stateOf(availability: ProviderAvailability[], id: ProviderId): ProviderAvailability {
   return availability.find((entry) => entry.provider === id) ?? {
-    provider: id, available: false, reason: "unknown",
+    provider: id, installed: false, authenticated: false, available: false, reason: "unknown",
   };
 }
 

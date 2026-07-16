@@ -104,6 +104,7 @@
 
 (def task-grade-values ["novice" "junior" "mid" "senior" "staff" "principal" "research-grade"])
 (def topology-values ["worker" "verifier" "orchestrator"])
+(def reasoning-values ["low" "medium" "high" "xhigh" "max"])
 (def composition-schema
   {:type "object"
    :properties {:kind {:type "string" :enum ["preset" "bespoke"]}
@@ -127,8 +128,9 @@
     :schema {:type "object"
              :properties {:id {:type "string" :description "Thread ID to dispatch (e.g. 2026-06-27-193317)"}
                           :model {:type "string" :description "opus|sonnet|haiku|fable (default sonnet)"}
-                          :effort {:type "string" :description "low|medium|high|xhigh (default high)"}
-                          :role {:type "string" :minLength 1 :description "Functional responsibility. Canonical presets include executor, implementer, integrator, designer, scout, and research-scientist; bespoke roles are allowed. researcher is a legacy alias for scout."}
+                          :effort {:type "string" :description "Compatibility alias for reasoning"}
+                          :reasoning {:type "string" :enum reasoning-values :description "Provider-neutral deliberation; independent of role and tier"}
+                          :role {:type "string" :minLength 1 :description "Functional responsibility from Gaffer's staffing catalog, or a reasoned bespoke role."}
                           :posture {:type "string" :description "explore|deliver|preserve"}
                           :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
                           :tier {:type "string" :enum ["economy" "standard" "senior" "frontier"] :description "Provider-neutral capability tier"}
@@ -143,8 +145,9 @@
     :schema {:type "object"
              :properties {:prompt {:type "string" :description "The task prompt"}
                           :model {:type "string" :description "opus|sonnet|haiku|fable (default sonnet)"}
-                          :effort {:type "string" :description "low|medium|high|xhigh (default high)"}
-                          :role {:type "string" :minLength 1 :description "Functional responsibility. Canonical presets include executor, implementer, integrator, designer, scout, and research-scientist; bespoke roles are allowed. researcher is a legacy alias for scout."}
+                          :effort {:type "string" :description "Compatibility alias for reasoning"}
+                          :reasoning {:type "string" :enum reasoning-values :description "Provider-neutral deliberation; independent of role and tier"}
+                          :role {:type "string" :minLength 1 :description "Functional responsibility from Gaffer's staffing catalog, or a reasoned bespoke role."}
                           :posture {:type "string" :description "explore|deliver|preserve"}
                           :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
                           :tier {:type "string" :enum ["economy" "standard" "senior" "frontier"] :description "Provider-neutral capability tier"}
@@ -174,11 +177,14 @@
 
 (defn invalid-routing [args]
   (let [grade (get args "taskGrade") topology (get args "topology") role (get args "role")
-        domains (get args "domainRequirements") composition (get args "composition")]
+        domains (get args "domainRequirements") composition (get args "composition")
+        reasoning (get args "reasoning") effort (get args "effort")]
     (cond
       (and role (or (not (string? role)) (str/blank? role))) "role must be a non-empty string"
       (and grade (not (some #{grade} task-grade-values))) "invalid taskGrade"
       (and topology (not (some #{topology} topology-values))) "invalid topology"
+      (and reasoning (not (some #{reasoning} reasoning-values))) "invalid reasoning"
+      (and reasoning effort (not= reasoning effort)) "reasoning and compatibility effort disagree"
       (and domains (or (not (sequential? domains)) (some #(or (not (string? %)) (str/blank? %)) domains))) "domainRequirements must contain non-empty strings"
       (and composition (not (map? composition))) "composition must be an object"
       (and composition (not (some #{(get composition "kind")} ["preset" "bespoke"]))) "invalid composition.kind"
@@ -200,6 +206,7 @@
       (let [id (get args "id")
             model (get args "model")
             effort (get args "effort")
+            reasoning (or (get args "reasoning") effort)
             role (get args "role")
             posture (get args "posture")
             provider (get args "provider")
@@ -211,7 +218,7 @@
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
                       model       (assoc "AGENT_MODEL" model)
-                      effort      (assoc "AGENT_EFFORT" effort)
+                      reasoning   (assoc "AGENT_REASONING" reasoning "AGENT_EFFORT" reasoning)
                       role        (assoc "AGENT_ROLE" role)
                       posture     (assoc "AGENT_POSTURE" posture)
                       provider    (assoc "AGENT_PROVIDER" provider)
@@ -235,6 +242,7 @@
       (let [prompt (get args "prompt")
             model (get args "model")
             effort (get args "effort")
+            reasoning (or (get args "reasoning") effort)
             role (get args "role")
             posture (get args "posture")
             provider (get args "provider")
@@ -247,7 +255,7 @@
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
                       model       (assoc "AGENT_MODEL" model)
-                      effort      (assoc "AGENT_EFFORT" effort)
+                      reasoning   (assoc "AGENT_REASONING" reasoning "AGENT_EFFORT" reasoning)
                       role        (assoc "AGENT_ROLE" role)
                       posture     (assoc "AGENT_POSTURE" posture)
                       provider    (assoc "AGENT_PROVIDER" provider)

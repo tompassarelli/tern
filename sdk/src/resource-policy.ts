@@ -21,6 +21,7 @@ const MODES: AllocationMode[] = ["preferential", "balanced", "reserved"];
 
 /** Pressure observations are trustworthy for one day unless `until` is set. */
 export const PRESSURE_TTL_MS = 24 * 60 * 60 * 1000;
+export const OBSERVATION_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const DEFAULT_ROUTING_POLICY_PATH = resolve(homedir(), ".config/north/routing-policy.json");
 export const DEFAULT_PROVIDER_OBSERVATIONS_PATH = resolve(homedir(), ".local/state/north/provider-usage-observations.json");
 
@@ -125,7 +126,9 @@ export function pressureObservationIsFresh(
   now = new Date(),
 ): boolean {
   if (!observation) return false;
-  const expiry = observation.until ? Date.parse(observation.until) : Date.parse(observation.observedAt) + PRESSURE_TTL_MS;
+  const observedAt = Date.parse(observation.observedAt);
+  if (observedAt > now.getTime() + OBSERVATION_CLOCK_SKEW_MS) return false;
+  const expiry = observation.until ? Date.parse(observation.until) : observedAt + PRESSURE_TTL_MS;
   return now.getTime() <= expiry;
 }
 

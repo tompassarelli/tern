@@ -2,8 +2,9 @@ import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ProviderUsageObservation, ProviderUsageWindow } from "./providers/types";
 import { writeProviderUsageObservations } from "./provider-observation-store";
-import { loadProviderUsageObservations, loadResourcePolicy } from "./resource-policy";
+import { DEFAULT_PROVIDER_OBSERVATIONS_PATH, loadProviderUsageObservations, loadResourcePolicy } from "./resource-policy";
 import type { ProviderPreference } from "./providers/types";
+import { withFileLease } from "./file-lease";
 
 const DEFAULT_TIMEOUT_MS = 3_000;
 export const CODEX_OBSERVATION_TTL_MS = 5 * 60 * 1000;
@@ -33,6 +34,8 @@ interface RefreshOptions extends ObserveOptions {
   observe?: (options: ObserveOptions) => Promise<ProviderUsageObservation>;
   onDiagnostic?: (message: string) => void;
 }
+
+const refreshes = new Map<string, Promise<ProviderUsageObservation | undefined>>();
 
 interface RateLimitWindow {
   usedPercent?: unknown;
@@ -201,23 +204,45 @@ export function shouldRefreshCodexEntitlement(requested: ProviderPreference | un
   return (requested ?? "auto") !== "anthropic";
 }
 
+function cachedCodexObservation(storePath: string | undefined, targetId: string): ProviderUsageObservation | undefined {
+  return loadProviderUsageObservations(storePath)?.observations
+    .filter((entry) => entry.provider === "openai" && entry.targetId === targetId)
+    .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0];
+}
+
+function observationFresh(cached: ProviderUsageObservation | undefined, now: Date): boolean {
+  const freshByAge = cached && now.getTime() - Date.parse(cached.observedAt) <= CODEX_OBSERVATION_TTL_MS;
+  const hasLiveWindow = cached?.windows?.some(({ resetsAt }) => Date.parse(resetsAt) > now.getTime()) ?? cached?.state !== undefined;
+  return Boolean(freshByAge && hasLiveWindow);
+}
+
 /** Refresh at most once per five minutes; failures preserve cached/unknown routing. */
 export async function refreshCodexEntitlementIfStale(options: RefreshOptions = {}): Promise<ProviderUsageObservation | undefined> {
   const now = options.now ?? new Date();
   const targetId = options.targetId ?? defaultCodexTargetId();
-  let cached: ProviderUsageObservation | undefined;
-  try {
-    cached = loadProviderUsageObservations(options.storePath)?.observations
-      .filter((entry) => entry.provider === "openai" && entry.targetId === targetId)
-      .sort((left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt))[0];
-    const freshByAge = cached && now.getTime() - Date.parse(cached.observedAt) <= CODEX_OBSERVATION_TTL_MS;
-    const hasLiveWindow = cached?.windows?.some(({ resetsAt }) => Date.parse(resetsAt) > now.getTime()) ?? cached?.state !== undefined;
-    if (freshByAge && hasLiveWindow) return cached;
-    return await (options.observe ?? observeCodexEntitlement)({ ...options, targetId, now });
-  } catch (error) {
-    (options.onDiagnostic ?? console.warn)(
-      `[north] Codex subscription headroom refresh unavailable; using ${cached ? "cached observation" : "unknown pressure"}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return cached;
-  }
+  const storePath = options.storePath ?? process.env.NORTH_PROVIDER_OBSERVATIONS ?? DEFAULT_PROVIDER_OBSERVATIONS_PATH;
+  const key = `${storePath}\u0000${targetId}`;
+  const running = refreshes.get(key);
+  if (running) return running;
+  const refresh = (async () => {
+    let cached: ProviderUsageObservation | undefined;
+    try {
+      cached = cachedCodexObservation(storePath, targetId);
+      if (observationFresh(cached, now)) return cached;
+      const lockPath = `${storePath}.refresh.lock`;
+      return await withFileLease(lockPath, async () => {
+        const afterWait = cachedCodexObservation(storePath, targetId);
+        if (observationFresh(afterWait, now)) return afterWait;
+        return (options.observe ?? observeCodexEntitlement)({ ...options, storePath, targetId, now });
+      });
+    } catch (error) {
+      (options.onDiagnostic ?? console.warn)(
+        `[north] Codex subscription headroom refresh unavailable; using ${cached ? "cached observation" : "unknown pressure"}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return cached;
+    }
+  })();
+  refreshes.set(key, refresh);
+  try { return await refresh; }
+  finally { if (refreshes.get(key) === refresh) refreshes.delete(key); }
 }

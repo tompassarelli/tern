@@ -23,6 +23,10 @@ let log: string;
 const MANAGED_ENV = [
   "PATH", "NORTH_BIN", "NORTH_PORT", "NORTH_STREAM_DIR", "AGENT_LAWS", "AGENT_PRAXIS",
   "AGENT_ID", "NORTH_AGENT_ID", "AGENT_COORDINATOR", "AGENT_MODEL", "AGENT_ROLE", "AGENT_EFFORT",
+  "NORTH_ROUTING_POLICY", "NORTH_ENVELOPE_ACCOUNTING",
+  "NORTH_PROVIDER_OBSERVATIONS", "NORTH_ALLOCATION_MODE", "NORTH_PROVIDER_ORDER",
+  "NORTH_PROVIDER_WEIGHTS", "NORTH_RESERVED_FRONTIER_PROVIDER",
+  "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
 ] as const;
 const origEnv: Record<string, string | undefined> = {};
 for (const k of MANAGED_ENV) origEnv[k] = process.env[k];
@@ -48,6 +52,14 @@ beforeAll(() => {
   process.env.NORTH_STREAM_DIR = dir; // keep stream jsonl out of ~/code/agent-data
   process.env.AGENT_LAWS = "off"; // trim system-prompt file reads; irrelevant to the boundary
   process.env.AGENT_PRAXIS = "off";
+  process.env.NORTH_ROUTING_POLICY = join(dir, "absent-routing-policy.json");
+  process.env.NORTH_PROVIDER_OBSERVATIONS = join(dir, "absent-provider-observations.json");
+  delete process.env.NORTH_ALLOCATION_MODE;
+  delete process.env.NORTH_PROVIDER_ORDER;
+  delete process.env.NORTH_PROVIDER_WEIGHTS;
+  delete process.env.NORTH_RESERVED_FRONTIER_PROVIDER;
+  delete process.env.NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE;
+  delete process.env.NORTH_OPENAI_ENTITLEMENT_PRESSURE;
 
   // Scrub inherited identity so a test spawn cannot adopt the invoking session's id/coordinator.
   delete process.env.AGENT_ID;
@@ -102,4 +114,57 @@ test("a query that dies mid-stream -> partial return + agent_death notification"
   expect(logged).toContain(`coordinator ${TEST_COORDINATOR}`);
   const inheritedCoord = origEnv.AGENT_COORDINATOR;
   if (inheritedCoord) expect(logged).not.toContain(inheritedCoord);
+});
+
+test("an exhausted run envelope rejects before an injected provider boundary is called", async () => {
+  const policy = join(dir, "denied-routing-policy.json");
+  writeFileSync(policy, JSON.stringify({
+    version: 1, mode: "preferential",
+    targets: [{ id: "anthropic", provider: "anthropic" }, { id: "openai", provider: "openai" }],
+    targetOrder: ["anthropic", "openai"],
+    envelopes: { month: { runs: 0 } },
+  }));
+  const absentPolicy = process.env.NORTH_ROUTING_POLICY!;
+  const originalAccounting = process.env.NORTH_ENVELOPE_ACCOUNTING;
+  try {
+    process.env.NORTH_ROUTING_POLICY = policy;
+    process.env.NORTH_ENVELOPE_ACCOUNTING = join(dir, "denied-accounting.json");
+    let providerCalls = 0;
+    await expect((await import("../src/spawn")).spawn({
+      prompt: "must not run", agentId: "denied-before-provider",
+      queryFn: () => { providerCalls++; return { async *[Symbol.asyncIterator]() {} } as any; },
+    })).rejects.toThrow("runs 0/0");
+    expect(providerCalls).toBe(0);
+  } finally {
+    process.env.NORTH_ROUTING_POLICY = absentPolicy;
+    if (originalAccounting === undefined) delete process.env.NORTH_ENVELOPE_ACCOUNTING;
+    else process.env.NORTH_ENVELOPE_ACCOUNTING = originalAccounting;
+  }
+});
+
+test("Gaffer-derived frontier tier is hydrated before envelope admission", async () => {
+  const policy = join(dir, "denied-frontier-policy.json");
+  writeFileSync(policy, JSON.stringify({
+    version: 1, mode: "preferential",
+    targets: [{ id: "anthropic", provider: "anthropic" }, { id: "openai", provider: "openai" }],
+    targetOrder: ["anthropic", "openai"],
+    envelopes: { month: { runs: 10, frontierRuns: 0 } },
+  }));
+  const absentPolicy = process.env.NORTH_ROUTING_POLICY!;
+  const originalAccounting = process.env.NORTH_ENVELOPE_ACCOUNTING;
+  try {
+    process.env.NORTH_ROUTING_POLICY = policy;
+    process.env.NORTH_ENVELOPE_ACCOUNTING = join(dir, "denied-frontier-accounting.json");
+    let providerCalls = 0;
+    await expect((await import("../src/spawn")).spawn({
+      prompt: "must not run", agentId: "gaffer-frontier-before-provider",
+      routingMetadata: { role: "designer" },
+      queryFn: () => { providerCalls++; return { async *[Symbol.asyncIterator]() {} } as any; },
+    })).rejects.toThrow("frontierRuns 0/0");
+    expect(providerCalls).toBe(0);
+  } finally {
+    process.env.NORTH_ROUTING_POLICY = absentPolicy;
+    if (originalAccounting === undefined) delete process.env.NORTH_ENVELOPE_ACCOUNTING;
+    else process.env.NORTH_ENVELOPE_ACCOUNTING = originalAccounting;
+  }
 });

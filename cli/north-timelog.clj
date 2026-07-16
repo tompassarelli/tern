@@ -31,9 +31,6 @@
 (def ^:private OWNER (or (first pos) "msa"))
 (def ^:private INV-FILTER (second pos))                  ; nil = all invoices
 (def ^:private WALL? (boolean (or (flags "--wall") (flags "--wallclock"))))
-(def ^:private LOG (or (System/getenv "FRAM_LOG")
-                       (str (System/getenv "HOME") "/.local/state/north/facts.log")))
-
 (defn- strip-at [s] (if (and s (str/starts-with? s "@")) (subs s 1) s))
 ;; Tolerant parse (fram.rt/iso-to-seconds): session timestamps are ZONE-LESS
 ;; local ISO (fram.rt/now-iso), so the old (Instant/parse s) threw on every
@@ -43,7 +40,7 @@
 (defn- to-int [s] (try (Integer/parseInt (str/trim (str s))) (catch Exception _ 0)))
 (defn- csv-cell [s] (str "\"" (str/replace (str s) "\"" "\"\"") "\""))
 
-(let [facts  (:facts (fold/fold (rt/read-log LOG)))
+(let [facts  (:facts (fold/fold (rt/read-configured-logs)))
       idx     (k/build-index facts)
       allsub  (:subjects idx)
       one     (fn [s p] (k/one-i idx s p))

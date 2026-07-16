@@ -211,7 +211,7 @@ function globalLawsAppendix(): string {
 }
 
 // PRAXIS_DIR — canonical role/posture/delta blocks — the gaffer plugin repo (single source; nixos praxis/ holds only personal residue).
-const PRAXIS_DIR = `${process.env.HOME}/code/gaffer/docs`;
+const PRAXIS_DIR = `${process.env.GAFFER_HOME ?? `${process.env.HOME}/code/gaffer`}/docs`;
 
 function extractFenceFromSection(text: string, heading: string): string | null {
   const lines = text.split("\n");

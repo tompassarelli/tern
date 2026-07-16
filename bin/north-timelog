@@ -6,5 +6,11 @@
 set -euo pipefail
 NORTH="$(cd "$(dirname "$0")/.." && pwd)"
 FRAM="${FRAM_HOME:-$HOME/code/fram}"
-export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
+if [ -z "${FRAM_LOG:-}" ]; then
+  if [ -f "$HOME/.local/state/north/coordination.log" ]; then
+    export FRAM_LOG="$HOME/.local/state/north/coordination.log"
+  else
+    export FRAM_LOG="$HOME/.local/state/north/facts.log"
+  fi
+fi
 exec bb -cp "$NORTH/out:$FRAM/out" "$NORTH/cli/north-timelog.clj" "$@"

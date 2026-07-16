@@ -5,6 +5,7 @@
 // fram, invisible to the work views. Fire-and-forget: telemetry must NEVER block
 // or fail an agent run, so writes are async and all errors are swallowed.
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { RoutingMetadata } from "./routing-metadata";
 
 export interface RunRecord {
@@ -32,7 +33,10 @@ export interface RunRecord {
   entitlementPressure?: string;
   fallbackCount?: number;
   fallbackPath?: string[];
-  outcome: string; // "ran" | "error" | "budget_exceeded" | "budget_exhausted" | "struggle_ceiling"
+  envelopeScopes?: string[];
+  envelopeRetries?: number;
+  envelopeAdvisories?: string[];
+  outcome: string; // "ran" | "error" | "resource_envelope_exceeded" | "budget_exceeded" | ...
   // escalate-not-kill (thread 019f1194-ca57) — present only on escalation-enabled runs.
   // Option A yields ONE @run row per spawn with an internal escalation chain, NOT one
   // row per tier (north-reconcile.clj queries adapt in lockstep — follow-up).
@@ -69,7 +73,14 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (rec.entitlementPressure) facts.push(["entitlement_pressure", rec.entitlementPressure]);
   if (rec.fallbackCount != null) facts.push(["fallback_count", String(rec.fallbackCount)]);
   if (rec.fallbackPath?.length) facts.push(["fallback_path", rec.fallbackPath.join(" -> ")]);
+  for (const scope of rec.envelopeScopes ?? []) facts.push(["envelope_scope", scope]);
+  if (rec.envelopeRetries != null) facts.push(["envelope_retries", String(rec.envelopeRetries)]);
+  for (const advisory of rec.envelopeAdvisories ?? []) facts.push(["envelope_advisory", advisory]);
   const metadata = rec.routingMetadata;
+  if (metadata?.role) facts.push(["requested_role", metadata.role]);
+  if (metadata?.tier) facts.push(["routing_tier", metadata.tier]);
+  if (metadata?.reasoning) facts.push(["requested_reasoning", metadata.reasoning]);
+  if (metadata?.posture) facts.push(["routing_posture", metadata.posture]);
   if (metadata?.taskGrade) facts.push(["task_grade", metadata.taskGrade]);
   if (metadata?.topology) facts.push(["topology", metadata.topology]);
   for (const domain of metadata?.domainRequirements ?? []) facts.push(["domain_requirement", domain]);
@@ -95,7 +106,7 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
 }
 
 export function recordRun(rec: RunRecord): void {
-  const id = `run-${rec.agent}-${Date.now().toString(36)}`;
+  const id = newRunId(rec.agent);
   for (const [p, v] of runFacts(rec)) {
     // async + ignored: never let telemetry add latency to, or break, the run.
     try {
@@ -104,4 +115,8 @@ export function recordRun(rec: RunRecord): void {
       /* swallow */
     }
   }
+}
+
+export function newRunId(agent: string): string {
+  return `run-${agent}-${randomUUID()}`;
 }

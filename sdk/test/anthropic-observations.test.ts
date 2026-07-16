@@ -35,6 +35,11 @@ test("normalizes terminal/warning status when Claude omits numeric utilization",
     new Date("2026-07-16T12:00:00Z"))).toMatchObject({ state: "low" });
 });
 
+test("an allowed event without utilization remains unknown", () => {
+  expect(observationFromAnthropicRateLimit(event({ status: "allowed" }), "anthropic",
+    new Date("2026-07-16T12:00:00Z"))).toMatchObject({ state: "unknown" });
+});
+
 test("observes rate-limit messages without extra turns and preserves the stream", async () => {
   const messages = [
     { type: "system", subtype: "init" },

@@ -34,6 +34,22 @@
         "type": "github"
       }
     },
+    "gaffer": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784206922,
+        "narHash": "sha256-bfxWUsUAvYRuE8zeVcBiuFEbvva08cid8Rhb1p5H+TM=",
+        "owner": "tompassarelli",
+        "repo": "gaffer",
+        "rev": "e142af0c272e7ad5e5686ee56491a0dc5712f3fd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tompassarelli",
+        "repo": "gaffer",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782467914,
@@ -54,6 +70,7 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "fram": "fram",
+        "gaffer": "gaffer",
         "nixpkgs": "nixpkgs"
       }
     },

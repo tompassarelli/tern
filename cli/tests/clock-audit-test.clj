@@ -81,6 +81,19 @@
                       "{:tx 12, :op \"assert\", :l \"@S3\", :p \"start_time\", :r \"2026-06-10T13:50:00\", :ts \"2026-06-10T00:00:00Z\"}"
                       "{:tx 13, :op \"assert\", :l \"@S3\", :p \"end_time\", :r \"2026-06-10T14:10:00\", :ts \"2026-06-10T00:00:00Z\"}"]))
 
+;; Canonical split: thread ownership is coordination; clock sessions are telemetry.
+;; Fram infers telemetry.log only for this canonical coordination.log name.
+(def split-dir (str root "/split"))
+(fs/create-dirs split-dir)
+(def split-lines (str/split-lines (fixture
+  ["{:tx 11, :op \"assert\", :l \"@S3\", :p \"session_of\", :r \"@T1\", :ts \"2026-06-10T00:00:00Z\"}"
+   "{:tx 12, :op \"assert\", :l \"@S3\", :p \"start_time\", :r \"2026-06-10T13:50:00\", :ts \"2026-06-10T00:00:00Z\"}"
+   "{:tx 13, :op \"assert\", :l \"@S3\", :p \"end_time\", :r \"2026-06-10T14:10:00\", :ts \"2026-06-10T00:00:00Z\"}"])))
+(def coordination-log (str split-dir "/coordination.log"))
+(def telemetry-log (str split-dir "/telemetry.log"))
+(spit coordination-log (str/join "\n" (take 4 split-lines)))
+(spit telemetry-log (str/join "\n" (drop 4 split-lines)))
+
 (defn run [log]
   (let [r (p/shell {:out :string :err :string :continue true
                     :extra-env {"FRAM_LOG" log}}
@@ -102,6 +115,11 @@
   (check "exit 0 when all commits covered"         (= 0 exit))
   (check "reports 0 uncovered"                     (str/includes? out "uncovered  0"))
   (when (pos? @fails) (println "--- run2 output ---") (println out)))
+
+(let [{:keys [out exit]} (run coordination-log)]
+  (check "split corpus joins telemetry sessions to coordination owners" (= 0 exit))
+  (check "split corpus reports 0 uncovered" (str/includes? out "uncovered  0"))
+  (when (pos? @fails) (println "--- split output ---") (println out)))
 
 ;; cleanup
 (fs/delete-tree root)

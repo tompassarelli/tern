@@ -5,10 +5,17 @@
 #   north-clock-audit [--repo <path>]... [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--persist]
 # --persist writes ONE kind=clock_audit_run summary entity per run (drift telemetry);
 # without it NOTHING is written — safe for cron/CI that only wants the exit code.
-# FRAM_LOG defaults to the live north fact log (facts.log — the file `north clock`
-# writes; the older `claims.log` name in the brief is stale).
+# The canonical split corpus is selected automatically when coordination.log exists.
+# An explicit FRAM_LOG is left untouched (and therefore remains isolated unless its
+# caller also configures FRAM_TELEMETRY_LOG).
 set -euo pipefail
 NORTH="$(cd "$(dirname "$0")/.." && pwd)"
 FRAM="${FRAM_HOME:-$HOME/code/fram}"
-export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
+if [ -z "${FRAM_LOG:-}" ]; then
+  if [ -f "$HOME/.local/state/north/coordination.log" ]; then
+    export FRAM_LOG="$HOME/.local/state/north/coordination.log"
+  else
+    export FRAM_LOG="$HOME/.local/state/north/facts.log"
+  fi
+fi
 exec bb -cp "$NORTH/out:$FRAM/out" "$NORTH/cli/clock-audit.clj" "$@"

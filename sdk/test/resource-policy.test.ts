@@ -67,6 +67,11 @@ test("pressure becomes unknown after 24 hours while until overrides that TTL", (
     new Date("2026-07-21T00:00:00Z"))).toBe("unknown");
 });
 
+test("a future-dated observation cannot poison current pressure", () => {
+  expect(effectivePressure({ state: "exhausted", observedAt: "2099-01-01T00:00:00Z" },
+    new Date("2026-07-16T12:00:00Z"))).toBe("unknown");
+});
+
 test("NORTH_ROUTING_POLICY selects a file and environment values override it", () => {
   process.env.NORTH_ROUTING_POLICY = policyFile(complete);
   process.env.NORTH_ALLOCATION_MODE = "balanced";
