@@ -113,7 +113,7 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
         effort: resolved.effort,
         systemPrompt: `You are a north worker agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
       }),
-    });
+    }, requestedTier);
     const watched = withStallWatchdog((q as AsyncIterable<any>)[Symbol.asyncIterator](), {
       stallMs: window,
       onStall: (mins) => notifyStall(agentId, mins, { coordinator: coordHandle }),
@@ -199,6 +199,10 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
               requestedTier: process.env.AGENT_TIER,
               requestedModel: process.env.AGENT_MODEL,
               requestedEffort: process.env.AGENT_EFFORT,
+              allocationMode: routing.allocationMode,
+              entitlementPressure: routing.entitlementPressure,
+              fallbackCount: routing.fallbackCount,
+              fallbackPath: routing.fallbackPath,
               routingMetadata,
               durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome });
   console.log(`\n[dispatch] @${threadId} ${outcome === "died" ? "DIED" : "complete"}`);

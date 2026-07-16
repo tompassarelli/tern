@@ -3,6 +3,7 @@ import { openaiProvider } from "./openai";
 import type { AgentProvider, ProviderId, ProviderPreference, RoutingDecision } from "./types";
 import type { AgentQuery } from "./types";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { resolveTier, type SemanticTier } from "./catalog";
 export { resourcePolicyFromEnv, selectProvider, selectProviderFromAvailability } from "../provider-routing";
 
 const providers: Record<ProviderId, AgentProvider> = {
@@ -12,7 +13,35 @@ const providers: Record<ProviderId, AgentProvider> = {
 
 export function providerFor(id: ProviderId): AgentProvider { return providers[id]; }
 
-const CAPACITY_ERROR = /quota|credit|rate.?limit|usage.?limit|billing|exhausted|429/i;
+const RETRYABLE_PROVIDER_ERROR = /usage.?limit|rate.?limit|quota|capacity|overload|exhausted|entitlement|auth(?:entication|orization)?|unauthorized|forbidden|log(?:ged)?\s?in|sign.?in|429|401|403/i;
+
+function replayablePrompt(prompt: string | AsyncIterable<any>): string | AsyncIterable<any> {
+  if (typeof prompt === "string") return prompt;
+  const source = prompt[Symbol.asyncIterator]();
+  const cache: any[] = [];
+  let done = false;
+  let pending: Promise<IteratorResult<any>> | undefined;
+  const readNext = async (): Promise<IteratorResult<any>> => {
+    if (done) return { done: true, value: undefined };
+    pending ??= source.next().finally(() => { pending = undefined; });
+    const item = await pending;
+    if (item.done) done = true;
+    else cache.push(item.value);
+    return item;
+  };
+  return {
+    async *[Symbol.asyncIterator]() {
+      let index = 0;
+      while (true) {
+        if (index < cache.length) { yield cache[index++]; continue; }
+        const item = await readNext();
+        if (item.done) return;
+        index++;
+        yield item.value;
+      }
+    },
+  };
+}
 
 // Automatic fallback is intentionally pre-side-effect only: if the primary has
 // emitted any event, North cannot prove that retrying is safe. A capacity/auth
@@ -20,8 +49,16 @@ const CAPACITY_ERROR = /quota|credit|rate.?limit|usage.?limit|billing|exhausted|
 export function routedQuery(
   decision: RoutingDecision,
   args: { prompt: string | AsyncIterable<any>; options: Options },
+  tier?: SemanticTier,
+  providerRegistry: Record<ProviderId, AgentProvider> = providers,
 ): AgentQuery {
   let active: AgentQuery | undefined;
+  const prompt = replayablePrompt(args.prompt);
+  const optionsFor = (provider: ProviderId): Options => {
+    if (provider === decision.fallbackPath[0]) return args.options;
+    const resolved = resolveTier(provider, tier);
+    return { ...args.options, model: resolved.model, effort: resolved.effort };
+  };
   return {
     interrupt: async () => { await active?.interrupt?.(); },
     setModel: async (model: string) => {
@@ -30,20 +67,29 @@ export function routedQuery(
     },
     async *[Symbol.asyncIterator]() {
       let emitted = 0;
-      try {
-        active = providerFor(decision.provider).query(args);
-        for await (const event of active as AsyncIterable<any>) { emitted++; yield event; }
-      } catch (err: any) {
-        const openai = decision.availability.find((x) => x.provider === "openai");
-        if (decision.requested === "auto" && decision.provider === "anthropic" && emitted === 0 &&
-            openai?.available && CAPACITY_ERROR.test(String(err?.message ?? err))) {
-          decision.provider = "openai";
-          decision.reason = `fallback before side effects: ${String(err?.message ?? err).slice(0, 160)}`;
-          active = providerFor("openai").query(args);
-          yield* active as AsyncIterable<any>;
+      while (true) {
+        try {
+          active = providerRegistry[decision.provider].query({
+            prompt,
+            options: optionsFor(decision.provider),
+          });
+          for await (const event of active as AsyncIterable<any>) { emitted++; yield event; }
           return;
+        } catch (err: any) {
+          const message = String(err?.message ?? err);
+          const fallback = decision.fallbackProviders[0];
+          if (decision.requested === "auto" && emitted === 0 && fallback && RETRYABLE_PROVIDER_ERROR.test(message)) {
+            decision.fallbackProviders.shift();
+            const previous = decision.provider;
+            decision.provider = fallback;
+            decision.entitlementPressure = decision.entitlementPressures[fallback] ?? "unknown";
+            decision.fallbackCount++;
+            decision.fallbackPath.push(fallback);
+            decision.reason = `fallback ${decision.fallbackCount} before side effects: ${previous} -> ${fallback}; ${message.slice(0, 160)}`;
+            continue;
+          }
+          throw err;
         }
-        throw err;
       }
     },
   };

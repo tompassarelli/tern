@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { routedQuery, selectProvider, selectProviderFromAvailability } from "../src/providers";
-import type { ProviderAvailability, ResourcePolicy } from "../src/providers/types";
+import type { AgentProvider, ProviderAvailability, ProviderId, ResourcePolicy } from "../src/providers/types";
 import { resolveTier } from "../src/providers/catalog";
 
 const saved = { disableA: process.env.NORTH_DISABLE_ANTHROPIC, disableO: process.env.NORTH_DISABLE_OPENAI, order: process.env.NORTH_PROVIDER_ORDER };
@@ -103,14 +103,129 @@ test("semantic tiers resolve independently per provider", () => {
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: undefined, effort: "xhigh" });
 });
 
-test("automatic fallback changes provider only on a pre-event capacity failure", async () => {
-  const decision: any = {
-    requested: "auto", provider: "anthropic", reason: "test",
-    availability: [{ provider: "anthropic", available: true, reason: "ready" }, { provider: "openai", available: false, reason: "disabled" }],
+function fakeProvider(id: ProviderId, query: AgentProvider["query"]): AgentProvider {
+  return { id, probe: () => ({ provider: id, available: true, reason: "ready" }), query };
+}
+
+async function eventsOf(query: AsyncIterable<any>): Promise<any[]> {
+  const events: any[] = [];
+  for await (const event of query) events.push(event);
+  return events;
+}
+
+test("automatic fallback routes Anthropic to OpenAI and re-resolves the same tier", async () => {
+  const decision = selectProviderFromAvailability("auto", available, policy(), "frontier");
+  const calls: Array<{ provider: ProviderId; args: any }> = [];
+  const prompt = "preserve this prompt";
+  const registry = {
+    anthropic: fakeProvider("anthropic", (args) => ({ async *[Symbol.asyncIterator]() {
+      calls.push({ provider: "anthropic", args });
+      throw new Error("subscription usage limit reached");
+    }})),
+    openai: fakeProvider("openai", (args) => ({ async *[Symbol.asyncIterator]() {
+      calls.push({ provider: "openai", args });
+      yield { type: "result", result: "ok" };
+    }})),
   };
-  const q = routedQuery(decision, { prompt: "x", options: {} as any });
-  // With no fallback provider, the original adapter error remains authoritative;
-  // this asserts the guard condition rather than invoking a live provider.
-  expect(decision.provider).toBe("anthropic");
-  expect(q[Symbol.asyncIterator]).toBeFunction();
+
+  expect(await eventsOf(routedQuery(decision, {
+    prompt, options: { model: "fable", effort: "high", systemPrompt: "keep system" } as any,
+  }, "frontier", registry))).toEqual([{ type: "result", result: "ok" }]);
+  expect(calls.map((call) => call.provider)).toEqual(["anthropic", "openai"]);
+  expect(calls[1].args.prompt).toBe(prompt);
+  expect(calls[1].args.options.systemPrompt).toBe("keep system");
+  expect(calls[1].args.options.model).toBeUndefined();
+  expect(calls[1].args.options.effort).toBe("xhigh");
+  expect(decision.provider).toBe("openai");
+  expect(decision.fallbackCount).toBe(1);
+  expect(decision.fallbackPath).toEqual(["anthropic", "openai"]);
+  expect(decision.reason).toContain("anthropic -> openai");
+});
+
+test("automatic fallback routes OpenAI to Anthropic and removes OpenAI dials", async () => {
+  const decision = selectProviderFromAvailability("auto", available,
+    policy({ providerOrder: ["openai", "anthropic"] }), "senior");
+  let fallbackArgs: any;
+  const registry = {
+    openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {
+      throw new Error("authentication required: please sign in");
+    }})),
+    anthropic: fakeProvider("anthropic", (args) => ({ async *[Symbol.asyncIterator]() {
+      fallbackArgs = args;
+      yield { type: "result", result: "ok" };
+    }})),
+  };
+
+  await eventsOf(routedQuery(decision, {
+    prompt: "x", options: { model: "gpt-5.6-sol", effort: "xhigh", systemPrompt: "system" } as any,
+  }, "senior", registry));
+  expect(fallbackArgs.options.model).toBe("opus");
+  expect(fallbackArgs.options.effort).toBe("high");
+  expect(fallbackArgs.options.systemPrompt).toBe("system");
+  expect(decision.fallbackPath).toEqual(["openai", "anthropic"]);
+});
+
+test("fallback replays a streaming prompt consumed by the failed provider", async () => {
+  const decision = selectProviderFromAvailability("auto", available, policy(), "standard");
+  const received: Record<string, string[]> = { anthropic: [], openai: [] };
+  const consumeOne = async (provider: ProviderId, prompt: string | AsyncIterable<any>) => {
+    if (typeof prompt === "string") return prompt;
+    const item = await prompt[Symbol.asyncIterator]().next();
+    received[provider].push(item.value.message.content);
+  };
+  const registry = {
+    anthropic: fakeProvider("anthropic", (args) => ({ async *[Symbol.asyncIterator]() {
+      await consumeOne("anthropic", args.prompt);
+      throw new Error("capacity unavailable");
+    }})),
+    openai: fakeProvider("openai", (args) => ({ async *[Symbol.asyncIterator]() {
+      await consumeOne("openai", args.prompt);
+      yield { type: "result", result: "ok" };
+    }})),
+  };
+  const prompt = { async *[Symbol.asyncIterator]() {
+    yield { type: "user", message: { content: "same payload" } };
+  }};
+
+  await eventsOf(routedQuery(decision, { prompt, options: {} as any }, "standard", registry));
+  expect(received).toEqual({ anthropic: ["same payload"], openai: ["same payload"] });
+});
+
+test("automatic routing never retries after the first emitted event", async () => {
+  const decision = selectProviderFromAvailability("auto", available, policy(), "standard");
+  let fallbackCalls = 0;
+  const registry = {
+    anthropic: fakeProvider("anthropic", () => ({ async *[Symbol.asyncIterator]() {
+      yield { type: "assistant", text: "observable" };
+      throw new Error("capacity exhausted");
+    }})),
+    openai: fakeProvider("openai", () => { fallbackCalls++; return { async *[Symbol.asyncIterator]() {} }; }),
+  };
+
+  const seen: any[] = [];
+  await expect(async () => {
+    for await (const event of routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry)) seen.push(event);
+  }).toThrow("capacity exhausted");
+  expect(seen).toHaveLength(1);
+  expect(fallbackCalls).toBe(0);
+  expect(decision.fallbackCount).toBe(0);
+  expect(decision.fallbackPath).toEqual(["anthropic"]);
+});
+
+test("an explicit provider never receives a fallback route", async () => {
+  const decision = selectProviderFromAvailability("anthropic", available, policy(), "standard");
+  let fallbackCalls = 0;
+  const registry = {
+    anthropic: fakeProvider("anthropic", () => ({ async *[Symbol.asyncIterator]() {
+      throw new Error("rate limit reached");
+    }})),
+    openai: fakeProvider("openai", () => { fallbackCalls++; return { async *[Symbol.asyncIterator]() {} }; }),
+  };
+
+  expect(decision.fallbackProviders).toEqual([]);
+  await expect(eventsOf(routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry)))
+    .rejects.toThrow("rate limit reached");
+  expect(fallbackCalls).toBe(0);
+  expect(decision.fallbackCount).toBe(0);
+  expect(decision.fallbackPath).toEqual(["anthropic"]);
 });

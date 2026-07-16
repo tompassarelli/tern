@@ -28,6 +28,10 @@ export interface RunRecord {
   requestedModel?: string;
   requestedEffort?: string;
   routingMetadata?: RoutingMetadata;
+  allocationMode?: string;
+  entitlementPressure?: string;
+  fallbackCount?: number;
+  fallbackPath?: string[];
   outcome: string; // "ran" | "error" | "budget_exceeded" | "budget_exhausted" | "struggle_ceiling"
   // escalate-not-kill (thread 019f1194-ca57) — present only on escalation-enabled runs.
   // Option A yields ONE @run row per spawn with an internal escalation chain, NOT one
@@ -61,6 +65,10 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (rec.requestedTier) facts.push(["requested_tier", rec.requestedTier]);
   if (rec.requestedModel) facts.push(["requested_model", rec.requestedModel]);
   if (rec.requestedEffort) facts.push(["requested_effort", rec.requestedEffort]);
+  if (rec.allocationMode) facts.push(["allocation_mode", rec.allocationMode]);
+  if (rec.entitlementPressure) facts.push(["entitlement_pressure", rec.entitlementPressure]);
+  if (rec.fallbackCount != null) facts.push(["fallback_count", String(rec.fallbackCount)]);
+  if (rec.fallbackPath?.length) facts.push(["fallback_path", rec.fallbackPath.join(" -> ")]);
   const metadata = rec.routingMetadata;
   if (metadata?.taskGrade) facts.push(["task_grade", metadata.taskGrade]);
   if (metadata?.topology) facts.push(["topology", metadata.topology]);

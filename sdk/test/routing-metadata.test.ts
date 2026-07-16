@@ -40,12 +40,18 @@ test("run telemetry records requested routing, composition, and outcome together
     thread: "(ad-hoc)", agent: "lane-1", tokens: 12, durationMs: 34, posture: "spawn", outcome: "ran",
     provider: "openai", model: "effective-model", effort: "high",
     requestedProvider: "auto", requestedTier: "frontier", requestedEffort: "max",
+    allocationMode: "reserved", entitlementPressure: "low", fallbackCount: 1,
+    fallbackPath: ["anthropic", "openai"],
     routingMetadata: { taskGrade: "research-grade", domainRequirements: ["computer-science"], topology: "worker",
       composition: { kind: "preset", id: "research-scientist", promotionCandidate: false } },
   }, "2026-07-16T00:00:00.000Z");
   expect(facts).toContainEqual(["outcome", "ran"]);
   expect(facts).toContainEqual(["requested_provider", "auto"]);
   expect(facts).toContainEqual(["requested_tier", "frontier"]);
+  expect(facts).toContainEqual(["allocation_mode", "reserved"]);
+  expect(facts).toContainEqual(["entitlement_pressure", "low"]);
+  expect(facts).toContainEqual(["fallback_count", "1"]);
+  expect(facts).toContainEqual(["fallback_path", "anthropic -> openai"]);
   expect(facts).toContainEqual(["task_grade", "research-grade"]);
   expect(facts).toContainEqual(["domain_requirement", "computer-science"]);
   expect(facts).toContainEqual(["topology", "worker"]);

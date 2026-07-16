@@ -91,7 +91,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   const escalations: Array<{ from: string; to: string; reason: string; atCost: number }> = [];
   const end = (oc: string) => { outcome = oc; try { ch.end(); } catch { /* already closed */ } };
 
-  const queryFn = opts.queryFn ?? ((args: any) => routedQuery(routing, args));
+  const queryFn = opts.queryFn ?? ((args: any) => routedQuery(routing, args, requestedTier));
   const q = queryFn({
     prompt: ch.stream(),
     options: harnessOptions({
@@ -254,6 +254,8 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     provider: routing.provider, providerReason: routing.reason,
     requestedProvider: requested.provider, requestedTier: requested.tier,
     requestedModel: requested.model, requestedEffort: requested.effort,
+    allocationMode: routing.allocationMode, entitlementPressure: routing.entitlementPressure,
+    fallbackCount: routing.fallbackCount, fallbackPath: routing.fallbackPath,
     routingMetadata,
     tokens: tokensOf(resultMsg), durationMs: resultMsg?.duration_ms ?? 0, outcome,
     costUsd: resultMsg?.total_cost_usd ?? runCost, numTurns: resultMsg?.num_turns ?? 0,

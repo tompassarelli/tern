@@ -40,4 +40,10 @@ export interface RoutingDecision {
   provider: ProviderId;
   reason: string;
   availability: ProviderAvailability[];
+  fallbackProviders: ProviderId[];
+  fallbackCount: number;
+  fallbackPath: ProviderId[];
+  allocationMode: AllocationMode;
+  entitlementPressure: EntitlementPressure;
+  entitlementPressures: Partial<Record<ProviderId, EntitlementPressure>>;
 }

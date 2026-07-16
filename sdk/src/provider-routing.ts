@@ -117,6 +117,12 @@ export function selectProviderFromAvailability(
       provider: requested,
       reason: `explicit provider; mode=${policy.mode}; pressure=${getPressure(requested)}`,
       availability,
+      fallbackProviders: [],
+      fallbackCount: 0,
+      fallbackPath: [requested],
+      allocationMode: policy.mode,
+      entitlementPressure: getPressure(requested),
+      entitlementPressures: policy.pressures,
     };
   }
 
@@ -160,6 +166,12 @@ export function selectProviderFromAvailability(
     provider: chosen,
     reason: `mode=${policy.mode}; pressure=${getPressure(chosen)}; ${detail}`,
     availability,
+    fallbackProviders: candidates.filter((id) => id !== chosen),
+    fallbackCount: 0,
+    fallbackPath: [chosen],
+    allocationMode: policy.mode,
+    entitlementPressure: getPressure(chosen),
+    entitlementPressures: policy.pressures,
   };
 }
 
