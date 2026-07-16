@@ -52,59 +52,85 @@ NORTH="$HOME/code/north/bin/north"
 # ---- python3 present? (parser needs it; fail-open otherwise)
 command -v python3 >/dev/null 2>&1 || exit 0
 
-# ---- Resolve the fram log. FRAM_LOG wins; else first existing of the brief's
-# documented default (claims.log) then the live name (facts.log). A default
-# pointing at a nonexistent file would make the backstop silently fail-open
-# forever, so we resolve to a log that actually exists.
-resolve_log() {
-  if [ -n "${FRAM_LOG:-}" ]; then printf '%s' "$FRAM_LOG"; return; fi
-  for c in "$HOME/.local/state/north/claims.log" "$HOME/.local/state/north/facts.log"; do
-    [ -r "$c" ] && { printf '%s' "$c"; return; }
-  done
-  printf '%s' "$HOME/.local/state/north/claims.log"        # documented default (may be absent)
-}
-LOG="$(resolve_log)"
-[ -r "$LOG" ] || exit 0                                    # unreadable log -> fail-open
+# ---- Resolve the canonical corpus. A split installation is ONE logical store:
+# thread ownership/Linear links live in coordination.log while clock sessions live
+# in telemetry.log. Reading either file alone can never answer the guard's join.
+# FRAM_LOG/FRAM_TELEMETRY_LOG remain the test/instance override; an explicit
+# coordination.log infers its sibling telemetry.log just like bin/north. The stale
+# pre-split facts.log is used only when no split corpus exists.
+LOGS=()
+if [ -n "${FRAM_LOG:-}" ]; then
+  LOGS+=("$FRAM_LOG")
+  if [ -n "${FRAM_TELEMETRY_LOG:-}" ]; then
+    LOGS+=("$FRAM_TELEMETRY_LOG")
+  elif [ "$(basename "$FRAM_LOG")" = "coordination.log" ] && [ -e "$(dirname "$FRAM_LOG")/telemetry.log" ]; then
+    LOGS+=("$(dirname "$FRAM_LOG")/telemetry.log")
+  fi
+elif [ -e "$HOME/.local/state/north/coordination.log" ]; then
+  LOGS+=("$HOME/.local/state/north/coordination.log")
+  [ -e "$HOME/.local/state/north/telemetry.log" ] && LOGS+=("$HOME/.local/state/north/telemetry.log")
+elif [ -r "$HOME/.local/state/north/facts.log" ]; then
+  LOGS+=("$HOME/.local/state/north/facts.log")
+fi
+[ "${#LOGS[@]}" -gt 0 ] || exit 0                           # no corpus -> fail-open
+for log in "${LOGS[@]}"; do [ -r "$log" ] || exit 0; done  # unreadable configured log -> fail-open
+
+# The ticket is useful only for the deny recipe, but resolve it before the fold so
+# the same current-state pass can locate its linked thread across the split corpus.
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+TICKET="$(printf '%s' "$BRANCH" | grep -oiE "${CLIENT}-[0-9]+" | head -1 | tr '[:lower:]' '[:upper:]' || true)"
 
 # ---- Parse the log for an open session owned by <client>.
 # Prints one of:  ALLOW  |  DENY\t<owners-open-csv>\t<n_open>  |  FAILOPEN
-DECISION="$(FRAM_LOG="$LOG" python3 - "$LOG" "$CLIENT" <<'PY' 2>/dev/null || printf 'FAILOPEN'
+DECISION="$(python3 - "$CLIENT" "$TICKET" "${LOGS[@]}" <<'PY' 2>/dev/null || printf 'FAILOPEN'
 import re, sys
-log, client = sys.argv[1], sys.argv[2]
+client, ticket, *logs = sys.argv[1:]
 # Flat EDN maps, one per line: {:tx N :op "assert" :l "@s" :p "pred" :r "val" ...}
+tx_re  = re.compile(r':tx\s+(\d+)')
 op_re = re.compile(r':op\s+"([^"]*)"')
 l_re  = re.compile(r':l\s+"([^"]*)"')
 p_re  = re.compile(r':p\s+"([^"]*)"')
 r_re  = re.compile(r':r\s+"([^"]*)"')     # only string-valued :r (session_of/times/owner all are)
-TRACK = {"session_of", "start_time", "end_time", "owner"}
-# Final state per (subject,predicate): last line in tx order wins (assert->value, retract->absent).
-state = {}
+TRACK = {"session_of", "start_time", "end_time", "owner", "linear"}
+# Gather tracked ops from BOTH files, then apply them in global tx order. Subjects
+# are kind-routed today, but the merge remains correct if a predicate migrates.
+events = []
 try:
-    with open(log, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if not ('session_of' in line or 'start_time' in line
-                    or 'end_time' in line or 'owner' in line):
-                continue
-            mp = p_re.search(line)
-            if not mp or mp.group(1) not in TRACK:
-                continue
-            ml, mo = l_re.search(line), op_re.search(line)
-            if not ml or not mo:
-                continue
-            subj, pred, op = ml.group(1), mp.group(1), mo.group(1)
-            mr = r_re.search(line)
-            val = mr.group(1) if mr else None
-            state[(subj, pred)] = (op, val)
+    for log in logs:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not any(p in line for p in TRACK):
+                    continue
+                mp = p_re.search(line)
+                if not mp or mp.group(1) not in TRACK:
+                    continue
+                ml, mo, mt = l_re.search(line), op_re.search(line), tx_re.search(line)
+                if not ml or not mo or not mt:
+                    continue
+                subj, pred, op, tx = ml.group(1), mp.group(1), mo.group(1), int(mt.group(1))
+                mr = r_re.search(line)
+                val = mr.group(1) if mr else None
+                events.append((tx, subj, pred, op, val))
 except OSError:
     print("FAILOPEN"); sys.exit(0)
 
+# Exact Fram singleton fold: assert supersedes; retract clears only when it names
+# the currently-live object. A later retract of an old value must not erase a
+# newer assertion.
+state = {}  # (subject,predicate) -> (value, assert-tx)
+for tx, subj, pred, op, val in sorted(events, key=lambda e: e[0]):
+    key = (subj, pred)
+    if op == "assert":
+        state[key] = (val, tx)
+    elif op == "retract" and state.get(key, (None,))[0] == val:
+        state.pop(key, None)
+
 def present(subj, pred):
-    v = state.get((subj, pred))
-    return v is not None and v[0] == "assert"
+    return (subj, pred) in state
 
 def value(subj, pred):
     v = state.get((subj, pred))
-    return v[1] if (v and v[0] == "assert") else None
+    return v[0] if v else None
 
 # Open sessions: session_of + start_time present, end_time NOT present.
 open_owners = []            # owners of every open session's thread (None if thread has no owner)
@@ -124,11 +150,16 @@ for (subj, pred) in list(state.keys()):
     if owner == client:
         allow = True
 
+linked = [(assert_tx, subj) for (subj, pred), (val, assert_tx) in state.items()
+          if pred == "linear" and val == ticket]
+linked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+ticket_thread = linked[0][1] if linked else ""
+
 if allow:
     print("ALLOW")
 else:
     owners = ",".join(sorted(set(open_owners))) if open_owners else ""
-    print("DENY\t%s\t%d" % (owners, len(open_owners)))
+    print("DENY\t%s\t%d\t%s" % (owners, len(open_owners), ticket_thread))
 PY
 )"
 
@@ -140,17 +171,13 @@ case "$DECISION" in
   *)        exit 0 ;;                                      # unknown shape -> fail-open
 esac
 
-# ---- REFUSE. Build the clock-in recipe: derive the Linear ticket from the
-# branch (<client>-NNN -> <CLIENT>-NNN, same trick as north-clock-guard.sh) and locate
-# its thread in the log if present.
+# ---- REFUSE. Build the clock-in recipe from the branch-derived Linear ticket
+# and the CURRENT folded split-corpus link found above.
 OPEN_OWNERS="$(printf '%s' "$DECISION" | cut -f2)"
 N_OPEN="$(printf '%s' "$DECISION" | cut -f3)"
-
-BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-TICKET="$(printf '%s' "$BRANCH" | grep -oiE "${CLIENT}-[0-9]+" | head -1 | tr '[:lower:]' '[:upper:]' || true)"
+TID="$(printf '%s' "$DECISION" | cut -f4)"
 
 if [ -n "$TICKET" ]; then
-  TID="$(sed -n "s/.*:l \"\(@[0-9a-f-]*\)\".*\"linear\".*\"$TICKET\".*/\1/p" "$LOG" 2>/dev/null | tail -1)"
   if [ -n "$TID" ]; then
     HINT="Thread for $TICKET exists — clock in:  $NORTH clock start ${TID#@}"
   else
