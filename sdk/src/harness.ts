@@ -24,7 +24,7 @@ const REPO = resolve(import.meta.dir, "../..");
 const ENGINE = `${REPO}/bin/north`;
 const MCP = `${REPO}/bin/north-mcp`;
 const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
-const PORT = process.env.NORTH_PORT ?? "7977";
+const northPort = () => process.env.NORTH_PORT ?? "7977";
 
 export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -76,7 +76,7 @@ export function peerCommandServer(self: string) {
         },
         async ({ to, op, args }) => {
           try {
-            const out = execFileSync("bb", [MSG_CLI, PORT, "send-cmd", self, to, op, ednArgs(args)], {
+            const out = execFileSync("bb", [MSG_CLI, northPort(), "send-cmd", self, to, op, ednArgs(args)], {
               encoding: "utf8",
             });
             return { content: [{ type: "text", text: `sent {:op :${op}} -> ${to}\n${out}`.trim() }] };
@@ -123,9 +123,11 @@ export interface HarnessOpts {
 // the concern protocol appended to the system prompt so it self-coordinates.
 function registerPresence(self: string): void {
   // fire-and-forget — coordination must never delay or break a spawn.
-  // PORT (the canonical :7977 log) — NOT a separate daemon: presence on :7978
+  // The canonical :7977 log — NOT a separate daemon: presence on :7978
   // stranded, invisible to concern/roster/board which all read :7977.
-  execFile("bb", [`${REPO}/cli/presence-cli.clj`, PORT, "register", self, process.cwd(), self], () => {});
+  // Resolve the port at dispatch time: Bun caches this module across test files,
+  // while each hermetic spawn test installs its own transport after import.
+  execFile("bb", [`${REPO}/cli/presence-cli.clj`, northPort(), "register", self, process.cwd(), self], () => {});
 }
 
 // SDK-lane presence heartbeat (F2). registerPresence writes the lease ONCE at
@@ -149,7 +151,7 @@ function renewPresence(self: string): void {
   // Best-effort + timeout-bounded: any failure is swallowed, never breaks the
   // tool call. On failure, roll the stamp back (only if no newer renew landed)
   // so the next tool call retries — same retry semantics as north-on-tooluse.
-  execFile("bb", [`${REPO}/cli/presence-cli.clj`, PORT, "renew", self], { timeout: 5000 }, (err) => {
+  execFile("bb", [`${REPO}/cli/presence-cli.clj`, northPort(), "renew", self], { timeout: 5000 }, (err) => {
     if (err && lastRenew.get(self) === now) lastRenew.set(self, prev);
   });
 }
