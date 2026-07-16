@@ -12,6 +12,7 @@ import { liveChildren, notifyEarlyExitChildren } from "./children";
 import { clockStart, clockFinalize } from "./clock";
 import { routedQuery, selectProvider, type ProviderPreference } from "./providers";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
+import { canonicalRole, routingMetadataFromEnv } from "./routing-metadata";
 
 const PLAN_TOOLS = ["Read", "Grep", "Glob", "Bash"];
 const EXEC_TOOLS = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
@@ -24,6 +25,8 @@ interface DispatchResult {
 }
 
 export async function dispatch(threadId: string): Promise<DispatchResult> {
+  const routingMetadata = routingMetadataFromEnv();
+  const role = canonicalRole(process.env.AGENT_ROLE);
   const facts = getThreadFacts(threadId);
   if (!facts.length) {
     throw new Error(`Thread @${threadId} not found or has no facts`);
@@ -188,8 +191,13 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
   // cost_usd fact this run records below (remaining() folds Σ over @run costs).
   recordRun({ thread: threadId, agent: agentId, tokens: tokensOf(resultMsg),
               model: resolved.model, effort: resolved.effort,
-              role: process.env.AGENT_ROLE,
+              role,
               provider: routing.provider, providerReason: routing.reason,
+              requestedProvider: process.env.AGENT_PROVIDER,
+              requestedTier: process.env.AGENT_TIER,
+              requestedModel: process.env.AGENT_MODEL,
+              requestedEffort: process.env.AGENT_EFFORT,
+              routingMetadata,
               durationMs: resultMsg?.duration_ms ?? 0, posture: postureLabel, outcome });
   console.log(`\n[dispatch] @${threadId} ${outcome === "died" ? "DIED" : "complete"}`);
   return { threadId, posture: postureLabel, result };

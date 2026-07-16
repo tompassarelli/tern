@@ -16,6 +16,7 @@ import { clockStart, clockFinalize } from "./clock";
 import { routedQuery, selectProvider, type ProviderPreference } from "./providers";
 import type { AgentQuery } from "./providers/types";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
+import { canonicalRole, routingMetadataFromEnv, validateRoutingMetadata, type RoutingMetadata } from "./routing-metadata";
 
 interface SpawnOptions {
   prompt: string;
@@ -34,12 +35,17 @@ interface SpawnOptions {
   coordinator?: string; // spawning coordinator handle -> gets a direct peer ping on death
   provider?: ProviderPreference;
   tier?: SemanticTier;
+  routingMetadata?: RoutingMetadata;
   queryFn?: (args: any) => AgentQuery; // injection seam for tests; bypasses provider selection
   // Known limitation: on escalate path the system prompt is built once at the starting tier,
   // so a mid-flight model change does not swap the model-delta block.
 }
 
 export async function spawn(opts: SpawnOptions): Promise<string> {
+  const requested = { provider: opts.provider ?? process.env.AGENT_PROVIDER, tier: opts.tier ?? process.env.AGENT_TIER,
+    model: opts.model ?? process.env.AGENT_MODEL, effort: opts.effort ?? process.env.AGENT_EFFORT };
+  const routingMetadata = opts.routingMetadata ? validateRoutingMetadata(opts.routingMetadata) : routingMetadataFromEnv();
+  opts.role = canonicalRole(opts.role ?? process.env.AGENT_ROLE);
   const agentId = opts.agentId ?? `lane-${Date.now().toString(36).slice(-8)}`;
   const stream = new StreamWriter(agentId);
   const routing = selectProvider(opts.provider);
@@ -48,7 +54,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   opts.effort = resolved.effort;
   writeAgentFacts(agentId, {
     kind: "lane",
-    role: opts.role ?? process.env.AGENT_ROLE,
+    role: opts.role,
     model: opts.model ?? process.env.AGENT_MODEL,
     effort: (opts.effort ?? process.env.AGENT_EFFORT) as string | undefined,
     repo: process.cwd().split("/").pop(),
@@ -243,8 +249,11 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     // mirrors the identity write so a bare AGENT_MODEL spawn is still attributed.
     model: rung().model ?? opts.model ?? process.env.AGENT_MODEL,
     effort: rung().effort ?? opts.effort ?? process.env.AGENT_EFFORT,
-    role: opts.role ?? process.env.AGENT_ROLE,
+    role: opts.role,
     provider: routing.provider, providerReason: routing.reason,
+    requestedProvider: requested.provider, requestedTier: requested.tier,
+    requestedModel: requested.model, requestedEffort: requested.effort,
+    routingMetadata,
     tokens: tokensOf(resultMsg), durationMs: resultMsg?.duration_ms ?? 0, outcome,
     costUsd: resultMsg?.total_cost_usd ?? runCost, numTurns: resultMsg?.num_turns ?? 0,
     errorCount: st.totalErrors, escalationTier: tier,
@@ -289,6 +298,7 @@ if (import.meta.main) {
     effort: process.env.AGENT_EFFORT as Effort | undefined,
     provider: process.env.AGENT_PROVIDER as ProviderPreference | undefined,
     tier: process.env.AGENT_TIER as SemanticTier | undefined,
+    routingMetadata: routingMetadataFromEnv(),
   })
     .then((result) => console.log(result))
     .catch((err) => {

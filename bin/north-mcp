@@ -102,6 +102,25 @@
 (def sdk-dir (str (.getParent (io/file (str here))) "/sdk/src"))
 (def bun "/run/current-system/sw/bin/bun")
 
+(def task-grade-values ["novice" "junior" "mid" "senior" "staff" "principal" "research-grade"])
+(def topology-values ["worker" "verifier" "orchestrator"])
+(def composition-schema
+  {:type "object"
+   :properties {:kind {:type "string" :enum ["preset" "bespoke"]}
+                :id {:type "string" :minLength 1}
+                :nearestPreset {:type "string" :minLength 1}
+                :bespokeReason {:type "string" :minLength 1}
+                :promotionCandidate {:type "boolean"}}
+   :required ["kind" "id"]
+   :allOf [{:if {:properties {:kind {:const "bespoke"}} :required ["kind"]}
+            :then {:required ["bespokeReason"]}}]
+   :additionalProperties false})
+(def routing-properties
+  {:taskGrade {:type "string" :enum task-grade-values :description "Real-world work grade; independent of model tier"}
+   :domainRequirements {:type "array" :items {:type "string" :minLength 1} :description "Domain expertise/context the lane must load"}
+   :topology {:type "string" :enum topology-values :description "Lane's coordination position"}
+   :composition composition-schema})
+
 (def sdk-tools
   [{:name "dispatch"
     :desc "Dispatch an agent for a thread (must exist — capture first). North derives posture and routes to an available provider. Returns the agent ID."
@@ -109,11 +128,15 @@
              :properties {:id {:type "string" :description "Thread ID to dispatch (e.g. 2026-06-27-193317)"}
                           :model {:type "string" :description "opus|sonnet|haiku|fable (default sonnet)"}
                           :effort {:type "string" :description "low|medium|high|xhigh (default high)"}
-                          :role {:type "string" :description "executor|implementer|integrator|designer|researcher"}
+                          :role {:type "string" :minLength 1 :description "Functional responsibility. Canonical presets include executor, implementer, integrator, designer, scout, and research-scientist; bespoke roles are allowed. researcher is a legacy alias for scout."}
                           :posture {:type "string" :description "explore|deliver|preserve"}
                           :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
                           :tier {:type "string" :enum ["economy" "standard" "senior" "frontier"] :description "Provider-neutral capability tier"}
-                          :coordinator {:type "string" :description "Caller's north id; the lane pings it on done/death + records a `coordinator` fact. Omit to inherit from AGENT_ID/NORTH_AGENT_ID env; pass explicitly from an interactive session."}}
+                          :coordinator {:type "string" :description "Caller's north id; the lane pings it on done/death + records a `coordinator` fact. Omit to inherit from AGENT_ID/NORTH_AGENT_ID env; pass explicitly from an interactive session."}
+                          :taskGrade (:taskGrade routing-properties)
+                          :domainRequirements (:domainRequirements routing-properties)
+                          :topology (:topology routing-properties)
+                          :composition (:composition routing-properties)}
              :required ["id"]}}
    {:name "spawn"
     :desc "Spawn an ad-hoc agent from a prompt (no thread needed; for thread work prefer capture+dispatch). Returns the agent ID."
@@ -121,12 +144,16 @@
              :properties {:prompt {:type "string" :description "The task prompt"}
                           :model {:type "string" :description "opus|sonnet|haiku|fable (default sonnet)"}
                           :effort {:type "string" :description "low|medium|high|xhigh (default high)"}
-                          :role {:type "string" :description "executor|implementer|integrator|designer|researcher"}
+                          :role {:type "string" :minLength 1 :description "Functional responsibility. Canonical presets include executor, implementer, integrator, designer, scout, and research-scientist; bespoke roles are allowed. researcher is a legacy alias for scout."}
                           :posture {:type "string" :description "explore|deliver|preserve"}
                           :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
                           :tier {:type "string" :enum ["economy" "standard" "senior" "frontier"] :description "Provider-neutral capability tier"}
                           :caveman {:type "string" :enum ["off" "lite" "full"] :description "Terse-output dial (default ambient AGENT_CAVEMAN)"}
-                          :coordinator {:type "string" :description "Caller's north id; see dispatch.coordinator"}}
+                          :coordinator {:type "string" :description "Caller's north id; see dispatch.coordinator"}
+                          :taskGrade (:taskGrade routing-properties)
+                          :domainRequirements (:domainRequirements routing-properties)
+                          :topology (:topology routing-properties)
+                          :composition (:composition routing-properties)}
              :required ["prompt"]}}])
 
 ;; Attribution (routing-overhaul PART 1): the spawned lane inherits AGENT_COORDINATOR
@@ -145,8 +172,28 @@
       (not-empty (get env "AGENT_ID"))
       (not-empty (System/getenv "NORTH_AGENT_ID"))))
 
+(defn invalid-routing [args]
+  (let [grade (get args "taskGrade") topology (get args "topology") role (get args "role")
+        domains (get args "domainRequirements") composition (get args "composition")]
+    (cond
+      (and role (or (not (string? role)) (str/blank? role))) "role must be a non-empty string"
+      (and grade (not (some #{grade} task-grade-values))) "invalid taskGrade"
+      (and topology (not (some #{topology} topology-values))) "invalid topology"
+      (and domains (or (not (sequential? domains)) (some #(or (not (string? %)) (str/blank? %)) domains))) "domainRequirements must contain non-empty strings"
+      (and composition (not (map? composition))) "composition must be an object"
+      (and composition (not (some #{(get composition "kind")} ["preset" "bespoke"]))) "invalid composition.kind"
+      (and composition (let [v (get composition "id")] (or (not (string? v)) (str/blank? v)))) "composition.id is required"
+      (and composition (contains? composition "nearestPreset")
+           (let [v (get composition "nearestPreset")] (or (not (string? v)) (str/blank? v)))) "composition.nearestPreset must be a non-empty string"
+      (and composition (contains? composition "promotionCandidate") (not (boolean? (get composition "promotionCandidate")))) "composition.promotionCandidate must be boolean"
+      (and (= "bespoke" (get composition "kind"))
+           (let [v (get composition "bespokeReason")] (or (not (string? v)) (str/blank? v)))) "bespoke composition requires bespokeReason"
+      :else nil)))
+
 (defn call-sdk [nm args]
-  (let [env (into {} (System/getenv))
+  (if-let [problem (invalid-routing args)]
+    {:content [{:type "text" :text problem}] :isError true}
+    (let [env (into {} (System/getenv))
         coordinator (resolve-coordinator env args)]
     (case nm
       "dispatch"
@@ -157,6 +204,10 @@
             posture (get args "posture")
             provider (get args "provider")
             tier (get args "tier")
+            task-grade (get args "taskGrade")
+            domains (get args "domainRequirements")
+            topology (get args "topology")
+            composition (get args "composition")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
                       model       (assoc "AGENT_MODEL" model)
@@ -165,6 +216,10 @@
                       posture     (assoc "AGENT_POSTURE" posture)
                       provider    (assoc "AGENT_PROVIDER" provider)
                       tier        (assoc "AGENT_TIER" tier)
+                      task-grade  (assoc "AGENT_TASK_GRADE" task-grade)
+                      domains     (assoc "AGENT_DOMAIN_REQUIREMENTS" (json/generate-string domains))
+                      topology    (assoc "AGENT_TOPOLOGY" topology)
+                      composition (assoc "AGENT_COMPOSITION" (json/generate-string composition))
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))]
           (.mkdirs (.getParentFile log))
@@ -184,6 +239,10 @@
             posture (get args "posture")
             provider (get args "provider")
             tier (get args "tier")
+            task-grade (get args "taskGrade")
+            domains (get args "domainRequirements")
+            topology (get args "topology")
+            composition (get args "composition")
             caveman (get args "caveman")
             agent-id (str "sdk-" (subs (str (java.util.UUID/randomUUID)) 0 8))
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
@@ -193,6 +252,10 @@
                       posture     (assoc "AGENT_POSTURE" posture)
                       provider    (assoc "AGENT_PROVIDER" provider)
                       tier        (assoc "AGENT_TIER" tier)
+                      task-grade  (assoc "AGENT_TASK_GRADE" task-grade)
+                      domains     (assoc "AGENT_DOMAIN_REQUIREMENTS" (json/generate-string domains))
+                      topology    (assoc "AGENT_TOPOLOGY" topology)
+                      composition (assoc "AGENT_COMPOSITION" (json/generate-string composition))
                       caveman     (assoc "AGENT_CAVEMAN" caveman)
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))]
@@ -203,7 +266,7 @@
                                             (when model (str " model=" model))
                                             (when coordinator (str " coordinator=" coordinator))
                                             "\nAgent is running in the background. "
-                                            "Watch via web client (:8088).")}]}))))
+                                            "Watch via web client (:8088).")}]})))))
 
 ;; `untell` is an accepted legacy alias for `retract` — route it to the same tool.
 (def tool-aliases {"untell" "retract"})
