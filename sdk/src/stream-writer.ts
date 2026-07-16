@@ -1,4 +1,4 @@
-import { appendFileSync, writeFileSync } from "fs";
+import { appendFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 
 // Resolved at CONSTRUCTION (not module load) so a NORTH_STREAM_DIR override applies
@@ -15,7 +15,12 @@ export class StreamWriter {
   private path: string;
 
   constructor(agentId: string) {
-    this.path = join(streamDir(), `agent-${agentId}.stream.jsonl`);
+    const dir = streamDir();
+    this.path = join(dir, `agent-${agentId}.stream.jsonl`);
+    // Fail-open on a missing stream dir: a spawn must never crash because its telemetry
+    // directory is absent (misconfigured NORTH_STREAM_DIR, or a dir reaped out from under
+    // a long run). recursive => no-op when it already exists (the production default).
+    mkdirSync(dir, { recursive: true });
     writeFileSync(this.path, "");
   }
 
