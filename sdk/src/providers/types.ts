@@ -2,6 +2,16 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
 export type ProviderId = "anthropic" | "openai";
 export type ProviderPreference = ProviderId | "auto";
+export type EntitlementPressure = "plenty" | "normal" | "low" | "exhausted" | "unknown";
+export type AllocationMode = "preferential" | "balanced" | "reserved";
+
+export interface ResourcePolicy {
+  mode: AllocationMode;
+  providerOrder: ProviderId[];
+  pressures: Partial<Record<ProviderId, EntitlementPressure>>;
+  weights?: Partial<Record<ProviderId, number>>;
+  reservedFrontierProvider?: ProviderId;
+}
 
 export interface ProviderAvailability {
   provider: ProviderId;

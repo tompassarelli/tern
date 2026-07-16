@@ -48,8 +48,9 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   opts.role = canonicalRole(opts.role ?? process.env.AGENT_ROLE);
   const agentId = opts.agentId ?? `lane-${Date.now().toString(36).slice(-8)}`;
   const stream = new StreamWriter(agentId);
-  const routing = selectProvider(opts.provider);
-  const resolved = resolveTier(routing.provider, opts.tier ?? process.env.AGENT_TIER as SemanticTier | undefined, opts.model, opts.effort);
+  const requestedTier = opts.tier ?? process.env.AGENT_TIER as SemanticTier | undefined;
+  const routing = selectProvider(opts.provider, undefined, { tier: requestedTier, stableKey: agentId });
+  const resolved = resolveTier(routing.provider, requestedTier, opts.model, opts.effort);
   opts.model = resolved.model;
   opts.effort = resolved.effort;
   writeAgentFacts(agentId, {

@@ -3,7 +3,7 @@ import { openaiProvider } from "./openai";
 import type { AgentProvider, ProviderId, ProviderPreference, RoutingDecision } from "./types";
 import type { AgentQuery } from "./types";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
-export { selectProvider } from "../provider-routing";
+export { resourcePolicyFromEnv, selectProvider, selectProviderFromAvailability } from "../provider-routing";
 
 const providers: Record<ProviderId, AgentProvider> = {
   anthropic: anthropicProvider,
@@ -48,4 +48,4 @@ export function routedQuery(
     },
   };
 }
-export type { AgentProvider, ProviderId, ProviderPreference, RoutingDecision } from "./types";
+export type { AgentProvider, AllocationMode, EntitlementPressure, ProviderId, ProviderPreference, ResourcePolicy, RoutingDecision } from "./types";

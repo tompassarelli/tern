@@ -63,8 +63,10 @@ export async function dispatch(threadId: string): Promise<DispatchResult> {
     process.env.AGENT_ID ??
     `sdk-${threadId.replace(/[^a-z0-9]/gi, "").slice(-12)}`;
   const stream = new StreamWriter(agentId);
-  const routing = selectProvider(process.env.AGENT_PROVIDER as ProviderPreference | undefined);
-  const resolved = resolveTier(routing.provider, process.env.AGENT_TIER as SemanticTier | undefined,
+  const requestedTier = process.env.AGENT_TIER as SemanticTier | undefined;
+  const routing = selectProvider(process.env.AGENT_PROVIDER as ProviderPreference | undefined, undefined,
+    { tier: requestedTier, stableKey: agentId });
+  const resolved = resolveTier(routing.provider, requestedTier,
     process.env.AGENT_MODEL, process.env.AGENT_EFFORT as Effort | undefined);
 
   console.log(`[dispatch] @${threadId} — ${posture.title}`);
