@@ -38,6 +38,8 @@
 (defn committed [facts]
   (assoc facts "identity_manifest_sha256"
          (north.agent-provenance/manifest-sha256 facts)))
+(defn fold-observed [facts]
+  (reduce-kv north.agent-provenance/fold-fact {} facts))
 (def ready-facts (committed ready-base))
 
 (try
@@ -100,6 +102,57 @@
            (and (= :completed (:status startup))
                 (= "ran" (:outcome startup))
                 (>= @probes 2))))
+
+  (let [log (temp-file "terminal-publication-race.log")
+        process (north.spawn-process/launch-detached! ["sleep" "10"] base-env log)
+        probes (atom 0)
+        partial (assoc ready-facts
+                       "process_outcome" "ran"
+                       "delivery_outcome" "unverified"
+                       "delivery_reason" "provider_terminal_success_without_external_verification"
+                       "outcome" "ran")
+        complete (assoc partial "terminal_manifest_sha256"
+                        (north.terminal-projection/terminal-manifest-sha256 partial))
+        startup (north.spawn-process/await-startup
+                 process "lane-terminal-publication-race" log
+                 (fn [_] (if (< (swap! probes inc) 4) partial complete))
+                 (constantly false)
+                 :timeout-ms 1000 :poll-ms 10)]
+    (check "partial new terminal publication cannot win the startup race"
+           (and (= :completed (:status startup))
+                (= "ran" (:outcome startup))
+                (>= @probes 4)))
+    (north.spawn-process/stop-process! process))
+
+  (let [log (temp-file "partial-terminal-exit.log")
+        process (north.spawn-process/launch-detached! ["bash" "-c" "exit 0"] base-env log)
+        _ @process
+        partial (assoc ready-facts "process_outcome" "ran" "outcome" "ran")
+        startup (north.spawn-process/await-startup
+                 process "lane-partial-terminal-exit" log
+                 (constantly partial) (constantly false)
+                 :timeout-ms 1000 :poll-ms 10 :exit-grace-ms 50)]
+    (check "process_outcome plus legacy alias without terminal marker stays partial"
+           (= :failed (:status startup))))
+
+  (let [log (temp-file "conflicting-terminal-exit.log")
+        terminal {"outcome" "ran"
+                  "process_outcome" "ran"
+                  "delivery_outcome" "unverified"
+                  "delivery_reason" "provider_terminal_success_without_external_verification"}
+        complete (merge ready-facts terminal
+                        {"terminal_manifest_sha256"
+                         (north.terminal-projection/terminal-manifest-sha256 terminal)})
+        conflicted (north.agent-provenance/fold-fact
+                    (fold-observed complete) "process_outcome" "died")
+        process (north.spawn-process/launch-detached! ["bash" "-c" "exit 0"] base-env log)
+        _ @process
+        startup (north.spawn-process/await-startup
+                 process "lane-conflicting-terminal-exit" log
+                 (constantly conflicted) (constantly false)
+                 :timeout-ms 1000 :poll-ms 10 :exit-grace-ms 50)]
+    (check "conflicting multi-valued terminal cannot acknowledge a completed startup"
+           (= :failed (:status startup))))
 
   (let [log (temp-file "failed.log")
         process (north.spawn-process/launch-detached!

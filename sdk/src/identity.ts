@@ -14,6 +14,8 @@ import { resolve } from "node:path";
 import {
   BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION,
 } from "./bespoke-contract";
+import type { ExecutionTerminal } from "./execution-outcome";
+import { classifyExecutionTerminal } from "./execution-outcome";
 export { bespokeContractFingerprint } from "./bespoke-contract";
 
 // NORTH_BIN override mirrors death.ts/clock.ts/children.ts/watchdog.ts, so the whole
@@ -152,14 +154,20 @@ export function agentRouteFacts(agentId: string, f: AgentIdentity): Array<[strin
   ];
 }
 
-function writeHarnessAgentOperation(operation: "publish" | "route" | "outcome", subject: string, value: string) {
+function writeHarnessAgentOperation(
+  operation: "publish" | "route" | "terminal",
+  subject: string,
+  value: string,
+) {
   if (process.env.NORTH_IDENTITY_TEST_REDIRECT === "1") {
     // Hermetic tests point NORTH_BIN at a tiny capture engine. Preserve the
     // ordinary fact-verb shape there so existing lifecycle assertions stay
     // readable, while every production publication goes through the scoped
     // readback/commit protocol below.
-    if (operation === "outcome") {
-      execFileSync(northBin(), ["tell", subject, "outcome", value], { stdio: "ignore", timeout: 10_000 });
+    if (operation === "terminal") {
+      const facts = JSON.parse(value) as Record<string, string>;
+      for (const [predicate, factValue] of Object.entries(facts))
+        execFileSync(northBin(), ["tell", subject, predicate, factValue], { stdio: "ignore", timeout: 10_000 });
       return;
     }
     if (operation === "publish") {
@@ -236,23 +244,30 @@ export function updateAgentRoute(agentId: string, f: AgentIdentity): void {
   writeHarnessAgentOperation("route", `agent:${agentId}`, JSON.stringify(route));
 }
 
-// Terminal-outcome fact on the agent entity ITSELF (@agent:<id>). The reactor's
-// died-unreported sweep (cli/reap.clj reap-lane?) reaps a lane whose @agent outcome is
-// EMPTY and whose presence lapsed >30min. A lane that reaches its finalize KNOWS its
-// outcome, so writing it here is the exact line between a REPORTED terminal (any outcome —
-// ran/died/stalled/capped) and a SILENT hard-kill (finally never ran → no outcome anywhere
-// → correctly reaped). recordRun's @run write is async fire-and-forget and races process
-// exit, so it cannot carry liveness; this write is SYNCHRONOUS (execFileSync) + NORTH_BIN-
-// honoring like writeAgentFacts, so it lands before the process exits. Non-fatal by
-// design: a failed outcome write must never break the finalize (a lane with no outcome is
-// still correctly reaped — fail-safe).
-export function writeAgentOutcome(agentId: string, outcome: string): void {
-  if (!outcome) return;
+// Crash-safe terminal projection on @agent:<id>. The scoped writer publishes
+// process + delivery facts, verifies the exact projection, then lands
+// terminal_manifest_sha256 last. The reactor accepts a modern terminal only
+// through that marker; an interrupted publication therefore remains unresolved
+// and is safely reaped after the presence-lapse bar. recordRun is a secondary,
+// independently committed trail. This synchronous write remains non-fatal:
+// lifecycle finalization must not throw merely because the evidence sink failed.
+export function writeAgentTerminal(agentId: string, terminal: ExecutionTerminal): void {
+  if (!terminal.processOutcome) return;
   try {
-    writeHarnessAgentOperation("outcome", `agent:${agentId}`, outcome);
+    writeHarnessAgentOperation("terminal", `agent:${agentId}`, JSON.stringify({
+      outcome: terminal.processOutcome,
+      process_outcome: terminal.processOutcome,
+      delivery_outcome: terminal.deliveryOutcome,
+      delivery_reason: terminal.deliveryReason,
+    }));
   } catch {
-    // non-fatal; presence-lapse reap still catches a truly silent death
+    // Non-fatal; presence-lapse reap catches absent or torn terminal evidence.
   }
+}
+
+/** Compatibility wrapper for callers not yet carrying the delivery axis. */
+export function writeAgentOutcome(agentId: string, outcome: string): void {
+  writeAgentTerminal(agentId, classifyExecutionTerminal(outcome));
 }
 
 // First sentence (or first 100 chars) of a spawn prompt — the goal fact seed.

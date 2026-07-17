@@ -47,10 +47,23 @@ export function providerSupportsCapabilities(
   capabilities: readonly GafferCapability[] | undefined,
 ): boolean {
   if (!capabilities) return true;
-  if (provider === "anthropic") return true;
+  const fileRead = capabilities.includes("filesystem.read");
+  const fileSearch = capabilities.includes("filesystem.search");
+  const fileWrite = capabilities.includes("filesystem.write");
   const shell = capabilities.includes("shell");
   const readonlyShell = capabilities.includes("shell.readonly");
-  const fileWrite = capabilities.includes("filesystem.write");
+  // Both concrete shell surfaces can read and search the checkout, and the
+  // unrestricted shell can write it. Reject a bespoke set that omits those
+  // effective authorities instead of advertising a narrower boundary than the
+  // provider can actually enforce.
+  if ((shell || readonlyShell) && (!fileRead || !fileSearch)) return false;
+  if (shell && !fileWrite) return false;
+  if (provider === "anthropic") return true;
+  // Codex managed workers have an enforceable North MCP surface, but its native
+  // exec adapter cannot yet prove child receipt/reconciliation. Orchestrator
+  // authority therefore routes elsewhere instead of spending a turn and
+  // reporting a coordinator-shaped prompt as operational coordination.
+  if (capabilities.includes("coordination")) return false;
   // Codex exec always owns a shell surface. It can hard-sandbox that whole run
   // read-only, but cannot presently make only shell read-only while preserving
   // built-in file edits. Authority shapes outside those two modes route to an

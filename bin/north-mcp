@@ -179,7 +179,7 @@
 (def topology-values ["worker" "orchestrator"])
 (def tier-values ["economy" "standard" "senior" "frontier"])
 (def reasoning-values ["low" "medium" "high" "xhigh" "max"])
-(def posture-values ["explore" "deliver" "preserve"])
+(def posture-values ["explore" "evaluate" "deliver" "preserve"])
 (def role-id-pattern "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 (def capability-values
   (vec (or (get-in gaffer-staffing ["vocabulary" "capabilities"]) [])))

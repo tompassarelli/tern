@@ -1,11 +1,8 @@
 ;; reap_test.clj — the reactor's liveness-reap verdict (north.reap, split from
-;; north-reactor.clj so it is testable off in-memory facts). The bug this guards:
-;; recordRun (sdk/src/spawn.ts) lands a lane's `outcome` on @run-<id>-<ts> (with an
-;; `agent <id>` fact), NOT on @agent:<id> — so the old sweep, checking the lane's OWN
-;; outcome, read a clean-finishing lane as silent and reaped it (false positive on
-;; sdk-4890385a / sdk-76b1fa19). The fix joins through the agent fact; these cases pin
-;; both halves: a finished lane (outcome on @run) is NOT reaped, a truly-silent lane
-;; (lease lapsed >30min, no @run outcome, no agent_death) IS.
+;; north-reactor.clj so it is testable off in-memory facts). A terminal is usable
+;; only after its publication marker: terminal_manifest_sha256 for a modern lane
+;; and kind=run for a run. These cases pin both markers, the legacy lane boundary,
+;; and the genuinely silent lane that should be reaped.
 ;;   bb reap_test.clj      (run from the repo root; no daemon, no classpath needed)
 (load-file "cli/reap.clj")
 
@@ -18,47 +15,77 @@
 (def old-spawn  (- now (* 3 60 60 1000)))     ; spawned 3h ago  -> leaseless-dead
 (def new-spawn  (- now (* 2 60 1000)))        ; spawned 2min ago -> leaseless too new
 
-;; reap-lane? [now lane-outcome resolved? lease-exp spawned-ms]
-(defn resolved? [h touts deaths] (north.reap/lane-resolved? h touts deaths))
+;; reap-lane? [now resolved? lease-exp spawned-ms]
+(def modern-terminal
+  {"outcome" "ran"
+   "process_outcome" "ran"
+   "delivery_outcome" "unverified"
+   "delivery_reason" "provider_terminal_success_without_external_verification"})
+(def marked-terminal
+  (assoc modern-terminal "terminal_manifest_sha256"
+         (north.terminal-projection/terminal-manifest-sha256 modern-terminal)))
+(def partial-run
+  {"agent" "sdk-run" "outcome" "ran" "process_outcome" "ran"})
+(def committed-run (assoc partial-run "kind" "run"))
+
+(defn resolved? [h lane runs]
+  (north.reap/lane-resolved? h lane runs))
 (defn reap? [& args] (apply north.reap/reap-lane? args))
 
 (def cases
-  [;; --- the false-positive gate: finished lane (outcome on @run) NEVER reaped -----
-   ["finished lane (outcome=ran on @run), lease lapsed => NOT reaped"
-    (reap? now [] (resolved? "sdk-a" [["ran"]] []) lapsed-exp nil)                 false]
+  [;; --- crash-safe publication boundaries ---------------------------------------
+   ["terminal digest canonical encoding is stable across runtimes"
+    (= "9514cd8eaf6900c116c6c2ae68e7918f423e45bb187b97ae067ddf729f2d55cd"
+       (north.terminal-projection/terminal-manifest-sha256 modern-terminal))        true]
+   ["marked modern lane terminal resolves"
+    (resolved? "sdk-a" marked-terminal [])                                       true]
+   ["partial modern lane terminal does not fall back to its outcome alias"
+    (resolved? "sdk-a" modern-terminal [])                                       false]
+   ["a mismatched terminal digest is rejected"
+    (resolved? "sdk-a" (assoc marked-terminal "terminal_manifest_sha256" "bad") []) false]
+   ["true legacy lane outcome resolves only without process_outcome"
+    (resolved? "sdk-a" {"outcome" "ran"} [])                                     true]
+   ["committed kind=run fallback resolves"
+    (resolved? "sdk-run" {} [committed-run])                                     true]
+   ["partial run body without kind=run stays invisible"
+    (resolved? "sdk-run" {} [partial-run])                                       false]
+
    ;; --- the true-positive: truly-silent lane IS reaped ---------------------------
-   ["silent lane (lease lapsed >30min, no @run outcome, no death) => reaped"
-    (reap? now [] (resolved? "sdk-b" [[] []] []) lapsed-exp nil)                   true]
+   ["silent lane (lease lapsed >30min, no committed terminal) => reaped"
+    (reap? now (resolved? "sdk-b" {} []) lapsed-exp nil)                          true]
 
    ;; --- liveness axis ------------------------------------------------------------
    ["live lease => NOT reaped"
-    (reap? now [] false fresh-exp nil)                                            false]
+    (reap? now false fresh-exp nil)                                               false]
    ["expired lease but <30min lapse => NOT reaped (too new)"
-    (reap? now [] false recent-exp nil)                                           false]
+    (reap? now false recent-exp nil)                                              false]
 
    ;; --- leaseless-dead class (lease GC'd / never taken): judge by spawned_at ------
    ["no lease, spawned 3h ago, unresolved => reaped (vanished-lease dead)"
-    (reap? now [] (resolved? "sdk-c" [] []) nil old-spawn)                         true]
+    (reap? now (resolved? "sdk-c" {} []) nil old-spawn)                           true]
    ["no lease, spawned 2min ago => NOT reaped (too new)"
-    (reap? now [] false nil new-spawn)                                            false]
-   ["no lease, spawned 3h ago, but resolved via @run => NOT reaped"
-    (reap? now [] (resolved? "sdk-d" [["ran"]] []) nil old-spawn)                 false]
+    (reap? now false nil new-spawn)                                               false]
+   ["no lease, spawned 3h ago, but resolved via committed @run => NOT reaped"
+    (reap? now (resolved? "sdk-d" {} [committed-run]) nil old-spawn)              false]
    ["no lease AND no spawned_at => NOT reaped (no staleness axis)"
-    (reap? now [] false nil nil)                                                  false]
+    (reap? now false nil nil)                                                     false]
 
    ;; --- other terminal short-circuits --------------------------------------------
-   ["lane already carries its OWN outcome => NOT reaped"
-    (reap? now ["died-unreported"] false lapsed-exp nil)                          false]
-   ["agent_death names the lane => resolved => NOT reaped"
-    (reap? now [] (resolved? "sdk-e" [] ["sdk-e | SIGKILL | 2026-07-09"]) lapsed-exp nil) false]
+   ["legacy reactor terminal is still terminal"
+    (reap? now (resolved? "sdk-legacy" {"outcome" "died-unreported"} [])
+           lapsed-exp nil)                                                        false]
+   ["agent_death alone does not resolve a stale lane"
+    (reap? now (resolved? "sdk-e" {} []) lapsed-exp nil)                          true]
+   ["agent_death exact receipt suppresses only duplicate notification"
+    (north.reap/death-reported? "sdk-e" ["sdk-e | SIGKILL | 2026-07-09"])         true]
 
    ;; --- lane-resolved? join precision --------------------------------------------
-   ["resolved?: any tagged subject with a non-empty outcome => true"
-    (resolved? "sdk-f" [[] ["ran"]] [])                                           true]
-   ["resolved?: all tagged outcomes empty, no deaths => false"
-    (resolved? "sdk-g" [[] []] [])                                                false]
+   ["resolved?: unrelated tagged subjects without kind=run stay false"
+    (resolved? "sdk-f" {} [{"kind" "session" "outcome" "ran"}])                   false]
+   ["resolved?: empty lane and runs, no deaths => false"
+    (resolved? "sdk-g" {} [])                                                     false]
    ["resolved?: death line prefix must be exact (sdk-01 not matched by sdk-011)"
-    (resolved? "sdk-01" [] ["sdk-011 | boom | ts"])                               false]])
+    (north.reap/death-reported? "sdk-01" ["sdk-011 | boom | ts"])                 false]])
 
 (def fails (filter (fn [[_ got want]] (not= got want)) cases))
 (doseq [[nm got want] cases]

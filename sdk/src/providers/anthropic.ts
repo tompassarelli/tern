@@ -7,12 +7,29 @@ import { observeAnthropicQuery } from "./anthropic-observations";
 import { providerEnvironmentForTarget } from "../accounts";
 import { resolve } from "node:path";
 import { requireGafferCapabilities } from "../gaffer-capabilities";
+import {
+  admitExecution, admitPinnedProvider, consumeExecutionAdmission,
+  validateManagedExecutionEnvelope,
+} from "../execution-admission";
+import {
+  READONLY_SHELL_SERVER, READONLY_SHELL_TOOL,
+} from "../readonly-shell";
+import {
+  COORDINATION_TOOLS, hasCanonicalAuthoringHooks, managedToolPolicy,
+  NATIVE_AGENT_TOOLS, ORCHESTRATION_TOOLS,
+} from "../harness";
 
 // Selection already proved a CLI-owned first-party Claude.ai session, and the
 // target environment strips API-key, cloud, and alternate-endpoint transports.
 // Claude Code Agent SDK 0.3.195 reports `none` for that subscription flow even
 // though its current ApiKeySource declaration omits the runtime value.
 const SUBSCRIPTION_SAFE_API_KEY_SOURCES = new Set(["oauth", "none"]);
+
+function exactStrings(actual: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(actual)
+    && actual.length === expected.length
+    && actual.every((value, index) => value === expected[index]);
+}
 
 function normalizedAnthropicMessage(message: any): any {
   if (!message || typeof message !== "object") return message;
@@ -70,53 +87,155 @@ export function normalizeAnthropicQueryDiagnostics(source: AgentQuery): AgentQue
   };
 }
 
+function validateAnthropicHarness(options: any): ReturnType<typeof requireGafferCapabilities> | undefined {
+  if (!options || !("northCapabilities" in options)) return undefined;
+  const capabilities = requireGafferCapabilities(
+    options.northCapabilities, "northCapabilities",
+  );
+  validateManagedExecutionEnvelope("anthropic", capabilities, options);
+  admitPinnedProvider("anthropic", capabilities);
+  const policy = managedToolPolicy(capabilities);
+  if (!Array.isArray(options.settingSources) || options.settingSources.length !== 0)
+    throw new ProviderRetrySafeError("anthropic_setting_sources_must_be_isolated");
+  if (options.strictMcpConfig !== true)
+    throw new ProviderRetrySafeError("anthropic_strict_mcp_config_required");
+  const denied = new Set(options.disallowedTools ?? []);
+  const allowed = new Set(options.allowedTools ?? []);
+  const requireDenied = (tools: string[], capability: string) => {
+    if (tools.some((toolName) => !denied.has(toolName)))
+      throw new ProviderRetrySafeError(
+        `anthropic_adapter_did_not_enforce_absent_${capability}_capability`,
+      );
+  };
+  const requireAllowed = (tools: string[], capability: string) => {
+    if (tools.some((toolName) => !allowed.has(toolName)))
+      throw new ProviderRetrySafeError(
+        `anthropic_adapter_did_not_apply_${capability}_capability`,
+      );
+  };
+  requireDenied(NATIVE_AGENT_TOOLS, "native_agent");
+  requireAllowed(COORDINATION_TOOLS, "north");
+
+  const exactCapability = (present: boolean, tools: string[], capability: string) => {
+    if (present) requireAllowed(tools, capability);
+    else requireDenied(tools, capability);
+  };
+  exactCapability(capabilities.includes("filesystem.read"), ["Read"], "filesystem_read");
+  exactCapability(capabilities.includes("filesystem.search"), ["Grep", "Glob"], "filesystem_search");
+  exactCapability(
+    capabilities.includes("filesystem.write"),
+    ["Edit", "Write", "MultiEdit", "NotebookEdit"],
+    "filesystem_write",
+  );
+  exactCapability(capabilities.includes("web"), ["WebSearch", "WebFetch"], "web");
+
+  if (capabilities.includes("shell")) {
+    requireAllowed(["Bash"], "shell");
+    requireDenied([READONLY_SHELL_TOOL], "readonly_shell");
+  } else if (capabilities.includes("shell.readonly")) {
+    requireDenied(["Bash"], "shell");
+    requireAllowed([READONLY_SHELL_TOOL], "readonly_shell");
+  } else {
+    requireDenied(["Bash", READONLY_SHELL_TOOL], "shell");
+  }
+
+  const expectedMcpServers = [
+    "north",
+    ...(capabilities.includes("coordination") ? ["north-peer"] : []),
+    ...(capabilities.includes("shell.readonly") ? [READONLY_SHELL_SERVER] : []),
+  ];
+  if (capabilities.includes("coordination")) {
+    requireAllowed(ORCHESTRATION_TOOLS, "coordination");
+    const peer = options.mcpServers?.["north-peer"];
+    if (peer?.type !== "sdk" || peer.name !== "north-peer")
+      throw new ProviderRetrySafeError("anthropic_coordination_server_contract_missing");
+  } else {
+    requireDenied(ORCHESTRATION_TOOLS, "coordination");
+  }
+
+  const permissionMode = capabilities.includes("filesystem.write") ? "acceptEdits" : "default";
+  if (options.permissionMode !== permissionMode)
+    throw new ProviderRetrySafeError("anthropic_permission_mode_contract_missing");
+  if (capabilities.includes("shell.readonly")) {
+    const readonly = options.mcpServers?.[READONLY_SHELL_SERVER];
+    if (readonly?.type !== "sdk" || readonly.name !== READONLY_SHELL_SERVER) {
+      throw new ProviderRetrySafeError("anthropic_readonly_shell_contract_missing");
+    }
+  }
+  const actualMcpServers = Object.keys(options.mcpServers ?? {});
+  if (!exactStrings(actualMcpServers, expectedMcpServers))
+    throw new ProviderRetrySafeError("anthropic_mcp_server_surface_contract_missing");
+  if (!exactStrings(options.tools, policy.tools))
+    throw new ProviderRetrySafeError("anthropic_builtin_tool_surface_contract_missing");
+  if (!exactStrings(options.allowedTools, policy.allowedTools))
+    throw new ProviderRetrySafeError("anthropic_auto_approval_contract_missing");
+  if (!exactStrings(options.disallowedTools, policy.disallowedTools))
+    throw new ProviderRetrySafeError("anthropic_denied_tool_contract_missing");
+  if (!hasCanonicalAuthoringHooks(options))
+    throw new ProviderRetrySafeError("anthropic_authoring_guard_contract_missing");
+  return capabilities;
+}
+
+export async function admitAnthropic(options: any): Promise<void> {
+  const capabilities = validateAnthropicHarness(options);
+  if (!capabilities) return;
+  await admitExecution("anthropic", capabilities, resolve(options.cwd ?? process.cwd()), options);
+}
+
+function createAnthropicQuery(
+  args: Parameters<AgentProvider["query"]>[0],
+  admitted: boolean,
+): AgentQuery {
+  let source: AgentQuery | undefined;
+  let initialization: Promise<AgentQuery> | undefined;
+  const initialize = async (): Promise<AgentQuery> => {
+    if (source) return source;
+    initialization ??= (async () => {
+      if (admitted) validateAnthropicHarness(args.options);
+      else await admitAnthropic(args.options);
+      admitted = true;
+      const options = {
+        ...args.options,
+        env: providerEnvironmentForTarget("anthropic", args.target, { env: args.options.env }),
+      };
+      try {
+        source = observeAnthropicQuery(
+          normalizeAnthropicQueryDiagnostics(query({ prompt: args.prompt, options })),
+          { targetId: () => args.target?.id ?? "anthropic" },
+        );
+        return source;
+      } catch {
+        throw new Error("anthropic_provider_execution_failed");
+      }
+    })();
+    return initialization;
+  };
+  return {
+    interrupt: async () => { await (await initialize()).interrupt?.(); },
+    setModel: async (model) => { await (await initialize()).setModel?.(model); },
+    applyFlagSettings: async (settings) => {
+      await (await initialize()).applyFlagSettings?.(settings);
+    },
+    supportsInFlightEscalation: () => source
+      ? Boolean(source.setModel && source.applyFlagSettings
+        && (source.supportsInFlightEscalation?.() ?? true))
+      : true,
+    async *[Symbol.asyncIterator]() {
+      for await (const message of await initialize()) yield message;
+    },
+  };
+}
+
 export const anthropicProvider: AgentProvider = {
   id: "anthropic",
   probe(target): ProviderAvailability {
     return probeAnthropic(target);
   },
+  admit: ({ options }) => admitAnthropic(options),
   query(args) {
-    if (args.options && "northCapabilities" in args.options) {
-      const capabilities = requireGafferCapabilities(
-        (args.options as any).northCapabilities, "northCapabilities",
-      );
-      const denied = new Set(args.options.disallowedTools ?? []);
-      const requireDenied = (tools: string[], capability: string) => {
-        if (tools.some((toolName) => !denied.has(toolName)))
-          throw new ProviderRetrySafeError(
-            `anthropic_adapter_did_not_enforce_absent_${capability}_capability`,
-          );
-      };
-      if (!capabilities.includes("filesystem.write"))
-        requireDenied(["Edit", "Write", "MultiEdit", "NotebookEdit"], "filesystem_write");
-      if (!capabilities.includes("shell") && !capabilities.includes("shell.readonly"))
-        requireDenied(["Bash"], "shell");
-      if (!capabilities.includes("web"))
-        requireDenied(["WebSearch", "WebFetch"], "web");
-      if (!capabilities.includes("coordination"))
-        requireDenied(["mcp__north__spawn", "mcp__north__dispatch", "mcp__north-peer__command_peer"], "coordination");
-      if (capabilities.includes("shell.readonly")) {
-        const sandbox = args.options.sandbox;
-        const cwd = resolve(args.options.cwd ?? process.cwd());
-        if (sandbox?.enabled !== true || sandbox.failIfUnavailable !== true
-            || sandbox.allowUnsandboxedCommands !== false
-            || !sandbox.filesystem?.denyWrite?.map((path) => resolve(path)).includes(cwd)) {
-          throw new ProviderRetrySafeError("anthropic_readonly_sandbox_contract_missing");
-        }
-      }
-    }
-    const options = {
-      ...args.options,
-      env: providerEnvironmentForTarget("anthropic", args.target, { env: args.options.env }),
-    };
-    try {
-      // The SDK exposes no typed proof that a failed request was never accepted,
-      // so diagnostics are redacted without manufacturing retry safety.
-      return observeAnthropicQuery(normalizeAnthropicQueryDiagnostics(query({ prompt: args.prompt, options })), {
-        targetId: () => args.target?.id ?? "anthropic",
-      });
-    } catch {
-      throw new Error("anthropic_provider_execution_failed");
-    }
+    const admitted = consumeExecutionAdmission("anthropic", args.options);
+    // Direct adapter callers are admitted lazily before SDK query construction;
+    // routedQuery carries a one-use receipt from the same full preflight.
+    return createAnthropicQuery(args, admitted);
   },
 };

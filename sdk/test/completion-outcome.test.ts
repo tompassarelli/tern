@@ -1,9 +1,7 @@
-// Reaper false-positive fix (thread 019f6af0-ba69): a lane that finishes must record its
-// terminal outcome ON the lane entity (@agent:<id>), SYNCHRONOUSLY, before the process
-// exits. Without it the reactor's presence-lapse sweep (cli/reap.clj reap-lane?) sees an
-// EMPTY @agent outcome + a lapsed lease and reaps a COMPLETED lane as died-unreported —
-// observed on ~400/410 lanes. recordRun's @run write is async fire-and-forget and cannot
-// carry liveness (it races exit and needs a join the sweep must not depend on).
+// Reaper false-positive fix (thread 019f6af0-ba69): a finishing lane publishes
+// its process/delivery terminal on @agent:<id> synchronously. Production commits
+// that projection with a digest marker; the capture fake below asserts its body.
+// A committed kind=run row is only a secondary trail.
 //
 // Hermetic: a fake `north` on PATH + NORTH_BIN captures every tell to a temp log; the
 // injected queryFn owns the whole SDK boundary, so no live coordinator / network / model.
@@ -12,6 +10,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { ProviderRetrySafeError } from "../src/providers";
 
 let dir: string;
 let log: string;
@@ -101,10 +100,14 @@ test("a clean-finishing lane records outcome=ran ON the lane entity (@agent:<id>
 
   expect(existsSync(log)).toBe(true);
   const logged = readFileSync(log, "utf8");
-  // The load-bearing assertion: the terminal outcome landed on the LANE entity itself, via
-  // the NORTH_BIN-honoring sync write. This is exactly what reap-lane?'s empty-outcome
-  // guard reads to keep a completed lane out of the died-unreported sweep.
+  // The terminal body lands on the lane via the NORTH_BIN-honoring sync write.
+  // Coordinator integration separately proves the production digest marker.
   expect(logged).toContain("tell agent:test-done-ok outcome ran");
+  expect(logged).toContain("tell agent:test-done-ok process_outcome ran");
+  expect(logged).toContain("tell agent:test-done-ok delivery_outcome unverified");
+  expect(logged).toContain(
+    "tell agent:test-done-ok delivery_reason provider_terminal_success_without_external_verification",
+  );
 });
 
 test("a lane that dies mid-stream records outcome=died ON the lane entity (reported, not silent)", async () => {
@@ -112,8 +115,8 @@ test("a lane that dies mid-stream records outcome=died ON the lane entity (repor
 
   // The SDK subprocess dies mid-turn (real exitError shape). The finally path runs, so this
   // is a REPORTED death: outcome=died on @agent:<id> alongside the agent_death fact. The
-  // reactor then skips it — died-unreported is reserved for a hard-kill where the finally
-  // never runs and NO outcome lands anywhere.
+  // reactor then skips its committed terminal — died-unreported is reserved for
+  // a hard-kill (or torn publication) with no committed terminal evidence.
   const dyingQuery: any = () =>
     (async function* () {
       yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "starting" }] } };
@@ -124,6 +127,8 @@ test("a lane that dies mid-stream records outcome=died ON the lane entity (repor
 
   const logged = readFileSync(log, "utf8");
   expect(logged).toContain("tell agent:test-done-died outcome died");
+  expect(logged).toContain("tell agent:test-done-died process_outcome died");
+  expect(logged).toContain("tell agent:test-done-died delivery_outcome blocked");
   expect(logged).toContain("tell @swarm agent_death"); // death path still fires
 });
 
@@ -190,6 +195,137 @@ test("repeated Anthropic terminals record ambiguity without a selected or summed
   expect(lines.some((line) => / (tokens|input_tokens|output_tokens) /.test(line))).toBe(false);
 });
 
+test("an empty spawn provider stream is a blocked provider error, never ran", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+
+  const result = await spawn({
+    prompt: "provider stream closes without a terminal", agentId: "test-empty-spawn",
+    role: "integrator",
+    queryFn: () => (async function* () {})(),
+  });
+
+  expect(result).toBe("");
+  const lines = await settledRunLines("test-empty-spawn");
+  expect(lines.some((line) => line.endsWith(" process_outcome provider_error"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" delivery_outcome blocked"))).toBe(true);
+});
+
+test("an empty dispatch provider stream is a blocked provider error, never ran", async () => {
+  const { dispatch } = await import("../src/dispatch");
+  writeFileSync(log, "");
+
+  const result = await dispatch("test-empty-dispatch", {
+    agentId: "test-empty-dispatch-agent",
+    routingMetadata: { role: "integrator" },
+    claimDriver: (() => ({ release() {} })) as any,
+    queryFn: () => (async function* () {})() as any,
+    loadThreadFacts: () => [
+      { predicate: "title", value: "Empty provider dispatch" },
+      { predicate: "planned", value: "true" },
+      { predicate: "atomic", value: "true" },
+    ],
+    loadChildren: () => [],
+  });
+
+  expect(result.result).toBe("");
+  const lines = await settledRunLines(
+    "test-empty-dispatch-agent", "applied_domain_requirement_count 0",
+  );
+  expect(lines.some((line) => line.endsWith(" process_outcome provider_error"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" delivery_outcome blocked"))).toBe(true);
+});
+
+test("spawn keeps omitted, reported-zero, and preflight-zero turn evidence distinct", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+
+  const terminal = (numTurns?: number) => () => (async function* () {
+    yield {
+      type: "result", subtype: "success", result: "done", duration_ms: 1,
+      ...(numTurns === undefined ? {} : { num_turns: numTurns }),
+    };
+  })();
+
+  await spawn({
+    prompt: "provider omits turn count", agentId: "test-turns-omitted",
+    role: "integrator", queryFn: terminal(),
+  });
+  const omitted = await settledRunLines("test-turns-omitted");
+  expect(omitted.some((line) => line.includes(" num_turns "))).toBe(false);
+
+  await spawn({
+    prompt: "provider reports zero turns", agentId: "test-turns-reported-zero",
+    role: "integrator", queryFn: terminal(0),
+  });
+  const reportedZero = await settledRunLines("test-turns-reported-zero");
+  expect(reportedZero.some((line) => line.endsWith(" num_turns 0"))).toBe(true);
+
+  await spawn({
+    prompt: "preflight blocks before provider acceptance", agentId: "test-turns-preflight-zero",
+    role: "integrator",
+    queryFn: () => { throw new ProviderRetrySafeError("test_retry_safe_preflight"); },
+  });
+  const preflightZero = await settledRunLines("test-turns-preflight-zero");
+  expect(preflightZero.some((line) => line.endsWith(" process_outcome blocked_preflight"))).toBe(true);
+  expect(preflightZero.some((line) => line.endsWith(" num_turns 0"))).toBe(true);
+});
+
+test("dispatch keeps omitted, reported-zero, and preflight-zero turn evidence distinct", async () => {
+  const { dispatch } = await import("../src/dispatch");
+  writeFileSync(log, "");
+
+  const terminal = (numTurns?: number) => () => (async function* () {
+    yield {
+      type: "result", subtype: "success", result: "done", duration_ms: 1,
+      ...(numTurns === undefined ? {} : { num_turns: numTurns }),
+    };
+  })();
+  const dependencies = (agentId: string, queryFn: any) => ({
+    agentId,
+    routingMetadata: { role: "integrator" },
+    claimDriver: (() => ({ release() {} })) as any,
+    queryFn,
+    loadThreadFacts: () => [
+      { predicate: "title", value: `Turn evidence for ${agentId}` },
+      { predicate: "planned", value: "true" },
+      { predicate: "atomic", value: "true" },
+    ],
+    loadChildren: () => [],
+  });
+
+  await dispatch(
+    "test-dispatch-turns-omitted",
+    dependencies("test-dispatch-turns-omitted-agent", terminal()),
+  );
+  const omitted = await settledRunLines(
+    "test-dispatch-turns-omitted-agent", "applied_domain_requirement_count 0",
+  );
+  expect(omitted.some((line) => line.includes(" num_turns "))).toBe(false);
+
+  await dispatch(
+    "test-dispatch-turns-reported-zero",
+    dependencies("test-dispatch-turns-reported-zero-agent", terminal(0)),
+  );
+  const reportedZero = await settledRunLines(
+    "test-dispatch-turns-reported-zero-agent", "num_turns 0",
+  );
+  expect(reportedZero.some((line) => line.endsWith(" num_turns 0"))).toBe(true);
+
+  await dispatch(
+    "test-dispatch-turns-preflight-zero",
+    dependencies(
+      "test-dispatch-turns-preflight-zero-agent",
+      () => { throw new ProviderRetrySafeError("test_retry_safe_preflight"); },
+    ),
+  );
+  const preflightZero = await settledRunLines(
+    "test-dispatch-turns-preflight-zero-agent", "num_turns 0",
+  );
+  expect(preflightZero.some((line) => line.endsWith(" process_outcome blocked_preflight"))).toBe(true);
+  expect(preflightZero.some((line) => line.endsWith(" num_turns 0"))).toBe(true);
+});
+
 async function waitForLog(needle: string): Promise<string> {
   for (let i = 0; i < 100; i++) {
     const value = existsSync(log) ? readFileSync(log, "utf8") : "";
@@ -197,6 +333,23 @@ async function waitForLog(needle: string): Promise<string> {
     await Bun.sleep(10);
   }
   throw new Error(`timed out waiting for telemetry fact: ${needle}`);
+}
+
+async function settledRunLines(agent: string, requiredSuffix = "error_count 0"): Promise<string[]> {
+  const marker = `tell run-${agent}-`;
+  for (let i = 0, stable = 0, previous = ""; i < 100; i++) {
+    const lines = (existsSync(log) ? readFileSync(log, "utf8") : "")
+      .split("\n")
+      .filter((line) => line.includes(marker));
+    const snapshot = lines.slice().sort().join("\n");
+    const hasTailEvidence = lines.some((line) => line.endsWith(` ${requiredSuffix}`));
+    if (hasTailEvidence && snapshot === previous) stable++;
+    else stable = 0;
+    if (stable >= 5) return lines;
+    previous = snapshot;
+    await Bun.sleep(10);
+  }
+  throw new Error(`timed out waiting for settled run telemetry: ${agent}`);
 }
 
 test("public spawn composes justified explicit axes before Gaffer hydration", async () => {

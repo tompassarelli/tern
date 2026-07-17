@@ -11,6 +11,7 @@ import {
   applyHarnessRoute, harnessRouteSeed,
   type Effort, type HarnessCompositionEvidence,
 } from "../harness";
+import { markExecutionAdmission } from "../execution-admission";
 export {
   ProviderSelectionError, resourcePolicyFromEnv, selectProvider, selectProviderFromAvailability,
 } from "../provider-routing";
@@ -87,11 +88,14 @@ export function routedQuery(
     // applyHarnessRoute looks up immutable composition state by object identity;
     // start from the original harness object and overlay route capacity afterwards.
     const rebuilt = applyHarnessRoute(args.options, provider, resolved.model);
-    const options = {
-      ...rebuilt.options,
-      ...(rebuilt.options === args.options && resolved.model ? { model: resolved.model } : {}),
-      ...(resolved.effort ? { effort: resolved.effort } : {}),
-    } as Options;
+    // A managed route already received a fresh, authority-sealed object from
+    // applyHarnessRoute. Preserve that identity; only non-harness callers need
+    // a defensive clone here.
+    const options = (rebuilt.options === args.options
+      ? { ...rebuilt.options }
+      : rebuilt.options) as Options;
+    if (rebuilt.options === args.options && resolved.model) options.model = resolved.model;
+    if (resolved.effort) options.effort = resolved.effort;
     decision.resolvedModel = options.model ?? resolved.model;
     decision.resolvedEffort = options.effort;
     return { options, evidence: rebuilt.evidence };
@@ -124,8 +128,16 @@ export function routedQuery(
         try {
           const route = optionsFor(decision.provider);
           const options = route.options;
+          const provider = providerRegistry[decision.provider];
+          if (provider.admit) {
+            await provider.admit({
+              options,
+              target: decision.routingTargets[decision.target],
+            });
+            markExecutionAdmission(decision.provider, options);
+          }
           onRoute?.(decision, route.evidence);
-          active = providerRegistry[decision.provider].query({
+          active = provider.query({
             prompt,
             options,
             target: decision.routingTargets[decision.target],

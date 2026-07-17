@@ -44,11 +44,27 @@
 ;; the daemon's current global version (only swap!/retract! read it now — the base).
 (defn cur-ver [port] (:version (send-op port {:op :version})))
 
+;; A Fact is a string subject/predicate/object triple. Blank literal objects are
+;; intentional in a few contracts (empty message bodies and DONE payloads), so
+;; preserve explicit ""; nil is different — `(str nil)` used to turn an omitted
+;; CLI argument into a blank fact. Reject malformed shapes before any socket write.
+(defn- write-value! [te p r]
+  (when-not (and (string? te) (not (str/blank? te)))
+    (throw (ex-info "coord write requires a nonblank string subject"
+                    {:type :invalid-write :field :subject})))
+  (when-not (and (string? p) (not (str/blank? p)))
+    (throw (ex-info "coord write requires a nonblank string predicate"
+                    {:type :invalid-write :field :predicate})))
+  (when (nil? r)
+    (throw (ex-info "coord write requires a non-nil object; pass \"\" explicitly when blank is intended"
+                    {:type :invalid-write :field :object})))
+  (str r))
+
 ;; append! — MULTI cardinality: one wire op, NO base, NO retry. The engine appends
 ;; (rival/disjoint values coexist; an identical (te,p,r) is idempotent). The safe
 ;; coexist default. (str r) coerces defensively (callers already pass strings).
 (defn append! [port te p r]
-  (send-op port {:op :assert :te te :p p :r (str r)}))
+  (send-op port {:op :assert :te te :p p :r (write-value! te p r)}))
 
 ;; put! — SINGLE last-writer-wins: one wire op, NO base. For a pred the engine has
 ;; declared single this SUPERSEDES the prior live value (LWW). Wire-identical to
@@ -56,24 +72,26 @@
 ;; supersede, so the verb names the call site's INTENT. A no-base write is never
 ;; staleness-rejected (base-optional engine), which IS the LWW contract.
 (defn put! [port te p r]
-  (send-op port {:op :assert :te te :p p :r (str r)}))
+  (send-op port {:op :assert :te te :p p :r (write-value! te p r)}))
 
 ;; swap! — SINGLE compare-and-swap: the ONLY base+retry verb. Reads the base, writes
 ;; under it, retries on :reject (a concurrent write moved the base). Reserve for a
 ;; genuine read-modify-write race; near-zero production callers after move-C. 4 tries.
 (defn swap! [port te p r]
-  (loop [tries 4]
-    (let [res (send-op port {:op :assert :te te :p p :r (str r) :base (cur-ver port)})]
-      (if (and (:reject res) (pos? tries)) (recur (dec tries)) res))))
+  (let [rv (write-value! te p r)]
+    (loop [tries 4]
+      (let [res (send-op port {:op :assert :te te :p p :r rv :base (cur-ver port)})]
+        (if (and (:reject res) (pos? tries)) (recur (dec tries)) res)))))
 
 ;; thin migration alias — old assert! WAS the swap! CAS ritual; keep it pointing
 ;; there so any un-migrated caller is byte-for-byte unchanged.
 (def assert! swap!)
 
 (defn retract! [port te p r]
-  (loop [tries 4]
-    (let [res (send-op port {:op :retract :te te :p p :r (str r) :base (cur-ver port)})]
-      (if (and (:reject res) (pos? tries)) (recur (dec tries)) res))))
+  (let [rv (write-value! te p r)]
+    (loop [tries 4]
+      (let [res (send-op port {:op :retract :te te :p p :r rv :base (cur-ver port)})]
+        (if (and (:reject res) (pos? tries)) (recur (dec tries)) res)))))
 
 ;; single live value of (te,p)  (the resolved/one/rf variants collapse here).
 (defn resolved [port te p] (:value (send-op port {:op :resolved :te te :p p})))

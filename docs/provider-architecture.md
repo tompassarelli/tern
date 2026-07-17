@@ -220,6 +220,17 @@ subscription. Both receive the target-specific environment and shared North
 supervision. Live mid-run steering and model escalation remain capability-checked:
 unsupported escalation fails visibly rather than pretending it succeeded.
 
+Every managed provider turn preflights the canonical North MCP executable and a
+live coordinator, including terminal workers: missing North is a blocked
+preflight, never a degraded native run. The child identity and explicit topology
+must agree in both the provider environment and North MCP environment. Anthropic
+SDK runs do not inherit interactive global hooks, so `harnessOptions` seals its
+exact PreToolUse authoring-guard callbacks by object provenance; adapter
+admission rejects a copied, missing, or mutated guard chain before constructing
+the Claude query. Codex independently disables its native multi-agent surface
+and restricts worker-visible North tools from the canonical capability contract,
+not from optional Claude-shaped deny metadata.
+
 The escalation ladder is provider-local and projected from Gaffer's tier
 catalog at run admission. It contains concrete model IDs and declared
 reasoning levels only; repeated tier boundaries are deduplicated. North then

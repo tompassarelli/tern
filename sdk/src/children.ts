@@ -10,14 +10,14 @@
 // is a 30-minute-late signal. This fires it IMMEDIATELY, at the moment of exit, so the
 // coordinator learns "I am leaving children behind" now, loudly, with the ids named.
 //
-// A child is RESOLVED (not orphaned) if it carries a completion signal, mirroring the
-// reactor's join (north.reap): recordRun lands `outcome` on a @run-<h>-<ts> subject
-// (`agent <h>`), so a clean child's @agent:<id> outcome is usually empty — we must check
-// BOTH the child's own outcome fact AND any @run tagged with it. Everything here is
-// FAIL-OPEN: a query hiccup must never block or throw out of a finalizing lane.
+// A child is RESOLVED (not orphaned) only by a committed lifecycle signal:
+// a digest-marked modern lane terminal (or a true pre-process_outcome legacy
+// lane), or a tagged run whose last-write kind=run marker landed. Everything
+// here is FAIL-OPEN: a query hiccup must never block finalization.
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { getThreadFacts } from "./north-client";
+import { laneResolvedByFacts } from "./terminal-projection";
 
 const REPO = resolve(import.meta.dir, "..", "..");
 const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
@@ -66,39 +66,56 @@ function childrenOf(coordId: string): string[] {
   return queryCol(oneColRule("c", "?", "coordinator", coordId));
 }
 
+export function resolveChildLifecycle(
+  laneFacts: ReturnType<typeof getThreadFacts>,
+  readTaggedRuns: () => ReturnType<typeof getThreadFacts>[],
+): boolean {
+  if (laneResolvedByFacts(laneFacts, [])) return true;
+  return laneResolvedByFacts([], readTaggedRuns());
+}
+
 // Does this child (subject literal, e.g. "@agent:x") carry a completion signal?
 function childResolved(childSubject: string): boolean {
   const bare = childSubject.replace(/^@?agent:/, "");
-  // (a) the child's own outcome fact (reactor writes died-unreported here; a lane may
-  //     also carry an explicit terminal outcome).
-  try {
-    if (getThreadFacts(`agent:${bare}`).some((f) => f.predicate === "outcome")) return true;
-  } catch {
-    /* fall through to the run check */
-  }
-  // (b) a @run tagged with this agent that recorded an outcome (the normal clean path).
-  const runs = queryCol({
-    find: "r",
-    rules: [
-      {
-        head: { rel: "r", args: [{ var: "r" }] },
-        body: [
-          { rel: "triple", args: [{ var: "r" }, "agent", bare] },
-          { rel: "triple", args: [{ var: "r" }, "outcome", { var: "_o" }] },
-        ],
-      },
-    ],
+  const laneFacts = getThreadFacts(`agent:${bare}`);
+  return resolveChildLifecycle(laneFacts, () => {
+    // The kind predicate is the run writer's commit marker, so a subject
+    // carrying agent/outcome body facts but no kind is absent from this join.
+    const runs = queryCol({
+      find: "r",
+      rules: [
+        {
+          head: { rel: "r", args: [{ var: "r" }] },
+          body: [
+            { rel: "triple", args: [{ var: "r" }, "agent", bare] },
+            { rel: "triple", args: [{ var: "r" }, "kind", "run"] },
+          ],
+        },
+      ],
+    });
+    return runs.map((run) => getThreadFacts(run.replace(/^@/, "")));
   });
-  return runs.length > 0;
 }
 
 // Children of this lane that have NOT reported an outcome — the orphans left behind if
 // the lane exits now. Fail-open: any error yields [] (no false alarm).
+export function gatherLiveChildren(
+  coordId: string,
+  readChildren: (id: string) => string[],
+  resolved: (child: string) => boolean,
+): string[] {
+  try {
+    if (!coordId) return [];
+    const kids = readChildren(coordId);
+    if (!kids.length) return [];
+    return kids.filter((child) => !resolved(child));
+  } catch {
+    return [];
+  }
+}
+
 export function liveChildren(coordId: string): string[] {
-  if (!coordId) return [];
-  const kids = childrenOf(coordId);
-  if (!kids.length) return [];
-  return kids.filter((c) => !childResolved(c));
+  return gatherLiveChildren(coordId, childrenOf, childResolved);
 }
 
 export interface EarlyExitCtx {

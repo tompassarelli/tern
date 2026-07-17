@@ -14,6 +14,7 @@
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str])
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/agent-provenance.clj"))
+(load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/terminal-projection.clj"))
 (def send-op  north.coord/send-op)
 (def resolved north.coord/resolved)
 (def many     north.coord/many)
@@ -31,6 +32,9 @@
 (defn red [s] (c "31" s)) (defn ylw [s] (c "33" s)) (defn cyn [s] (c "36" s))
 
 (defn iso->ms [s] (try (.toEpochMilli (java.time.Instant/parse (str s))) (catch Exception _ nil)))
+(defn identity-route-detail [facts]
+  (str "model=" (or (get facts "model") "?")
+       " effort=" (or (get facts "effort") "?")))
 (defn ago [ms] (if (nil? ms) "?"
   (let [s (quot ms 1000)]
     (cond (< s 60) (str s "s") (< s 3600) (str (quot s 60) "m")
@@ -85,6 +89,31 @@
   (let [f (io/file AGENT-LOGDIR (str id ".log"))]
     (when (.exists f) {:path (.getPath f) :mtime (.lastModified f) :size (.length f)})))
 
+(defn execution-terminal-state
+  "Resolve execution truth without promoting a death notification into a
+  terminal. Any lane terminal evidence owns the decision: a partial/conflicting
+  modern projection or conflicting legacy outcome fails closed and cannot fall
+  through to a secondary run trail. A committed run remains the compatibility
+  fallback only when the lane carries no terminal body at all."
+  [facts last-run deaths]
+  (let [lane-evidence? (or (north.terminal-projection/fact-present?
+                            facts "process_outcome")
+                           (north.terminal-projection/fact-present? facts "outcome"))
+        lane-outcome (north.terminal-projection/terminal-process-outcome facts)
+        run-outcome (when (and (not lane-evidence?) (nil? lane-outcome))
+                      (:outcome last-run))
+        outcome (or lane-outcome run-outcome)]
+    {:outcome outcome
+     :source (cond lane-outcome :agent run-outcome :run :else nil)
+     :terminal? (boolean outcome)
+     :kind (cond
+             (= "ran" outcome) :ran
+             (= "died" outcome) :died
+             (= "died-unreported" outcome) :died-unreported
+             outcome :stopped
+             :else nil)
+     :death-notifications (count deaths)}))
+
 ;; ---- render one stage line ---------------------------------------------------
 (defn stage [n mark label detail cmd]
   (let [g (case mark :ok (grn "✓") :na (dim "·") :fail (red "✗"))]
@@ -127,13 +156,10 @@
             runs (agent-runs id)
             last-run (last runs)
             deaths (deaths-for id)
-            du (= "died-unreported" (get facts "outcome"))
-            terminal? (boolean (or last-run (seq deaths) du))
-            terminal-kind (cond du :died-unreported
-                                (seq deaths) :died
-                                (and last-run (= "ran" (:outcome last-run))) :ran
-                                (and last-run (not= "ran" (:outcome last-run))) :stopped
-                                :else nil)
+            terminal-state (execution-terminal-state facts last-run deaths)
+            terminal? (:terminal? terminal-state)
+            terminal-kind (:kind terminal-state)
+            execution-outcome (:outcome terminal-state)
             inbox (inbox-to id)]
         ;; header
         (println (str (bold "north trace ") (bold id) "  ·  :" PORT))
@@ -151,7 +177,7 @@
                          :else :na)
               provenance (north.agent-provenance/provenance-detail facts)
               detail (cond idfull (str "kind=" kind " role=" (get facts "role")
-                                       " model=" (get facts "model") "-" (or (get facts "effort") "?")
+                                       " " (identity-route-detail facts)
                                        " " (:label provenance)
                                        (when-let [co (get facts "coordinator")] (str " coord=" co)))
                            (= lineage :sdk-lane) (str "CORRUPT: " (str/join ", " identity-defects))
@@ -197,16 +223,25 @@
                         (if (pos? inbox) (str inbox " message(s) addressed to it") (dim "none sent"))
                         (str "bb " NORTH "/cli/msg-cli.clj " PORT " inbox " id)))
         ;; 6 COMPLETION / DEATH
-        (let [mark (cond (= terminal-kind :ran) :ok
-                         (nil? terminal-kind) (if online :na :fail)   ; not terminal + offline = missing signal
+        (let [death-notification (last deaths)
+              mark (cond (= terminal-kind :ran) :ok
+                         terminal-kind :fail
+                         death-notification :fail
+                         online :na
                          :else :fail)
               detail (case terminal-kind
                        :ran (str (grn "outcome=ran") (when last-run (str " " (ago (- NOW (:ms last-run))) " ago")))
-                       :died (str (red "agent_death") ": \"" (:reason (last deaths)) "\"")
+                       :died (str (red "outcome=died")
+                                  (when death-notification
+                                    (str " · notification: \"" (:reason death-notification) "\"")))
                        :died-unreported (red "outcome=died-unreported (reactor-reaped silent death)")
-                       :stopped (str (ylw (str "outcome=" (:outcome last-run))))
-                       (if online (dim "still running — no terminal signal yet")
-                           (red "NO completion/death signal (offline, unrecorded)")))]
+                       :stopped (str (ylw (str "outcome=" execution-outcome)))
+                       (cond
+                         death-notification
+                         (str (red "agent_death notification without committed terminal")
+                              ": \"" (:reason death-notification) "\"")
+                         online (dim "still running — no terminal signal yet")
+                         :else (red "NO committed completion terminal (offline, unrecorded)")))]
           (println (stage 6 mark "6 COMPLETION" detail "north show @swarm")))
         ;; 7 REAPING
         (let [stale-concern (first (filter #(and (= (:status %) "building")) concerns))
@@ -227,6 +262,9 @@
                 (str (red "F1 — API-death mid-lane.") " agent_death recorded. Remedy: re-dispatch the thread (idempotent); enable AGENT_ESCALATE=1 for chronic deaths; read the partial result first.")
                 (= terminal-kind :died-unreported)
                 (str (red "F3 — died with no self-reported signal; reactor reaped it (outcome=died-unreported).") " The lease/telemetry missed the death; trust the reactor verdict.")
+                (and (seq deaths) (not terminal?))
+                (str (red "F1/F3 — death notification received but execution remains unresolved.")
+                     " A notification is diagnostic only; require a committed lane terminal or committed run before treating the lane as finished.")
                 (and on-roster (not terminal?) (not online))
                 (str (red "F2/F3 — offline with NO completion signal.")
                      (if l " Lease lapsed but still present:" " Lease gone entirely (expired + reaped, or never leased):")
@@ -243,5 +281,8 @@
           (println (str (bold "verdict: ") verdict)))))
     (System/exit 0)))
 
-(try (-main (vec *command-line-args*))
-     (catch Throwable t (binding [*out* *err*] (println (str "north trace: " (.getMessage t)))) (System/exit 1)))
+(when-not (= "1" (System/getProperty "north.trace.lib"))
+  (try (-main (vec *command-line-args*))
+       (catch Throwable t
+         (binding [*out* *err*] (println (str "north trace: " (.getMessage t))))
+         (System/exit 1))))

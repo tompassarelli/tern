@@ -13,8 +13,8 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, relative, resolve, sep } from "node:path";
 import { resolveGuard, evaluateGuards } from "./authoring-guards";
 import { recordDenial } from "./guard-log";
 import { resolveModelAlias, resolveModelDelta } from "./providers/catalog";
@@ -28,6 +28,10 @@ import {
   bespokeContractFingerprint, canonicalGafferCapabilities,
 } from "./bespoke-contract";
 import { assertCoordinationAuthority } from "./topology-authority";
+import {
+  MAX_READONLY_COMMAND_BYTES, READONLY_SHELL_SERVER, READONLY_SHELL_TOOL, runReadonlyShell,
+} from "./readonly-shell";
+import { managedNorthMcpEnvironment } from "./execution-admission";
 
 // sdk/src/harness.ts -> repo root (~/code/north).
 const REPO = resolve(import.meta.dir, "../..");
@@ -151,7 +155,7 @@ export function peerCommandServer(self: string) {
 }
 
 // Coordination tools are universal; orchestration tools are positive authority.
-const COORDINATION_TOOLS = [
+export const COORDINATION_TOOLS = [
   "mcp__north__capture",
   "mcp__north__tell",
   "mcp__north__show",
@@ -160,22 +164,124 @@ const COORDINATION_TOOLS = [
   "mcp__north__board",
   "mcp__north__plate",
 ];
-const ORCHESTRATION_TOOLS = [
+export const ORCHESTRATION_TOOLS = [
   "mcp__north__dispatch",
   "mcp__north__spawn",
   "mcp__north-peer__command_peer",
 ];
-const NATIVE_AGENT_TOOLS = ["Agent", "Task", "Workflow"];
+export const NATIVE_AGENT_TOOLS = ["Agent", "Task", "Workflow"];
+export const NORTH_MCP_TOOL_NAMES = [
+  "ready",
+  "next",
+  "board",
+  "plate",
+  "blocked",
+  "agenda",
+  "leverage",
+  "needs_review",
+  "validate",
+  "show",
+  "capture",
+  "tell",
+  "retract",
+  "clock_start",
+  "clock_stop",
+  "clock_status",
+  "clock_report",
+  "presentation",
+  "linear_get",
+  "linear_import",
+  "linear_plan",
+  "linear_sync",
+  "dispatch",
+  "spawn",
+] as const;
+const ALL_NORTH_MCP_TOOLS = NORTH_MCP_TOOL_NAMES.map((name) => `mcp__north__${name}`);
 const CAPABILITY_TOOLS: Record<GafferCapability, string[]> = {
   "filesystem.read": ["Read"],
   "filesystem.search": ["Grep", "Glob"],
   "filesystem.write": ["Edit", "Write", "MultiEdit", "NotebookEdit"],
   shell: ["Bash"],
-  "shell.readonly": ["Bash"],
+  "shell.readonly": [READONLY_SHELL_TOOL],
   web: ["WebSearch", "WebFetch"],
   coordination: ORCHESTRATION_TOOLS,
 };
 const ALL_CAPABILITY_TOOLS = [...new Set(Object.values(CAPABILITY_TOOLS).flat())];
+
+export interface ManagedToolPolicy {
+  /** Exact Claude SDK built-in availability surface. MCP tools are configured separately. */
+  tools: string[];
+  /** Auto-approval policy only; never interpreted as availability. */
+  allowedTools: string[];
+  /** Explicit defense-in-depth denies, including every noncontract North MCP tool. */
+  disallowedTools: string[];
+}
+
+export function managedToolPolicy(
+  capabilities: readonly GafferCapability[],
+): ManagedToolPolicy {
+  const selectedCapabilityTools = [
+    ...new Set(capabilities.flatMap((capability) => CAPABILITY_TOOLS[capability])),
+  ];
+  const orchestrationAllowed = capabilities.includes("coordination");
+  const allowedTools = [...new Set([
+    ...selectedCapabilityTools,
+    ...COORDINATION_TOOLS,
+    ...(orchestrationAllowed ? ORCHESTRATION_TOOLS : []),
+  ])];
+  const disallowedTools = [...new Set([
+    ...NATIVE_AGENT_TOOLS,
+    ...ALL_CAPABILITY_TOOLS.filter((toolName) => !selectedCapabilityTools.includes(toolName)),
+    ...ALL_NORTH_MCP_TOOLS.filter((toolName) => !allowedTools.includes(toolName)),
+    ...(!orchestrationAllowed ? ["mcp__north-peer__command_peer"] : []),
+  ])];
+  return {
+    tools: selectedCapabilityTools.filter((toolName) => !toolName.startsWith("mcp__")),
+    allowedTools,
+    disallowedTools,
+  };
+}
+
+function readonlyShellServer(cwd: string) {
+  return createSdkMcpServer({
+    name: READONLY_SHELL_SERVER,
+    version: "0.1.0",
+    tools: [
+      tool(
+        "run",
+        "Run one command in North's network-isolated read-only shell. The checkout and host "
+          + "filesystem are read-only; only an ephemeral /tmp is writable.",
+        {
+          command: z.string().min(1).max(MAX_READONLY_COMMAND_BYTES)
+            .describe("Command interpreted intentionally by bash -lc inside the read-only sandbox"),
+          timeoutMs: z.number().finite().int().min(100).max(120_000).optional()
+            .describe("Bounded command timeout in milliseconds (default: 30000; maximum: 120000)"),
+        },
+        async ({ command, timeoutMs }) => {
+          try {
+            const result = await runReadonlyShell(command, cwd, timeoutMs);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result) }],
+              ...(!result.ok ? { isError: true } : {}),
+            };
+          } catch (error: any) {
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  ok: false,
+                  error: error?.code ?? "readonly_shell_unavailable",
+                  message: error?.message ?? String(error),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        },
+      ),
+    ],
+  });
+}
 
 export interface HarnessOpts {
   self: string; // this agent's id/handle (peer commands + stream identity)
@@ -267,29 +373,204 @@ function esoAppendix(): string {
     "  val1\\tval2\\tval3   ← one tab-delimited row per record (strings with tabs/newlines use JSON quoting)";
 }
 
-// AGENT_LAWS=on|off — appends the user's provider-neutral global AGENTS.md to every spawned agent.
+// AGENT_LAWS=on|off — appends the user's provider-neutral global AGENTS.md to Anthropic
+// workers. Codex loads the same global file natively; injecting it there would duplicate
+// the constitution. Project AGENTS files are composed explicitly for both providers below.
 // A custom-string systemPrompt bypasses the SDK's claude_code preset, which is the
 // only path that injects CLAUDE.md — so without this, workers get NONE of the
-// global laws interactive sessions live under. Read per spawn (~/.claude/CLAUDE.md
-// is an out-of-store symlink into nixos-config, so it's always the current text —
-// one source, no drift). Fail-open: unreadable file must never block a spawn.
-function globalLawsAppendix(): string {
-  if ((process.env.AGENT_LAWS ?? "on") !== "on") return "";
-  try {
-    const candidates = [
-      `${process.env.HOME}/.codex/AGENTS.md`,
-      `${process.env.HOME}/.agents/AGENTS.md`,
-      `${process.env.HOME}/.claude/CLAUDE.md`, // migration fallback
-    ];
-    const path = candidates.find((p) => { try { readFileSync(p); return true; } catch { return false; } });
-    if (!path) return "";
-    const laws = readFileSync(path, "utf8").trim();
-    return laws
-      ? `\n\n## Global laws — ${path} (binds every provider and agent)\n\n` + laws
-      : "";
-  } catch {
-    return "";
+// global laws interactive sessions live under. ~/.codex/AGENTS.md is the one
+// provider-neutral bootstrap source. Missing, replaced, unreadable, malformed,
+// or oversized authority is a hard configuration error; AGENT_LAWS=off is the
+// sole explicit escape hatch.
+export const GLOBAL_AGENTS_MAX_BYTES = 32 * 1024;
+
+export interface CanonicalGlobalAgents {
+  path: string;
+  realpath: string;
+  bytes: Buffer;
+  text: string;
+}
+
+function agentLawsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const mode = env.AGENT_LAWS ?? "on";
+  if (mode === "on") return true;
+  if (mode === "off") return false;
+  throw new Error("AGENT_LAWS must be exactly 'on' or 'off'");
+}
+
+function readGlobalAgents(path: string, label: string): Omit<CanonicalGlobalAgents, "path" | "realpath"> {
+  let info;
+  try { info = statSync(path); }
+  catch (cause) {
+    throw new Error(`global AGENTS bootstrap cannot inspect ${label}: ${path}`, { cause });
   }
+  if (!info.isFile())
+    throw new Error(`global AGENTS bootstrap ${label} is not a regular file: ${path}`);
+  if (info.size > GLOBAL_AGENTS_MAX_BYTES)
+    throw new Error(`global AGENTS bootstrap exceeds ${GLOBAL_AGENTS_MAX_BYTES} bytes at: ${path}`);
+
+  let bytes: Buffer;
+  try { bytes = readFileSync(path); }
+  catch (cause) {
+    throw new Error(`global AGENTS bootstrap cannot read ${label}: ${path}`, { cause });
+  }
+  if (bytes.byteLength > GLOBAL_AGENTS_MAX_BYTES)
+    throw new Error(`global AGENTS bootstrap exceeds ${GLOBAL_AGENTS_MAX_BYTES} bytes at: ${path}`);
+
+  let text: string;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch (cause) {
+    throw new Error(`global AGENTS bootstrap is not valid UTF-8 at: ${path}`, { cause });
+  }
+  if (!text.trim()) throw new Error(`global AGENTS bootstrap is empty at: ${path}`);
+  return { bytes, text };
+}
+
+/** The exact provider-neutral global authority source for this process home. */
+export function canonicalGlobalAgents(
+  env: NodeJS.ProcessEnv = process.env,
+): CanonicalGlobalAgents | undefined {
+  if (!agentLawsEnabled(env)) return undefined;
+  const home = env.HOME?.trim();
+  if (!home) throw new Error("global AGENTS bootstrap requires HOME");
+  const path = resolve(home, ".codex", "AGENTS.md");
+  const source = readGlobalAgents(path, "canonical source");
+  let canonicalPath: string;
+  try { canonicalPath = realpathSync(path); }
+  catch (cause) {
+    throw new Error(`global AGENTS bootstrap cannot resolve canonical source: ${path}`, { cause });
+  }
+  return { path, realpath: canonicalPath, ...source };
+}
+
+function globalLawsAppendix(): string {
+  const laws = canonicalGlobalAgents();
+  if (!laws) return "";
+  const trailingNewline = laws.text.endsWith("\n") ? "" : "\n";
+  return `\n\n## Global laws — ${laws.path} (binds every provider and agent)\n\n`
+    + laws.text + trailingNewline;
+}
+
+export const PROJECT_AGENTS_MAX_BYTES = 32 * 1024;
+
+function gitRootForProject(cwd: string): { cwd: string; root: string } {
+  let canonicalCwd: string;
+  try {
+    canonicalCwd = realpathSync(cwd);
+    if (!statSync(canonicalCwd).isDirectory())
+      throw new Error(`working directory is not a directory: ${canonicalCwd}`);
+  } catch (cause) {
+    throw new Error(`project AGENTS bootstrap cannot resolve cwd: ${cwd}`, { cause });
+  }
+  let cursor = canonicalCwd;
+  while (true) {
+    const marker = resolve(cursor, ".git");
+    try {
+      const markerStat = statSync(marker);
+      if (!markerStat.isDirectory() && !markerStat.isFile())
+        throw new Error(`Git marker is neither file nor directory: ${marker}`);
+      return { cwd: canonicalCwd, root: cursor };
+    } catch (error: any) {
+      if (error?.code !== "ENOENT")
+        throw new Error(`project AGENTS bootstrap cannot inspect Git marker: ${marker}`, { cause: error });
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) return { cwd: canonicalCwd, root: canonicalCwd };
+    cursor = parent;
+  }
+}
+
+function projectInstructionFile(directory: string): string | undefined {
+  for (const name of ["AGENTS.override.md", "AGENTS.md"]) {
+    const path = resolve(directory, name);
+    let info;
+    try {
+      info = statSync(path);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") continue;
+      throw new Error(`project AGENTS bootstrap cannot inspect: ${path}`, { cause: error });
+    }
+    if (!info.isFile())
+      throw new Error(`project instruction source is not a regular file: ${path}`);
+    if (info.size > PROJECT_AGENTS_MAX_BYTES) {
+      throw new Error(
+        `project AGENTS bootstrap exceeds ${PROJECT_AGENTS_MAX_BYTES} bytes at: ${path}`,
+      );
+    }
+    return path;
+  }
+  return undefined;
+}
+
+/**
+ * Deterministic, bounded root-to-cwd project instruction composition.
+ *
+ * Managed Codex disables native project-doc loading and consumes this same block,
+ * while Anthropic receives it directly because the SDK's settings sources are
+ * sealed off. A discovered but unreadable/malformed/oversized instruction source
+ * blocks the spawn instead of silently creating a provider-specific authority gap.
+ */
+export function projectAgentsAppendix(cwd: string): string {
+  if (!agentLawsEnabled()) return "";
+  const project = gitRootForProject(cwd);
+  const rel = relative(project.root, project.cwd);
+  if (rel === ".." || rel.startsWith(`..${sep}`))
+    throw new Error(`project AGENTS bootstrap cwd escapes Git root: ${project.cwd}`);
+  const directories = [project.root];
+  let cursor = project.root;
+  for (const segment of rel.split(sep).filter(Boolean)) {
+    cursor = resolve(cursor, segment);
+    directories.push(cursor);
+  }
+
+  const sections: string[] = [];
+  for (const directory of directories) {
+    const path = projectInstructionFile(directory);
+    if (!path) continue;
+    let source: Buffer;
+    try { source = readFileSync(path); }
+    catch (cause) {
+      throw new Error(`project AGENTS bootstrap cannot read: ${path}`, { cause });
+    }
+    let text: string;
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(source).trim(); }
+    catch (cause) {
+      throw new Error(`project AGENTS bootstrap is not valid UTF-8: ${path}`, { cause });
+    }
+    if (!text) continue;
+    const next = [...sections, `### ${path}\n\n${text}`];
+    const appendix = `\n\n## Project instructions — Git root to cwd\n\n${next.join("\n\n")}`;
+    if (Buffer.byteLength(appendix, "utf8") > PROJECT_AGENTS_MAX_BYTES) {
+      throw new Error(
+        `project AGENTS bootstrap exceeds ${PROJECT_AGENTS_MAX_BYTES} bytes at: ${path}`,
+      );
+    }
+    sections.push(next.at(-1)!);
+  }
+  return sections.length
+    ? `\n\n## Project instructions — Git root to cwd\n\n${sections.join("\n\n")}`
+    : "";
+}
+
+function providerInstructionAppendix(provider: ProviderId, cwd: string): string {
+  // Codex keeps native global AGENTS discovery but native project loading is
+  // disabled by the managed adapter, so project instructions are explicit once.
+  return (provider === "anthropic" ? globalLawsAppendix() : "")
+    + projectAgentsAppendix(cwd);
+}
+
+function assertCanonicalGlobalAgentsExactlyOnce(prompt: string): void {
+  const canonical = canonicalGlobalAgents();
+  if (!canonical) return;
+  const needle = canonical.text.trim();
+  let count = 0;
+  let offset = 0;
+  while ((offset = prompt.indexOf(needle, offset)) !== -1) {
+    count++;
+    offset += needle.length;
+  }
+  if (count !== 1)
+    throw new Error(`Anthropic global AGENTS bootstrap expected exactly once, observed ${count}`);
 }
 
 function gafferHome(): string {
@@ -435,6 +716,7 @@ export interface HarnessCompositionEvidence {
 
 interface HarnessCompositionState {
   baseSystemPrompt: string;
+  cwd: string;
   evidence: HarnessCompositionEvidence;
   initialProvider?: ProviderId;
   initialModel?: string;
@@ -443,6 +725,59 @@ interface HarnessCompositionState {
 
 const harnessComposition = new WeakMap<object, HarnessCompositionState>();
 const appliedEvidence = new WeakMap<object, HarnessCompositionEvidence>();
+interface AuthoringHookSealEntry {
+  matcher?: string;
+  hooks: unknown[];
+}
+interface AuthoringHookSeal {
+  topology?: string;
+  entries: AuthoringHookSealEntry[];
+  mcpServers: Array<[string, unknown]>;
+}
+const authoringHookSeals = new WeakMap<object, AuthoringHookSeal>();
+
+function sealAuthoringHooks(options: Options): void {
+  const entries = (options.hooks as any)?.PreToolUse;
+  if (!Array.isArray(entries)) return;
+  authoringHookSeals.set(options as object, {
+    topology: (options.env as any)?.AGENT_TOPOLOGY,
+    entries: entries.map((entry: any) => ({
+      matcher: entry?.matcher,
+      hooks: Array.isArray(entry?.hooks) ? [...entry.hooks] : [],
+    })),
+    mcpServers: Object.entries((options.mcpServers as any) ?? {}),
+  });
+}
+
+function inheritAuthoringHookSeal(source: Options, target: Options): void {
+  const seal = authoringHookSeals.get(source as object);
+  if (seal) authoringHookSeals.set(target as object, seal);
+}
+
+/**
+ * Provider admission proof that the SDK-only guard chain and exact MCP server
+ * instances came from harnessOptions and were not replaced before the model turn.
+ */
+export function hasCanonicalAuthoringHooks(options: Options): boolean {
+  const seal = authoringHookSeals.get(options as object);
+  const entries = (options.hooks as any)?.PreToolUse;
+  const mcpServers = Object.entries((options.mcpServers as any) ?? {});
+  if (!seal
+      || (options.env as any)?.AGENT_TOPOLOGY !== seal.topology
+      || !Array.isArray(entries)
+      || entries.length !== seal.entries.length
+      || mcpServers.length !== seal.mcpServers.length
+      || mcpServers.some(([name, server], index) =>
+        name !== seal.mcpServers[index][0] || server !== seal.mcpServers[index][1])) return false;
+  return seal.entries.every((expected, index) => {
+    const actual = entries[index];
+    return actual?.matcher === expected.matcher
+      && Array.isArray(actual?.hooks)
+      && actual.hooks.length === expected.hooks.length
+      && actual.hooks.every((hook: unknown, hookIndex: number) =>
+        hook === expected.hooks[hookIndex]);
+  });
+}
 
 /** Compose Gaffer's authority contracts. Missing canonical artifacts are fatal. */
 export function gafferAppendix(metadata: RoutingMetadata | undefined, cwd = process.cwd()): {
@@ -553,12 +888,17 @@ export function applyHarnessRoute(options: Options, provider: ProviderId, model?
   if (!state) return { options };
   const concreteModel = resolveModelAlias(provider, model);
   const delta = modelDeltaAppendix(provider, concreteModel, state.omitModelDeltaReason);
+  const systemPrompt = state.baseSystemPrompt
+    + providerInstructionAppendix(provider, state.cwd)
+    + delta.appendix;
+  if (provider === "anthropic") assertCanonicalGlobalAgentsExactlyOnce(systemPrompt);
   const next = {
     ...options,
     model: concreteModel ?? options.model,
-    systemPrompt: state.baseSystemPrompt + delta.appendix,
+    systemPrompt,
   } as Options;
   harnessComposition.set(next as object, state);
+  inheritAuthoringHookSeal(options, next);
   const evidence = { ...state.evidence, modelDelta: delta.evidence };
   appliedEvidence.set(next as object, evidence);
   return { options: next, evidence };
@@ -651,20 +991,6 @@ async function guardHook(self: string, scripts: string[], input: unknown, topolo
   return { continue: true };
 }
 
-// The single Options builder. dispatch.ts + spawn.ts both route through here.
-// Pre-create the engine's git-isolation stub for READ-ONLY lanes. The sandbox
-// writes identity-isolation config to `$cwd/.gitconfig` during setup; with the
-// whole cwd write-denied, bwrap can only rw-bind that path if the file already
-// exists (a bind mount needs a mount point). Best-effort — an existing file is
-// left untouched; a failure falls through to the engine's own error surface.
-function ensureGitIsolationStub(cwd: string): string {
-  const stub = resolve(cwd, ".gitconfig");
-  try {
-    writeFileSync(stub, "", { flag: "wx" }); // create-only; never truncate
-  } catch { /* exists or uncreatable — engine surfaces the real error */ }
-  return stub;
-}
-
 export function harnessOptions(o: HarnessOpts): Options {
   const cwd = o.cwd ?? process.cwd();
   const metadata = o.routingMetadata ?? (
@@ -674,23 +1000,18 @@ export function harnessOptions(o: HarnessOpts): Options {
   const gaffer = gafferAppendix(metadata, cwd);
   const capabilities = gaffer.evidence.capabilities;
   const baseSystemPrompt = withCoordination(o.self, o.systemPrompt ?? DEFAULT_SYSTEM_PROMPT, cwd)
-    + globalLawsAppendix() + gaffer.appendix + cavemanAppendix(o.caveman) + esoAppendix();
+    + gaffer.appendix + cavemanAppendix(o.caveman) + esoAppendix();
   // Orchestration is positive authority, never an ambient default. A lane with
   // no topology remains prompt-neutral but receives coordination-only tools.
   const orchestrationAllowed = topology === "orchestrator"
     && capabilities?.includes("coordination") === true;
-  const selectedCapabilityTools = capabilities
-    ? [...new Set(capabilities.flatMap((capability) => CAPABILITY_TOOLS[capability]))]
-    : undefined;
-  const disallowedTools = [...new Set([
+  const policy = capabilities ? managedToolPolicy(capabilities) : undefined;
+  const disallowedTools = policy?.disallowedTools ?? [...new Set([
     ...NATIVE_AGENT_TOOLS,
     ...(orchestrationAllowed ? [] : ORCHESTRATION_TOOLS),
-    ...(selectedCapabilityTools
-      ? ALL_CAPABILITY_TOOLS.filter((toolName) => !selectedCapabilityTools.includes(toolName))
-      : []),
   ])];
-  const allowedTools = [...new Set([
-    ...(selectedCapabilityTools ?? o.extraTools ?? []).filter((name) => !disallowedTools.includes(name)),
+  const allowedTools = policy?.allowedTools ?? [...new Set([
+    ...(o.extraTools ?? []).filter((name) => !disallowedTools.includes(name)),
     ...COORDINATION_TOOLS,
     ...(orchestrationAllowed ? ORCHESTRATION_TOOLS : []),
   ])];
@@ -700,8 +1021,10 @@ export function harnessOptions(o: HarnessOpts): Options {
     ...ambientEnv,
     AGENT_ID: o.self,
     AGENT_TOPOLOGY: enforcementTopology,
+    // One explicit value feeds lane presence, provider CLI, North MCP, and
+    // admission. Never let a later process ambient choose a different graph.
+    NORTH_PORT: northPort(),
   };
-  if (o.presenceRegistrar !== false) (o.presenceRegistrar ?? registerPresence)(o.self, cwd);
   // An injected registrar denotes a hermetic boundary: never pair it with a
   // real graph renewer implicitly. Tests/adapters that want both injected
   // phases supply presenceRenewer explicitly. Production (both omitted) keeps
@@ -710,39 +1033,36 @@ export function harnessOptions(o: HarnessOpts): Options {
     ? undefined
     : o.presenceRenewer ?? (o.presenceRegistrar === undefined ? renewPresence : undefined);
   const readonlyShell = capabilities?.includes("shell.readonly") === true;
+  const northMcpEnv = managedNorthMcpEnvironment({ ...childEnv, NORTH_BIN: ENGINE });
+  const initialInstructionAppendix = o.provider
+    ? ""
+    : globalLawsAppendix() + projectAgentsAppendix(cwd);
+  const initialSystemPrompt = baseSystemPrompt + initialInstructionAppendix;
+  if (!o.provider) assertCanonicalGlobalAgentsExactlyOnce(initialSystemPrompt);
   const options = {
     mcpServers: {
-      north: { type: "stdio", command: MCP, args: [], env: { ...childEnv, NORTH_BIN: ENGINE } },
+      north: { type: "stdio", command: MCP, args: [], env: northMcpEnv },
       ...(orchestrationAllowed ? { "north-peer": peerCommandServer(o.self) } : {}),
+      // Compile the minimum authority surface for every retry-safe route up
+      // front. Codex ignores Claude SDK tool allowlists and independently
+      // enforces --sandbox read-only; an Anthropic fallback must still inherit
+      // denied native Bash plus North's isolated read-only shell.
+      ...(readonlyShell ? { [READONLY_SHELL_SERVER]: readonlyShellServer(cwd) } : {}),
     },
+    ...(policy ? {
+      tools: policy.tools,
+      settingSources: [],
+      strictMcpConfig: true,
+    } : {}),
     allowedTools,
     ...(disallowedTools.length ? { disallowedTools } : {}),
     model: o.provider ? resolveModelAlias(o.provider, o.model) : o.model,
     effort: o.effort, // the reasoning knob spawn.ts used to drop on the floor
     env: childEnv,
     permissionMode: capabilities && !capabilities.includes("filesystem.write") ? "default" : "acceptEdits",
-    ...(readonlyShell ? {
-      sandbox: {
-        enabled: true,
-        failIfUnavailable: true,
-        allowUnsandboxedCommands: false,
-        // denyWrite(cwd) alone bricked EVERY read-only lane's bash (2026-07-17):
-        // the sandbox's own git-isolation writes a `.gitconfig` stub at cwd
-        // during SETUP, so bwrap aborted with EROFS before any command ran
-        // ("bash is dead for this whole session"). Carve out exactly that
-        // engine-owned scaffolding path; the rest of cwd stays write-denied.
-        // The stub must EXIST before spawn — bwrap can rw-bind an existing
-        // file over an ro directory, but cannot create one inside it (see
-        // ensureGitIsolationStub below).
-        filesystem: {
-          denyWrite: [resolve(cwd)],
-          allowWrite: [ensureGitIsolationStub(cwd)],
-        },
-      },
-    } : {}),
     ...(capabilities ? { northCapabilities: [...capabilities] } : {}),
     cwd,
-    systemPrompt: baseSystemPrompt,
+    systemPrompt: initialSystemPrompt,
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
     hooks: {
       // PreToolUse authoring-guard parity — the fix for worker edits running with
@@ -764,6 +1084,7 @@ export function harnessOptions(o: HarnessOpts): Options {
   } as Options & { northCapabilities?: GafferCapability[] };
   const state: HarnessCompositionState = {
     baseSystemPrompt,
+    cwd,
     evidence: gaffer.evidence,
     initialProvider: o.provider,
     initialModel: o.model,
@@ -771,8 +1092,15 @@ export function harnessOptions(o: HarnessOpts): Options {
   };
   harnessComposition.set(options as object, state);
   appliedEvidence.set(options as object, gaffer.evidence);
-  if (o.provider) return applyHarnessRoute(options, o.provider, o.model).options;
-  return options;
+  sealAuthoringHooks(options);
+  // Presence is an assertion that a runnable lane exists. Every synchronous
+  // prompt/bootstrap contract for the initial route must succeed first, or a
+  // malformed AGENTS/Gaffer/model source would leave a ghost roster entry.
+  const routedOptions = o.provider
+    ? applyHarnessRoute(options, o.provider, o.model).options
+    : options;
+  if (o.presenceRegistrar !== false) (o.presenceRegistrar ?? registerPresence)(o.self, cwd);
+  return routedOptions;
 }
 
 export const DEFAULT_SYSTEM_PROMPT =

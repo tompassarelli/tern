@@ -11,7 +11,7 @@ import { recordRun } from "./telemetry";
 import { notifyDeath } from "./death";
 import { inputChannel } from "./coordination";
 import {
-  bespokeContractFingerprint, writeAgentFacts, writeAgentOutcome, updateAgentRoute, goalFromPrompt,
+  bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute, goalFromPrompt,
   userAnchoredPath,
 } from "./identity";
 import { BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION } from "./bespoke-contract";
@@ -25,7 +25,8 @@ import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgta
 import { liveChildren, notifyEarlyExitChildren } from "./children";
 import { clockStart, clockFinalize } from "./clock";
 import {
-  routedQuery, selectProvider, ProviderEscalationUnsupportedError, type ProviderPreference,
+  routedQuery, selectProvider, ProviderEscalationUnsupportedError, ProviderRetrySafeError,
+  type ProviderPreference,
 } from "./providers";
 import { refreshCodexEntitlementsIfStale } from "./codex-entitlement";
 import type { AgentQuery } from "./providers/types";
@@ -40,6 +41,8 @@ import {
   reserveResourceEnvelopeRetry, ResourceEnvelopeExceededError, type EnvelopeAdmission,
 } from "./resource-envelopes";
 import { assertCoordinationAuthority } from "./topology-authority";
+import { admitPinnedProvider } from "./execution-admission";
+import { classifyExecutionTerminal } from "./execution-outcome";
 
 export interface SpawnOptions {
   prompt: string;
@@ -97,6 +100,7 @@ function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetada
 }
 
 async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata }, envelopeAdmission?: EnvelopeAdmission): Promise<string> {
+  const runStartedAt = process.hrtime.bigint();
   // Composition is deliberately complete before admission and stays immutable
   // through routing, identity, provider execution, and terminal telemetry.
   const routingMetadata = opts.routingMetadata;
@@ -110,6 +114,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   const providerPreference = opts.provider ?? "auto";
   const targetPreference = opts.target;
   const routingRequest = { provider: providerPreference, target: targetPreference };
+  if (!opts.queryFn) admitPinnedProvider(opts.provider, capabilities);
   // Injected query functions own their entire provider boundary; keeping the
   // refresh out of that path makes tests and alternative adapters hermetic.
   if (!opts.queryFn) {
@@ -248,6 +253,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     omitModelDeltaReason: escalate ? "cross_model_escalation_enabled" : undefined,
     systemPrompt: opts.systemPrompt, maxTurns: opts.maxTurns,
     role: opts.role, posture: opts.posture,
+    cwd: process.cwd(),
     // per-spawn dial wins over ambient env; env-or-full is the harness fallback
     caveman: opts.caveman ?? process.env.AGENT_CAVEMAN ?? "full",
   });
@@ -307,6 +313,22 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       terminalMessages.push(msg);
       if (typeof msg.result === "string") result = msg.result;
       resultMsg = msg;
+      const cap = typeof msg.subtype === "string" && msg.subtype.startsWith("error_max")
+        ? msg.subtype
+        : null;
+      if (cap) {
+        end(cap === "error_max_turns" ? "max_turns" : "capped");
+        const partial = result.trim() ? `partial: ${result.trim().slice(0, 200)}` : "no partial result";
+        notifyTurnCap(agentId, `${cap} — ${partial}`, { coordinator: coordHandle });
+        break;
+      }
+      const providerError = msg.subtype !== "success"
+        || msg.is_error === true
+        || (Array.isArray(msg.errors) && msg.errors.length > 0);
+      if (providerError) {
+        end("provider_error");
+        break;
+      }
       if (escalate && !result.trim()) { // terminal empty result -> escalate rather than give up
         const d = decideEscalation(tier, ladder);
         if (d.kind === "escalate") {
@@ -330,17 +352,6 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
         }
       }
       if (ch.pending() === 0) {
-        // Turn-cap ping (thread 019f4d54): a provider-enforced terminal cap arrives as a
-        // `result` with an error_max_* subtype. Ignoring it records outcome="ran" — a cap
-        // masquerades as success. Detect it, mark the outcome, and ping the coordinator
-        // with a partial-result note instead of stopping silently.
-        const cap = typeof msg.subtype === "string" && msg.subtype.startsWith("error_max") ? msg.subtype : null;
-        if (cap) {
-          end(cap === "error_max_turns" ? "max_turns" : "capped");
-          const partial = result.trim() ? `partial: ${result.trim().slice(0, 200)}` : "no partial result";
-          notifyTurnCap(agentId, `${cap} — ${partial}`, { coordinator: coordHandle });
-          break;
-        }
         // Refuse to exit while harness-tracked background tasks are live (thread 019f4ed2,
         // half a). Inject a continuation message + keep looping: the SDK re-invokes the
         // model, the task settles (task_notification / task_updated), bgContinuations
@@ -363,6 +374,11 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       }
     }
   }
+  if (!resultMsg && outcome === "ran") {
+    // A clean iterator close is transport completion, not provider success.
+    // Only an explicit terminal result may establish process=ran.
+    outcome = "provider_error";
+  }
   if (stallAborted) {
     // 2N of silence: make the stall TERMINAL + VISIBLE. Interrupt the hung query, record
     // outcome=stalled, and fire the death path (agent_death fact + coordinator ping) so a
@@ -376,6 +392,9 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     if (err instanceof ResourceEnvelopeExceededError) {
       outcome = "resource_envelope_exceeded";
       console.error(`[envelope] @agent:${agentId} ${err.message}`);
+    } else if (err instanceof ProviderRetrySafeError) {
+      outcome = "blocked_preflight";
+      console.error(`[preflight] @agent:${agentId} ${err.message}`);
     } else {
       outcome = "died";
       notifyDeath(agentId, err, { thread: undefined, coordinator: opts.coordinator });
@@ -389,7 +408,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   }
 
   // Early exit with live children (thread 019f4ed2, half b): on TRUE finalize (any
-  // terminal path), if this lane spawned agents that have not yet reported an outcome,
+  // terminal path), if this lane spawned agents without committed terminal evidence,
   // make the orphaning loud NOW instead of waiting up to 30min for the reactor's sweep —
   // a loud lane-log line + coordinator ping + a durable early_exit_children fact.
   // Fail-open: a graph hiccup here must never break the finalize.
@@ -401,14 +420,19 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   // Close the auto-clock (only if this spawn opened one): crash -> orphan-close, else stop.
   if (opts.thread) clockFinalize(agentId, outcome);
 
-  // Record the terminal outcome ON the lane entity (SYNC, before exit) so the reactor's
-  // presence-lapse sweep never reaps a completed lane as died-unreported. `outcome` is
-  // final here (all terminal paths — ran/died/stalled/capped — have settled it).
+  // Commit the lane's process/delivery terminal (SYNC, digest marker last)
+  // before exit so the reactor cannot mistake a completed lane for silence.
   refreshIdentityRoute();
-  writeAgentOutcome(agentId, outcome);
+  const terminal = classifyExecutionTerminal(outcome);
+  writeAgentTerminal(agentId, terminal);
 
   const tokenUsage = normalizeUsage(terminalMessages, routing.provider);
   const finalRoute = activeRoute();
+  const numTurns = typeof resultMsg?.num_turns === "number"
+    ? resultMsg.num_turns
+    // A retry-safe preflight block proves the provider accepted no turn. This
+    // zero is North-observed; every other missing provider value stays absent.
+    : terminal.processOutcome === "blocked_preflight" ? 0 : undefined;
   recordRun({
     thread: opts.thread ?? "(ad-hoc)", agent: agentId, posture: "spawn",
     // Effective FINAL dial (rung() reflects any in-flight escalation); env-fallback
@@ -430,8 +454,11 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     routingMetadata,
     promptComposition: compositionEvidence,
     tokenUsage,
-    durationMs: resultMsg?.duration_ms ?? 0, outcome,
-    numTurns: resultMsg?.num_turns ?? 0,
+    durationMs: Number(process.hrtime.bigint() - runStartedAt) / 1_000_000,
+    providerDurationMs: typeof resultMsg?.duration_ms === "number" ? resultMsg.duration_ms : undefined,
+    outcome, processOutcome: terminal.processOutcome,
+    deliveryOutcome: terminal.deliveryOutcome, deliveryReason: terminal.deliveryReason,
+    numTurns,
     errorCount: st.totalErrors, escalationTier: tier,
     escalations: escalations.length ? escalations : undefined,
   });
@@ -445,10 +472,12 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     try {
       const { execFileSync } = await import("node:child_process");
       execFileSync("bb", [`${REPO_ROOT}/cli/msg-cli.clj`, process.env.NORTH_PORT ?? "7977",
-        "send", agentId, coord, "AGENT COMPLETE", `outcome=${outcome}`], { stdio: "ignore", timeout: 10000 });
+        "send", agentId, coord, "AGENT COMPLETE",
+        `process=${terminal.processOutcome} delivery=${terminal.deliveryOutcome}`],
+      { stdio: "ignore", timeout: 10000 });
     } catch { /* non-fatal */ }
   }
-  console.log(`[spawn] @agent:${agentId} complete (${outcome}` +
+  console.log(`[spawn] @agent:${agentId} complete (process=${outcome}, delivery=${terminal.deliveryOutcome}` +
     `${escalations.length ? `, ${escalations.length} escalation(s) -> ${rung().model}/${rung().effort}` : ""})`);
   return result;
 }

@@ -1,14 +1,23 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import {
   ProviderRetrySafeError, ProviderSelectionError, routedQuery, selectProvider, selectProviderFromAvailability,
 } from "../src/providers";
 import { balancedAllocationEstimates } from "../src/provider-routing";
+import { consumeExecutionAdmission, markExecutionAdmission } from "../src/execution-admission";
 import type { AgentProvider, ProviderAvailability, ProviderId, ResourcePolicy } from "../src/providers/types";
 import { resolveTier } from "../src/providers/catalog";
 import { anthropicProvider, normalizeAnthropicQueryDiagnostics } from "../src/providers/anthropic";
+import { codexHarnessArguments, openaiProvider } from "../src/providers/openai";
+import {
+  READONLY_SHELL_SERVER, READONLY_SHELL_TOOL,
+} from "../src/readonly-shell";
+import { harnessOptions, type HarnessCompositionEvidence } from "../src/harness";
+import { applyGafferStaffing, gafferCapabilities } from "../src/gaffer-staffing";
 import { agentRouteFacts } from "../src/identity";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
+import type { AddressInfo } from "node:net";
 
 const MANAGED_ENV = [
   "NORTH_DISABLE_ANTHROPIC", "NORTH_DISABLE_OPENAI", "NORTH_PROVIDER_ORDER",
@@ -18,6 +27,22 @@ const MANAGED_ENV = [
   "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
 ] as const;
 const saved = Object.fromEntries(MANAGED_ENV.map((key) => [key, process.env[key]])) as Record<typeof MANAGED_ENV[number], string | undefined>;
+const savedNorthPort = process.env.NORTH_PORT;
+const coordinator = createServer((socket) => {
+  socket.once("data", () => socket.end("{:version \"providers-test\"}\n"));
+});
+beforeAll(async () => {
+  await new Promise<void>((resolve, reject) => {
+    coordinator.once("error", reject);
+    coordinator.listen(0, "127.0.0.1", resolve);
+  });
+  process.env.NORTH_PORT = String((coordinator.address() as AddressInfo).port);
+});
+afterAll(async () => {
+  if (savedNorthPort === undefined) delete process.env.NORTH_PORT;
+  else process.env.NORTH_PORT = savedNorthPort;
+  await new Promise<void>((resolve) => coordinator.close(() => resolve()));
+});
 const available: ProviderAvailability[] = [
   { provider: "anthropic", available: true, reason: "ready" },
   { provider: "openai", available: true, reason: "ready" },
@@ -423,21 +448,21 @@ test("semantic tiers resolve independently per provider", () => {
 });
 
 test("provider selection filters tier and reasoning before allocation", () => {
-  expect(() => resolveTier("openai", "senior", undefined, "xhigh"))
-    .toThrow("provider openai cannot resolve semantic tier senior with reasoning xhigh");
+  expect(() => resolveTier("anthropic", "senior", undefined, "medium"))
+    .toThrow("provider anthropic cannot resolve semantic tier senior with reasoning medium");
   const decision = selectProviderFromAvailability(
     "auto",
     available,
-    policy({ providerOrder: ["openai", "anthropic"] }),
+    policy({ providerOrder: ["anthropic", "openai"] }),
     "senior",
     "asymmetric-route",
-    "xhigh",
+    "medium",
   );
-  expect(decision.provider).toBe("anthropic");
+  expect(decision.provider).toBe("openai");
   expect(decision.fallbackProviders).toEqual([]);
-  expect(decision.selectionReason).toContain("route=senior/xhigh");
+  expect(decision.selectionReason).toContain("route=senior/medium");
   try {
-    selectProviderFromAvailability("openai", available, policy(), "senior", "exact-incompatible", "xhigh");
+    selectProviderFromAvailability("anthropic", available, policy(), "senior", "exact-incompatible", "medium");
     throw new Error("expected route incompatibility");
   } catch (error) {
     expect(error).toMatchObject({ kind: "route_unresolvable", preSideEffect: true });
@@ -454,13 +479,46 @@ test("provider selection filters unenforceable capability shapes before side eff
   expect(decision.fallbackProviders).toEqual([]);
   expect(() => selectProviderFromAvailability(
     "openai", available, policy(), "senior", "capability-pin", "high", undefined, capabilities,
-  )).toThrow("no eligible provider resolves");
+  )).toThrow("cannot enforce the requested Gaffer capabilities");
+
+  const orchestratorCapabilities = [
+    "filesystem.read", "filesystem.search", "shell.readonly", "web", "coordination",
+  ] as const;
+  const orchestrator = selectProviderFromAvailability(
+    "auto", available, policy({ providerOrder: ["openai", "anthropic"] }),
+    "senior", "coordination-route", "high", undefined, orchestratorCapabilities,
+  );
+  expect(orchestrator.provider).toBe("anthropic");
+  expect(() => selectProviderFromAvailability(
+    "openai", available, policy(), "senior", "coordination-pin", "high", undefined,
+    orchestratorCapabilities,
+  )).toThrow("cannot enforce the requested Gaffer capabilities");
+  try {
+    selectProviderFromAvailability(
+      { provider: "auto", target: "codex-personal" },
+      accountAvailability,
+      accountPolicy(),
+      "senior",
+      "coordination-target-pin",
+      "high",
+      undefined,
+      orchestratorCapabilities,
+    );
+    throw new Error("expected target capability admission to fail");
+  } catch (error) {
+    expect(error).toMatchObject({
+      kind: "blocked_preflight",
+      processOutcome: "blocked_preflight",
+      preSideEffect: true,
+    });
+  }
 });
 
 test("temporary Fable promotion is Anthropic-only at the semantic frontier", () => {
   process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
   expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
-  expect(resolveTier("anthropic", "frontier", undefined, "high")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "high" });
+  expect(() => resolveTier("anthropic", "frontier", undefined, "high"))
+    .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
   expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
   expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
@@ -478,6 +536,146 @@ async function eventsOf(query: AsyncIterable<any>): Promise<any[]> {
   for await (const event of query) events.push(event);
   return events;
 }
+
+test("routed provider admission runs once while direct adapter defense remains armed", async () => {
+  const decision = selectProviderFromAvailability("anthropic", available, policy(), "standard");
+  let admissions = 0;
+  const provider: AgentProvider = {
+    ...fakeProvider("anthropic", ({ options }) => {
+      if (!consumeExecutionAdmission("anthropic", options)) admissions++;
+      return { async *[Symbol.asyncIterator]() { yield { type: "result", result: "ok" }; } };
+    }),
+    admit: async () => { admissions++; },
+  };
+  const registry = {
+    anthropic: provider,
+    openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {} })),
+  };
+
+  await eventsOf(routedQuery(
+    decision,
+    { prompt: "managed", options: {} as any },
+    "standard",
+    registry,
+  ));
+  expect(admissions).toBe(1);
+
+  const direct = provider.query({ prompt: "direct", options: {} as any });
+  await eventsOf(direct as AsyncIterable<any>);
+  expect(admissions).toBe(2);
+});
+
+async function assertReadonlyCrossProviderFallback(
+  initial: ProviderId,
+  fallback: ProviderId,
+): Promise<void> {
+  const metadata = applyGafferStaffing({ role: "designer" });
+  const capabilities = gafferCapabilities(metadata);
+  const decision = selectProviderFromAvailability(
+    "auto",
+    available,
+    policy({ providerOrder: [initial, fallback] }),
+    "frontier",
+    `readonly-${initial}-to-${fallback}`,
+    "xhigh",
+    undefined,
+    capabilities,
+  );
+  const initialRoute = resolveTier(initial, "frontier", undefined, "xhigh");
+  const fallbackRoute = resolveTier(fallback, "frontier", undefined, "xhigh");
+  const baseOptions = harnessOptions({
+    self: `readonly-${initial}-to-${fallback}`,
+    provider: initial,
+    model: initialRoute.model,
+    effort: "xhigh",
+    routingMetadata: metadata,
+    presenceRegistrar: false,
+  }) as any;
+
+  // The precompiled envelope is safe for either provider. Codex ignores the
+  // Claude SDK allowlist and independently constrains its native exec surface.
+  expect(baseOptions.allowedTools).toContain(READONLY_SHELL_TOOL);
+  expect(baseOptions.allowedTools).not.toContain("Bash");
+  expect(baseOptions.disallowedTools).toContain("Bash");
+  expect(baseOptions.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
+  expect(codexHarnessArguments(baseOptions)).toEqual(expect.arrayContaining([
+    "--sandbox", "read-only",
+  ]));
+
+  const admissions: Record<ProviderId, number> = { anthropic: 0, openai: 0 };
+  const duplicateAdmissions: Record<ProviderId, number> = { anthropic: 0, openai: 0 };
+  const attempts: Array<{ provider: ProviderId; options: any }> = [];
+  const routeEvidence: Array<{
+    provider: ProviderId;
+    model?: string;
+    evidence?: HarnessCompositionEvidence;
+  }> = [];
+  const adapter = { anthropic: anthropicProvider, openai: openaiProvider };
+  const provider = (id: ProviderId): AgentProvider => ({
+    ...fakeProvider(id, ({ options }) => {
+      if (!consumeExecutionAdmission(id, options)) duplicateAdmissions[id]++;
+      attempts.push({ provider: id, options });
+      return {
+        async *[Symbol.asyncIterator]() {
+          if (id === initial)
+            throw new ProviderRetrySafeError(`${id}_retry_safe_before_acceptance`);
+          yield { type: "result", result: "ok" };
+        },
+      };
+    }),
+    admit: async (args) => {
+      admissions[id]++;
+      await adapter[id].admit!(args);
+    },
+  });
+
+  expect(await eventsOf(routedQuery(
+    decision,
+    { prompt: "inspect without writing", options: baseOptions },
+    "frontier",
+    { anthropic: provider("anthropic"), openai: provider("openai") },
+    undefined,
+    (route, evidence) => routeEvidence.push({
+      provider: route.provider,
+      model: route.resolvedModel,
+      evidence,
+    }),
+  ))).toEqual([{ type: "result", result: "ok" }]);
+
+  expect(attempts.map(({ provider }) => provider)).toEqual([initial, fallback]);
+  expect(attempts[0].options.model).toBe(initialRoute.model);
+  expect(attempts[1].options.model).toBe(fallbackRoute.model);
+  for (const { options } of attempts) {
+    expect(options.allowedTools).toContain(READONLY_SHELL_TOOL);
+    expect(options.allowedTools).not.toContain("Bash");
+    expect(options.disallowedTools).toContain("Bash");
+    expect(options.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
+    expect(codexHarnessArguments(options)).toEqual(expect.arrayContaining([
+      "--sandbox", "read-only",
+    ]));
+  }
+  expect(admissions).toEqual({ [initial]: 1, [fallback]: 1 });
+  expect(duplicateAdmissions).toEqual({ anthropic: 0, openai: 0 });
+  expect(routeEvidence.map(({ provider, model }) => ({ provider, model }))).toEqual([
+    { provider: initial, model: initialRoute.model },
+    { provider: fallback, model: fallbackRoute.model },
+  ]);
+  expect(routeEvidence[0].evidence?.modelDelta).toMatchObject({
+    provider: initial, model: initialRoute.model,
+  });
+  expect(routeEvidence[1].evidence?.modelDelta).toMatchObject({
+    provider: fallback, model: fallbackRoute.model,
+  });
+  expect(decision.fallbackPath).toEqual([initial, fallback]);
+}
+
+test("OpenAI read-only fallback to Anthropic preserves minimum authority and exact route", async () => {
+  await assertReadonlyCrossProviderFallback("openai", "anthropic");
+});
+
+test("Anthropic read-only fallback to OpenAI preserves minimum authority and exact route", async () => {
+  await assertReadonlyCrossProviderFallback("anthropic", "openai");
+});
 
 test("Anthropic adapter diagnostics redact SDK failures across stream and controls", async () => {
   const canary = "ANTHROPIC_SDK_CANARY_DO_NOT_EXPOSE";
@@ -536,30 +734,138 @@ test("Anthropic adapter diagnostics redact SDK failures across stream and contro
   }
 });
 
-test("Anthropic readonly capability requires an exact hard sandbox before SDK side effects", () => {
-  const base = {
-    northCapabilities: ["filesystem.read", "filesystem.search", "shell.readonly"],
-    disallowedTools: [
-      "Edit", "Write", "MultiEdit", "NotebookEdit", "WebSearch", "WebFetch",
-      "mcp__north__spawn", "mcp__north__dispatch", "mcp__north-peer__command_peer",
+test("Anthropic managed admission rejects every omitted authority boundary before SDK side effects", async () => {
+  let sequence = 0;
+  const makeBase = () => harnessOptions({
+    self: `anthropic-authority-probe-${sequence++}`,
+    provider: "anthropic",
+    model: "claude-opus-4-8",
+    routingMetadata: applyGafferStaffing({ role: "designer" }),
+    presenceRegistrar: false,
+  }) as any;
+  const changed = (mutate: (options: any) => void) => {
+    const options = makeBase();
+    mutate(options);
+    return options;
+  };
+  const withoutServer = (name: string) => {
+    return changed((options) => { delete options.mcpServers[name]; });
+  };
+  const writableWithoutGuards = harnessOptions({
+    self: "anthropic-unrestricted-shell-without-guards",
+    provider: "anthropic",
+    model: "claude-opus-4-8",
+    routingMetadata: applyGafferStaffing({ role: "integrator" }),
+    presenceRegistrar: false,
+  }) as any;
+  writableWithoutGuards.hooks.PreToolUse = [];
+  const cases: Array<[any, string]> = [
+    [
+      withoutServer("north"),
+      "anthropic_managed_north_mcp_contract_missing",
     ],
-    cwd: "/tmp/north-anthropic-readonly",
-  } as any;
-  for (const sandbox of [
-    undefined,
-    { enabled: true, failIfUnavailable: false, allowUnsandboxedCommands: false,
-      filesystem: { denyWrite: [base.cwd] } },
-    { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: true,
-      filesystem: { denyWrite: [base.cwd] } },
-    { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
-      filesystem: { denyWrite: ["/tmp/other"] } },
-  ]) {
+    [
+      changed((options) => { options.settingSources = ["user"]; }),
+      "anthropic_setting_sources_must_be_isolated",
+    ],
+    [
+      changed((options) => { options.strictMcpConfig = false; }),
+      "anthropic_strict_mcp_config_required",
+    ],
+    [
+      changed((options) => {
+        options.disallowedTools = options.disallowedTools.filter(
+          (toolName: string) => toolName !== "Agent",
+        );
+      }),
+      "anthropic_adapter_did_not_enforce_absent_native_agent_capability",
+    ],
+    [
+      changed((options) => { options.northCapabilities = ["filesystem.search"]; }),
+      "anthropic_adapter_did_not_enforce_absent_filesystem_read_capability",
+    ],
+    [
+      changed((options) => { options.northCapabilities = ["filesystem.read"]; }),
+      "anthropic_adapter_did_not_enforce_absent_filesystem_search_capability",
+    ],
+    [
+      changed((options) => {
+        options.allowedTools = options.allowedTools.filter(
+          (toolName: string) => toolName !== READONLY_SHELL_TOOL,
+        );
+      }),
+      "anthropic_adapter_did_not_apply_readonly_shell_capability",
+    ],
+    [
+      changed((options) => {
+        options.disallowedTools = options.disallowedTools.filter(
+          (toolName: string) => toolName !== "Bash",
+        );
+      }),
+      "anthropic_adapter_did_not_enforce_absent_shell_capability",
+    ],
+    [
+      withoutServer(READONLY_SHELL_SERVER),
+      "anthropic_readonly_shell_contract_missing",
+    ],
+    [
+      changed((options) => { options.tools = [...options.tools, "Bash"]; }),
+      "anthropic_builtin_tool_surface_contract_missing",
+    ],
+    [
+      changed((options) => { options.allowedTools = [...options.allowedTools, "Bash"]; }),
+      "anthropic_auto_approval_contract_missing",
+    ],
+    [
+      changed((options) => {
+        options.disallowedTools = options.disallowedTools.filter(
+          (toolName: string) => toolName !== "mcp__north__linear_sync",
+        );
+      }),
+      "anthropic_denied_tool_contract_missing",
+    ],
+    [
+      changed((options) => { options.mcpServers.ambient = options.mcpServers.north; }),
+      "anthropic_mcp_server_surface_contract_missing",
+    ],
+    [
+      changed((options) => {
+        options.mcpServers.north = { ...options.mcpServers.north };
+      }),
+      "anthropic_authoring_guard_contract_missing",
+    ],
+    [
+      changed((options) => { options.env.AGENT_TOPOLOGY = undefined; }),
+      "anthropic_managed_identity_topology_contract_missing",
+    ],
+    [
+      writableWithoutGuards,
+      "anthropic_authoring_guard_contract_missing",
+    ],
+  ];
+  for (const [options, message] of cases) {
     let caught: unknown;
-    try { anthropicProvider.query({ prompt: "x", options: { ...base, sandbox } }); }
+    try { await anthropicProvider.admit!({ options }); }
     catch (error) { caught = error; }
     expect(caught).toBeInstanceOf(ProviderRetrySafeError);
-    expect((caught as Error).message).toBe("anthropic_readonly_sandbox_contract_missing");
+    expect((caught as Error).message).toBe(message);
   }
+  await expect(eventsOf(anthropicProvider.query({
+    prompt: "must not reach Claude",
+    options: cases[0][0],
+  }) as AsyncIterable<any>)).rejects.toThrow("anthropic_managed_north_mcp_contract_missing");
+  const base = makeBase();
+  await expect(anthropicProvider.admit!({ options: base })).resolves.toBeUndefined();
+
+  markExecutionAdmission("anthropic", base);
+  const admitted = anthropicProvider.query({
+    prompt: "must still not reach Claude", options: base,
+  });
+  base.disallowedTools = base.disallowedTools.filter(
+    (toolName: string) => toolName !== "Agent",
+  );
+  await expect(eventsOf(admitted as AsyncIterable<any>))
+    .rejects.toThrow("anthropic_adapter_did_not_enforce_absent_native_agent_capability");
 });
 
 test("unsafe Anthropic init is redacted and never manufactures retry-safe fallback", async () => {

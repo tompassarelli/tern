@@ -1,16 +1,31 @@
 #!/usr/bin/env bb
 ;; Harness-owned agent identity writer. This file is deliberately not routed by
 ;; `north` or MCP. Its surface is typed and fail-closed: one safe @agent subject,
-;; three exact operations, and an exhaustive predicate vocabulary. It is an
+;; four exact operations, and an exhaustive predicate vocabulary. It is an
 ;; application-integrity boundary, not same-UID hostile-process isolation.
 (require '[cheshire.core :as json]
          '[clojure.java.io :as io]
          '[clojure.string :as str])
 
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
+(load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/terminal-projection.clj"))
 
 (def safe-agent-id #"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 (def marker-predicate "identity_manifest_sha256")
+(def terminal-marker-predicate "terminal_manifest_sha256")
+(def terminal-predicates
+  #{"outcome" "process_outcome" "delivery_outcome" "delivery_reason"})
+(def terminal-publication-order
+  ;; Readers treat process_outcome without the marker as a partial new-style
+  ;; publication. Keep the legacy outcome alias last so it cannot masquerade as
+  ;; a complete legacy terminal while a new projection is still being written.
+  ["process_outcome" "delivery_outcome" "delivery_reason" "outcome"])
+(def terminal-retraction-order
+  ;; Once the marker is gone, remove the legacy alias before process_outcome.
+  ;; The remaining process_outcome forces modern validation to fail closed; if
+  ;; process_outcome disappeared first, a crash could expose stale outcome as a
+  ;; valid legacy singleton.
+  ["outcome" "process_outcome" "delivery_outcome" "delivery_reason"])
 (def route-authority-predicates #{"provider" "provider_target" "model" "effort"})
 (def projection-predicates #{"display_handle" "display_name"})
 (def route-predicates (into route-authority-predicates projection-predicates))
@@ -157,18 +172,55 @@
       (fail! "managed identity commit marker was not acknowledged" {:marker marker}))
     marker))
 
+(defn terminal-marker! [port subject facts]
+  (let [marker (north.terminal-projection/terminal-manifest-sha256 facts)]
+    (when-not marker
+      (fail! "cannot commit an incomplete managed terminal projection" {}))
+    (checked! (north.coord/put! port subject terminal-marker-predicate marker)
+              [:put subject terminal-marker-predicate marker])
+    (when-not (= marker (north.coord/resolved port subject terminal-marker-predicate))
+      (fail! "managed terminal commit marker was not acknowledged" {:marker marker}))
+    marker))
+
 (defn publish! [port subject facts]
   (validate-publish! facts)
   (let [before (facts-of port subject)]
     ;; A previous generation may have left any optional shape field or outcome.
-    ;; Remove its commit marker first; readers cannot mistake a partial rewrite for
-    ;; a complete current generation. Simultaneous reuse of one id is unsupported.
+    ;; Withdraw both generation markers deterministically before touching either
+    ;; projection body; readers cannot mistake a partial identity rewrite or a
+    ;; stale terminal for a committed current generation. Simultaneous reuse of
+    ;; one id is unsupported.
     (retract-values! port subject marker-predicate (get before marker-predicate #{}))
-    (doseq [predicate (conj publish-predicates "outcome")]
+    (retract-values! port subject terminal-marker-predicate
+                     (get before terminal-marker-predicate #{}))
+    (doseq [predicate terminal-retraction-order]
+      (retract-values! port subject predicate (get before predicate #{})))
+    (doseq [predicate (sort publish-predicates)]
       (retract-values! port subject predicate (get before predicate #{})))
     (put-facts! port subject facts)
     (verify-exact! port subject facts publish-predicates)
     (commit-marker! port subject facts)))
+
+(defn terminal! [port subject facts]
+  (when-not (= terminal-predicates (set (keys facts)))
+    (fail! "terminal requires exactly outcome, process_outcome, delivery_outcome, and delivery_reason"
+           {:predicates (keys facts)}))
+  (when-not (= (get facts "outcome") (get facts "process_outcome"))
+    (fail! "legacy outcome must equal process_outcome" {}))
+  (when-not (contains? #{"unverified" "blocked" "reported" "verified"}
+                       (get facts "delivery_outcome"))
+    (fail! "invalid delivery_outcome" {:delivery-outcome (get facts "delivery_outcome")}))
+  (let [before (facts-of port subject)]
+    (retract-values! port subject terminal-marker-predicate
+                     (get before terminal-marker-predicate #{}))
+    (doseq [predicate terminal-retraction-order]
+      (retract-values! port subject predicate (get before predicate #{})))
+    (doseq [predicate terminal-publication-order
+            :let [value (get facts predicate)]]
+      (checked! (north.coord/put! port subject predicate value)
+                [:put subject predicate value]))
+    (verify-exact! port subject facts terminal-predicates)
+    (terminal-marker! port subject facts)))
 
 (defn update-route! [port subject facts]
   (let [unknown (seq (remove route-predicates (keys facts)))
@@ -244,12 +296,7 @@
                "publish" (publish! port subject (payload raw))
                "route" (update-route! port subject (payload raw))
                "retask" (retask! port subject (payload raw))
-               "outcome" (do
-                           (when (str/blank? (str raw))
-                             (fail! "agent outcome must be nonblank" {}))
-                           (checked! (north.coord/put! port subject "outcome" raw)
-                                     [:put subject "outcome" raw])
-                           raw)
-               (fail! "internal agent fact operation must be publish, route, retask, or outcome"
+               "terminal" (terminal! port subject (payload raw))
+               (fail! "internal agent fact operation must be publish, route, retask, or terminal"
                       {:operation operation}))]
   (println (json/generate-string {:ok true :result result})))

@@ -33,7 +33,7 @@ test("peer command accepts role-only hydration or a complete Gaffer envelope, ne
     topology: "worker",
     tier: "senior",
     reasoning: "high",
-    posture: "explore",
+    posture: "evaluate",
     composition: { kind: "preset", id: "verifier", overrides: [] },
   })).not.toThrow();
   expect(() => validatePeerCommandArgs("spawn", {

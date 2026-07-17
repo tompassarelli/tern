@@ -7,18 +7,23 @@
 // or fail an agent run, so writes are async and all errors are swallowed.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import type { RoutingMetadata } from "./routing-metadata";
 import type { NormalizedTokenUsage } from "./usage";
 import type { AllocationEvidence, RoutingFallbackReason } from "./providers/types";
 import type { HarnessCompositionEvidence } from "./harness";
 import { GAFFER_CAPABILITIES } from "./gaffer-capabilities";
 
+const REPO = resolve(import.meta.dir, "../..");
+const internalWriter = resolve(REPO, "cli/run-fact-internal.clj");
+
 export interface RunRecord {
   thread: string; // the thread driven, or "(ad-hoc)" for a bare spawn
   agent: string; // agent id / handle
   tokens?: number; // legacy exact total for producers without structured terminal usage
   tokenUsage?: NormalizedTokenUsage; // observed components plus terminal scope/status
-  durationMs: number; // SDK result duration_ms
+  durationMs: number; // North-observed wall-clock duration
+  providerDurationMs?: number; // provider-reported duration when available
   posture: string; // unplanned | atomic | composite | spawn
   // Routing dials — the EFFECTIVE final dial the run finished at (escalation-aware:
   // spawn passes rung() after any ladder climb, so this is the tier that actually did
@@ -50,6 +55,9 @@ export interface RunRecord {
   envelopeRetries?: number;
   envelopeAdvisories?: string[];
   outcome: string; // "ran" | "error" | "resource_envelope_exceeded" | ...
+  processOutcome?: string;
+  deliveryOutcome?: string;
+  deliveryReason?: string;
   // escalate-not-kill (thread 019f1194-ca57) — present only on escalation-enabled runs.
   // Option A yields ONE @run row per spawn with an internal escalation chain, NOT one
   // row per tier (north-reconcile.clj queries adapt in lockstep — follow-up).
@@ -80,6 +88,11 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
     ["outcome", rec.outcome],
     ["at", at],
   );
+  if (rec.providerDurationMs != null)
+    facts.push(["provider_duration_ms", String(Math.round(rec.providerDurationMs))]);
+  if (rec.processOutcome) facts.push(["process_outcome", rec.processOutcome]);
+  if (rec.deliveryOutcome) facts.push(["delivery_outcome", rec.deliveryOutcome]);
+  if (rec.deliveryReason) facts.push(["delivery_reason", rec.deliveryReason]);
   if (rec.model) facts.push(["model", rec.model]);
   if (rec.effort) facts.push(["effort", rec.effort]);
   if (rec.role) facts.push(["role", rec.role]);
@@ -193,13 +206,25 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
 
 export function recordRun(rec: RunRecord): void {
   const id = newRunId(rec.agent);
-  for (const [p, v] of runFacts(rec)) {
-    // async + ignored: never let telemetry add latency to, or break, the run.
-    try {
-      execFile(process.env.NORTH_BIN ?? "north", ["tell", id, p, v], () => {});
-    } catch {
-      /* swallow */
+  const facts = runFacts(rec);
+  // Hermetic capture engines intentionally retain the ordinary fact-verb shape.
+  if (process.env.NORTH_IDENTITY_TEST_REDIRECT === "1") {
+    for (const [predicate, value] of facts) {
+      try {
+        execFile(process.env.NORTH_BIN ?? "north", ["tell", id, predicate, value], () => {});
+      } catch { /* swallow */ }
     }
+    return;
+  }
+  try {
+    execFile("bb", [
+      internalWriter,
+      process.env.NORTH_PORT ?? "7977",
+      id,
+      JSON.stringify(facts),
+    ], () => {});
+  } catch {
+    /* telemetry must never replace the run's real terminal result */
   }
 }
 

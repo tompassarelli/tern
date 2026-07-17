@@ -171,8 +171,8 @@ export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: s
   }
 
   // Fable is a temporary North runtime promotion, not a Gaffer model pin. Keep
-  // the request's reasoning exact; max stays on Opus because the promotion is
-  // proven only for Fable high/xhigh. An explicit model remains the opt-out.
+  // any catalog-valid requested reasoning exact and default an unspecified
+  // request to xhigh. Max stays on Opus; an explicit model remains the opt-out.
   const temporaryFable = provider === "anthropic" && tier === "frontier" && !model
     && effort !== "max" && fableWindowOpen();
   const resolvedModel = temporaryFable

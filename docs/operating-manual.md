@@ -665,6 +665,10 @@ north account usage       # per-account subscription windows, resets, fixed fail
 north providers           # auth/headroom + approximate balanced routing shares
 north providers --json    # stable machine status; automation uses this, not prose
 north config routing      # allocation mode, configured order, reserve, pressure, envelopes
+north templates           # Gaffer's reusable stock templates and routing defaults
+north routing report performance       # complete current managed-run evidence
+north routing report performance --all # include legacy/incomplete historical rows
+north routing report usage             # observed-token lower bounds + exact coverage
 ```
 
 `north dashboard` and `north doctor` folded in from convoy (2026-07-10). The
@@ -676,6 +680,20 @@ reads `~/code/gaffer/staffing/catalog.json`, then North selects an eligible targ
 and resolves the semantic tier through that provider's catalog. Generated agent
 markdown and `~/code/gaffer/docs/adapters/north.md` remain provider-adapter
 artifacts, never North's metadata source.
+
+`north templates` is the human view of Gaffer's stock library. It deliberately
+says **template** while the versioned machine contract retains `presets`,
+`composition.kind="preset"`, and `nearestPreset`. Templates are reusable
+starting points, not limits: select an exact template, justify an axis override,
+or author a complete bespoke composition. Routing performance defaults to
+complete current v2 managed-run evidence: an explicit terminal reason and
+process/delivery outcomes plus the applied role, capabilities, and every routing
+axis. The applied role must match the composition ID, preset IDs must still
+exist in the current stock catalog, and bespoke compositions need matching
+fingerprint evidence. `--all`
+exposes legacy and unattributed history. Usage totals are exact
+only when every included run has exact token evidence; otherwise the displayed
+sum is a lower bound with its exact-run coverage.
 
 `north account add|login|status|list|usage` manages provider-owned subscription login
 inside isolated homes under `~/.local/state/north/accounts`. `--target <id>` is

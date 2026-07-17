@@ -23,6 +23,9 @@
    (k/->Fact "@depends_on" "cardinality" "single")  (k/->Fact "@depends_on" "acyclic" "true")
    (k/->Fact "@rate" "value_kind" "literal")
    (k/->Fact "@weird" "foo" "bar")
+   ;; A historical malformed write must remain inspectable through the no-arg
+   ;; census instead of taking the entire schema command down.
+   (k/->Fact nil "reached" "")
    ;; a synthetic `gadget` kind for the per-kind field spec (required vs optional):
    ;; `name` on 3/3 subjects (100% => REQUIRED), `color` on 1/3 (33% => OPTIONAL),
    ;; `tag` asserted twice on ONE subject (coverage must dedup to 1 subject, not 2).
@@ -50,6 +53,10 @@
   (filter (fn [s] (or (some? (k/one-i idx s "cardinality")) (some? (k/one-i idx s "value_kind"))))
           (:subjects idx)))
 
+(def no-arg-schema-output
+  (with-redefs-fn {#'m/live-facts (fn [_] facts)}
+    #(with-out-str (m/cmd-schema "ignored" ""))))
+
 (def checks
   [["kind fact wins: @t1 => thread"                (= "thread" (kof "@t1"))]
    ["title (no kind) => thread"                    (= "thread" (kof "@2026-05-01-000000"))]
@@ -63,10 +70,12 @@
    ["prefix session: => session-telemetry"          (= "session-telemetry" (kof "@session:s1"))]
    ["schema-as-facts subject => predicate"          (= "predicate" (kof "@depends_on"))]
    ["unclassifiable => other"                       (= "other" (kof "@weird"))]
+   ["malformed nil subject => other"                (= "other" (kof nil))]
+   ["no-arg schema tolerates malformed subject"     (.contains no-arg-schema-output "SCHEMA —")]
    ["census: 2 thread subjects"                     (= 2 (subj-of "thread"))]
    ["census: 2 concern subjects"                    (= 2 (subj-of "concern"))]
    ["census: 2 session-telemetry subjects"          (= 2 (subj-of "session-telemetry"))]
-   ["census: 1 other subject"                       (= 1 (subj-of "other"))]
+   ["census: 2 other subjects"                      (= 2 (subj-of "other"))]
    ["census sorted by fact count desc"              facts-desc?]
    ["predicate metadata surfaces depends_on"        (some #{"@depends_on"} pred-subs)]
    ["predicate metadata surfaces rate"              (some #{"@rate"} pred-subs)]

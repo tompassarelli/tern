@@ -103,6 +103,7 @@
 (def audited-clj-variable-sites
   #{["cli/agent-fact-internal.clj" "put!" "predicate"]
     ["cli/agent-fact-internal.clj" "put!" "marker-predicate"]
+    ["cli/agent-fact-internal.clj" "put!" "terminal-marker-predicate"]
     ["cli/agent-fact-internal.clj" "retract!" "predicate"]
     ["cli/msg-cli.clj" "put!" "(arg-pred k)"]
     ["cli/msg-cli.clj" "retract!" "predicate"]
@@ -110,7 +111,8 @@
     ["cli/pred-cli.clj" "put!" "p"]
     ["cli/pred-cli.clj" "retract!" "p"]
     ["cli/presence-cli.clj" "retract!" "p"]
-    ["cli/presence-cli.clj" "append!" "(name k)"]})
+    ["cli/presence-cli.clj" "append!" "(name k)"]
+    ["cli/run-fact-internal.clj" "put!" "predicate"]})
 
 ;; Fixed SDK fact constructors are audited instead of their variable transport
 ;; loops. A variable p in recordRun is not permission to omit a runFacts tuple.
@@ -132,13 +134,14 @@
     "applied_role_contract" "applied_routing_tier" "applied_task_grade"
     "applied_topology" "at" "bespoke_reason" "cache_create_tokens"
     "cache_read_tokens" "cached_input_tokens" "composition_id"
-    "composition_kind" "composition_override_reason" "duration_ms" "effort"
+    "composition_kind" "composition_override_reason" "delivery_outcome"
+    "delivery_reason" "duration_ms" "provider_duration_ms" "effort"
     "entitlement_pressure" "envelope_retries" "error_count" "escalation_count"
     "escalation_path" "escalation_reasons" "escalation_tier" "fallback_count"
     "fallback_path" "fallback_target_path" "input_tokens" "kind" "model"
     "model_delta_kind" "model_delta_model" "model_delta_path"
     "model_delta_provider" "model_delta_reason" "nearest_preset" "num_turns"
-    "outcome" "output_tokens" "posture" "promotion_candidate"
+    "outcome" "process_outcome" "output_tokens" "posture" "promotion_candidate"
     "prompt_composition_applied" "provider" "provider_reason" "provider_target"
     "reasoning_output_tokens" "requested_effort" "requested_model"
     "requested_provider" "requested_reasoning" "requested_role"
@@ -149,7 +152,7 @@
 
 (def identity-source (slurp-source "sdk/src/identity.ts"))
 (def identity-predicates
-  (conj
+  (into
    (set/union
     (pair-predicates (section identity-source
                               "export function agentRouteFacts"
@@ -157,8 +160,9 @@
     (pair-predicates (section identity-source
                               "export function agentIdentityFacts"
                               "export function updateAgentRoute")))
-   (literal-def "cli/agent-fact-internal.clj" 'marker-predicate)
-   "outcome"))
+   #{(literal-def "cli/agent-fact-internal.clj" 'marker-predicate)
+     (literal-def "cli/agent-fact-internal.clj" 'terminal-marker-predicate)
+     "outcome" "process_outcome" "delivery_outcome" "delivery_reason"}))
 
 (def guard-source (slurp-source "sdk/src/guard-log.ts"))
 (def guard-predicates

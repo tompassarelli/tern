@@ -61,10 +61,10 @@
   (or (str/starts-with? bare "session:") (or (str/starts-with? bare "sess-") (or (str/starts-with? bare "run-") (or (str/starts-with? bare "snapshot:") (or (str/starts-with? bare "arena-") (or (str/starts-with? bare "cc-") (str/starts-with? bare "cmd:"))))))) "session-telemetry"
   :else ""))
 
-(defn- ^String kind-of [idx ^String te]
-  (let [ek (k/one-i idx te "kind")]
+(defn- ^String kind-of [idx te]
+  (if (nil? te) "other" (let [ek (k/one-i idx te "kind")]
   (if (some? ek) (kind-bucket ek) (let [np (namespace-kind (short-id te))]
-  (if (not (str/blank? np)) np (if (some? (k/one-i idx te "title")) "thread" (if (or (some? (k/one-i idx te "cardinality")) (or (some? (k/one-i idx te "value_kind")) (some? (k/one-i idx te "acyclic")))) "predicate" "other")))))))
+  (if (not (str/blank? np)) np (if (some? (k/one-i idx te "title")) "thread" (if (or (some? (k/one-i idx te "cardinality")) (or (some? (k/one-i idx te "value_kind")) (some? (k/one-i idx te "acyclic")))) "predicate" "other"))))))))
 
 (defn- ^String driver-label [idx ^String te]
   (let [d (k/one-i idx te "driver")]

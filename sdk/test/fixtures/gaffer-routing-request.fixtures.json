@@ -22,6 +22,23 @@
       }
     },
     {
+      "name": "evaluate posture stock template",
+      "request": {
+        "role": "verifier",
+        "taskGrade": "senior",
+        "domainRequirements": [],
+        "topology": "worker",
+        "tier": "senior",
+        "reasoning": "high",
+        "posture": "evaluate",
+        "composition": {
+          "kind": "preset",
+          "id": "verifier",
+          "overrides": []
+        }
+      }
+    },
+    {
       "name": "complete bespoke contract",
       "request": {
         "role": "migration-forensics", "taskGrade": "senior", "domainRequirements": ["schema history"],
@@ -49,8 +66,8 @@
       "errorContains": "overrideReason",
       "request": {
         "role": "integrator", "taskGrade": "senior", "domainRequirements": [],
-        "topology": "worker", "tier": "frontier", "reasoning": "high", "posture": "deliver",
-        "composition": { "kind": "preset", "id": "integrator", "overrides": ["tier"] }
+        "topology": "worker", "tier": "frontier", "reasoning": "xhigh", "posture": "deliver",
+        "composition": { "kind": "preset", "id": "integrator", "overrides": ["tier", "reasoning"] }
       }
     },
     {

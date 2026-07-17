@@ -11,6 +11,7 @@
 (def writer (str root "/cli/agent-fact-internal.clj"))
 (load-file (str root "/cli/coord.clj"))
 (load-file (str root "/cli/agent-provenance.clj"))
+(load-file (str root "/cli/terminal-projection.clj"))
 
 (def checks (atom []))
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
@@ -39,6 +40,9 @@
 (defn scalar-facts [facts]
   (into {} (keep (fn [[predicate values]]
                    (when (= 1 (count values)) [predicate (first values)]))) facts))
+(defn log-ops [file]
+  (with-open [reader (io/reader file)]
+    (mapv edn/read-string (line-seq reader))))
 
 (let [port (free-port)
       tmp (.toFile (java.nio.file.Files/createTempDirectory
@@ -79,15 +83,40 @@
              (= (north.agent-provenance/manifest-sha256 stored)
                 (get stored "identity_manifest_sha256"))))
 
-    (north.coord/put! port subject "outcome" "ran")
-    (let [second-result (run-writer port "publish" subject (json/generate-string bespoke))
+    (let [terminal {"outcome" "ran" "process_outcome" "ran"
+                    "delivery_outcome" "unverified"
+                    "delivery_reason" "provider_terminal_success_without_external_verification"}
+          terminal-result (run-writer port "terminal" subject (json/generate-string terminal))
+          stored (scalar-facts (entity-facts port subject))]
+      (check "terminal process and delivery axes publish together"
+             (and (zero? (:exit terminal-result))
+                  (= "ran" (get stored "process_outcome"))
+                  (= "unverified" (get stored "delivery_outcome"))
+                  (= "ran"
+                     (north.terminal-projection/terminal-process-outcome stored)))))
+    (let [before-op-count (count (log-ops log))
+          second-result (run-writer port "publish" subject (json/generate-string bespoke))
+          generation-ops (->> (log-ops log)
+                              (drop before-op-count)
+                              (filter #(= subject (:l %)))
+                              vec)
           raw-stored (entity-facts port subject)
           stored (scalar-facts raw-stored)]
       (check "sequential reuse publishes the second shape" (zero? (:exit second-result)))
+      (check "identity reuse withdraws identity and terminal markers before any body mutation"
+             (= [["retract" "identity_manifest_sha256"]
+                 ["retract" "terminal_manifest_sha256"]]
+                (mapv (juxt :op :p) (take 2 generation-ops))))
+      (check "identity reuse withdraws the legacy outcome before process_outcome"
+             (= [["retract" "outcome"] ["retract" "process_outcome"]]
+                (mapv (juxt :op :p) (take 2 (drop 2 generation-ops)))))
       (check "sequential reuse removes every stale optional preset field and outcome"
              (and (nil? (get raw-stored "composition_overrides"))
                   (nil? (get raw-stored "composition_override_reason"))
                   (nil? (get raw-stored "outcome"))
+                  (nil? (get raw-stored "process_outcome"))
+                  (nil? (get raw-stored "delivery_outcome"))
+                  (nil? (get raw-stored "terminal_manifest_sha256"))
                   (= #{"analyst"} (get raw-stored "nearest_preset"))))
       (check "every managed identity predicate has exactly one live value"
              (every? #(= 1 (count %))

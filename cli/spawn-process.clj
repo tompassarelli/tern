@@ -10,6 +10,7 @@
             [clojure.string :as str]))
 
 (load-file (str (.getParent (io/file *file*)) "/agent-provenance.clj"))
+(load-file (str (.getParent (io/file *file*)) "/terminal-projection.clj"))
 
 (def default-startup-timeout-ms 45000)
 (def default-startup-poll-ms 100)
@@ -88,7 +89,7 @@
     (loop [facts initial-facts]
       (let [observed (try (or (probe-identity agent-id) {}) (catch Exception _ {}))
             merged (merge facts observed)
-            outcome (some-> (get merged "outcome") str str/trim not-empty)]
+            outcome (north.terminal-projection/terminal-process-outcome merged)]
         (if (or (and (identity-ready? merged) outcome)
                 (>= (System/currentTimeMillis) deadline))
           merged
@@ -108,7 +109,7 @@
       (let [facts (try (or (probe-identity agent-id) {})
                        (catch Exception _ last-facts))
             identity? (identity-ready? facts)
-            outcome (some-> (get facts "outcome") str str/trim not-empty)
+            outcome (north.terminal-projection/terminal-process-outcome facts)
             first-exit (process-exit process)
             online? (and identity? (nil? first-exit)
                          (try (boolean (probe-online agent-id)) (catch Exception _ false)))
@@ -127,7 +128,7 @@
           (some? exit)
           (let [final-facts (final-terminal-facts
                              agent-id facts probe-identity exit-grace-ms poll-ms)
-                final-outcome (some-> (get final-facts "outcome") str str/trim not-empty)]
+                final-outcome (north.terminal-projection/terminal-process-outcome final-facts)]
             (if (and (identity-ready? final-facts) final-outcome)
               {:status :completed :agent-id agent-id
                :handle (get final-facts "display_handle")

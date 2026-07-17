@@ -43,16 +43,19 @@ export type ProviderSelectionFailure =
   | "provider_unavailable"
   | "entitlement_exhausted"
   | "route_unresolvable"
+  | "blocked_preflight"
   | "no_provider_available";
 
 // Provider selection happens before a provider query is constructed, so this
 // error is an explicit no-side-effect signal to callers such as discovery.
 export class ProviderSelectionError extends Error {
   readonly preSideEffect = true;
+  readonly processOutcome: "blocked_preflight" | undefined;
 
   constructor(readonly kind: ProviderSelectionFailure, message: string) {
     super(message);
     this.name = "ProviderSelectionError";
+    this.processOutcome = kind === "blocked_preflight" ? "blocked_preflight" : undefined;
   }
 }
 
@@ -563,9 +566,11 @@ export function selectProviderFromAvailability(
   const requestedProvider = request.provider ?? "auto";
   const requestedTarget = request.target;
   const targets = orderedTargets(policy);
+  const capabilityCompatible = (target: RoutingTarget) =>
+    providerSupportsCapabilities(target.provider, capabilities);
   const routeCompatible = (target: RoutingTarget) => providerSupportsRoute(target.provider, tier, reasoning)
     && providerSupportsModel(target.provider, model)
-    && providerSupportsCapabilities(target.provider, capabilities);
+    && capabilityCompatible(target);
   const targetPressures = Object.fromEntries(targets.map((target) => [
     target.id, routePressure(target, policy, tier, reasoning, model),
   ])) as Record<string, EntitlementPressure>;
@@ -590,6 +595,11 @@ export function selectProviderFromAvailability(
     if (requestedProvider !== "auto" && target.provider !== requestedProvider)
       throw new ProviderSelectionError("provider_unavailable",
         `routing target ${requestedTarget} belongs to ${target.provider}, not requested provider ${requestedProvider}`);
+    if (!capabilityCompatible(target))
+      throw new ProviderSelectionError(
+        "blocked_preflight",
+        `routing target ${target.id} cannot enforce the requested Gaffer capabilities`,
+      );
     if (!routeCompatible(target)) throw routeFailure([target.provider]);
     const state = stateOfTarget(availability, target);
     if (!state.available)
@@ -602,6 +612,11 @@ export function selectProviderFromAvailability(
     const providerTargets = targets.filter((target) => target.provider === requestedProvider);
     if (!providerTargets.length)
       throw new ProviderSelectionError("provider_unavailable", `provider ${requestedProvider} has no configured routing target`);
+    if (capabilities && providerTargets.every((target) => !capabilityCompatible(target)))
+      throw new ProviderSelectionError(
+        "blocked_preflight",
+        `provider ${requestedProvider} cannot enforce the requested Gaffer capabilities`,
+      );
     const compatibleTargets = providerTargets.filter(routeCompatible);
     if (!compatibleTargets.length) throw routeFailure([requestedProvider]);
     candidates = compatibleTargets.filter(eligible);

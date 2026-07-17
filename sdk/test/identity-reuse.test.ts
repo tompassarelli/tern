@@ -20,7 +20,7 @@ test("sequential lane-id reuse retracts the prior outcome before publishing iden
   const fake = join(directory, "north");
   writeFileSync(fake, `#!/usr/bin/env bash
 if [ "$1 $2" = "json show" ]; then
-  printf '%s\\n' '[{"predicate":"kind","value":"lane"},{"predicate":"outcome","value":"ran"}]'
+  printf '%s\\n' '[{"predicate":"kind","value":"lane"},{"predicate":"outcome","value":"ran"},{"predicate":"process_outcome","value":"ran"},{"predicate":"delivery_outcome","value":"unverified"},{"predicate":"delivery_reason","value":"provider_terminal_success_without_external_verification"},{"predicate":"terminal_manifest_sha256","value":"old"}]'
   exit 0
 fi
 printf '%s\\n' "$*" >> "${log}"
@@ -38,6 +38,9 @@ printf '%s\\n' "$*" >> "${log}"
   const commands = readFileSync(log, "utf8").trim().split("\n");
   const firstTell = commands.findIndex((command) => command.startsWith("tell "));
   expect(commands).toContain("retract agent:stable-id outcome ran");
+  expect(commands).toContain("retract agent:stable-id process_outcome ran");
+  expect(commands).toContain("retract agent:stable-id delivery_outcome unverified");
+  expect(commands).toContain("retract agent:stable-id terminal_manifest_sha256 old");
   expect(firstTell).toBeGreaterThan(0);
   expect(commands.slice(0, firstTell).every((command) => command.startsWith("retract "))).toBe(true);
   expect(commands[firstTell]).toBe("tell agent:stable-id kind lane");

@@ -9,6 +9,7 @@ import { applyGafferStaffing } from "../src/gaffer-staffing";
 import type { RoutingMetadata } from "../src/routing-metadata";
 import { runFacts } from "../src/telemetry";
 import { codexGlobalArguments, codexHarnessArguments } from "../src/providers/openai";
+import { READONLY_SHELL_SERVER, READONLY_SHELL_TOOL } from "../src/readonly-shell";
 
 const north = resolve(import.meta.dir, "../..");
 const savedEnv = Object.fromEntries(
@@ -136,35 +137,37 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   expect(designer.northCapabilities).toEqual([
     "filesystem.read", "filesystem.search", "shell.readonly",
   ]);
-  expect(designer.allowedTools).toEqual(expect.arrayContaining(["Read", "Grep", "Glob", "Bash"]));
+  expect(designer.allowedTools).toEqual(expect.arrayContaining([
+    "Read", "Grep", "Glob", READONLY_SHELL_TOOL,
+  ]));
+  expect(designer.allowedTools).not.toContain("Bash");
+  expect(designer.disallowedTools).toContain("Bash");
+  expect(designer.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
   expect(designer.allowedTools).not.toEqual(expect.arrayContaining(["Edit", "Write", "WebSearch"]));
   expect(designer.disallowedTools).toEqual(expect.arrayContaining([
     "Edit", "Write", "MultiEdit", "NotebookEdit", "WebSearch", "WebFetch",
     "mcp__north__spawn", "mcp__north__dispatch",
   ]));
   expect(designer.permissionMode).toBe("default");
-  expect(designer.sandbox).toEqual({
-    enabled: true,
-    failIfUnavailable: true,
-    allowUnsandboxedCommands: false,
-    // The engine's git-isolation stub writes `$cwd/.gitconfig` at sandbox
-    // SETUP; denying it bricked every read-only lane's bash (2026-07-17).
-    filesystem: { denyWrite: [north], allowWrite: [`${north}/.gitconfig`] },
-  });
+  expect(designer.sandbox).toBeUndefined();
 
   const director = harnessOptions({
     self: "capability-director", provider: "openai", model: "gpt-5.6-sol", cwd: north,
     presenceRegistrar: false, routingMetadata: preset("director"),
   }) as any;
   expect(director.allowedTools).toEqual(expect.arrayContaining([
-    "Read", "Grep", "Glob", "Bash", "WebSearch", "WebFetch",
+    "Read", "Grep", "Glob", READONLY_SHELL_TOOL, "WebSearch", "WebFetch",
     "mcp__north__spawn", "mcp__north__dispatch", "mcp__north-peer__command_peer",
   ]));
   expect(director.disallowedTools).toEqual(expect.arrayContaining([
-    "Edit", "Write", "MultiEdit", "NotebookEdit", "Agent", "Task", "Workflow",
+    "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Agent", "Task", "Workflow",
   ]));
+  expect(director.allowedTools).toContain(READONLY_SHELL_TOOL);
+  expect(director.allowedTools).not.toContain("Bash");
   expect(codexGlobalArguments(director)).toEqual(["--search"]);
   expect(codexHarnessArguments(director)).toEqual(expect.arrayContaining(["--sandbox", "read-only"]));
+  expect(codexHarnessArguments(director)).toContain("mcp_servers.north.required=true");
+  expect(director.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
 
   const integrator = harnessOptions({
     self: "capability-integrator", provider: "openai", model: "gpt-5.6-sol", cwd: north,

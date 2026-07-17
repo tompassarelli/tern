@@ -103,7 +103,9 @@ test("North rejects unlogged bespoke roles and composition identity mismatches",
 
 test("bespoke Gaffer composition rationale reaches North telemetry", () => {
   const request = composed("migration-forensics", "--rationale",
-    "provenance tracing plus schema recovery", "--contract", contract, "--no-promotion-candidate");
+    "provenance tracing plus schema recovery", "--contract", contract, "--no-promotion-candidate",
+    "--task-grade", "senior", "--topology", "worker", "--tier", "senior",
+    "--reasoning", "high", "--posture", "explore");
   const metadata = validateRoutingMetadata(request);
   expect(metadata.composition).toMatchObject({
     kind: "bespoke", id: "migration-forensics",

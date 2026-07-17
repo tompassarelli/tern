@@ -1,0 +1,428 @@
+import { afterEach, expect, test } from "bun:test";
+import {
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+  canonicalGlobalAgents,
+  COORDINATION_TOOLS,
+  GLOBAL_AGENTS_MAX_BYTES,
+  harnessOptions,
+  NORTH_MCP_TOOL_NAMES,
+  PROJECT_AGENTS_MAX_BYTES,
+  projectAgentsAppendix,
+} from "../src/harness";
+import { providerEnvironmentForTarget } from "../src/accounts";
+import { applyGafferStaffing } from "../src/gaffer-staffing";
+import {
+  MANAGED_NORTH_MCP_ENV_KEYS, validateManagedExecutionEnvelope,
+} from "../src/execution-admission";
+import {
+  assertCodexGlobalAgentsForEnvironment, codexHarnessArguments,
+} from "../src/providers/openai";
+
+const north = join(import.meta.dir, "../..");
+const temporary: string[] = [];
+const envKeys = [
+  "HOME", "AGENT_LAWS", "NORTH_PORT", "FRAM_LOG", "FRAM_TELEMETRY_LOG",
+  "FRAM_THREADS", "UNRELATED_SECRET_CANARY",
+] as const;
+const inheritedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+
+afterEach(() => {
+  for (const key of envKeys) {
+    const value = inheritedEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+function designer(provider: "anthropic" | "openai", self: string): any {
+  return harnessOptions({
+    self,
+    provider,
+    cwd: north,
+    presenceRegistrar: false,
+    routingMetadata: applyGafferStaffing({ role: "designer" }),
+  }) as any;
+}
+
+test("North MCP tool inventory and managed Anthropic exposure stay in exact parity", () => {
+  const source = readFileSync(join(north, "bin/north-mcp"), "utf8");
+  const main = source.slice(source.indexOf("(def tools"), source.indexOf(";; --- SDK agent tools"));
+  const sdk = source.slice(source.indexOf("(def sdk-tools"), source.indexOf(";; Attribution"));
+  const names = [...main.matchAll(/\{:name "([^"]+)"/g), ...sdk.matchAll(/\{:name "([^"]+)"/g)]
+    .map((match) => match[1]);
+  expect(names).toEqual([...NORTH_MCP_TOOL_NAMES]);
+
+  const options = designer("anthropic", "anthropic-exact-surface");
+  expect(options.settingSources).toEqual([]);
+  expect(options.strictMcpConfig).toBe(true);
+  expect(options.tools).toEqual(["Read", "Grep", "Glob"]);
+  expect(options.allowedTools).toEqual([
+    "Read", "Grep", "Glob", "mcp__north-readonly-shell__run", ...COORDINATION_TOOLS,
+  ]);
+  const contractNorth = new Set([
+    ...COORDINATION_TOOLS.map((name) => name.replace("mcp__north__", "")),
+  ]);
+  for (const name of NORTH_MCP_TOOL_NAMES) {
+    if (!contractNorth.has(name)) expect(options.disallowedTools).toContain(`mcp__north__${name}`);
+  }
+  expect(options.disallowedTools).toEqual(expect.arrayContaining([
+    "mcp__north__clock_start",
+    "mcp__north__linear_get",
+    "mcp__north__linear_sync",
+    "mcp__north__dispatch",
+    "mcp__north__spawn",
+  ]));
+
+  const director = harnessOptions({
+    self: "openai-exact-orchestrator-surface",
+    provider: "openai",
+    cwd: north,
+    presenceRegistrar: false,
+    routingMetadata: applyGafferStaffing({ role: "director" }),
+  }) as any;
+  const codexArgs = codexHarnessArguments(director);
+  const enabledTools = codexArgs.find((argument) =>
+    argument.startsWith("mcp_servers.north.enabled_tools="))!;
+  expect(enabledTools).toBe(
+    'mcp_servers.north.enabled_tools=["capture","tell","show","ready","next","board","plate","dispatch","spawn"]',
+  );
+  expect(enabledTools).not.toMatch(/clock|linear|retract|validate/);
+});
+
+test("both providers receive the exact custom North and Fram instance selectors without ambient secrets", () => {
+  process.env.NORTH_PORT = "64129";
+  process.env.FRAM_LOG = "/tmp/north-authority-facts.log";
+  process.env.FRAM_TELEMETRY_LOG = "/tmp/north-authority-telemetry.log";
+  process.env.FRAM_THREADS = "/tmp/north-authority-threads";
+  process.env.UNRELATED_SECRET_CANARY = "must-not-cross-mcp-boundary";
+
+  for (const provider of ["anthropic", "openai"] as const) {
+    const options = designer(provider, `${provider}-custom-instance`);
+    const env = options.mcpServers.north.env;
+    expect(env).toMatchObject({
+      NORTH_PORT: "64129",
+      FRAM_LOG: "/tmp/north-authority-facts.log",
+      FRAM_TELEMETRY_LOG: "/tmp/north-authority-telemetry.log",
+      FRAM_THREADS: "/tmp/north-authority-threads",
+    });
+    expect(env).not.toHaveProperty("UNRELATED_SECRET_CANARY");
+    expect(Object.keys(env).every((key) =>
+      (MANAGED_NORTH_MCP_ENV_KEYS as readonly string[]).includes(key))).toBe(true);
+    expect(() => validateManagedExecutionEnvelope(
+      provider, options.northCapabilities, options,
+    )).not.toThrow();
+  }
+
+  const openai = designer("openai", "openai-custom-instance-argv");
+  const envArgument = codexHarnessArguments(openai)
+    .find((argument) => argument.startsWith("mcp_servers.north.env="))!;
+  expect(envArgument).toContain('NORTH_PORT="64129"');
+  expect(envArgument).toContain('FRAM_LOG="/tmp/north-authority-facts.log"');
+  expect(envArgument).toContain('FRAM_TELEMETRY_LOG="/tmp/north-authority-telemetry.log"');
+  expect(envArgument).toContain('FRAM_THREADS="/tmp/north-authority-threads"');
+  expect(envArgument).not.toContain("UNRELATED_SECRET_CANARY");
+
+  const tainted = {
+    ...openai,
+    mcpServers: {
+      ...openai.mcpServers,
+      north: {
+        ...openai.mcpServers.north,
+        env: { ...openai.mcpServers.north.env, UNRELATED_SECRET_CANARY: "injected" },
+      },
+    },
+  };
+  expect(() => validateManagedExecutionEnvelope(
+    "openai", tainted.northCapabilities, tainted,
+  )).toThrow("openai_managed_north_mcp_contract_missing");
+
+  const omittedPort = {
+    ...openai,
+    mcpServers: {
+      ...openai.mcpServers,
+      north: {
+        ...openai.mcpServers.north,
+        env: Object.fromEntries(Object.entries(openai.mcpServers.north.env)
+          .filter(([key]) => key !== "NORTH_PORT")),
+      },
+    },
+  };
+  expect(() => validateManagedExecutionEnvelope(
+    "openai", omittedPort.northCapabilities, omittedPort,
+  )).toThrow("openai_managed_north_mcp_contract_missing");
+
+  const mutatedPort = {
+    ...openai,
+    mcpServers: {
+      ...openai.mcpServers,
+      north: {
+        ...openai.mcpServers.north,
+        env: { ...openai.mcpServers.north.env, NORTH_PORT: "64130" },
+      },
+    },
+  };
+  expect(() => validateManagedExecutionEnvelope(
+    "openai", mutatedPort.northCapabilities, mutatedPort,
+  )).toThrow("openai_managed_north_mcp_contract_missing");
+});
+
+test("managed lanes materialize the canonical default North port in lane and MCP environments", () => {
+  delete process.env.NORTH_PORT;
+  for (const provider of ["anthropic", "openai"] as const) {
+    const options = designer(provider, `${provider}-default-port`);
+    expect(options.env.NORTH_PORT).toBe("7977");
+    expect(options.mcpServers.north.env.NORTH_PORT).toBe("7977");
+    expect(() => validateManagedExecutionEnvelope(
+      provider, options.northCapabilities, options,
+    )).not.toThrow();
+  }
+});
+
+test("canonical global AGENTS is fail-closed, bounded, valid UTF-8, and injected once for Anthropic", () => {
+  const home = mkdtempSync(join(tmpdir(), "north-global-agents-"));
+  temporary.push(home);
+  const codexHome = join(home, ".codex");
+  const source = join(codexHome, "AGENTS.md");
+  mkdirSync(codexHome, { recursive: true });
+  process.env.HOME = home;
+  process.env.AGENT_LAWS = "on";
+
+  expect(() => canonicalGlobalAgents()).toThrow("global AGENTS bootstrap cannot inspect canonical source");
+  for (const provider of ["anthropic", undefined] as const) {
+    let registrations = 0;
+    expect(() => harnessOptions({
+      self: `invalid-global-no-presence-${provider ?? "auto"}`,
+      provider,
+      cwd: north,
+      presenceRegistrar: () => { registrations++; },
+    })).toThrow("global AGENTS bootstrap cannot inspect canonical source");
+    expect(registrations).toBe(0);
+  }
+
+  mkdirSync(source);
+  expect(() => canonicalGlobalAgents()).toThrow("is not a regular file");
+  rmSync(source, { recursive: true });
+
+  writeFileSync(source, Buffer.from([0xc3, 0x28]));
+  expect(() => canonicalGlobalAgents()).toThrow("is not valid UTF-8");
+
+  writeFileSync(source, "x".repeat(GLOBAL_AGENTS_MAX_BYTES + 1));
+  expect(() => canonicalGlobalAgents()).toThrow(
+    `global AGENTS bootstrap exceeds ${GLOBAL_AGENTS_MAX_BYTES} bytes`,
+  );
+
+  writeFileSync(source, "GLOBAL_EXACT_ONCE_CANARY_67143\n");
+  chmodSync(source, 0o000);
+  try {
+    expect(() => canonicalGlobalAgents()).toThrow("global AGENTS bootstrap cannot read canonical source");
+  } finally {
+    chmodSync(source, 0o600);
+  }
+
+  const canonical = canonicalGlobalAgents()!;
+  expect(canonical.path).toBe(source);
+  expect(canonical.text).toBe("GLOBAL_EXACT_ONCE_CANARY_67143\n");
+  const anthropic = harnessOptions({
+    self: "anthropic-global-exact-once",
+    provider: "anthropic",
+    cwd: north,
+    presenceRegistrar: false,
+  }) as any;
+  expect(anthropic.systemPrompt.match(/GLOBAL_EXACT_ONCE_CANARY_67143/g)).toHaveLength(1);
+  expect(() => harnessOptions({
+    self: "anthropic-global-duplicate-denial",
+    provider: "anthropic",
+    cwd: north,
+    presenceRegistrar: false,
+    systemPrompt: "GLOBAL_EXACT_ONCE_CANARY_67143",
+  })).toThrow("Anthropic global AGENTS bootstrap expected exactly once, observed 2");
+
+  const openai = harnessOptions({
+    self: "openai-global-native-only",
+    provider: "openai",
+    cwd: north,
+    presenceRegistrar: false,
+  }) as any;
+  expect(openai.systemPrompt).not.toContain("GLOBAL_EXACT_ONCE_CANARY_67143");
+
+  rmSync(source);
+  process.env.AGENT_LAWS = "off";
+  expect(canonicalGlobalAgents()).toBeUndefined();
+  expect(() => harnessOptions({
+    self: "anthropic-global-explicit-opt-out",
+    provider: "anthropic",
+    cwd: north,
+    presenceRegistrar: false,
+  })).not.toThrow();
+});
+
+test("ambient and isolated Codex targets resolve the exact canonical global AGENTS source", () => {
+  const home = mkdtempSync(join(tmpdir(), "north-codex-global-targets-"));
+  temporary.push(home);
+  const codexHome = join(home, ".codex");
+  const source = join(codexHome, "AGENTS.md");
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(source, "CODEX_TARGET_GLOBAL_CANARY_81277\n");
+  const baseEnv = { ...process.env, HOME: home, AGENT_LAWS: "on" };
+
+  const ambient = providerEnvironmentForTarget("openai", undefined, { env: baseEnv });
+  expect(ambient.CODEX_HOME).toBe(codexHome);
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    ambient, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).not.toThrow();
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...ambient, AGENT_LAWS: "off" }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_agent_laws_opt_out_unenforceable");
+
+  const target = {
+    id: "codex-isolated-global-proof",
+    provider: "openai" as const,
+    authMode: "isolated" as const,
+    profile: "isolated-global-proof",
+  };
+  const isolated = providerEnvironmentForTarget("openai", target, { env: baseEnv });
+  const isolatedAgents = join(isolated.CODEX_HOME!, "AGENTS.md");
+  expect(readlinkSync(isolatedAgents)).toBe(source);
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    isolated, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).not.toThrow();
+
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    isolated, "CODEX_TARGET_GLOBAL_CANARY_81277",
+  )).toThrow("openai_global_agents_duplicated_in_developer_instructions");
+
+  const missingHome = join(home, "missing");
+  mkdirSync(missingHome);
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...baseEnv, CODEX_HOME: missingHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_target_global_agents_unavailable");
+
+  const replacedHome = join(home, "replaced");
+  mkdirSync(replacedHome);
+  mkdirSync(join(replacedHome, "AGENTS.md"));
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...baseEnv, CODEX_HOME: replacedHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_target_global_agents_not_regular_file");
+
+  const copiedHome = join(home, "copied");
+  mkdirSync(copiedHome);
+  writeFileSync(join(copiedHome, "AGENTS.md"), readFileSync(source));
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...baseEnv, CODEX_HOME: copiedHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_target_global_agents_not_canonical");
+
+  const invalidHome = join(home, "invalid");
+  mkdirSync(invalidHome);
+  writeFileSync(join(invalidHome, "AGENTS.md"), Buffer.from([0xc3, 0x28]));
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...baseEnv, CODEX_HOME: invalidHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_target_global_agents_invalid_utf8");
+
+  const unreadableHome = join(home, "unreadable");
+  mkdirSync(unreadableHome);
+  const unreadable = join(unreadableHome, "AGENTS.md");
+  writeFileSync(unreadable, readFileSync(source));
+  chmodSync(unreadable, 0o000);
+  try {
+    expect(() => assertCodexGlobalAgentsForEnvironment(
+      { ...baseEnv, CODEX_HOME: unreadableHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+    )).toThrow("openai_target_global_agents_unavailable");
+  } finally {
+    chmodSync(unreadable, 0o600);
+  }
+
+  const oversizedHome = join(home, "oversized");
+  mkdirSync(oversizedHome);
+  writeFileSync(join(oversizedHome, "AGENTS.md"), "x".repeat(GLOBAL_AGENTS_MAX_BYTES + 1));
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...baseEnv, CODEX_HOME: oversizedHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_target_global_agents_oversized");
+
+  const linkedHome = join(home, "linked");
+  mkdirSync(linkedHome);
+  symlinkSync(source, join(linkedHome, "AGENTS.md"));
+  writeFileSync(join(linkedHome, "AGENTS.override.md"), "OVERRIDE_MUST_NOT_WIN\n");
+  expect(() => assertCodexGlobalAgentsForEnvironment(
+    { ...baseEnv, CODEX_HOME: linkedHome }, "PROJECT_ONLY_DEVELOPER_CANARY",
+  )).toThrow("openai_global_agents_override_present");
+});
+
+test("native Codex loads global AGENTS exactly once while managed project discovery is disabled", () => {
+  const home = mkdtempSync(join(tmpdir(), "north-codex-native-agents-"));
+  temporary.push(home);
+  const codexHome = join(home, "codex-home");
+  const project = join(home, "project");
+  mkdirSync(codexHome);
+  mkdirSync(join(project, ".git"), { recursive: true });
+  writeFileSync(join(codexHome, "AGENTS.md"), "NATIVE_GLOBAL_EXACT_ONCE_CANARY_41729\n");
+  writeFileSync(join(project, "AGENTS.md"), "NATIVE_PROJECT_MUST_BE_SUPPRESSED_41729\n");
+  const probe = spawnSync("codex", [
+    "-C", project,
+    "debug", "prompt-input",
+    "-c", "project_doc_max_bytes=0",
+    "NATIVE_TASK_CANARY_41729",
+  ], {
+    // AGENT_LAWS is a North switch, not a native Codex switch. This probe
+    // proves why managed OpenAI must reject that opt-out as unenforceable.
+    env: { ...process.env, AGENT_LAWS: "off", CODEX_HOME: codexHome },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  expect(probe.error).toBeUndefined();
+  expect(probe.status).toBe(0);
+  expect(probe.stdout.match(/NATIVE_GLOBAL_EXACT_ONCE_CANARY_41729/g)).toHaveLength(1);
+  expect(probe.stdout).not.toContain("NATIVE_PROJECT_MUST_BE_SUPPRESSED_41729");
+  expect(probe.stdout.match(/NATIVE_TASK_CANARY_41729/g)).toHaveLength(1);
+});
+
+test("project AGENTS composition is bounded, root-to-cwd, override-aware, and provider-neutral", () => {
+  const managedOpenAI = designer("openai", "openai-native-project-doc-suppression");
+  const home = mkdtempSync(join(tmpdir(), "north-project-agents-"));
+  temporary.push(home);
+  const project = join(home, "project");
+  const nested = join(project, "src", "module");
+  mkdirSync(join(project, ".git"), { recursive: true });
+  mkdirSync(nested, { recursive: true });
+  mkdirSync(join(home, ".codex"), { recursive: true });
+  writeFileSync(join(home, ".codex", "AGENTS.md"), "GLOBAL_AUTHORITY_CANARY\n");
+  writeFileSync(join(project, "AGENTS.md"), "ROOT_PROJECT_CANARY\n");
+  writeFileSync(join(project, "src", "AGENTS.md"), "SRC_PROJECT_CANARY\n");
+  writeFileSync(join(nested, "AGENTS.md"), "SHADOWED_PROJECT_CANARY\n");
+  writeFileSync(join(nested, "AGENTS.override.md"), "OVERRIDE_PROJECT_CANARY\n");
+  process.env.HOME = home;
+  process.env.AGENT_LAWS = "on";
+
+  const appendix = projectAgentsAppendix(nested);
+  expect(appendix.indexOf("ROOT_PROJECT_CANARY")).toBeLessThan(appendix.indexOf("SRC_PROJECT_CANARY"));
+  expect(appendix.indexOf("SRC_PROJECT_CANARY")).toBeLessThan(appendix.indexOf("OVERRIDE_PROJECT_CANARY"));
+  expect(appendix).not.toContain("SHADOWED_PROJECT_CANARY");
+
+  const anthropic = harnessOptions({
+    self: "anthropic-project-bootstrap", provider: "anthropic", cwd: nested, presenceRegistrar: false,
+  }) as any;
+  const openai = harnessOptions({
+    self: "openai-project-bootstrap", provider: "openai", cwd: nested, presenceRegistrar: false,
+  }) as any;
+  for (const options of [anthropic, openai]) {
+    expect(options.systemPrompt).toContain("ROOT_PROJECT_CANARY");
+    expect(options.systemPrompt).toContain("SRC_PROJECT_CANARY");
+    expect(options.systemPrompt).toContain("OVERRIDE_PROJECT_CANARY");
+  }
+  expect(anthropic.systemPrompt).toContain("GLOBAL_AUTHORITY_CANARY");
+  expect(openai.systemPrompt).not.toContain("GLOBAL_AUTHORITY_CANARY");
+  expect(codexHarnessArguments({
+    ...managedOpenAI,
+    cwd: nested,
+  })).toContain("project_doc_max_bytes=0");
+
+  writeFileSync(join(project, "AGENTS.md"), "x".repeat(PROJECT_AGENTS_MAX_BYTES));
+  expect(() => projectAgentsAppendix(nested)).toThrow(
+    `project AGENTS bootstrap exceeds ${PROJECT_AGENTS_MAX_BYTES} bytes`,
+  );
+});

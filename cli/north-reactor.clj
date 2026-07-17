@@ -29,7 +29,8 @@
 ;;   bb cli/north-reactor.clj 7977 250        # tighter debounce
 ;;   north reactor &                          # via the bin/north wrapper (bg task)
 ;; ============================================================================
-(require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
+(require '[cheshire.core :as json]
+         '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
          '[babashka.process :as proc])
 
 ;; shared coord substrate (write verbs + renewable-lease liveness) — the sweep judges
@@ -61,8 +62,9 @@
 ;; Two terminal verdicts the reactor writes on its cadence (or via sweep-once):
 ;;   1. a `building` concern whose owner has been LAPSED >24h  -> reached=abandoned-stale
 ;;      (likely-to-land is EXEMPT — it survives owner death as a handoff signal).
-;;   2. a kind=lane agent LAPSED >30min with NO outcome fact   -> outcome=died-unreported,
-;;      display_name prefixed "✝ ", and if it carries a coordinator/supervisor, ping it.
+;;   2. a kind=lane agent LAPSED >30min with no COMMITTED lane/run terminal
+;;      -> a committed process=died-unreported, delivery=blocked terminal; if it
+;;      carries a coordinator/supervisor, ping it.
 ;; Every write goes through :7977 (coord/append!/put!), so the audit trail is a fact.
 (def CONCERN-STALE-MS north.reap/CONCERN-STALE-MS)   ; 24h
 (def LANE-STALE-MS    north.reap/LANE-STALE-MS)      ; 30min
@@ -122,23 +124,61 @@
     (proc/shell {:out :string :err :string :continue true}
                 "bb" (str (.getParent (io/file (System/getProperty "babashka.file"))) "/msg-cli.clj")
                 (str port) "send" "north-reactor" coord "URGENT"
-                (str "lane " h " died unreported (presence lapsed >30min, no outcome) — reaped by reactor"))
+                (str "lane " h
+                     " died unreported (presence lapsed >30min, no committed terminal) — reaped by reactor"))
     (catch Throwable _ nil)))
 
 ;; ---- impure GATHER for the reap verdict (pure logic lives in north.reap) ------------
-;; The lane's own outcome is NOT authoritative: recordRun lands `outcome ran` on
-;; @run-<h>-<ts> with `agent <h>`, so a clean lane's @agent:<h> outcome is empty. Join
-;; through the agent fact and cross-ref @swarm agent_death before judging a lane silent.
-(defn subjects-tagged-agent
-  "Every subject carrying an `agent <h>` fact (runs land here; the session too)."
+;; The synchronous lane terminal is primary. A committed kind=run row is a
+;; secondary trail; body facts from a crashed run writer remain invisible until
+;; its last kind=run write. @swarm agent_death is a notification receipt only:
+;; a hard kill between that ping and terminal publication must remain reapable.
+(defn subject-facts
+  "All live facts for one subject, preserving multi-value conflicts as sets."
+  [subject]
+  (let [rows (:ok (north.coord/send-op
+                   port {:op :query
+                         :query {:find "terminal_fact"
+                                 :rules [{:head {:rel "terminal_fact"
+                                                 :args [{:var "p"} {:var "r"}]}
+                                          :body [{:rel "triple"
+                                                  :args [subject {:var "p"} {:var "r"}]}]}]}}))]
+    (reduce (fn [facts [predicate value]]
+              (update facts predicate (fnil conj #{}) value))
+            {}
+            rows)))
+
+(defn committed-runs-tagged-agent
+  "Run subjects carrying both agent=<h> and the writer's last-write kind=run marker."
   [h]
-  (distinct (q-col [{:rel "triple" :args [{:var "e"} "agent" h]}])))
+  (distinct
+   (q-col [{:rel "triple" :args [{:var "e"} "agent" h]}
+           {:rel "triple" :args [{:var "e"} "kind" "run"]}])))
 
 (defn lane-resolved?* [h]
   (north.reap/lane-resolved?
     h
-    (map #(north.coord/many port % "outcome") (subjects-tagged-agent h))
-    (north.coord/many port "@swarm" "agent_death")))
+    (subject-facts (str "@agent:" h))
+    (map subject-facts (committed-runs-tagged-agent h))))
+
+(def agent-fact-writer
+  (str (.getParent (io/file (System/getProperty "babashka.file")))
+       "/agent-fact-internal.clj"))
+
+(defn publish-reaped-terminal!
+  "Use the harness's scoped terminal writer so a reaper verdict has the same
+  readback and last-write digest protocol as every SDK terminal."
+  [subject]
+  (let [payload (json/generate-string
+                 {"outcome" "died-unreported"
+                  "process_outcome" "died-unreported"
+                  "delivery_outcome" "blocked"
+                  "delivery_reason" "presence_lapsed_without_committed_terminal"})
+        result (proc/shell {:out :string :err :string :continue true}
+                           "bb" agent-fact-writer (str port) "terminal" subject payload)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "failed to commit reaper terminal"
+                      {:subject subject :stderr (:err result)})))))
 
 (defn spawned-ms
   "@agent:<id> spawned_at (ISO) -> epoch ms, or nil (the leaseless-dead staleness axis)."
@@ -196,26 +236,29 @@
 (defn sweep-lanes! [dry?]
   (let [lanes (distinct (q-col [{:rel "triple" :args [{:var "e"} "kind" "lane"]}]))
         now   (System/currentTimeMillis)
+        deaths (north.coord/many port "@swarm" "agent_death")
         hits (for [e lanes
                    :let  [h        (strip-sigil e "@agent:")
-                          lane-oc  (north.coord/many port e "outcome")
                           l        (north.coord/lease-of port (str "session:" h))
                           lease-exp (:exp l)
                           sp       (or (spawned-ms e) (north.reap/sdk-agent-mint-ms h))]
-                   :when (north.reap/reap-lane? now lane-oc (lane-resolved?* h) lease-exp sp)]
+                   :when (north.reap/reap-lane? now (lane-resolved?* h) lease-exp sp)]
                {:e e :h h :lapse (north.reap/lane-lapse-ms now lease-exp sp)})]
     (doseq [{:keys [e h lapse]} hits]
       (when-not dry?
-        (north.coord/put! port e "outcome" "died-unreported")
+        (publish-reaped-terminal! e)
         (orphan-clock! h)                                                  ; close any orphan clock session the dead lane left open
         (release-orphaned-drivers! h)                                      ; unblock threads held by the hard-killed lane
-        ;; Death is an outcome fact, not a mutation of identity/name caches.
-        ;; Every UI derives the terminal decoration from outcome.
+        ;; Death is terminal evidence, not a mutation of identity/name caches.
+        ;; Every UI derives its decoration from the committed process/delivery facts.
         (let [coord (or (north.coord/resolved port e "coordinator")
                         (north.coord/resolved port e "supervisor"))]
-          (when (and coord (seq coord)) (ping-coordinator coord h))))
+          (when (and coord (seq coord)
+                     (not (north.reap/death-reported? h deaths)))
+            (ping-coordinator coord h))))
       (println (str "[sweep] " (if dry? "WOULD reap" "reaped") " lane " e
-                    "  lapsed " (long (/ lapse 60000)) "min -> outcome=died-unreported")))
+                    "  lapsed " (long (/ lapse 60000))
+                    "min -> process=died-unreported delivery=blocked")))
     (count hits)))
 
 ;; ---- DAILY CLOCK-AUDIT TICK (drift telemetry) -------------------------------
@@ -267,9 +310,9 @@
 ;; unbounded, off-graph. Two BOUNDED hygiene ops, piggybacked on the sweep and gated
 ;; exactly like the reaper — the JANITOR never declares death, it only prunes what the
 ;; REAPER already marked terminal:
-;;   (a) DELETE a log whose agent has a terminal outcome fact AND mtime >30d. An agent
-;;       with NO outcome is NEVER touched, regardless of age — a silent-but-alive or
-;;       not-yet-reaped agent's trail must survive for the reaper/audit to judge death.
+;;   (a) DELETE a log whose agent has committed terminal evidence AND mtime >30d.
+;;       Without committed evidence it is NEVER touched, regardless of age — a
+;;       silent-but-alive or not-yet-reaped trail must survive for the reaper/audit.
 ;;   (b) CAP any single log at 5MB, keeping the TAIL (recent turns are the useful end;
 ;;       the stale head is dropped). Independent of outcome — a runaway log is bounded
 ;;       even while its agent is live.

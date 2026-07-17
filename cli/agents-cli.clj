@@ -69,6 +69,43 @@
                     acc))
                 roles aliases))))
 
+(defn gaffer-templates []
+  (when-let [{:keys [presets defaults]} (gaffer-catalog)]
+    (mapv #(merge defaults %) presets)))
+
+(defn cmd-templates [args]
+  (when (some #{"--help" "-h" "help"} args)
+    (println "north templates — inspect Gaffer's reusable stock templates")
+    (println)
+    (println "Usage:")
+    (println "  north templates             compact template catalog")
+    (println "  north templates --verbose   include each template's selection boundary")
+    (System/exit 0))
+  (when-let [unknown (first (remove #{"--verbose"} args))]
+    (binding [*out* *err*]
+      (println (red (str "unknown templates option: " unknown)))
+      (println "usage: north templates [--verbose]"))
+    (System/exit 2))
+  (let [verbose? (some #{"--verbose"} args)
+        templates (gaffer-templates)]
+    (if-not (seq templates)
+      (do
+        (binding [*out* *err*]
+          (println (red (str "Gaffer staffing catalog unavailable: " GAFFER-STAFFING))))
+        (System/exit 1))
+      (do
+        (println (bold "GAFFER STOCK TEMPLATES — reusable starting points, not limits"))
+        (println (dim "Selection ladder: exact template → justified axis override → bespoke composition."))
+        (println (dim "Machine payloads retain composition.kind=preset; this view uses the human word template."))
+        (doseq [{:keys [name tagline taskGrade tier deliberation topology posture
+                        capabilities description]} templates]
+          (println)
+          (println (bold name) "—" tagline)
+          (println (dim (str "  grade " taskGrade " · " tier "/" deliberation
+                             " · " topology " · " posture)))
+          (println (dim (str "  capabilities " (str/join " " capabilities))))
+          (when verbose? (println (str "  " description))))))))
+
 (declare fable-window-open?)
 
 (defn dry-resolved-route [provider tier explicit-model reasoning]
@@ -217,8 +254,11 @@
                  (when (and native? (known (get facts "repo")))
                    (str "native session in " (get facts "repo")))
                  "unknown")
+        process-outcome (north.terminal-projection/terminal-process-outcome facts)
+        delivery-outcome (north.terminal-projection/singleton-value facts "delivery_outcome")
         state (cond
-                (known (get facts "outcome")) (str "finished(" (get facts "outcome") ")")
+                process-outcome (str "finished(process:" process-outcome
+                                     ", delivery:" (or delivery-outcome "unrecorded") ")")
                 (known (get facts "stalled")) "stalled"
                 (:online presence) "working"
                 :else "offline")
@@ -231,7 +271,7 @@
 
 (defn roster-category [facts]
   (cond
-    (known (get facts "outcome")) :recently-finished
+    (north.terminal-projection/terminal-process-outcome facts) :recently-finished
     (= "lane" (get facts "kind")) :active-agent
     (= "session" (get facts "kind")) :native-session
     :else :unclassified))
@@ -293,7 +333,9 @@
         (render-section "active agents" nil active-agents)
         (render-section "native sessions" "(active provider CLI sessions)" native-sessions)
         (render-section "unclassified presence" "(legacy or missing identity facts)" unclassified)
-        (render-section "recently finished" "(completion recorded; presence lease has not lapsed)" finished)))))
+        (render-section "recently finished"
+                        "(process is terminal; delivery evidence is shown separately; presence lease has not lapsed)"
+                        finished)))))
 
 (def spawn-flags
   {"--notify" :notify "--provider" :provider "--target" :target "--taskGrade" :taskGrade "--task-grade" :taskGrade
@@ -307,14 +349,15 @@
     (println "north spawn — start one managed lane with an explicit Gaffer composition")
     (println)
     (println "Usage:")
-    (println "  north spawn <preset-role> \"<prompt>\" [routing options] [--dry-run]")
+    (println "  north spawn <template-role> \"<prompt>\" [routing options] [--dry-run]")
     (println "  north spawn <new-role> \"<prompt>\" --rationale WHY --contract JSON|@file [bespoke options]")
     (println)
-    (println "Preset role:")
+    (println "Stock template:")
     (println "  The role hydrates Gaffer's task grade, tier, reasoning, topology, posture, and capabilities.")
     (println "  Override an axis with --task-grade, --domain, --topology, --tier, --reasoning, or --posture;")
-    (println "  any changed preset axis requires --override-reason WHY. Unchanged presets must not carry a reason.")
-    (println "  Available presets:" (if (seq roles) (str/join " " roles) "(catalog unavailable)"))
+    (println "  any changed template axis requires --override-reason WHY. Exact templates carry no override reason.")
+    (println "  Available templates:" (if (seq roles) (str/join " " roles) "(catalog unavailable)"))
+    (println "  Inspect their full routing defaults with: north templates")
     (println)
     (println "Bespoke role:")
     (println "  An unknown lowercase kebab-case role is valid only with --rationale and --contract.")
@@ -322,9 +365,9 @@
     (println "  mustEscalate, doneWhen, report. Text fields are nonblank; list fields are nonempty.")
     (println "  Canonical capabilities: filesystem.read filesystem.search filesystem.write shell")
     (println "                          shell.readonly web coordination")
-    (println "  --nearest PRESET is optional reference provenance, not inheritance.")
+    (println "  --nearest TEMPLATE is optional reference provenance, not inheritance.")
     (println "  --promotion-candidate nominates recurrence for human review; default is false.")
-    (println "  --composition JSON|@file is the advanced full preset/bespoke payload form.")
+    (println "  --composition JSON|@file is the advanced full payload form (machine kinds: preset|bespoke).")
     (println)
     (println "Routing and control:")
     (println "  --provider auto|anthropic|openai   provider preference (default auto)")
@@ -901,6 +944,7 @@
     (try
       (case cmd
         "agents"  (cmd-agents args)
+        "templates" (cmd-templates args)
         "spawn"   (if (and (= 1 (count args)) (contains? #{"--help" "-h" "help"} (first args)))
                     (cmd-spawn-help)
                     (cmd-spawn args))
@@ -912,7 +956,7 @@
         "watch"   (cmd-watch args)
         "steer"   (cmd-tell-agent args)
         "retask"  (cmd-retask args)
-        (do (println "usage: north {agents|spawn|delegate|watch|steer|retask} ...")
+        (do (println "usage: north {agents|templates|spawn|delegate|watch|steer|retask} ...")
             (System/exit 1)))
       (catch clojure.lang.ExceptionInfo error
         (if (north.topology-authority/denial? error)

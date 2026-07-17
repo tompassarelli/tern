@@ -49,6 +49,23 @@ test("run telemetry preserves requested, active, and fallback account targets", 
   })]]);
 });
 
+test("run telemetry separates wall time, provider time, process terminal, and delivery truth", () => {
+  const facts = runFacts({
+    thread: "thread-terminal", agent: "lane-terminal",
+    durationMs: 1250, providerDurationMs: 900,
+    posture: "spawn", outcome: "ran", processOutcome: "ran",
+    deliveryOutcome: "unverified",
+    deliveryReason: "provider_terminal_success_without_external_verification",
+  });
+  expect(facts).toContainEqual(["duration_ms", "1250"]);
+  expect(facts).toContainEqual(["provider_duration_ms", "900"]);
+  expect(facts).toContainEqual(["process_outcome", "ran"]);
+  expect(facts).toContainEqual(["delivery_outcome", "unverified"]);
+  expect(facts).toContainEqual([
+    "delivery_reason", "provider_terminal_success_without_external_verification",
+  ]);
+});
+
 test("run telemetry preserves each exact observed token component once", () => {
   const facts = runFacts({
     thread: "thread-2",

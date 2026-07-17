@@ -191,6 +191,8 @@ export interface RoutingFallbackReason {
 export interface AgentProvider {
   id: ProviderId;
   probe(target?: RoutingTarget): ProviderAvailability;
+  /** Fail before a provider can accept the turn when the compiled harness is unenforceable. */
+  admit?(args: { options: Options; target?: RoutingTarget }): Promise<void> | void;
   query(args: { prompt: string | AsyncIterable<any>; options: Options; target?: RoutingTarget }): AgentQuery;
 }
 

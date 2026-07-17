@@ -1,12 +1,12 @@
 // Programmatic parity for the interactive PreToolUse authoring guards.
 // ============================================================================
 // THE SMOKING GUN: harness.ts builds worker Options with a programmatic `hooks`
-// object and NO settingSources, so the SDK never loads ~/.claude/settings.json —
+// object and settingSources:[], so the SDK never loads ~/.claude/settings.json —
 // every north-dispatched worker ran with ZERO authoring guards. north-clock-guard
 // never fired for a single worker edit, and nearly all edit volume IS worker
 // edits: ~30% of billable client wall-time shipped unclocked in one week.
 //
-// We do NOT enable settingSources (it would drag the whole user-settings surface —
+// We deliberately keep settingSources empty (enabling one would drag the user-settings surface —
 // permissions, MCP, statusline, plugins — into workers). Instead we RE-EXECUTE the
 // same guard scripts the interactive matchers run, in-process, and translate their
 // CLI-hook-protocol output into the SDK's HookJSONOutput. One source of truth for

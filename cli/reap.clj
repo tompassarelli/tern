@@ -4,9 +4,12 @@
 ;; the same shapes directly. No coordinator, no clock, no atoms here — inputs in, verdict
 ;; out. Loaded (not required) the same way north-reactor.clj loads coord.clj.
 (ns north.reap
-  (:require [clojure.string :as str]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
 
-(def LANE-STALE-MS    (* 30 60 1000))      ; 30min silent + no outcome -> dead lane
+(load-file (str (.getParent (io/file *file*)) "/terminal-projection.clj"))
+
+(def LANE-STALE-MS    (* 30 60 1000))      ; 30min silent + no committed terminal -> dead lane
 (def CONCERN-STALE-MS (* 24 60 60 1000))   ; 24h owner-lapsed -> abandoned-stale concern
 (def SDK-AGENT-ID-EPOCH-FLOOR-MS
   ;; The timestamp+full-UUID format was introduced in July 2026. Refuse to
@@ -17,18 +20,21 @@
   #"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 (defn lane-resolved?
-  "RESOLVED (never reap) iff a terminal fact exists for lane <h> — even though it may
-   live on a DIFFERENT subject than @agent:<h>. The PRIMARY signal is the lane's own
-   outcome: the spawn/dispatch finalize writes `outcome` on @agent:<h> SYNCHRONOUSLY
-   (sdk/src/identity.ts writeAgentOutcome) at every terminal path, so reap-lane?'s
-   empty-outcome guard already excludes a reported terminal. This join is the SECONDARY
-   net: recordRun ALSO lands the outcome on @run-<h>-<ts> carrying `agent`=<h> (async,
-   best-effort), so even if the lane write were lost the run trail resolves it. Join
-   through agent=<h>: `tagged-outcomes` = the outcome-seq of EACH subject carrying
-   agent=<h> (runs + session); `deaths` = @swarm agent_death lines (`<id> | reason | ts`)."
-  [h tagged-outcomes deaths]
-  (boolean (or (some seq tagged-outcomes)
-               (some #(str/starts-with? (str %) (str h " | ")) deaths))))
+  "RESOLVED (never reap) from committed execution state: the lane's valid
+  terminal projection or a kind=run row tagged to the lane. A death report is
+  only a notification receipt; it cannot substitute for materializing a
+  committed terminal. Torn modern lane terminals and pre-kind run rows are
+  invisible."
+  [_h lane-facts tagged-run-facts]
+  (boolean (or (north.terminal-projection/terminal-process-outcome lane-facts)
+               (some north.terminal-projection/committed-run-process-outcome
+                     tagged-run-facts))))
+
+(defn death-reported?
+  "Whether @swarm already received the lane's exact death notification. This
+  suppresses duplicate pings only; it deliberately does not resolve liveness."
+  [h deaths]
+  (boolean (some #(str/starts-with? (str %) (str h " | ")) deaths)))
 
 (defn lane-lapse-ms
   "Ms the lane has been SILENT, or nil if live / too-new-to-judge. Expired lease -> the
@@ -43,12 +49,10 @@
     :else                             nil))
 
 (defn reap-lane?
-  "Terminal verdict. Reap iff the lane's OWN outcome is empty (not already terminal), it
-   is NOT resolved elsewhere (@run outcome / agent_death), and its silence lapse has
-   reached LANE-STALE-MS."
-  [now lane-outcome resolved? lease-exp spawned-ms]
-  (and (empty? lane-outcome)
-       (not resolved?)
+  "Terminal verdict. Reap iff no committed lane/run terminal resolves the lane
+  and its silence lapse has reached LANE-STALE-MS."
+  [now resolved? lease-exp spawned-ms]
+  (and (not resolved?)
        (let [lp (lane-lapse-ms now lease-exp spawned-ms)]
          (boolean (and lp (>= lp LANE-STALE-MS))))))
 

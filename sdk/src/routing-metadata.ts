@@ -17,7 +17,7 @@ export const SEMANTIC_TIERS = ["economy", "standard", "senior", "frontier"] as c
 export type RoutingTier = typeof SEMANTIC_TIERS[number];
 export const REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type ReasoningLevel = typeof REASONING_LEVELS[number];
-export const POSTURES = ["explore", "deliver", "preserve"] as const;
+export const POSTURES = ["explore", "evaluate", "deliver", "preserve"] as const;
 export type RoutingPosture = typeof POSTURES[number];
 
 export const ROUTING_OVERRIDE_FIELDS = [

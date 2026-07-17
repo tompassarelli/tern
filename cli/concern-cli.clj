@@ -114,6 +114,20 @@
 ;; Double-report is idempotent; full history is retained; no set-single! retract-then-put.
 (def maturity ["exploring" "building" "likely-to-land" "landed"])
 (def maturity-idx (into {} (map-indexed (fn [i m] [m i]) maturity)))
+(def usage
+  "usage: concern-cli.clj <port> {declare <agent> <repo> \"<intent>\" <foot,> | overlap <id> [--landing] | ls [repo] | status <id> <exploring|building|likely-to-land|landed> | done <id>}")
+(defn usage-error! [message]
+  (binding [*out* *err*]
+    (println (str "concern: " message))
+    (println usage))
+  (System/exit 2))
+(defn existing-concern! [port raw]
+  (when (str/blank? raw)
+    (usage-error! "a concern id is required"))
+  (let [c (norm-cid raw)]
+    (when-not (= "concern" (resolved port c "kind"))
+      (usage-error! (str c " is not an existing concern")))
+    c))
 (defn status-of [port c]
   (let [reached (many port c "reached")]
     (if (seq reached)
@@ -156,6 +170,72 @@
    :abandoned (abandoned? port c)
    :code-port (resolved port c "code_port")
    :touches (touches-of port c)})
+
+;; `ls` is a whole-corpus view. Reading seven fields per concern made its runtime
+;; grow linearly with historical concern count (>8s in the live corpus). Fetch
+;; each required predicate once from LIVE coordinator state instead. This keeps
+;; declared-single supersession exact and preserves all live multi values.
+(def concern-list-predicates
+  ["kind" "agent" "repo" "intent" "reached" "code_port" "touches" "lease"])
+
+(defn add-live-rows [facts predicate rows]
+  (reduce (fn [current [entity value]]
+            (update-in current [entity predicate] (fnil conj #{}) value))
+          facts rows))
+
+(defn concern-list-facts [port]
+  (reduce
+   (fn [facts predicate]
+     (add-live-rows
+      facts predicate
+      (north.coord/agg-rows
+       port ["e" "r"]
+       [{:rel "triple" :args [{:var "e"} predicate {:var "r"}]}])))
+   {}
+   concern-list-predicates))
+
+(defn singleton-live [facts subject predicate]
+  (let [values (get-in facts [subject predicate] #{})]
+    (when (= 1 (count values)) (first values))))
+
+(defn status-from-live [facts concern]
+  (let [reached (get-in facts [concern "reached"] #{})]
+    (if (seq reached)
+      (last (sort-by #(get maturity-idx % -1) reached))
+      "building")))
+
+(defn liveness-from-live [facts concern agent now]
+  (if (str/blank? agent)
+    {:online true :lapsed-ago-ms nil}
+    (let [handle (if (str/starts-with? agent "@") (subs agent 1) agent)
+          lease (north.coord/decode-lease
+                 (singleton-live facts (str "@lease:session:" handle) "lease"))]
+      (cond
+        (and lease (> (:exp lease) now)) {:online true :lapsed-ago-ms nil}
+        lease {:online false :lapsed-ago-ms (- now (:exp lease))}
+        :else {:online false
+               :lapsed-ago-ms (when-let [minted (concern-mint-ms concern)]
+                                (- now minted))}))))
+
+(defn meta-from-live [facts concern now]
+  (let [agent (singleton-live facts concern "agent")
+        reached (get-in facts [concern "reached"] #{})]
+    (merge
+     {:id concern
+      :agent agent
+      :repo (singleton-live facts concern "repo")
+      :intent (singleton-live facts concern "intent")
+      :status (status-from-live facts concern)
+      :abandoned (contains? reached "abandoned-stale")
+      :code-port (singleton-live facts concern "code_port")
+      :touches (get-in facts [concern "touches"] #{})}
+     (liveness-from-live facts concern agent now))))
+
+(defn concerns-from-live [facts]
+  (->> facts
+       (keep (fn [[entity predicates]]
+               (when (= #{"concern"} (get predicates "kind")) entity)))
+       distinct))
 
 (defn fmt [m]
   (format "  %-12s %-14s %-10s {%s}\n     ↳ %s  (%s)"
@@ -301,10 +381,12 @@
     (let [flags   (set (filter #(str/starts-with? % "--") args))
           show-all (boolean (or (flags "--all") (flags "--stale")))
           repo    (first (remove #(str/starts-with? % "--") args))
-          all-ms  (->> (all-concerns port) (map #(meta-of port %))
+          facts   (concern-list-facts port)
+          now     (System/currentTimeMillis)
+          all-ms  (->> (concerns-from-live facts)
+                       (map #(meta-from-live facts % now))
                        (remove #(= (:status %) "landed"))
                        (filter #(or (nil? repo) (= (:repo %) repo)))
-                       (map #(with-liveness port %))
                        (sort-by (juxt :repo #(str (:agent %)))))
           active  (remove :abandoned all-ms)             ; abandoned-stale retired: hidden unless --all
           shown   (if show-all all-ms active)
@@ -321,16 +403,23 @@
         (println (decorate m))))
 
     "status"
-    (let [[c st] args
-          c (norm-cid c)]
-      (append! port c "reached" st)                        ; monotone ladder — append, never set
-      (println (str "✓ " c " reached=" st " (status=" (status-of port c) ")")))
+    (let [[raw st] args]
+      (when-not (= 2 (count args))
+        (usage-error! "status requires exactly <concern-id> <maturity>"))
+      (when-not (contains? maturity-idx st)
+        (usage-error! (str "invalid maturity " (pr-str st) "; expected one of "
+                           (str/join ", " maturity))))
+      (let [c (existing-concern! port raw)]
+        (append! port c "reached" st)                      ; monotone ladder — append, never set
+        (println (str "✓ " c " reached=" st " (status=" (status-of port c) ")"))))
 
     "done"
-    (let [[c] args
-          c (norm-cid c)]
-      (append! port c "reached" "landed")
-      (println (str "✓ " c " landed")))
+    (let [[raw] args]
+      (when-not (= 1 (count args))
+        (usage-error! "done requires exactly <concern-id>"))
+      (let [c (existing-concern! port raw)]
+        (append! port c "reached" "landed")
+        (println (str "✓ " c " landed"))))
 
-    (do (println "usage: concern-cli.clj <port> {declare <agent> <repo> \"<intent>\" <foot,> | overlap <id> [--landing] | ls [repo] | status <id> <st> | done <id>}")
+    (do (println usage)
         (System/exit 2))))

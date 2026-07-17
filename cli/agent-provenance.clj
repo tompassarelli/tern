@@ -19,19 +19,32 @@
   ["kind" "role" "goal" "provider" "provider_target" "model" "effort"
    "composition_kind" "composition_id" "repo" "spawned_at" "display_handle"
    "display_name" "identity_manifest_sha256"])
+(def terminal-predicates
+  #{"outcome" "process_outcome" "delivery_outcome" "delivery_reason"
+    "terminal_manifest_sha256"})
 (def conflict-key "__identity_conflicts")
 
+(defn- fold-terminal-value [prior value]
+  (cond
+    (nil? prior) #{value}
+    (set? prior) (conj prior value)
+    (and (sequential? prior) (not (string? prior))) (conj (set prior) value)
+    :else #{prior value}))
+
 (defn fold-fact
-  "Fold one graph row without hiding a second live identity value. Consumers
-  preserve a conflict marker so default-multi corruption cannot masquerade as a
-  valid arbitrary resolved value."
+  "Fold one graph row without hiding a second live managed value. Identity
+  conflicts retain their explicit defect marker; terminal values remain sets so
+  terminal projection validation rejects ambiguity instead of accepting the
+  graph row that happened to arrive last."
   [facts predicate value]
-  (let [managed-predicate? (or (identity-predicates predicate)
-                               (= "identity_manifest_sha256" predicate))
-        prior (get facts predicate)]
-    (cond-> (assoc facts predicate value)
-      (and managed-predicate? (some? prior) (not= prior value))
-      (update conflict-key (fnil conj #{}) predicate))))
+  (if (terminal-predicates predicate)
+    (update facts predicate fold-terminal-value value)
+    (let [managed-predicate? (or (identity-predicates predicate)
+                                 (= "identity_manifest_sha256" predicate))
+          prior (get facts predicate)]
+      (cond-> (assoc facts predicate value)
+        (and managed-predicate? (some? prior) (not= prior value))
+        (update conflict-key (fnil conj #{}) predicate)))))
 
 (defn known [value]
   (let [s (some-> value str str/trim)] (when (seq s) s)))

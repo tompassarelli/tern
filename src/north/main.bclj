@@ -146,21 +146,26 @@
      "session-telemetry"]
     [:else ""]))
 
-(defn- kind-of [idx :- k/Index te :- String] :- String
-  (let [ek (k/one-i idx te "kind")]
-    (if (some? ek)
-      (kind-bucket ek)
-      (let [np (namespace-kind (short-id te))]
-        (if (not (str/blank? np))
-          np
-          (if (some? (k/one-i idx te "title"))
-            "thread"
-            ;; schema-as-facts predicate subject (cardinality/value_kind/acyclic)?
-            (if (or (some? (k/one-i idx te "cardinality"))
-                    (or (some? (k/one-i idx te "value_kind"))
-                        (some? (k/one-i idx te "acyclic"))))
-              "predicate"
-              "other")))))))
+(defn- kind-of [idx :- k/Index te :- String?] :- String
+  ;; Historical malformed writes can leave an unrenderable subject in a warm
+  ;; store. The census is a diagnostic read: keep it total and surface that
+  ;; subject in `other` instead of crashing before the operator can inspect it.
+  (if (nil? te)
+    "other"
+    (let [ek (k/one-i idx te "kind")]
+      (if (some? ek)
+        (kind-bucket ek)
+        (let [np (namespace-kind (short-id te))]
+          (if (not (str/blank? np))
+            np
+            (if (some? (k/one-i idx te "title"))
+              "thread"
+              ;; schema-as-facts predicate subject (cardinality/value_kind/acyclic)?
+              (if (or (some? (k/one-i idx te "cardinality"))
+                      (or (some? (k/one-i idx te "value_kind"))
+                          (some? (k/one-i idx te "acyclic"))))
+                "predicate"
+                "other"))))))))
 
 ;; The human label for a thread's driver: its display_name if the agent carries
 ;; one, else the bare ref — board legibility (who's on what).

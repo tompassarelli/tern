@@ -30,9 +30,8 @@ test("NORTH_FABLE_NOW env overrides the clock (both sides)", () => {
 test("activeLadder() appends the fable rung ONLY inside the window", () => {
   process.env.NORTH_FABLE_NOW = JUST_BEFORE;
   const open = activeLadder("anthropic");
-  expect(open.length).toBe(LADDER.length + 2);
-  expect(open.slice(-2)).toEqual([
-    { provider: "anthropic", tier: "frontier", model: "claude-fable-5", effort: "high" },
+  expect(open.length).toBe(LADDER.length + 1);
+  expect(open.slice(-1)).toEqual([
     { provider: "anthropic", tier: "frontier", model: "claude-fable-5", effort: "xhigh" },
   ]);
 
@@ -42,15 +41,14 @@ test("activeLadder() appends the fable rung ONLY inside the window", () => {
   expect(closed.some((r) => r.model === "claude-fable-5")).toBe(false);
 });
 
-test("base ladder ends at opus/xhigh; fable sits strictly above it", () => {
+test("base ladder ends at frontier opus/xhigh; fable sits strictly above it", () => {
   expect(LADDER[LADDER.length - 1]).toEqual({
-    provider: "anthropic", tier: "senior", model: "claude-opus-4-8", effort: "xhigh",
+    provider: "anthropic", tier: "frontier", model: "claude-opus-4-8", effort: "xhigh",
   });
   process.env.NORTH_FABLE_NOW = JUST_BEFORE;
-  expect(tierIndexOf("anthropic", "fable", "high")).toBe(LADDER.length);
-  expect(tierIndexOf("anthropic", "fable", "xhigh")).toBe(LADDER.length + 1);
-  expect(decideEscalation(tierIndexOf("anthropic", "fable", "high"), activeLadder("anthropic")))
-    .toEqual({ kind: "escalate", toTier: LADDER.length + 1 });
+  expect(tierIndexOf("anthropic", "fable", "xhigh")).toBe(LADDER.length);
+  expect(decideEscalation(LADDER.length - 1, activeLadder("anthropic")))
+    .toEqual({ kind: "escalate", toTier: LADDER.length });
   process.env.NORTH_FABLE_NOW = AT_CUTOFF;
   // Out of window an unavailable model is treated as a ceiling, never silently
   // downgraded to a cheaper default rung.

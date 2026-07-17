@@ -80,9 +80,10 @@ north — your one card. Type a command to do the thing next to it.
     north agenda                       what's dated / overdue today
     north health                       coordination rollup: lanes ran/died, stale concerns
     north trace <id>                   diagnose one agent's lifecycle
-    north routing report performance  operational routing + verification evidence coverage
+    north templates                    Gaffer's reusable stock templates and routing defaults
+    north routing report performance  current managed evidence  (--all = legacy/incomplete history)
     north routing report usage        provider work usage (never dollars / API credits)
-    north routing report promotions   recurring bespoke roles for human review
+    north routing report promotions   bespoke patterns for stock-template review
     north schema                       the fact vocabulary in use
     web  http://127.0.0.1:8088         the browser cockpit (stakeholder view)
 
@@ -174,7 +175,7 @@ CARD
     exec bun run "$NORTH/sdk/src/provider-observations-cli.ts" "${@:2}" ;;
   up)
     exec "$FRAM/bin/fram-up" "${@:2}" ;;
-  agents|spawn|delegate|request|fork|req|watch|steer|retask)
+  agents|templates|spawn|delegate|request|fork|req|watch|steer|retask)
     # Agent verbs — agents are a north concern (spawn/presence/facts live here).
     # Implementation: cli/agents-cli.clj (ported from the convoy cockpit 2026-07-09).
     exec bb "$NORTH/cli/agents-cli.clj" "$@" ;;

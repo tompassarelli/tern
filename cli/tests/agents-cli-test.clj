@@ -17,6 +17,20 @@
                     facts)]
     (assoc base "identity_manifest_sha256"
            (north.agent-provenance/manifest-sha256 base))))
+(defn marked-terminal
+  ([facts] (marked-terminal facts "ran" "unverified"))
+  ([facts process delivery]
+   (let [terminal {"outcome" process
+                   "process_outcome" process
+                   "delivery_outcome" delivery
+                   "delivery_reason" (if (= delivery "unverified")
+                                       "provider_terminal_success_without_external_verification"
+                                       "execution_did_not_reach_success_terminal")}]
+     (merge facts terminal
+            {"terminal_manifest_sha256"
+             (north.terminal-projection/terminal-manifest-sha256 terminal)}))))
+(defn fold-observed [facts]
+  (reduce-kv north.agent-provenance/fold-fact {} facts))
 
 (check "preset roster line uses canonical structured axes"
        (= "anthropic:ambient · opus · xhigh · gaffer:designer · working: build the roster"
@@ -103,7 +117,39 @@
        (and (= :active-agent (roster-category {"kind" "lane"}))
             (= :native-session (roster-category {"kind" "session"}))
             (= :recently-finished (roster-category {"kind" "lane" "outcome" "ran"}))
+            (= :active-agent
+               (roster-category {"kind" "lane" "process_outcome" "ran" "outcome" "ran"}))
+            (= :recently-finished
+               (roster-category (marked-terminal {"kind" "lane"})))
             (= :unclassified (roster-category {}))))
+
+(check "terminal roster state separates process exit from delivery truth"
+       (and (str/includes?
+             (agent-primary-line
+              {:online true}
+              (marked-terminal {"kind" "lane" "goal" "attempt delivery"}))
+             "finished(process:ran, delivery:unverified)")
+            (str/includes?
+             (agent-primary-line {:online true}
+                                 {"kind" "lane" "outcome" "ran" "goal" "legacy"})
+             "finished(process:ran, delivery:unrecorded)")))
+
+(check "folded terminal conflicts stay visible and cannot manufacture a finished lane"
+       (let [committed (fold-observed
+                        (marked-terminal {"kind" "lane" "goal" "conflict probe"}))
+             process-conflict (north.agent-provenance/fold-fact
+                               committed "process_outcome" "died")
+             marker-conflict (north.agent-provenance/fold-fact
+                              committed "terminal_manifest_sha256" "corrupt")]
+         (and (= #{"ran"} (get committed "process_outcome"))
+              (= :recently-finished (roster-category committed))
+              (str/includes? (agent-primary-line {:online true} committed)
+                             "finished(process:ran, delivery:unverified)")
+              (= #{"ran" "died"} (get process-conflict "process_outcome"))
+              (= :active-agent (roster-category process-conflict))
+              (str/includes? (agent-primary-line {:online true} process-conflict)
+                             " · working: conflict probe")
+              (= :active-agent (roster-category marker-conflict)))))
 
 (check "uncomposed role remains visible without inventing Gaffer provenance"
        (let [facts {"kind" "lane" "provider" "anthropic" "model" "opus"
@@ -119,6 +165,16 @@
           (semantic-handle "session-native"
                            {"kind" "session" "provider" "openai" "model" "gpt-5.6-sol"
                             "effort" "unobserved"})))
+
+(check "composition_kind=none never manufactures native provenance"
+       (and (str/includes?
+             (agent-primary-line {:online true}
+                                 {"kind" "lane" "composition_kind" "none"})
+             "gaffer:legacy-debt")
+            (str/includes?
+             (agent-primary-line {:online true}
+                                 {"kind" "session" "composition_kind" "none"})
+             "gaffer:not-selected")))
 
 (check "display labels are never reverse-parsed into missing structured facts"
        (let [facts {"kind" "lane" "display_name" "anthropic opus xhigh designer"}]
@@ -177,13 +233,22 @@
                                                           "model" "gpt-5.6-sol" "effort" "high"
                                                           "role" "designer" "composition_kind" "preset"
                                                           "composition_id" "designer" "composition_overrides" "[]"
-                                                          "outcome" "ran"}})]
+                                                          "outcome" "ran" "process_outcome" "ran"
+                                                          "delivery_outcome" "unverified"
+                                                          "delivery_reason" "provider_terminal_success_without_external_verification"
+                                                          "terminal_manifest_sha256"
+                                                          (north.terminal-projection/terminal-manifest-sha256
+                                                           {"outcome" "ran"
+                                                            "process_outcome" "ran"
+                                                            "delivery_outcome" "unverified"
+                                                            "delivery_reason" "provider_terminal_success_without_external_verification"})}})]
             (with-out-str (cmd-agents [])))]
   (check "roster summary separates active and recently finished counts"
          (and (str/includes? out "3 roster entries · 2 active · 1 recently finished")
               (str/includes? out "active agents (1)")
               (str/includes? out "native sessions (1)")
               (str/includes? out "recently finished (1)")
+              (str/includes? out "finished(process:ran, delivery:unverified)")
               (not (str/includes? out "live agents"))))
   (check "ordinary roster output hides the internal presence probe"
          (not (str/includes? out "presence-cli.clj"))))
@@ -206,15 +271,35 @@
 (let [help (proc/shell {:out :string :err :string :continue true
                         :extra-env {"NO_COLOR" "1"}}
                        (str root "/bin/north") "spawn" "--help")]
-  (check "top-level spawn help explains preset overrides and the bespoke contract"
+  (check "top-level spawn help explains template overrides and the bespoke contract"
          (and (zero? (:exit help))
-              (str/includes? (:out help) "Preset role:")
-              (str/includes? (:out help) "any changed preset axis requires --override-reason WHY")
+              (str/includes? (:out help) "Stock template:")
+              (str/includes? (:out help) "any changed template axis requires --override-reason WHY")
+              (str/includes? (:out help) "north templates")
               (str/includes? (:out help) "Bespoke role:")
               (str/includes? (:out help) "--rationale WHY --contract JSON|@file")
               (str/includes? (:out help) "responsibility, deliverable, capabilities, mayDecide")
               (str/includes? (:out help) "--target ACCOUNT")
               (not (str/includes? (str (:out help) (:err help)) "unknown spawn option")))))
+
+(let [templates (proc/shell {:out :string :err :string :continue true
+                             :extra-env {"NO_COLOR" "1"}}
+                            (str root "/bin/north") "templates")]
+  (check "north templates is a routed human view over the Gaffer catalog"
+         (and (zero? (:exit templates))
+              (str/includes? (:out templates) "GAFFER STOCK TEMPLATES")
+              (str/includes? (:out templates)
+                             "exact template → justified axis override → bespoke composition")
+              (str/includes? (:out templates) "integrator")
+              (str/includes? (:out templates) "grade senior · senior/high · worker · deliver")
+              (str/includes? (:out templates) "composition.kind=preset"))))
+
+(let [card (proc/shell {:out :string :err :string :continue true}
+                       (str root "/bin/north") "help")]
+  (check "the top-level card advertises the templates view"
+         (and (zero? (:exit card))
+              (str/includes? (:out card) "north templates")
+              (str/includes? (:out card) "stock templates"))))
 
 (let [dry (proc/shell {:out :string :err :string :continue true
                        :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
