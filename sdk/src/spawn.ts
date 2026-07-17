@@ -453,8 +453,15 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   return result;
 }
 
+// TRUE only in the import.meta.main adapter bootstrap below: that process runs
+// under the CHILD's composed identity env (AGENT_TOPOLOGY=worker etc.), and the
+// invoking adapter (bb agents-cli) already enforced the real caller's authority
+// BEFORE composing it. Re-asserting here would read the child's topology as the
+// caller's and deny every managed delegate (the 2026-07-17 self-deny bug).
+let bootstrapAuthorityGranted = false;
+
 export async function spawn(opts: SpawnOptions): Promise<string> {
-  assertCoordinationAuthority("spawn");
+  if (!bootstrapAuthorityGranted) assertCoordinationAuthority("spawn");
   const composed = composeSpawnOptions(opts);
   const context = envelopeContextFromEnv();
   const requestedTier = composed.tier;
@@ -480,6 +487,9 @@ export async function spawnParallel(
 }
 
 if (import.meta.main) {
+  // Caller authority was enforced by the invoking adapter before it composed
+  // this process's env with the child identity — see bootstrapAuthorityGranted.
+  bootstrapAuthorityGranted = true;
   const prompt = process.argv.slice(2).join(" ");
   if (!prompt) {
     console.error("usage: bun run src/spawn.ts <prompt>");

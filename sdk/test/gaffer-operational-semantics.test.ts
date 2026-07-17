@@ -147,7 +147,9 @@ test("Gaffer capabilities compile to exact provider authority before work starts
     enabled: true,
     failIfUnavailable: true,
     allowUnsandboxedCommands: false,
-    filesystem: { denyWrite: [north] },
+    // The engine's git-isolation stub writes `$cwd/.gitconfig` at sandbox
+    // SETUP; denying it bricked every read-only lane's bash (2026-07-17).
+    filesystem: { denyWrite: [north], allowWrite: [`${north}/.gitconfig`] },
   });
 
   const director = harnessOptions({

@@ -13,7 +13,7 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveGuard, evaluateGuards } from "./authoring-guards";
 import { recordDenial } from "./guard-log";
@@ -652,6 +652,19 @@ async function guardHook(self: string, scripts: string[], input: unknown, topolo
 }
 
 // The single Options builder. dispatch.ts + spawn.ts both route through here.
+// Pre-create the engine's git-isolation stub for READ-ONLY lanes. The sandbox
+// writes identity-isolation config to `$cwd/.gitconfig` during setup; with the
+// whole cwd write-denied, bwrap can only rw-bind that path if the file already
+// exists (a bind mount needs a mount point). Best-effort — an existing file is
+// left untouched; a failure falls through to the engine's own error surface.
+function ensureGitIsolationStub(cwd: string): string {
+  const stub = resolve(cwd, ".gitconfig");
+  try {
+    writeFileSync(stub, "", { flag: "wx" }); // create-only; never truncate
+  } catch { /* exists or uncreatable — engine surfaces the real error */ }
+  return stub;
+}
+
 export function harnessOptions(o: HarnessOpts): Options {
   const cwd = o.cwd ?? process.cwd();
   const metadata = o.routingMetadata ?? (
@@ -713,7 +726,18 @@ export function harnessOptions(o: HarnessOpts): Options {
         enabled: true,
         failIfUnavailable: true,
         allowUnsandboxedCommands: false,
-        filesystem: { denyWrite: [resolve(cwd)] },
+        // denyWrite(cwd) alone bricked EVERY read-only lane's bash (2026-07-17):
+        // the sandbox's own git-isolation writes a `.gitconfig` stub at cwd
+        // during SETUP, so bwrap aborted with EROFS before any command ran
+        // ("bash is dead for this whole session"). Carve out exactly that
+        // engine-owned scaffolding path; the rest of cwd stays write-denied.
+        // The stub must EXIST before spawn — bwrap can rw-bind an existing
+        // file over an ro directory, but cannot create one inside it (see
+        // ensureGitIsolationStub below).
+        filesystem: {
+          denyWrite: [resolve(cwd)],
+          allowWrite: [ensureGitIsolationStub(cwd)],
+        },
       },
     } : {}),
     ...(capabilities ? { northCapabilities: [...capabilities] } : {}),
