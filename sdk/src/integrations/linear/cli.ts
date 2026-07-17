@@ -493,7 +493,7 @@ export async function runLinearCommand(argv: readonly string[], dependencies: Pa
       // diagnoses it; requiring a separate hand-seeding incantation makes the
       // bridge depend on hidden setup state. Conflicts remain diagnostic and
       // are never overwritten.
-      if (!schemaBefore.conflicting.length) await ensureLinearSchema(deps.graph);
+      if (!schemaBefore.conflicting.length) await ensureLinearSchema(deps.graph, schemaBefore);
       const schema = schemaBefore.ok || schemaBefore.conflicting.length
         ? schemaBefore : await inspectLinearSchema(deps.graph);
       return {

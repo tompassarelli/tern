@@ -21,6 +21,7 @@ export interface GraphFact { predicate: string; value: string }
 
 export interface GraphStore {
   show(subject: string): Promise<readonly GraphFact[]>;
+  showMany?(subjects: readonly string[]): Promise<ReadonlyMap<string, readonly GraphFact[]>>;
   /** Coordinator-serialized graph assertion. Subject is bare; refs retain @. */
   put(subject: string, predicate: string, value: string): Promise<void>;
 }
@@ -56,6 +57,24 @@ export class NorthGraphStore implements GraphStore {
     if (!Array.isArray(parsed) || parsed.some((fact) => typeof fact?.predicate !== "string" || typeof fact?.value !== "string"))
       throw new Error(`north json show returned invalid facts for @${bare}`);
     return parsed;
+  }
+
+  async showMany(subjects: readonly string[]): Promise<ReadonlyMap<string, readonly GraphFact[]>> {
+    const bareSubjects = [...new Set(subjects.map((subject) => subject.replace(/^@/, "")))];
+    const grouped = new Map<string, GraphFact[]>(bareSubjects.map((subject) => [subject, []]));
+    if (!bareSubjects.length) return grouped;
+    if (bareSubjects.some((subject) => subject.includes(",")))
+      throw new Error("north json show-many subjects cannot contain commas");
+    const parsed = JSON.parse(await command(this.northBin, ["json", "show-many", bareSubjects.join(",")]));
+    if (!Array.isArray(parsed) || parsed.some((fact) =>
+      typeof fact?.subject !== "string" || typeof fact?.predicate !== "string" || typeof fact?.value !== "string"))
+      throw new Error("north json show-many returned invalid facts");
+    for (const fact of parsed as { subject: string; predicate: string; value: string }[]) {
+      const rows = grouped.get(fact.subject);
+      if (!rows) throw new Error(`north json show-many returned unrequested subject @${fact.subject}`);
+      rows.push({ predicate: fact.predicate, value: fact.value });
+    }
+    return grouped;
   }
 
   async put(subject: string, predicate: string, value: string): Promise<void> {
@@ -135,12 +154,18 @@ export interface SchemaInspection {
   conflicting: readonly string[];
 }
 
+async function showSubjects(
+  graph: GraphStore, subjects: readonly string[],
+): Promise<ReadonlyMap<string, readonly GraphFact[]>> {
+  const unique = [...new Set(subjects.map((subject) => subject.replace(/^@/, "")))];
+  if (graph.showMany) return graph.showMany(unique);
+  return new Map(await Promise.all(unique.map(async (subject) => [subject, await graph.show(subject)] as const)));
+}
+
 export async function inspectLinearSchema(graph: GraphStore): Promise<SchemaInspection> {
   const missing: string[] = [];
   const conflicting: string[] = [];
-  const subjects = new Map<string, readonly GraphFact[]>();
-  for (const [subject] of LINEAR_SCHEMA_FACTS)
-    if (!subjects.has(subject)) subjects.set(subject, await graph.show(subject));
+  const subjects = await showSubjects(graph, LINEAR_SCHEMA_FACTS.map(([subject]) => subject));
   for (const [subject, predicate, value] of LINEAR_SCHEMA_FACTS) {
     const values = [...new Set(subjects.get(subject)!.filter((fact) => fact.predicate === predicate).map((fact) => fact.value))];
     if (!values.includes(value)) missing.push(`@${subject} ${predicate} ${value}`);
@@ -149,8 +174,8 @@ export async function inspectLinearSchema(graph: GraphStore): Promise<SchemaInsp
   return { ok: missing.length === 0 && conflicting.length === 0, missing, conflicting };
 }
 
-export async function ensureLinearSchema(graph: GraphStore): Promise<void> {
-  const inspection = await inspectLinearSchema(graph);
+export async function ensureLinearSchema(graph: GraphStore, prior?: SchemaInspection): Promise<void> {
+  const inspection = prior ?? await inspectLinearSchema(graph);
   if (inspection.conflicting.length) throw new Error(`Linear graph schema conflicts: ${inspection.conflicting.join("; ")}`);
   const missing = new Set(inspection.missing);
   for (const [subject, predicate, value] of LINEAR_SCHEMA_FACTS)

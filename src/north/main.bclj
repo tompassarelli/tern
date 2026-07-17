@@ -651,6 +651,7 @@
 (defrecord JPresentation [active :- String ready :- String blocked :- String draft :- String])
 (defrecord JReview [id :- String title :- String pred :- String detail :- String])
 (defrecord JFact [predicate :- String value :- String])
+(defrecord JSubjectFact [subject :- String predicate :- String value :- String])
 (defrecord JAgentFact [id :- String predicate :- String value :- String])
 (defrecord JClockRow [id :- String title :- String est_h :- Int actual_sec :- Int done :- Bool])
 (defrecord JCalib [pct :- Int sample :- Int])
@@ -735,6 +736,18 @@
        (println (fram.rt/to-json
                  (mapv (fn [c :- k/Fact] :- JFact (->JFact (:p c) (:r c)))
                        (k/q-by-l facts (str "@" arg)))))]
+      [(= what "show-many")
+       (let [subjects (filterv (fn [s :- String] :- Bool (not (str/blank? s)))
+                               (mapv (fn [s :- String] :- String (short-id s))
+                                     (vec (str/split arg #","))))
+             subject-set (reduce (fn [m :- (Map String Bool) s :- String] :- (Map String Bool)
+                                   (assoc m (str "@" s) true))
+                                 {} subjects)]
+         (println (fram.rt/to-json
+                   (mapv (fn [c :- k/Fact] :- JSubjectFact
+                           (->JSubjectFact (short-id (:l c)) (:p c) (:r c)))
+                         (filterv (fn [c :- k/Fact] :- Bool (get subject-set (:l c) false))
+                                  facts)))))]
       [(= what "agents")
        (println (fram.rt/to-json
                  (mapv (fn [c :- k/Fact] :- JAgentFact
@@ -752,7 +765,7 @@
        (println (fram.rt/to-json
                  (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready")
                                   (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))]
-      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|agents|presentation")])))
+      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|agents|presentation")])))
 
 (defn cmd-needs-review [log :- String] :- Nil
   (let [as (fram.rt/read-log log)

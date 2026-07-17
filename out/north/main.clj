@@ -381,6 +381,14 @@
 
 (defn jfact-value [r] (:value r))
 
+(defrecord JSubjectFact [subject predicate value])
+
+(defn jsubjectfact-subject [r] (:subject r))
+
+(defn jsubjectfact-predicate [r] (:predicate r))
+
+(defn jsubjectfact-value [r] (:value r))
+
 (defrecord JAgentFact [id predicate value])
 
 (defn jagentfact-id [r] (:id r))
@@ -451,10 +459,13 @@
    cal (clk/calibration rs)]
   (println (fram.rt/to-json (->JClockReport (mapv (fn [r] (->JClockRow (short-id (:te r)) (title-of idx (:te r)) (:est-h r) (:act-sec r) (:term r))) rs) (->JCalib (:pct cal) (:sample cal))))))
   (= what "show") (println (fram.rt/to-json (mapv (fn [c] (->JFact (:p c) (:r c))) (k/q-by-l facts (str "@" arg)))))
+  (= what "show-many") (let [subjects (filterv (fn [s] (not (str/blank? s))) (mapv (fn [s] (short-id s)) (vec (str/split arg #","))))
+   subject-set (reduce (fn [m s] (assoc m (str "@" s) true)) {} subjects)]
+  (println (fram.rt/to-json (mapv (fn [c] (->JSubjectFact (short-id (:l c)) (:p c) (:r c))) (filterv (fn [c] (get subject-set (:l c) false)) facts)))))
   (= what "agents") (println (fram.rt/to-json (mapv (fn [c] (->JAgentFact (subs (:l c) (count "@agent:")) (:p c) (:r c))) (filterv (fn [c] (let [l (:l c)]
   (and (some? l) (str/starts-with? l "@agent:")))) facts))))
   (= what "presentation") (println (fram.rt/to-json (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready") (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))
-  :else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|agents|presentation"))))
+  :else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|agents|presentation"))))
 
 (defn cmd-needs-review [^String log]
   (let [as (fram.rt/read-log log)

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runLinearCommand, type LinearCliDependencies } from "../src/integrations/linear/cli";
@@ -10,13 +10,24 @@ import type { LinearGateway, LinearCallEnvelope } from "../src/integrations/line
 class FakeGraph implements GraphStore {
   rows = new Map<string, GraphFact[]>();
   writes: { subject: string; predicate: string; value: string }[] = [];
+  showReads = 0;
+  bulkReads = 0;
   failSubjectPrefix?: string;
   failPredicate?: string;
   failAfter = Infinity;
   private matchingWrites = 0;
 
   async show(subject: string): Promise<readonly GraphFact[]> {
+    this.showReads++;
     return [...(this.rows.get(subject.replace(/^@/, "")) ?? [])];
+  }
+
+  async showMany(subjects: readonly string[]): Promise<ReadonlyMap<string, readonly GraphFact[]>> {
+    this.bulkReads++;
+    return new Map(subjects.map((subject) => {
+      const bare = subject.replace(/^@/, "");
+      return [bare, [...(this.rows.get(bare) ?? [])]] as const;
+    }));
   }
 
   async put(subjectInput: string, predicate: string, value: string): Promise<void> {
@@ -441,12 +452,17 @@ test("doctor bootstraps graph schema exactly once; get stays read-only and irrel
     graphSchemaBootstrap: { applied: true, assertions: 19 },
   });
   expect(h.graph.writes).toHaveLength(19);
+  expect(h.graph.bulkReads).toBe(2);
+  expect(h.graph.showReads).toBe(0);
+  const readsBeforeSecondDoctor = h.graph.bulkReads;
   const second = await runLinearCommand(["doctor"], h.dependencies);
   expect(second).toMatchObject({
     graphSchema: { ok: true, missing: [], conflicting: [] },
     graphSchemaBootstrap: { applied: false, assertions: 0 },
   });
   expect(h.graph.writes).toHaveLength(19);
+  expect(h.graph.bulkReads - readsBeforeSecondDoctor).toBe(1);
+  expect(h.graph.showReads).toBe(0);
   const beforeGet = h.graph.writes.length;
   await runLinearCommand(["get", "MSA-236"], h.dependencies);
   expect(h.graph.writes).toHaveLength(beforeGet);
@@ -498,5 +514,25 @@ test("NorthGraphStore never mistakes a no-coordinator message for a commit", asy
     chmodSync(fram, 0o700);
     await expect(new NorthGraphStore(north, fram).put("link:x", "kind", "integration_link"))
       .rejects.toThrow("coordinator rejected");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("NorthGraphStore reads a multi-subject graph snapshot with one CLI process", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-linear-bulk-"));
+  try {
+    const north = join(directory, "north");
+    const fram = join(directory, "fram");
+    const calls = join(directory, "calls");
+    writeFileSync(north, `#!/bin/sh
+printf '%s\\n' "$*" >> '${calls}'
+printf '%s\\n' '[{"subject":"linked_thread","predicate":"cardinality","value":"single"},{"subject":"linear_link","predicate":"value_kind","value":"ref"}]'
+`);
+    writeFileSync(fram, "#!/bin/sh\nexit 1\n");
+    chmodSync(north, 0o700);
+    chmodSync(fram, 0o700);
+    const rows = await new NorthGraphStore(north, fram).showMany(["@linked_thread", "linear_link"]);
+    expect(rows.get("linked_thread")).toEqual([{ predicate: "cardinality", value: "single" }]);
+    expect(rows.get("linear_link")).toEqual([{ predicate: "value_kind", value: "ref" }]);
+    expect(readFileSync(calls, "utf8").trim()).toBe("json show-many linked_thread,linear_link");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
