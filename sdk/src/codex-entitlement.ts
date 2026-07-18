@@ -14,7 +14,7 @@ import type { ResourcePolicy, RoutingPreference, RoutingTarget } from "./provide
 import { withFileLease } from "./file-lease";
 import { codexConfigArguments, providerEnvironmentForTarget } from "./accounts";
 
-const DEFAULT_TIMEOUT_MS = 3_000;
+export const CODEX_USAGE_PROBE_TIMEOUT_MS = 10_000;
 export const CODEX_OBSERVATION_TTL_MS = 5 * 60 * 1000;
 export const CODEX_USAGE_SOURCE = "codex-app-server:account-rate-limits";
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -194,7 +194,7 @@ export async function readCodexEntitlementObservation(options: AppServerOptions 
       rejectAll(new CodexUsageUnavailableError("codex_usage_transport_failed"));
   });
 
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? CODEX_USAGE_PROBE_TIMEOUT_MS;
   const timeout = setTimeout(() => {
     rejectAll(new CodexUsageUnavailableError("codex_usage_probe_timed_out"));
     child.kill("SIGKILL");

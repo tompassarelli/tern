@@ -158,6 +158,11 @@ export function normalizeAnthropicUsage(
   };
 }
 
+function responseSchemaChanged(error: unknown): boolean {
+  return error instanceof AnthropicUsageUnavailableError
+    && error.reason === "anthropic_usage_response_schema_changed";
+}
+
 function idlePrompt(signal: AbortSignal): AsyncIterable<SDKUserMessage> {
   return {
     async *[Symbol.asyncIterator]() {
@@ -205,11 +210,24 @@ export async function readAnthropicSubscriptionUsage(
       },
     }), remaining());
     usageQuery = warm.query(idlePrompt(controller.signal));
-    const method = usageQuery[USAGE_METHOD];
+    const query = usageQuery;
+    const method = query[USAGE_METHOD];
     if (typeof method !== "function")
       throw new AnthropicUsageUnavailableError("anthropic_usage_capability_unavailable");
-    const response = await timed(method.call(usageQuery), remaining());
-    return normalizeAnthropicUsage(response, options.target.id, options.now);
+    const normalizeResponse = async () => normalizeAnthropicUsage(
+      await timed(method.call(query), remaining()),
+      options.target.id,
+      options.now,
+    );
+    try {
+      return await normalizeResponse();
+    } catch (error) {
+      if (!responseSchemaChanged(error)) throw error;
+      // The control surface is read-only and emits no model turn. One retry
+      // absorbs a transient experimental-envelope mismatch while the shared
+      // deadline keeps permanent schema drift bounded and explicit.
+      return await normalizeResponse();
+    }
   } catch (error) {
     if (error instanceof AnthropicUsageUnavailableError) throw error;
     throw new AnthropicUsageUnavailableError("anthropic_usage_probe_failed");

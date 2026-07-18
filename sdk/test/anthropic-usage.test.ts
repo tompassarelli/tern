@@ -25,6 +25,15 @@ function usageResponse() {
       model_scoped: [
         { display_name: "Fable", utilization: 38, resets_at: "2026-07-18T12:00:01Z" },
       ],
+      limits: [
+        { group: "session", is_active: false, kind: "session", percent: 0,
+          resets_at: "2026-07-18T12:00:00Z", scope: null, severity: "normal" },
+        { group: "weekly", is_active: true, kind: "weekly_all", percent: 40,
+          resets_at: "2026-07-18T12:00:00Z", scope: null, severity: "normal" },
+        { group: "weekly", is_active: false, kind: "weekly_scoped", percent: 38,
+          resets_at: "2026-07-18T12:00:01Z",
+          scope: { model: { id: null, display_name: "Fable" }, surface: null }, severity: "normal" },
+      ],
       // These are deliberately forbidden inputs to routing/accounting.
       extra_usage: { is_enabled: true, used_credits: 1234, monthly_limit: 9999, currency: "USD" },
       spend: { canary_secret: "must-not-escape" },
@@ -53,6 +62,7 @@ test("allowlists documented Claude subscription windows and ignores credit/unkno
   expect(JSON.stringify(result)).not.toContain("credits");
   expect(JSON.stringify(result)).not.toContain("canary_secret");
   expect(JSON.stringify(result)).not.toContain("undocumented_window");
+  expect(JSON.stringify(result)).not.toContain("weekly_scoped");
 });
 
 test("provider-controlled model labels and reset comments never persist", () => {
@@ -80,6 +90,47 @@ test("experimental contract drift fails soft with a fixed reason", () => {
     expect((error as AnthropicUsageUnavailableError).reason).toBe("anthropic_usage_response_schema_changed");
     expect(String(error)).not.toContain(JSON.stringify(drifted));
   }
+});
+
+test("one transient experimental-envelope mismatch is retried within the same deadline", async () => {
+  const target = { id: "claude", provider: "anthropic" as const, authMode: "ambient" as const };
+  let calls = 0;
+  const result = await readAnthropicSubscriptionUsage({
+    target,
+    start: async () => ({
+      query: () => ({
+        async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+          calls++;
+          return calls === 1 ? { temporary: true } : usageResponse();
+        },
+        close() {},
+      }),
+      close() {},
+    }),
+  });
+  expect(calls).toBe(2);
+  expect(result.observation.windows?.map(({ limitId }) => limitId)).toEqual([
+    "claude:seven_day", "claude:seven_day_opus", "claude:model:fable",
+  ]);
+});
+
+test("persistent experimental-envelope drift remains a fixed bounded failure", async () => {
+  const target = { id: "claude", provider: "anthropic" as const, authMode: "ambient" as const };
+  let calls = 0;
+  await expect(readAnthropicSubscriptionUsage({
+    target,
+    start: async () => ({
+      query: () => ({
+        async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+          calls++;
+          return { temporary: true };
+        },
+        close() {},
+      }),
+      close() {},
+    }),
+  })).rejects.toThrow("anthropic_usage_response_schema_changed");
+  expect(calls).toBe(2);
 });
 
 test("an unavailable plan endpoint and unusable windows never infer headroom", () => {

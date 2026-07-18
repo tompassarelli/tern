@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import {
-  CODEX_OBSERVATION_TTL_MS, normalizeCodexRateLimits, observeCodexEntitlement,
+  CODEX_OBSERVATION_TTL_MS, CODEX_USAGE_PROBE_TIMEOUT_MS,
+  normalizeCodexRateLimits, observeCodexEntitlement,
   readCodexEntitlementObservation, refreshCodexEntitlementIfStale,
   refreshCodexEntitlementsIfStale, shouldRefreshCodexEntitlement,
 } from "../src/codex-entitlement";
@@ -33,13 +34,30 @@ function responses(account: unknown = { type: "chatgpt", email: "person@example.
     initialize: { userAgent: "fake" },
     "account/read": { account, requiresOpenaiAuth: true },
     "account/rateLimits/read": {
-      rateLimits: { limitId: "codex", primary: { usedPercent: 61, resetsAt: 1_800_000_000 } },
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: {
+        credits: { hasCredits: true, balance: "999", unlimited: false },
+        individualLimit: null,
+        limitId: "codex",
+        limitName: null,
+        planType: "pro",
+        primary: { usedPercent: 61, resetsAt: 1_800_000_000, windowDurationMins: 10_080 },
+        rateLimitReachedType: null,
+        secondary: null,
+      },
       rateLimitsByLimitId: {
-        codex: { limitId: "codex", primary: { usedPercent: 61, resetsAt: 1_800_000_000 },
-          secondary: { usedPercent: 81, resetsAt: 1_800_086_400 } },
+        codex: {
+          credits: { hasCredits: true, balance: "999", unlimited: false },
+          individualLimit: null,
+          limitId: "codex",
+          limitName: null,
+          planType: "pro",
+          primary: { usedPercent: 61, resetsAt: 1_800_000_000, windowDurationMins: 10_080 },
+          rateLimitReachedType: null,
+          secondary: { usedPercent: 81, resetsAt: 1_800_086_400, windowDurationMins: 20_160 },
+        },
         codex_model_x: { limitId: "codex_model_x", primary: { usedPercent: 100, resetsAt: 1_800_000_000 } },
       },
-      credits: { hasCredits: true, balance: "999" },
     },
   };
 }
@@ -98,6 +116,21 @@ test("fails within the configured timeout", async () => {
   const payload = responses();
   payload.initialize = "never" as any;
   await expect(observe(payload, 40)).rejects.toThrow("codex_usage_probe_timed_out");
+});
+
+test("the default deadline tolerates a slow authenticated app-server startup", async () => {
+  expect(CODEX_USAGE_PROBE_TIMEOUT_MS).toBe(10_000);
+  process.env.FAKE_CODEX_RESPONSES = JSON.stringify(responses());
+  // Each of the three serialized RPC responses waits 1050ms, making this a
+  // >3.15s end-to-end probe that deterministically exceeded the old 3s budget.
+  process.env.FAKE_CODEX_DELAY_MS = "1050";
+  const observation = await readCodexEntitlementObservation({
+    command: process.execPath,
+    commandArgs: [fixture],
+    targetId: "codex-primary",
+    now: new Date("2026-07-16T12:00:00Z"),
+  });
+  expect(observation.windows?.[0]?.usedPercent).toBe(61);
 });
 
 test("fails clearly when the shared Codex bucket is absent", async () => {
