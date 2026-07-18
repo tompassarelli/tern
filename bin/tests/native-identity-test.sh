@@ -29,6 +29,19 @@ EOF
 cat > "$SHIM/bb" <<'EOF'
 #!/usr/bin/env bash
 [ -n "${NORTH_BB_LOG:-}" ] && printf '%s\n' "$*" >> "$NORTH_BB_LOG"
+if [ "${1:-}" = "-e" ] && [ -n "${NORTH_NATIVE_SUBJECT:-}" ]; then
+  [ "${NORTH_IDENTITY_FAIL:-0}" = 1 ] && exit 1
+  subject="${NORTH_NATIVE_SUBJECT#@}"
+  {
+    printf 'tell %s kind session\n' "$subject"
+    printf 'tell %s repo %s\n' "$subject" "$NORTH_NATIVE_REPO"
+    printf 'tell %s provider %s\n' "$subject" "$NORTH_NATIVE_PROVIDER"
+    printf 'tell %s model %s\n' "$subject" "$NORTH_NATIVE_MODEL"
+    printf 'tell %s effort %s\n' "$subject" "$NORTH_NATIVE_EFFORT"
+    printf 'tell %s display_handle %s\n' "$subject" "$NORTH_NATIVE_DISPLAY"
+    printf 'tell %s display_name %s\n' "$subject" "$NORTH_NATIVE_DISPLAY"
+  } >> "$NORTH_IDENTITY_LOG"
+fi
 exit 0
 EOF
 chmod +x "$FAKE_HOME/code/north/bin/north" "$SHIM/bb"
@@ -47,6 +60,15 @@ run_hook() {
     XDG_RUNTIME_DIR="$XDG" NORTH_PORT=1 NORTH_IDENTITY_LOG="$LOG" \
     NORTH_BB_LOG="$BB_LOG" "$@" \
     bash "$hook" >/dev/null 2>&1
+  # PostToolUse identity convergence is deliberately asynchronous. The
+  # singleflight lock is removed only after the publisher and route-cache
+  # commit finish, so it is the deterministic hermetic completion signal.
+  for _ in $(seq 1 100); do
+    if ! find "$XDG" -type d -name '*.lock' -print -quit 2>/dev/null | grep -q .; then
+      break
+    fi
+    sleep 0.01
+  done
 }
 
 SID="11112222-3333-4444-8555-666677778888"
@@ -101,7 +123,8 @@ run_hook "$TOOLUSE" \
   CLAUDE_EFFORT=low ANTHROPIC_MODEL=ambient-wrong
 has "records structured effective effort" "tell agent:$ID effort medium"
 lacks "does not use unrelated nested level" "tell agent:$ID effort wrong"
-lacks "does not claim a PostToolUse model" "tell agent:$ID model "
+lacks "does not claim the nested tool-input model" "tell agent:$ID model also-wrong"
+lacks "does not claim an ambient model" "tell agent:$ID model ambient-wrong"
 
 : > "$LOG"
 run_hook "$TOOLUSE" \

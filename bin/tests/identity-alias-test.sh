@@ -71,6 +71,14 @@ run_hook() {
       XDG_RUNTIME_DIR="$XDG" BB_REG_LOG="$BB_REG_LOG" NORTH_PORT=1 \
       bash "$hook" >/dev/null 2>&1
   fi
+  # PostToolUse renewals are asynchronous and singleflight-coalesced. Lock
+  # removal is the completion signal; wait for it before reading the shim log.
+  for _ in $(seq 1 100); do
+    if ! find "$XDG" -type d -name '*.lock' -print -quit 2>/dev/null | grep -q .; then
+      break
+    fi
+    sleep 0.01
+  done
   tail -n1 "$BB_REG_LOG" 2>/dev/null || true
 }
 cache_of() { cat "$CACHE/$1" 2>/dev/null || true; }

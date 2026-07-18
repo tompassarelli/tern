@@ -3,21 +3,81 @@
 # Registers the agent's presence on the north roster and injects the concern-
 # coordination protocol into the new session via hookSpecificOutput.additionalContext
 # — so an agent coordinates the moment it spawns, no human pasting anything.
-# jq-free (jq isn't on PATH here). SessionStart cannot block startup; best-effort.
+# SessionStart cannot block startup; all graph maintenance is best-effort.
 set -uo pipefail
-IN="$(cat 2>/dev/null || true)"
-# pull a flat JSON string field without jq
-jget() { printf '%s' "$IN" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
-# `effort` is a structured common hook field: {"level":"xhigh"}. Restrict
-# extraction to that object so an unrelated nested `level` can never become an
-# identity claim.
-jget_effort() {
-  printf '%s' "$IN" | sed -n 's/.*"effort"[[:space:]]*:[[:space:]]*{[^}]*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
-}
-cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
-sid="$(jget session_id)"
-agent_id="$(jget agent_id)"
-evt="$(jget hook_event_name)"; [ -z "$evt" ] && evt="SessionStart"
+umask 077
+
+# The provider allows 15s, but startup must never approach that deadline. Buffer
+# one complete envelope behind a much smaller circuit breaker; malformed input,
+# a wedged filesystem, or an unexpected crash becomes an empty successful hook
+# instead of a provider-visible SessionStart timeout or truncated JSON.
+if [ "${NORTH_SPAWN_INNER:-0}" != 1 ]; then
+  out_dir="${XDG_RUNTIME_DIR:-/tmp}"
+  timeout --signal=TERM --kill-after=0.1s 0.3s mkdir -p "$out_dir" 2>/dev/null || out_dir=/tmp
+  in=""
+  out=""
+  trap 'timeout --signal=TERM --kill-after=0.1s 0.2s rm -f "$in" "$out" 2>/dev/null || true' EXIT
+  in="$(timeout --signal=TERM --kill-after=0.1s 0.3s \
+    mktemp "$out_dir/north-spawn-input.XXXXXX" 2>/dev/null || true)"
+  out="$(timeout --signal=TERM --kill-after=0.1s 0.3s \
+    mktemp "$out_dir/north-spawn-output.XXXXXX" 2>/dev/null || true)"
+  [ -n "$in" ] && [ -n "$out" ] || exit 0
+  timeout --signal=TERM --kill-after=0.2s 1s cat >"$in" 2>/dev/null || exit 0
+  expected_event="$(timeout --signal=TERM --kill-after=0.1s 0.5s python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle).get("hook_event_name", "SessionStart")
+print(value if isinstance(value, str) and value else "SessionStart")
+' "$in" 2>/dev/null || true)"
+  case "$expected_event" in
+    SessionStart|SubagentStart|SubagentSessionStart) ;;
+    *) exit 0 ;;
+  esac
+  NORTH_SPAWN_INNER=1 timeout --signal=TERM --kill-after=0.2s 3s \
+    "$0" <"$in" >"$out" 2>/dev/null || true
+  if [ -s "$out" ] &&
+      timeout --signal=TERM --kill-after=0.1s 0.5s python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+specific = payload["hookSpecificOutput"]
+assert specific["hookEventName"] == sys.argv[2]
+assert isinstance(specific["additionalContext"], str)
+' "$out" "$expected_event" 2>/dev/null; then
+    timeout --signal=TERM --kill-after=0.1s 0.5s cat "$out" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# Parse the envelope once. Provider hook payloads can be large, and the former
+# per-field sed scans multiplied that cost while misparsing escaped strings.
+PARSED="$(python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    effort = d.get("effort")
+    effort = effort.get("level", "") if isinstance(effort, dict) else ""
+    values = (
+        d.get("cwd", ""),
+        d.get("session_id", ""),
+        d.get("agent_id", ""),
+        d.get("hook_event_name", ""),
+        d.get("model", ""),
+        effort,
+    )
+    for value in values:
+        value = value if isinstance(value, str) else ""
+        print(value.replace("\n", "").replace("\r", ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+mapfile -t JFIELDS <<<"$PARSED"
+cwd="${JFIELDS[0]:-}"; [ -z "$cwd" ] && cwd="$PWD"
+sid="${JFIELDS[1]:-}"
+agent_id="${JFIELDS[2]:-}"
+evt="${JFIELDS[3]:-}"; [ -z "$evt" ] && evt="SessionStart"
+MODEL="${JFIELDS[4]:-}"
+EFFORT="${JFIELDS[5]:-}"
 # SubagentStart carries a provider-owned `agent_id`; on Codex its session_id is
 # explicitly the PARENT session. Keying presence/cache by that parent would
 # collapse every native subagent onto one row. Prefer the actor id when present.
@@ -41,42 +101,54 @@ DERIVED="session-$RN-${identity_seed:0:8}"
 # Identity, de-aliased. INVARIANT: one live actor == one id; an id is only
 # renewed/registered by the session that FIRST acquired it. An env pin
 # (NORTH_AGENT_ID) is honored ONLY if no OTHER session already owns it. Otherwise
-# it's an INHERITED pin — a parent's NORTH_AGENT_ID leaking into a subagent/child
-# through the process environment: SubagentSessionStart fires with the subagent's
-# OWN session_id but the parent's env, so honoring the pin would alias the parent
-# id (2026-07-03: cc-fram-* had 3 workstreams + mail answered by the wrong actor).
-# When the pin is already owned elsewhere, derive a distinct id from our own sid.
+# it is an inherited parent pin and this actor derives a distinct id.
+#
+# Pin ownership uses an atomic hard-link claim. The former scan -> choose ->
+# write sequence was TOCTOU: concurrent sibling starts could both observe no
+# cache owner and both publish the same inherited pin. A fully written temp file
+# is linked into the stable claim name atomically, so every contender observes
+# one complete winner. Existing pre-claim cache entries seed the first claim.
 ID=""
 pin="${NORTH_AGENT_ID:-}"
 if [ -n "$pin" ]; then
-  owned_by_other=0
-  if [ -d "$IDDIR" ]; then
+  pin_owners="$IDDIR/.pin-owners"
+  pin_digest="$(printf '%s' "$pin" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+  existing_owner=""
+  conflicting_owners=0
+  if mkdir -p "$IDDIR" "$pin_owners" 2>/dev/null; then
     for f in "$IDDIR"/*; do
-      [ -e "$f" ] || continue                        # empty dir -> literal glob, skip
-      [ "${f##*/}" = "$identity_key" ] && continue   # our own prior acquisition doesn't count
-      [ "$(cat "$f" 2>/dev/null)" = "$pin" ] && { owned_by_other=1; break; }
+      [ -f "$f" ] || continue
+      [ "$(cat "$f" 2>/dev/null || true)" = "$pin" ] || continue
+      if [ -z "$existing_owner" ]; then
+        existing_owner="${f##*/}"
+      elif [ "$existing_owner" != "${f##*/}" ]; then
+        conflicting_owners=1
+      fi
     done
+    claim_owner="${existing_owner:-$identity_key}"
+    [ "$conflicting_owners" -eq 0 ] || claim_owner="__conflicting_legacy_owners__"
+    claim_file="$pin_owners/$pin_digest"
+    claim_tmp="$pin_owners/.$pin_digest.$$.${RANDOM}.tmp"
+    if printf '%s' "$claim_owner" >"$claim_tmp" 2>/dev/null; then
+      ln "$claim_tmp" "$claim_file" 2>/dev/null || true
+      rm -f "$claim_tmp" 2>/dev/null || true
+    fi
+    committed_owner="$(cat "$claim_file" 2>/dev/null || true)"
+    [ "$committed_owner" = "$identity_key" ] && ID="$pin"
   fi
-  [ "$owned_by_other" = 0 ] && ID="$pin"             # legit: fresh/first acquirer
 fi
-[ -z "$ID" ] && ID="$DERIVED"                        # inherited pin, or no pin at all
+[ -z "$ID" ] && ID="$DERIVED"
 
 # pin identity for the session's lifetime: tooluse renews THIS id, whatever cwd later
 # tool calls run in. Without the pin, identity flapped per (cwd-repo x session) and the
-# roster flooded with phantoms (188 cc-after-text-* ghosts, 2026-07-02). Writing our
-# OWN sid's file also stakes the acquisition, so a concurrent sibling subagent that reads
-# the dir sees this id already owned and derives its own instead of aliasing.
+# roster flooded with phantoms (188 cc-after-text-* ghosts, 2026-07-02).
 if [ -n "$identity_key" ]; then
-  mkdir -p "$IDDIR" 2>/dev/null && printf '%s' "$ID" > "$IDDIR/$identity_key" 2>/dev/null || true
+  identity_tmp="$IDDIR/.$identity_key.$$.${RANDOM}.tmp"
+  if mkdir -p "$IDDIR" 2>/dev/null && printf '%s' "$ID" >"$identity_tmp" 2>/dev/null; then
+    mv -f "$identity_tmp" "$IDDIR/$identity_key" 2>/dev/null || rm -f "$identity_tmp" 2>/dev/null || true
+  fi
 fi
 
-# register presence — best-effort, bounded; must never wedge a spawn.
-# Canonical :7977 log (NOT the stranded :7978 daemon concern/roster/board never read).
-timeout 5 bb "$HOME/code/north/cli/presence-cli.clj" "${NORTH_PORT:-7977}" register "$ID" "$REPO" "$ID" >/dev/null 2>&1 || true
-
-# identity facts on @agent:<id> — ids stay meaningless; meaning lives in facts.
-# Best-effort + bounded: a fact write must never wedge a spawn.
-NORTHBIN="$HOME/code/north/bin/north"
 PROVIDER=""
 case "${AGENT_PROVIDER:-}" in
   anthropic|openai) PROVIDER="$AGENT_PROVIDER" ;; # explicit SDK/provider boundary
@@ -90,8 +162,7 @@ fi
 # tool-context hooks also expose effective effort; Codex hooks currently do not.
 # Prefer exact hook observations over adapter env. `unobserved` is an explicit
 # epistemic state, never an inferred model/effort/provider claim.
-MODEL="$(jget model)"; [ -n "$MODEL" ] || MODEL="${AGENT_MODEL:-}"
-EFFORT="$(jget_effort)"
+[ -n "$MODEL" ] || MODEL="${AGENT_MODEL:-}"
 [ -n "$EFFORT" ] || EFFORT="${CLAUDE_EFFORT:-${AGENT_REASONING:-${AGENT_EFFORT:-}}}"
 PROVIDER_OBS="${PROVIDER:-unobserved}"
 MODEL_OBS="${MODEL:-unobserved}"
@@ -116,25 +187,68 @@ provider_segment="$(slug "$PROVIDER_OBS")"; [ -n "$provider_segment" ] || provid
 model_segment="$(slug "$MODEL_OBS")"; [ -n "$model_segment" ] || model_segment="unobserved"
 effort_segment="$(slug "$EFFORT_OBS")"; [ -n "$effort_segment" ] || effort_segment="unobserved"
 DISPLAY_HANDLE="$provider_segment-$model_segment-$effort_segment-native-${ID##*-}"
-projection_ok=1
-timeout 4 "$NORTHBIN" tell "agent:$ID" kind session >/dev/null 2>&1 || projection_ok=0
-timeout 4 "$NORTHBIN" tell "agent:$ID" repo "$RN" >/dev/null 2>&1 || projection_ok=0
-timeout 4 "$NORTHBIN" tell "agent:$ID" provider "$PROVIDER_OBS" >/dev/null 2>&1 || projection_ok=0
-timeout 4 "$NORTHBIN" tell "agent:$ID" model "$MODEL_OBS" >/dev/null 2>&1 || projection_ok=0
-timeout 4 "$NORTHBIN" tell "agent:$ID" effort "$EFFORT_OBS" >/dev/null 2>&1 || projection_ok=0
-timeout 4 "$NORTHBIN" tell "agent:$ID" display_handle "$DISPLAY_HANDLE" >/dev/null 2>&1 || projection_ok=0
-timeout 4 "$NORTHBIN" tell "agent:$ID" display_name "$DISPLAY_HANDLE" >/dev/null 2>&1 || projection_ok=0
-# The route cache is change detection, not a source of inferred identity. Write
-# it only after the effort + stored projections converged, so a failed write is
-# retried by the next PostToolUse instead of being hidden by a premature cache hit.
-if [ "$projection_ok" -eq 1 ] && [ -n "$identity_key" ]; then
-  route_cache="$ROUTEDIR/$identity_key"
-  route_tmp="$ROUTEDIR/.$identity_key.$$.tmp"
-  if mkdir -p "$ROUTEDIR" 2>/dev/null &&
-      printf '%s\n%s\n%s\n' "$PROVIDER_OBS" "$MODEL_OBS" "$EFFORT_OBS" > "$route_tmp" 2>/dev/null; then
-    mv -f "$route_tmp" "$route_cache" 2>/dev/null || rm -f "$route_tmp" 2>/dev/null || true
-  fi
-fi
+
+acquire_singleflight() {
+  local lock="$1" stale_after_s="$2" now_s modified_s
+  mkdir "$lock" 2>/dev/null && return 0
+  now_s="$(date +%s 2>/dev/null || echo 0)"
+  modified_s="$(stat -c %Y "$lock" 2>/dev/null || echo 0)"
+  case "$now_s:$modified_s" in
+    *[!0-9:]*|0:*|*:0) return 1 ;;
+  esac
+  [ $((now_s - modified_s)) -ge "$stale_after_s" ] || return 1
+  rmdir "$lock" 2>/dev/null || return 1
+  mkdir "$lock" 2>/dev/null
+}
+
+# Presence and graph projection are maintenance, not bootstrap context. Launch
+# them once per actor behind a shared deadline; the foreground has already
+# resolved and pinned the exact ID that both context and this worker use.
+schedule_spawn_maintenance() {
+  local lock="$ROUTEDIR/$identity_key.spawn.lock"
+  local route_cache="$ROUTEDIR/$identity_key"
+  local route_tmp="$ROUTEDIR/.$identity_key.$$.${RANDOM}.tmp"
+  mkdir -p "$ROUTEDIR" 2>/dev/null || return 0
+  acquire_singleflight "$lock" 10 || return 0
+  (
+    trap 'rm -f "$route_tmp" 2>/dev/null || true; rm -rf "$lock" 2>/dev/null || true' EXIT
+    timeout --signal=TERM --kill-after=0.2s 3s \
+      bb "$HOME/code/north/cli/presence-cli.clj" "${NORTH_PORT:-7977}" \
+      register "$ID" "$REPO" "$ID" >/dev/null 2>&1 &
+    presence_pid=$!
+    timeout --signal=TERM --kill-after=0.2s 6s env \
+      NORTH_NATIVE_PORT="${NORTH_PORT:-7977}" \
+      NORTH_NATIVE_SUBJECT="@agent:$ID" \
+      NORTH_NATIVE_REPO="$RN" \
+      NORTH_NATIVE_PROVIDER="$PROVIDER_OBS" \
+      NORTH_NATIVE_MODEL="$MODEL_OBS" \
+      NORTH_NATIVE_EFFORT="$EFFORT_OBS" \
+      NORTH_NATIVE_DISPLAY="$DISPLAY_HANDLE" \
+      bb -e '
+        (load-file (str (System/getenv "HOME") "/code/north/cli/coord.clj"))
+        (let [port (Integer/parseInt (System/getenv "NORTH_NATIVE_PORT"))
+              subject (System/getenv "NORTH_NATIVE_SUBJECT")
+              facts [["kind" "session"]
+                     ["repo" (System/getenv "NORTH_NATIVE_REPO")]
+                     ["provider" (System/getenv "NORTH_NATIVE_PROVIDER")]
+                     ["model" (System/getenv "NORTH_NATIVE_MODEL")]
+                     ["effort" (System/getenv "NORTH_NATIVE_EFFORT")]
+                     ["display_handle" (System/getenv "NORTH_NATIVE_DISPLAY")]
+                     ["display_name" (System/getenv "NORTH_NATIVE_DISPLAY")]]
+              results (mapv (fn [[p r]] (north.coord/put! port subject p r)) facts)]
+          (when (some :reject results) (System/exit 1)))' >/dev/null 2>&1 &
+    projection_pid=$!
+    projection_ok=0
+    wait "$projection_pid" && projection_ok=1
+    wait "$presence_pid" 2>/dev/null || true
+    # The route cache is a convergence marker. Commit it only after every
+    # identity fact lands, so PostToolUse repairs any failed projection.
+    if [ "$projection_ok" -eq 1 ] &&
+        printf '%s\n%s\n%s\n' "$PROVIDER_OBS" "$MODEL_OBS" "$EFFORT_OBS" >"$route_tmp" 2>/dev/null; then
+      mv -f "$route_tmp" "$route_cache" 2>/dev/null || rm -f "$route_tmp" 2>/dev/null || true
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+}
 
 CTX="$(cat <<EOF
 [north coordination active — you are agent "$ID" in repo "$RN"]
@@ -156,6 +270,18 @@ Ping a peer:  bb ~/code/north/cli/msg-cli.clj 7977 send $ID <peer-id> "URGENT" "
 EOF
 )"
 
-# emit additionalContext as valid JSON (escape \  then "  then newlines -> \n)
-esc="$(printf '%s' "$CTX" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')"
-printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$evt" "$esc"
+# Emit bootstrap context before starting any external maintenance. The real
+# serializer keeps repo/identity text with control characters valid JSON.
+printf '%s' "$CTX" | HOOK_EVENT_NAME="$evt" python3 -c '
+import json, os, sys
+payload = {
+    "hookSpecificOutput": {
+        "hookEventName": os.environ["HOOK_EVENT_NAME"],
+        "additionalContext": sys.stdin.read(),
+    }
+}
+sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+' 2>/dev/null || true
+
+schedule_spawn_maintenance
+exit 0

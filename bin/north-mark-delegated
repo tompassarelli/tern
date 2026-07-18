@@ -7,12 +7,34 @@
 # delegating (correct — never blocks), but a yielded turn only gets re-woken by an
 # ARMED background listener; without one, a worker's ping lands in a dead inbox and
 # the session goes silent until a human pokes it (the 2026-07-11 failure).
-# Best-effort, jq-free, always exits 0 — must NEVER break a tool call.
+# Best-effort, always exits 0 — must NEVER break a tool call.
 set -uo pipefail
-IN="$(cat 2>/dev/null || true)"
-jget() { printf '%s' "$IN" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
-cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
-sid="$(jget session_id)"
+umask 077
+
+# This hook has no provider-visible output. Bound the whole implementation so a
+# blocked stdin, hostile cwd/git lookup, or slow filesystem degrades to a clean
+# no-op well before the provider's 10s PostToolUse deadline.
+if [ "${NORTH_MARK_DELEGATED_INNER:-0}" != 1 ]; then
+  NORTH_MARK_DELEGATED_INNER=1 timeout --signal=TERM --kill-after=0.2s 2s \
+    "$0" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+PARSED="$(python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for key in ("cwd", "session_id"):
+        value = data.get(key, "")
+        value = value if isinstance(value, str) else ""
+        print(value.replace("\n", "").replace("\r", ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+mapfile -t JFIELDS <<<"$PARSED"
+cwd="${JFIELDS[0]:-}"; [ -z "$cwd" ] && cwd="$PWD"
+sid="${JFIELDS[1]:-}"
+[ -n "$sid" ] || [ -n "${NORTH_AGENT_ID:-}" ] || exit 0
 REPO="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || echo "$cwd")"
 RN="$(basename "$REPO")"
 

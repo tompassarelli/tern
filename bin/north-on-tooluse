@@ -2,18 +2,63 @@
 # north-on-tooluse — Claude Code / Codex PostToolUse "mail heartbeat".
 # After EVERY tool call, surface any new north peer-messages for this agent via
 # hookSpecificOutput.additionalContext — no background task, no re-arm. Must NEVER block
-# or error out a tool call: bounded by `timeout`, swallows errors, always exits 0. jq-free
-# (jq isn't on PATH) — same sed/jget + agent-id derivation as north-on-spawn so ids match.
+# or error out a tool call: bounded by `timeout`, swallows errors, always exits 0.
+# Input and output both use Python's JSON parser/serializer; no hand-built escaping.
 set -uo pipefail
-IN="$(cat 2>/dev/null || true)"
-# pull a flat JSON string field without jq
-jget() { printf '%s' "$IN" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
-jget_effort() {
-  printf '%s' "$IN" | sed -n 's/.*"effort"[[:space:]]*:[[:space:]]*{[^}]*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
-}
-cwd="$(jget cwd)"; [ -z "$cwd" ] && cwd="$PWD"
-sid="$(jget session_id)"
-agent_id="$(jget agent_id)"
+umask 077
+
+# The provider harness gives this hook 10s, but several individually bounded
+# best-effort operations below can otherwise add up past that outer limit. Run
+# the implementation behind one much smaller circuit breaker and buffer stdout:
+# a timeout/crash therefore becomes an empty, successful hook response rather
+# than a provider-visible PostToolUse failure or a truncated JSON envelope.
+# Identity repair is retryable because its convergence cache is written only
+# after every projection write succeeds.
+if [ "${NORTH_TOOLUSE_INNER:-0}" != 1 ]; then
+  out_dir="${XDG_RUNTIME_DIR:-/tmp}"
+  timeout --signal=TERM --kill-after=0.1s 0.3s mkdir -p "$out_dir" 2>/dev/null || out_dir=/tmp
+  out="$(timeout --signal=TERM --kill-after=0.1s 0.3s \
+    mktemp "$out_dir/north-tooluse-output.XXXXXX" 2>/dev/null || true)"
+  [ -n "$out" ] || exit 0
+  trap 'timeout --signal=TERM --kill-after=0.1s 0.2s rm -f "$out" 2>/dev/null || true' EXIT
+  NORTH_TOOLUSE_INNER=1 timeout --signal=TERM --kill-after=0.2s 4s "$0" >"$out" 2>/dev/null || true
+  if [ -s "$out" ] &&
+      timeout --signal=TERM --kill-after=0.1s 0.5s python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+specific = payload["hookSpecificOutput"]
+assert specific["hookEventName"] == "PostToolUse"
+assert isinstance(specific["additionalContext"], str)
+' "$out" 2>/dev/null; then
+    timeout --signal=TERM --kill-after=0.1s 0.5s cat "$out" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# Parse the envelope once. Tool responses can be tens of megabytes; retaining
+# the full payload in a shell variable and rescanning it with sed for every
+# field made hook cost O(fields × payload). Python is already a global harness
+# dependency and its JSON parser gives us one O(payload) pass plus correct
+# top-level/structured-field semantics.
+PARSED="$(python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    effort = d.get("effort")
+    effort = effort.get("level", "") if isinstance(effort, dict) else ""
+    values = (d.get("cwd", ""), d.get("session_id", ""), d.get("agent_id", ""), effort)
+    for value in values:
+        value = value if isinstance(value, str) else ""
+        print(value.replace("\n", "").replace("\r", ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+mapfile -t JFIELDS <<<"$PARSED"
+cwd="${JFIELDS[0]:-}"; [ -z "$cwd" ] && cwd="$PWD"
+sid="${JFIELDS[1]:-}"
+agent_id="${JFIELDS[2]:-}"
+EFFORT="${JFIELDS[3]:-}"
 IDDIR="${XDG_RUNTIME_DIR:-/tmp}/north-agent-ids"
 # `agent_id` is ambiguous across provider hook surfaces: SubagentStart uses it
 # as the native actor id, while some PostToolUse emitters use an invocation-local
@@ -58,7 +103,7 @@ fi
 # effort to hooks. Neither surface sends the active model at PostToolUse,
 # so the per-session route cache carries only the last exact SessionStart model;
 # never infer one from tool input or ambient ANTHROPIC_MODEL.
-EFFORT="$(jget_effort)"; [ -n "$EFFORT" ] || EFFORT="${CLAUDE_EFFORT:-}"
+[ -n "$EFFORT" ] || EFFORT="${CLAUDE_EFFORT:-}"
 cached_provider=""; cached_model=""; cached_effort=""
 if [ -r "$ROUTE_CACHE" ]; then
   cached_provider="$(sed -n '1p' "$ROUTE_CACHE" 2>/dev/null || true)"
@@ -72,6 +117,80 @@ if [ ! -r "$ROUTE_CACHE" ] && [ -r "$ROUTE_SEED" ]; then
   seed_effort="$(sed -n '3p' "$ROUTE_SEED" 2>/dev/null || true)"
 fi
 
+# Acquire a per-session singleflight directory, reclaiming it only after the
+# worker's own deadline plus a safety margin. Runtime-dir cleanup handles reboot;
+# this handles a worker SIGKILL without suppressing repair for the session.
+acquire_singleflight() {
+  local lock="$1" stale_after_s="$2" now_s modified_s
+  mkdir "$lock" 2>/dev/null && return 0
+  now_s="$(date +%s 2>/dev/null || echo 0)"
+  modified_s="$(stat -c %Y "$lock" 2>/dev/null || echo 0)"
+  case "$now_s:$modified_s" in
+    *[!0-9:]*|0:*|*:0) return 1 ;;
+  esac
+  [ $((now_s - modified_s)) -ge "$stale_after_s" ] || return 1
+  rmdir "$lock" 2>/dev/null || return 1
+  mkdir "$lock" 2>/dev/null
+}
+
+# Coalesce native identity convergence behind one background publisher. The
+# PostToolUse foreground must stay a mail fast-path; it must not launch seven
+# serial `north tell` processes before looking for mail. One Babashka process
+# loads the shared coordinator client once, publishes the complete projection,
+# and only then advances the route cache. The mkdir is a per-session singleflight
+# gate, while the worker's shared deadline bounds even a delayed/down daemon.
+schedule_projection_repair() {
+  local provider="$1" model="$2" effort="$3" display="$4"
+  local lock="${ROUTE_CACHE}.repair.lock"
+  local route_tmp="${ROUTE_CACHE}.$$.${RANDOM}.tmp"
+  local current_provider="" current_model="" current_effort=""
+  mkdir -p "$(dirname "$ROUTE_CACHE")" 2>/dev/null || return 0
+  acquire_singleflight "$lock" 10 || return 0
+  # A concurrent cold hook may have decided repair was needed before the first
+  # publisher committed its cache. Recheck after winning the lock so a burst
+  # cannot serialize redundant publishers behind the singleflight gate.
+  if [ -r "$ROUTE_CACHE" ]; then
+    current_provider="$(sed -n '1p' "$ROUTE_CACHE" 2>/dev/null || true)"
+    current_model="$(sed -n '2p' "$ROUTE_CACHE" 2>/dev/null || true)"
+    current_effort="$(sed -n '3p' "$ROUTE_CACHE" 2>/dev/null || true)"
+  fi
+  if [ "$current_provider" = "$provider" ] &&
+      [ "$current_model" = "$model" ] &&
+      [ "$current_effort" = "$effort" ]; then
+    rmdir "$lock" 2>/dev/null || true
+    return 0
+  fi
+  (
+    trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+    if timeout --signal=TERM --kill-after=0.2s 6s env \
+        NORTH_NATIVE_PORT="${NORTH_PORT:-7977}" \
+        NORTH_NATIVE_SUBJECT="@agent:$ID" \
+        NORTH_NATIVE_REPO="$RN" \
+        NORTH_NATIVE_PROVIDER="$provider" \
+        NORTH_NATIVE_MODEL="$model" \
+        NORTH_NATIVE_EFFORT="$effort" \
+        NORTH_NATIVE_DISPLAY="$display" \
+        bb -e '
+          (load-file (str (System/getenv "HOME") "/code/north/cli/coord.clj"))
+          (let [port (Integer/parseInt (System/getenv "NORTH_NATIVE_PORT"))
+                subject (System/getenv "NORTH_NATIVE_SUBJECT")
+                facts [["kind" "session"]
+                       ["repo" (System/getenv "NORTH_NATIVE_REPO")]
+                       ["provider" (System/getenv "NORTH_NATIVE_PROVIDER")]
+                       ["model" (System/getenv "NORTH_NATIVE_MODEL")]
+                       ["effort" (System/getenv "NORTH_NATIVE_EFFORT")]
+                       ["display_handle" (System/getenv "NORTH_NATIVE_DISPLAY")]
+                       ["display_name" (System/getenv "NORTH_NATIVE_DISPLAY")]]
+                results (mapv (fn [[p r]] (north.coord/put! port subject p r)) facts)]
+            (when (some :reject results) (System/exit 1)))' >/dev/null 2>&1
+    then
+      if printf '%s\n%s\n%s\n' "$provider" "$model" "$effort" >"$route_tmp" 2>/dev/null; then
+        mv -f "$route_tmp" "$ROUTE_CACHE" 2>/dev/null || rm -f "$route_tmp" 2>/dev/null || true
+      fi
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+}
+
 # SessionStart deliberately publishes presence and identity best-effort. Under
 # coordinator contention the lease can land while one of the identity writes
 # times out; without repair that creates an online but unclassified roster row
@@ -81,7 +200,6 @@ fi
 # from an exact runtime marker, while model/effort remain explicitly unobserved
 # unless this hook exposes effort. A later exact hook observation supersedes it.
 if [ ! -r "$ROUTE_CACHE" ]; then
-  NORTHBIN="$HOME/code/north/bin/north"
   PROVIDER="$seed_provider"
   case "${AGENT_PROVIDER:-}" in
     anthropic|openai) PROVIDER="$AGENT_PROVIDER" ;;
@@ -101,27 +219,10 @@ if [ ! -r "$ROUTE_CACHE" ]; then
   model_segment="$(slug "$cached_model")"; [ -n "$model_segment" ] || model_segment="unobserved"
   effort_segment="$(slug "$cached_effort")"; [ -n "$effort_segment" ] || effort_segment="unobserved"
   display_handle="$provider_segment-$model_segment-$effort_segment-native-${ID##*-}"
-  projection_ok=1
-  timeout 4 "$NORTHBIN" tell "agent:$ID" kind session >/dev/null 2>&1 || projection_ok=0
-  timeout 4 "$NORTHBIN" tell "agent:$ID" repo "$RN" >/dev/null 2>&1 || projection_ok=0
-  timeout 4 "$NORTHBIN" tell "agent:$ID" provider "$cached_provider" >/dev/null 2>&1 || projection_ok=0
-  timeout 4 "$NORTHBIN" tell "agent:$ID" model "$cached_model" >/dev/null 2>&1 || projection_ok=0
-  timeout 4 "$NORTHBIN" tell "agent:$ID" effort "$cached_effort" >/dev/null 2>&1 || projection_ok=0
-  timeout 4 "$NORTHBIN" tell "agent:$ID" display_handle "$display_handle" >/dev/null 2>&1 || projection_ok=0
-  timeout 4 "$NORTHBIN" tell "agent:$ID" display_name "$display_handle" >/dev/null 2>&1 || projection_ok=0
-  if [ "$projection_ok" -eq 1 ]; then
-    route_tmp="$ROUTE_CACHE.$$.tmp"
-    if mkdir -p "$(dirname "$ROUTE_CACHE")" 2>/dev/null &&
-        printf '%s\n%s\n%s\n' "$cached_provider" "$cached_model" "$cached_effort" > "$route_tmp" 2>/dev/null; then
-      mv -f "$route_tmp" "$ROUTE_CACHE" 2>/dev/null || rm -f "$route_tmp" 2>/dev/null || true
-    fi
-  fi
+  schedule_projection_repair "$cached_provider" "$cached_model" "$cached_effort" "$display_handle"
 fi
 
 if [ -n "$EFFORT" ] && [ "$EFFORT" != "$cached_effort" ]; then
-  NORTHBIN="$HOME/code/north/bin/north"
-  projection_ok=1
-  timeout 4 "$NORTHBIN" tell "agent:$ID" effort "$EFFORT" >/dev/null 2>&1 || projection_ok=0
   if [ -r "$ROUTE_CACHE" ]; then
     slug() {
       printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9][^a-z0-9]*/-/g; s/^-//; s/-$//'
@@ -130,14 +231,7 @@ if [ -n "$EFFORT" ] && [ "$EFFORT" != "$cached_effort" ]; then
     model_segment="$(slug "${cached_model:-unknown}")"; [ -n "$model_segment" ] || model_segment="unknown"
     effort_segment="$(slug "$EFFORT")"; [ -n "$effort_segment" ] || effort_segment="unknown"
     display_handle="$provider_segment-$model_segment-$effort_segment-native-${ID##*-}"
-    timeout 4 "$NORTHBIN" tell "agent:$ID" display_handle "$display_handle" >/dev/null 2>&1 || projection_ok=0
-    timeout 4 "$NORTHBIN" tell "agent:$ID" display_name "$display_handle" >/dev/null 2>&1 || projection_ok=0
-  fi
-  if [ "$projection_ok" -eq 1 ] && [ -r "$ROUTE_CACHE" ]; then
-    route_tmp="$ROUTE_CACHE.$$.tmp"
-    if printf '%s\n%s\n%s\n' "$cached_provider" "$cached_model" "$EFFORT" > "$route_tmp" 2>/dev/null; then
-      mv -f "$route_tmp" "$ROUTE_CACHE" 2>/dev/null || rm -f "$route_tmp" 2>/dev/null || true
-    fi
+    schedule_projection_repair "$cached_provider" "$cached_model" "$EFFORT" "$display_handle"
   fi
 fi
 
@@ -155,19 +249,55 @@ last_s=0
 [ -r "$RENEW_MARK" ] && last_s="$(cat "$RENEW_MARK" 2>/dev/null || echo 0)"
 case "$last_s" in ''|*[!0-9]*) last_s=0 ;; esac
 if [ "$now_s" -eq 0 ] || [ $(( now_s - last_s )) -ge 60 ]; then
-  if timeout 5 bb "$HOME/code/north/cli/presence-cli.clj" "${NORTH_PORT:-7977}" register "$ID" "$REPO" "$ID" >/dev/null 2>&1; then
-    mkdir -p "$RENEW_DIR" 2>/dev/null || true
-    printf '%s' "$now_s" > "$RENEW_MARK" 2>/dev/null || true
+  # The lease write is maintenance, not mail delivery. Singleflight it and let
+  # the foreground continue immediately; only a successful register advances
+  # the throttle marker, so a delayed/down coordinator is retried later.
+  RENEW_LOCK="${RENEW_MARK}.lock"
+  if mkdir -p "$RENEW_DIR" 2>/dev/null && acquire_singleflight "$RENEW_LOCK" 8; then
+    fresh_last_s=0
+    [ -r "$RENEW_MARK" ] && fresh_last_s="$(cat "$RENEW_MARK" 2>/dev/null || echo 0)"
+    case "$fresh_last_s" in ''|*[!0-9]*) fresh_last_s=0 ;; esac
+    if [ "$now_s" -ne 0 ] && [ $((now_s - fresh_last_s)) -lt 60 ]; then
+      rmdir "$RENEW_LOCK" 2>/dev/null || true
+    else
+      (
+        trap 'rm -rf "$RENEW_LOCK" 2>/dev/null || true' EXIT
+        if timeout --signal=TERM --kill-after=0.2s 3s \
+            bb "$HOME/code/north/cli/presence-cli.clj" "${NORTH_PORT:-7977}" \
+            register "$ID" "$REPO" "$ID" >/dev/null 2>&1
+        then
+          renew_tmp="${RENEW_MARK}.$$.${RANDOM}.tmp"
+          if printf '%s' "$now_s" >"$renew_tmp" 2>/dev/null; then
+            mv -f "$renew_tmp" "$RENEW_MARK" 2>/dev/null || rm -f "$renew_tmp" 2>/dev/null || true
+          fi
+        fi
+      ) </dev/null >/dev/null 2>&1 &
+    fi
   fi
 fi
 
-# peek + ack inbox — bounded; failure is silent (never wedge a tool call)
-MAIL="$(timeout 6 bb "$HOME/code/north/cli/inbox-peek.clj" 7977 "$ID" 2>/dev/null || true)"
+# Peek + ack is the only coordinator operation on the foreground path. The
+# helper prints a complete message before attempting its ack, so even if this
+# deadline interrupts a slow ack, command substitution retains the delivered
+# text and the message can safely repeat later instead of disappearing.
+MAIL="$(timeout --signal=TERM --kill-after=0.2s 1.25s \
+  bb "$HOME/code/north/cli/inbox-peek.clj" "${NORTH_PORT:-7977}" "$ID" 2>/dev/null || true)"
 [ -z "$MAIL" ] && exit 0
 
 CTX="[north] new peer message(s):
 $MAIL"
-# emit additionalContext as valid JSON (escape \  then "  then newlines -> \n)
-esc="$(printf '%s' "$CTX" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')"
-printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$esc"
+# Serialize with a real JSON encoder: peer mail is arbitrary text and may
+# contain tabs or other control characters that a quote/newline-only shell
+# escape leaves as malformed JSON.
+printf '%s' "$CTX" | python3 -c '
+import json, sys
+context = sys.stdin.read()
+payload = {
+    "hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "additionalContext": context,
+    }
+}
+sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+' 2>/dev/null || true
 exit 0
