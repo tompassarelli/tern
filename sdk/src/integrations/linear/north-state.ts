@@ -145,10 +145,9 @@ export const LINEAR_SCHEMA_FACTS = [
   ["linear_link", "cardinality", "single"],
   ["conflict_field", "cardinality", "multi"],
   ["linked_thread", "value_kind", "ref"],
-  // Integration links are titleless entities. Fram's current `ref` kind is a
-  // thread ref (the target must carry `title`), so the reverse handle is an
-  // explicit literal subject ID rather than a fake thread edge.
-  ["linear_link", "value_kind", "literal"],
+  // Integration links are fact-bearing entities even though they are not
+  // threads. Fram validates this as an entity ref; North owns thread-only refs.
+  ["linear_link", "value_kind", "ref"],
 ] as const;
 
 export interface SchemaInspection {
@@ -158,9 +157,9 @@ export interface SchemaInspection {
 }
 
 export function isKnownLinearSchemaMigration(inspection: SchemaInspection): boolean {
-  return inspection.missing.includes("@linear_link value_kind literal")
+  return inspection.missing.includes("@linear_link value_kind ref")
     && inspection.conflicting.length === 1
-    && inspection.conflicting[0] === "@linear_link value_kind: ref";
+    && inspection.conflicting[0] === "@linear_link value_kind: literal";
 }
 
 async function showSubjects(

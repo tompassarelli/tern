@@ -281,8 +281,8 @@ async function importIssue(
     } else if (!threadHasTitle)
       throw new Error(`canonical link points to missing pre-existing thread @${link.threadId}`);
     await deps.graph.put(link.threadId, "linear", freshIssue.key);
-    // Preserve the established opaque handle spelling while schema classifies
-    // the predicate as literal; integration-link entities are not threads.
+    // Preserve the established opaque handle spelling as a true ref to the
+    // fact-bearing integration-link entity; integration links are not threads.
     await deps.graph.put(link.threadId, "linear_link", `@${link.subject}`);
     if (link.manifest.phase !== "adopted")
       await writeManifest(deps.graph, link, { ...link.manifest, phase: "adopted" });

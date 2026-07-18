@@ -58,11 +58,11 @@ Import creates one deterministic integration-link entity and either adopts the
 explicit North thread or deterministically creates one. The thread retains a
 `linear <KEY>` compatibility alias, but aliases are never used as identity or
 auto-matched: duplicate historical aliases are common. The canonical reverse
-handle is the literal-valued `linear_link @link:...`. Its opaque value retains
-the established `@link:` spelling for compatibility, while `value_kind literal`
-deliberately prevents Fram from treating the titleless integration-link entity
-as a thread ref. `north linear doctor` mechanically migrates the one
-adapter-owned legacy `linear_link value_kind ref` declaration to `literal`.
+handle is the ref-valued `linear_link @link:...`. Its target is the
+fact-bearing integration-link entity, not a thread. Fram validates generic
+refs against any fact-bearing entity; North alone applies thread-only rules to
+its thread predicates. `north linear doctor` mechanically migrates the one
+adapter-owned legacy workaround from `linear_link value_kind literal` to `ref`.
 
 The current Linear MCP response omits native workspace and issue UUIDs. North
 therefore records an honest `mcp-bootstrap-v1` connector fingerprint over the

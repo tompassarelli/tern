@@ -626,16 +626,16 @@ test("doctor reports schema conflicts without overwriting them", async () => {
   expect(h.graph.writes).toHaveLength(0);
 });
 
-test("doctor mechanically migrates the adapter-owned integration handle from thread ref to literal", async () => {
+test("doctor mechanically migrates the adapter-owned integration handle from literal to entity ref", async () => {
   const h = harness();
-  h.graph.seed("linear_link", "value_kind", "ref");
+  h.graph.seed("linear_link", "value_kind", "literal");
   const result = await runLinearCommand(["doctor"], h.dependencies);
   expect(result).toMatchObject({
     graphSchema: { ok: true, missing: [], conflicting: [] },
     graphSchemaBootstrap: { applied: true, assertions: 19 },
   });
   expect((await h.graph.show("linear_link")).filter(({ predicate }) => predicate === "value_kind"))
-    .toEqual([{ predicate: "value_kind", value: "literal" }]);
+    .toEqual([{ predicate: "value_kind", value: "ref" }]);
 });
 
 test("corrupted partial manifest evidence fails closed instead of being healed", async () => {
