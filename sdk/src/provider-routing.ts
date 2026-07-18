@@ -24,14 +24,23 @@ import type {
 import {
   applyProviderUsageObservations,
   automatedPressure,
+  categoricalSignalExpiresAt,
+  categoricalSignalIsActive,
   collectionFailureIsFresh,
   effectivePressure,
   loadProviderUsageObservations,
+  normalizeLegacyRateLimitObservation,
   pressureObservationIsFresh,
+  pressureFromCategoricalSignals,
   loadResourcePolicy,
   pressureFromUsageWindows,
+  sameProviderWindow,
 } from "./resource-policy";
-import type { ProviderUsageObservation, ProviderUsageWindow } from "./providers/types";
+import type {
+  ProviderUsageCategoricalSignal,
+  ProviderUsageObservation,
+  ProviderUsageWindow,
+} from "./providers/types";
 import { codexConfigArguments, isClaudeSubscriptionStatus, providerEnvironmentForTarget } from "./accounts";
 import {
   providerSupportsCapabilities, type GafferCapability,
@@ -240,10 +249,37 @@ function stableUnit(value: string): number {
 }
 
 function routeObservations(target: RoutingTarget, policy: ResourcePolicy): ProviderUsageObservation[] {
-  return policy.automatedPressureObservationSets?.[target.id]
+  const observations = policy.automatedPressureObservationSets?.[target.id]
     ?? (policy.automatedPressureObservations?.[target.id]
       ? [policy.automatedPressureObservations[target.id]!]
       : []);
+  return observations.map(normalizeLegacyRateLimitObservation);
+}
+
+function routeLimitApplies(
+  target: RoutingTarget,
+  limitId: string | undefined,
+  tier?: SemanticTier,
+  reasoning?: Effort,
+  model?: string,
+) : boolean {
+  if (target.provider !== "anthropic") return true;
+  if (!providerSupportsRoute(target.provider, tier, reasoning)) return false;
+  const family = modelFamily(target.provider,
+    model ? resolveTier(target.provider, tier, model, reasoning).model
+      : tier ? resolveTier(target.provider, tier, undefined, reasoning).model
+        : undefined);
+  const id = limitId?.toLowerCase() ?? "";
+  if (id.includes("seven_day_opus")) return family === "opus";
+  if (id.includes("seven_day_sonnet")) return family === "sonnet";
+  if (id.startsWith("claude:model:")) {
+    const scopedFamily = id.slice("claude:model:".length);
+    // Model-scoped data stays route-dependent even when its provider label is
+    // opaque. A route-unspecified scalar excludes it; a concrete known family
+    // includes only its own catalog-declared bucket.
+    return scopedFamily === family;
+  }
+  return true;
 }
 
 function routeUsageWindows(
@@ -254,25 +290,20 @@ function routeUsageWindows(
   model?: string,
 ) : ProviderUsageWindow[] | undefined {
   if (!observation.windows?.length) return undefined;
-  if (target.provider !== "anthropic") return observation.windows;
-  if (!providerSupportsRoute(target.provider, tier, reasoning)) return [];
-  const family = modelFamily(target.provider,
-    model ? resolveTier(target.provider, tier, model, reasoning).model
-      : tier ? resolveTier(target.provider, tier, undefined, reasoning).model
-        : undefined);
-  return observation.windows.filter(({ limitId }) => {
-    const id = limitId?.toLowerCase() ?? "";
-    if (id.includes("seven_day_opus")) return family === "opus";
-    if (id.includes("seven_day_sonnet")) return family === "sonnet";
-    if (id.startsWith("claude:model:")) {
-      const scopedFamily = id.slice("claude:model:".length);
-      // Model-scoped data stays route-dependent even when its provider label is
-      // opaque. A route-unspecified scalar excludes it; a concrete known family
-      // includes only its own catalog-declared bucket.
-      return scopedFamily === family;
-    }
-    return true;
-  });
+  return observation.windows.filter(({ limitId }) =>
+    routeLimitApplies(target, limitId, tier, reasoning, model));
+}
+
+function routeCategoricalSignals(
+  target: RoutingTarget,
+  observation: ProviderUsageObservation,
+  tier?: SemanticTier,
+  reasoning?: Effort,
+  model?: string,
+) : ProviderUsageCategoricalSignal[] | undefined {
+  if (!observation.categoricalSignals?.length) return undefined;
+  return observation.categoricalSignals.filter(({ limitId }) =>
+    routeLimitApplies(target, limitId, tier, reasoning, model));
 }
 
 const pressureRank: Record<EntitlementPressure, number> = {
@@ -282,8 +313,9 @@ const pressureRank: Record<EntitlementPressure, number> = {
 interface RouteObservationEvidence {
   observation: ProviderUsageObservation;
   windows?: ProviderUsageWindow[];
+  categoricalSignals?: ProviderUsageCategoricalSignal[];
   pressure?: EntitlementPressure;
-  pressureKind?: "windows" | "state" | "failure";
+  pressureKind?: "windows" | "categorical-signal" | "state" | "failure";
 }
 
 function routeObservationEvidence(
@@ -297,34 +329,45 @@ function routeObservationEvidence(
   if (model && !providerSupportsModel(target.provider, model)) return [];
   return routeObservations(target, policy).map((observation) => {
     const windows = routeUsageWindows(target, observation, tier, reasoning, model);
+    const categoricalSignals = routeCategoricalSignals(target, observation, tier, reasoning, model);
     let routePressure: EntitlementPressure | undefined;
     let pressureKind: RouteObservationEvidence["pressureKind"];
     if (collectionFailureIsFresh(observation, now)) {
       // Failed collection is absence of knowledge. Retain only a still-live,
       // route-matching exhaustion; never reward stale partial headroom.
-      routePressure = windows?.length && pressureFromUsageWindows(windows, now) === "exhausted"
-        ? "exhausted"
-        : "unknown";
+      const windowPressure = windows?.length ? pressureFromUsageWindows(windows, now) : undefined;
+      const signalPressure = categoricalSignals?.length
+        ? pressureFromCategoricalSignals(observation, categoricalSignals, now)
+        : undefined;
+      routePressure = windowPressure === "exhausted" || signalPressure === "exhausted"
+        ? "exhausted" : "unknown";
       pressureKind = "failure";
-    } else if (!pressureObservationIsFresh(observation, now)) {
-      const staleWindowPressure = windows?.length ? pressureFromUsageWindows(windows, now) : undefined;
-      routePressure = staleWindowPressure === "exhausted" ? "exhausted" : undefined;
-      pressureKind = routePressure ? "windows" : undefined;
-    } else if (windows !== undefined) {
-      const windowPressure = windows.length ? pressureFromUsageWindows(windows, now) : undefined;
-      if (observation.state !== undefined
-          && (windowPressure === undefined || pressureRank[observation.state] > pressureRank[windowPressure])) {
-        routePressure = observation.state;
-        pressureKind = "state";
-      } else {
-        routePressure = windowPressure;
-        pressureKind = windowPressure === undefined ? undefined : "windows";
-      }
     } else {
-      routePressure = observation.state;
-      pressureKind = observation.state === undefined ? undefined : "state";
+      const observationFresh = pressureObservationIsFresh(observation, now);
+      const staleWindowPressure = windows?.length ? pressureFromUsageWindows(windows, now) : undefined;
+      const windowPressure = observationFresh ? staleWindowPressure
+        : staleWindowPressure === "exhausted" ? "exhausted" : undefined;
+      const signalPressure = categoricalSignals?.length
+        ? pressureFromCategoricalSignals(observation, categoricalSignals, now)
+        : undefined;
+      const candidates: Array<{
+        pressure: EntitlementPressure | undefined;
+        kind: RouteObservationEvidence["pressureKind"];
+      }> = [
+        { pressure: windowPressure, kind: "windows" },
+        { pressure: signalPressure, kind: "categorical-signal" },
+        { pressure: observationFresh ? observation.state : undefined, kind: "state" },
+      ];
+      const driving = candidates
+        .filter((candidate): candidate is typeof candidate & { pressure: EntitlementPressure } =>
+          candidate.pressure !== undefined)
+        .sort((left, right) => pressureRank[right.pressure] - pressureRank[left.pressure])[0];
+      if (driving) {
+        routePressure = driving.pressure;
+        pressureKind = driving.kind;
+      }
     }
-    return { observation, windows, pressure: routePressure, pressureKind };
+    return { observation, windows, categoricalSignals, pressure: routePressure, pressureKind };
   });
 }
 
@@ -336,33 +379,75 @@ function numericHeadroomEvidence(
   model?: string,
   now = new Date(),
 ): { headroom: number; evidence: AllocationEvidence } | undefined {
-  const candidates = routeObservationEvidence(target, policy, tier, reasoning, model, now)
+  const routeEvidence = routeObservationEvidence(target, policy, tier, reasoning, model, now);
+  const measured = routeEvidence
     .filter(({ observation }) => collectionFailureIsFresh(observation, now)
       || pressureObservationIsFresh(observation, now))
     .flatMap(({ observation, windows }) => (windows ?? [])
       .filter(({ resetsAt }) => Date.parse(resetsAt) > now.getTime())
       .map((window) => ({ observation, window })));
-  const driving = candidates.sort((left, right) =>
-    right.window.usedPercent - left.window.usedPercent
-      || Date.parse(right.observation.observedAt) - Date.parse(left.observation.observedAt))[0];
-  if (!driving) return undefined;
-  return {
+  const candidates: Array<{
+    headroom: number;
+    observedAt: string;
+    categorical: boolean;
+    evidence: AllocationEvidence;
+  }> = measured.map(({ observation, window }) => ({
     headroom: Math.min(
-      driving.observation.collectionFailure ? pressureWeight.unknown : 1,
-      Math.max(0.001, (100 - Math.min(100, driving.window.usedPercent)) / 100),
+      observation.collectionFailure ? pressureWeight.unknown : 1,
+      Math.max(0.001, (100 - Math.min(100, window.usedPercent)) / 100),
     ),
+    observedAt: observation.observedAt,
+    categorical: false,
     evidence: {
       kind: "numeric-headroom",
-      source: driving.observation.source ?? "legacy-observation",
-      observedAt: driving.observation.observedAt,
-      ...(driving.window.limitId ? { limitId: driving.window.limitId } : {}),
-      usedPercent: driving.window.usedPercent,
-      resetsAt: driving.window.resetsAt,
-      ...(driving.observation.collectionFailure
-        ? { collectionFailure: driving.observation.collectionFailure }
+      source: observation.source ?? "legacy-observation",
+      observedAt: observation.observedAt,
+      ...(window.limitId ? { limitId: window.limitId } : {}),
+      usedPercent: window.usedPercent,
+      resetsAt: window.resetsAt,
+      ...(observation.collectionFailure
+        ? { collectionFailure: observation.collectionFailure }
         : {}),
     },
-  };
+  }));
+  for (const { observation, categoricalSignals } of routeEvidence) {
+    for (const signal of categoricalSignals ?? []) {
+      if (!categoricalSignalIsActive(observation, signal, now)) continue;
+      if (collectionFailureIsFresh(observation, now) && signal.kind !== "rejection") continue;
+      const routingFloorPercent = signal.kind === "rejection" ? 100 : 80;
+      const matchingMeasurement = measured
+        .filter(({ window }) => sameProviderWindow(target.provider, window, signal))
+        .sort((left, right) =>
+          Date.parse(right.observation.observedAt) - Date.parse(left.observation.observedAt))[0];
+      candidates.push({
+        headroom: Math.max(0.001, (100 - routingFloorPercent) / 100),
+        observedAt: observation.observedAt,
+        categorical: true,
+        evidence: {
+          kind: "conservative-floor",
+          source: observation.source ?? "legacy-observation",
+          observedAt: observation.observedAt,
+          ...(signal.limitId ? { limitId: signal.limitId } : {}),
+          ...(signal.resetsAt ? { resetsAt: signal.resetsAt } : {}),
+          routingFloorPercent,
+          ...(categoricalSignalExpiresAt(observation, signal)
+            ? { routingFloorExpiresAt: categoricalSignalExpiresAt(observation, signal) }
+            : {}),
+          ...(matchingMeasurement ? {
+            measuredUsedPercent: matchingMeasurement.window.usedPercent,
+            measurementSource: matchingMeasurement.observation.source ?? "legacy-observation",
+            measurementObservedAt: matchingMeasurement.observation.observedAt,
+          } : {}),
+        },
+      });
+    }
+  }
+  const driving = candidates.sort((left, right) =>
+    left.headroom - right.headroom
+      || Number(right.categorical) - Number(left.categorical)
+      || Date.parse(right.observedAt) - Date.parse(left.observedAt))[0];
+  if (!driving) return undefined;
+  return { headroom: driving.headroom, evidence: driving.evidence };
 }
 
 function observedHeadroom(
@@ -412,6 +497,10 @@ function decisiveAllocationEvidence(
     .sort((left, right) => pressureRank[right.pressure] - pressureRank[left.pressure]
       || Date.parse(right.observation.observedAt) - Date.parse(left.observation.observedAt))[0];
   if (!driving) return undefined;
+  if (driving.pressureKind === "categorical-signal") {
+    const floor = numericHeadroomEvidence(target, policy, tier, reasoning, model, now);
+    if (floor?.evidence.kind === "conservative-floor") return floor.evidence;
+  }
   const liveWindow = driving.pressureKind === "state" ? undefined : [...(driving.windows ?? [])]
     .filter(({ resetsAt }) => Date.parse(resetsAt) > now.getTime())
     .sort((left, right) => right.usedPercent - left.usedPercent)[0];

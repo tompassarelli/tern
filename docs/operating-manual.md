@@ -714,6 +714,13 @@ unknown coverage never becomes zero, and mixed coverage is labeled as a known
 lower bound plus incomplete coverage. Full contract:
 `~/code/north/docs/provider-architecture.md`.
 
+Provider severity is not numeric usage. A categorical rate-limit warning may
+temporarily impose a labeled routing-only conservative floor, but
+`north providers` / `--json` keep that derived floor distinct from any
+provider-measured percentage. Cross-source measurements are joined only when
+their canonical limit ID and reset boundary identify the same subscription
+window.
+
 The final `north providers` route probe uses one fixed diagnostic key. It is a
 health check, not a provider preference and not the next route prediction.
 

@@ -31,6 +31,18 @@ export interface ProviderUsageWindow {
   limitId?: string;
   usedPercent: number;
   resetsAt: string;
+  /** Explicit on ambiguous event sources when the number came from the provider. */
+  measurementKind?: "provider-measured";
+}
+
+/**
+ * A provider's categorical rate-limit signal. Unlike a usage window, this is
+ * not a numeric utilization measurement.
+ */
+export interface ProviderUsageCategoricalSignal {
+  kind: "warning" | "rejection";
+  limitId?: string;
+  resetsAt?: string;
 }
 
 export type ProviderUsageSource =
@@ -74,6 +86,8 @@ export interface ProviderUsageObservation {
   /** Adapter-normalized state when the provider does not expose numeric windows. */
   state?: EntitlementPressure;
   windows?: ProviderUsageWindow[];
+  /** Provider-emitted severity kept separate from numeric utilization. */
+  categoricalSignals?: ProviderUsageCategoricalSignal[];
   /** Fixed, non-secret reasons that a provider-exposed component was omitted. */
   unavailableComponents?: ProviderUsageUnavailableComponent[];
   /** A failed refresh attached to the last trustworthy observation. */
@@ -86,12 +100,20 @@ export interface ProviderUsageObservationStore {
 }
 
 export interface AllocationEvidence {
-  kind: "numeric-headroom" | "categorical-pressure";
+  kind: "numeric-headroom" | "categorical-pressure" | "conservative-floor";
   source: ProviderUsageSource | "legacy-observation" | "manual-policy" | "policy-default";
   observedAt?: string;
   limitId?: string;
+  /** Present only for a provider-reported numeric measurement. */
   usedPercent?: number;
   resetsAt?: string;
+  /** A routing-only conversion of categorical severity, never provider-measured usage. */
+  routingFloorPercent?: number;
+  routingFloorExpiresAt?: string;
+  /** Optional raw measurement joined to the same canonical provider window. */
+  measuredUsedPercent?: number;
+  measurementSource?: ProviderUsageSource | "legacy-observation";
+  measurementObservedAt?: string;
   collectionFailure?: ProviderUsageCollectionFailure;
 }
 

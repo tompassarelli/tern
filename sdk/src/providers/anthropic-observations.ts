@@ -3,7 +3,12 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { listProviderAccounts } from "../accounts";
 import { writeProviderUsageObservations } from "../provider-observation-store";
-import type { AgentQuery, EntitlementPressure, ProviderUsageObservation } from "./types";
+import type {
+  AgentQuery,
+  EntitlementPressure,
+  ProviderUsageCategoricalSignal,
+  ProviderUsageObservation,
+} from "./types";
 
 type RateLimitInfo = SDKRateLimitEvent["rate_limit_info"];
 
@@ -36,7 +41,7 @@ function usedPercent(value: number | undefined): number | undefined {
   if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
   // Rate-limit events historically use a 0..1 utilization fraction while the
   // structured usage response names 0..100 percentages. Accept either shape.
-  return value <= 1 ? value * 100 : value;
+  return value <= 1 ? Number((value * 100).toFixed(10)) : value;
 }
 
 function state(info: RateLimitInfo, percent: number | undefined): EntitlementPressure | undefined {
@@ -62,22 +67,27 @@ export function observationFromAnthropicRateLimit(
   const rateLimitType = safeRateLimitType(info.rateLimitType);
   const common = { targetId, provider: "anthropic" as const,
     source: "claude-agent-sdk:rate-limit-event" as const, observedAt: now.toISOString() };
-  if (resetsAt && (percent !== undefined || info.status === "rejected" || info.status === "allowed_warning")) {
-    const observedPercent = percent ?? (info.status === "rejected" ? 100 : 80);
+  const categoricalSignal: ProviderUsageCategoricalSignal | undefined =
+    info.status === "rejected" || info.status === "allowed_warning"
+      ? {
+          kind: info.status === "rejected" ? "rejection" : "warning",
+          ...(rateLimitType ? { limitId: rateLimitType } : {}),
+          ...(resetsAt ? { resetsAt } : {}),
+        }
+      : undefined;
+  if (resetsAt && percent !== undefined) {
     return {
       ...common,
       windows: [{
         ...(rateLimitType ? { limitId: rateLimitType } : {}),
-        // Provider status is authoritative over a lagging utilization number,
-        // but the floor stays on this concrete window so a model-scoped Opus
-        // rejection cannot incorrectly exhaust a Sonnet route.
-        usedPercent: info.status === "rejected" ? 100
-          : info.status === "allowed_warning" ? Math.max(80, observedPercent)
-            : observedPercent,
+        usedPercent: percent,
         resetsAt,
+        measurementKind: "provider-measured",
       }],
+      ...(categoricalSignal ? { categoricalSignals: [categoricalSignal] } : {}),
     };
   }
+  if (categoricalSignal) return { ...common, categoricalSignals: [categoricalSignal] };
   return {
     ...common,
     ...(normalizedState === undefined ? { state: "unknown" as const } : { state: normalizedState }),

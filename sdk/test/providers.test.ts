@@ -3,6 +3,7 @@ import {
   ProviderRetrySafeError, ProviderSelectionError, routedQuery, selectProvider, selectProviderFromAvailability,
 } from "../src/providers";
 import { balancedAllocationEstimates } from "../src/provider-routing";
+import { RATE_LIMIT_WARNING_TTL_MS } from "../src/resource-policy";
 import { consumeExecutionAdmission, markExecutionAdmission } from "../src/execution-admission";
 import type { AgentProvider, ProviderAvailability, ProviderId, ResourcePolicy } from "../src/providers/types";
 import { resolveTier } from "../src/providers/catalog";
@@ -290,6 +291,96 @@ test("balanced allocation uses each account's observed numeric headroom", () => 
   expect(counts["claude-personal"]).toBeLessThan(counts["claude-work"]);
   expect(counts["claude-work"]).toBeLessThan(counts["codex-personal"]);
   expect(Object.values(counts).reduce((sum, count) => sum + count, 0)).toBe(2_000);
+});
+
+test("same-window Anthropic warning applies a routing-only floor without fabricating measured usage", () => {
+  const now = new Date();
+  const observedAt = now.toISOString();
+  const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
+  const calibrated = accountPolicy({
+    mode: "balanced",
+    automatedPressureObservationSets: {
+      "claude-personal": [
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:usage-control-experimental", observedAt,
+          windows: [{
+            limitId: "claude:seven_day", usedPercent: 55,
+            resetsAt: "2099-01-01T01:59:59.671Z",
+          }],
+        },
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:rate-limit-event", observedAt,
+          categoricalSignals: [{
+            kind: "warning", limitId: "seven_day", resetsAt: "2099-01-01T02:00:00.000Z",
+          }],
+        },
+      ],
+    },
+  });
+  const estimate = balancedAllocationEstimates(target, calibrated, "standard", "medium")[0]!;
+  expect(estimate).toMatchObject({ pressure: "low", effectiveWeight: 0.2 });
+  expect(estimate.allocationEvidence).toMatchObject({
+    kind: "conservative-floor",
+    source: "claude-agent-sdk:rate-limit-event",
+    routingFloorPercent: 80,
+    measuredUsedPercent: 55,
+    measurementSource: "claude-agent-sdk:usage-control-experimental",
+  });
+  expect(estimate.allocationEvidence.usedPercent).toBeUndefined();
+});
+
+test("warning floors expire and do not absorb unlike provider windows", () => {
+  const now = new Date();
+  const staleWarningAt = new Date(now.getTime() - RATE_LIMIT_WARNING_TTL_MS - 1_000).toISOString();
+  const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
+  const stale = accountPolicy({
+    mode: "balanced",
+    automatedPressureObservationSets: {
+      "claude-personal": [
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:usage-control-experimental", observedAt: now.toISOString(),
+          windows: [{ limitId: "claude:seven_day", usedPercent: 55, resetsAt: "2099-01-01T02:00:00Z" }],
+        },
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:rate-limit-event", observedAt: staleWarningAt,
+          categoricalSignals: [{ kind: "warning", limitId: "seven_day", resetsAt: "2099-01-01T02:00:00Z" }],
+        },
+      ],
+    },
+  });
+  expect(balancedAllocationEstimates(target, stale, "standard", "medium")[0]).toMatchObject({
+    pressure: "normal",
+    effectiveWeight: 0.45,
+    allocationEvidence: {
+      kind: "numeric-headroom", usedPercent: 55,
+      source: "claude-agent-sdk:usage-control-experimental",
+    },
+  });
+
+  const unlike = accountPolicy({
+    mode: "balanced",
+    automatedPressureObservationSets: {
+      "claude-personal": [
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:usage-control-experimental", observedAt: now.toISOString(),
+          windows: [{ limitId: "claude:five_hour", usedPercent: 55, resetsAt: "2099-01-01T02:00:00Z" }],
+        },
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:rate-limit-event", observedAt: now.toISOString(),
+          categoricalSignals: [{ kind: "warning", limitId: "seven_day", resetsAt: "2099-01-01T02:00:00Z" }],
+        },
+      ],
+    },
+  });
+  const unlikeEvidence = balancedAllocationEstimates(target, unlike, "standard", "medium")[0]!.allocationEvidence;
+  expect(unlikeEvidence).toMatchObject({ kind: "conservative-floor", routingFloorPercent: 80 });
+  expect(unlikeEvidence.measuredUsedPercent).toBeUndefined();
 });
 
 test("model-scoped exhaustion constrains only the matching Anthropic route", () => {

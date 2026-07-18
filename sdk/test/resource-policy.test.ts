@@ -3,9 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  applyProviderUsageObservations, automatedPressure, COLLECTION_FAILURE_TTL_MS, effectivePressure,
+  applyProviderUsageObservations, automatedPressure, canonicalProviderWindowId,
+  categoricalSignalExpiresAt, categoricalSignalIsActive, COLLECTION_FAILURE_TTL_MS, effectivePressure,
   loadProviderUsageObservations, loadResourcePolicy, parseProviderUsageObservations, parseResourcePolicy,
-  pressureFromUsageWindows, PRESSURE_TTL_MS,
+  pressureFromUsageWindows, PRESSURE_TTL_MS, RATE_LIMIT_WARNING_TTL_MS, sameProviderWindow,
 } from "../src/resource-policy";
 import { balancedAllocationEstimates, resourcePolicyFromEnv, selectProviderFromAvailability } from "../src/provider-routing";
 import type { ProviderAvailability } from "../src/providers/types";
@@ -235,6 +236,63 @@ test("routing combines live telemetry sources conservatively without letting unk
   expect(exhausted.pressures.anthropic).toBe("exhausted");
   expect(exhausted.automatedPressureObservations?.["claude-primary"]?.source)
     .toBe("claude-agent-sdk:rate-limit-event");
+});
+
+test("canonical window identity tolerates only source prefixes and reset jitter", () => {
+  expect(canonicalProviderWindowId("anthropic", "claude:seven_day")).toBe("seven_day");
+  expect(sameProviderWindow("anthropic",
+    { limitId: "claude:seven_day", resetsAt: "2026-07-23T01:59:59.671Z" },
+    { kind: "warning", limitId: "seven_day", resetsAt: "2026-07-23T02:00:00.000Z" },
+  )).toBe(true);
+  expect(sameProviderWindow("anthropic",
+    { limitId: "claude:seven_day", resetsAt: "2026-07-23T01:59:58.999Z" },
+    { kind: "warning", limitId: "seven_day", resetsAt: "2026-07-23T02:00:00.000Z" },
+  )).toBe(false);
+  expect(sameProviderWindow("anthropic",
+    { limitId: "claude:five_hour", resetsAt: "2026-07-23T02:00:00.000Z" },
+    { kind: "warning", limitId: "seven_day", resetsAt: "2026-07-23T02:00:00.000Z" },
+  )).toBe(false);
+});
+
+test("warning evidence has an explicit short TTL while rejection survives through reset", () => {
+  const observation = { observedAt: "2026-07-18T11:00:00.000Z" };
+  const warning = { kind: "warning" as const, limitId: "seven_day", resetsAt: "2026-07-23T02:00:00.000Z" };
+  expect(categoricalSignalExpiresAt(observation, warning))
+    .toBe(new Date(Date.parse(observation.observedAt) + RATE_LIMIT_WARNING_TTL_MS).toISOString());
+  expect(categoricalSignalIsActive(observation, warning,
+    new Date(Date.parse(observation.observedAt) + RATE_LIMIT_WARNING_TTL_MS))).toBe(true);
+  expect(categoricalSignalIsActive(observation, warning,
+    new Date(Date.parse(observation.observedAt) + RATE_LIMIT_WARNING_TTL_MS + 1))).toBe(false);
+
+  const rejection = { kind: "rejection" as const, limitId: "seven_day", resetsAt: "2026-07-23T02:00:00.000Z" };
+  expect(categoricalSignalExpiresAt(observation, rejection)).toBe(rejection.resetsAt);
+  expect(categoricalSignalIsActive(observation, rejection, new Date("2026-07-22T00:00:00Z"))).toBe(true);
+  expect(categoricalSignalIsActive(observation, rejection, new Date("2026-07-23T02:00:00.001Z"))).toBe(false);
+});
+
+test("legacy rate-event floors migrate away from numeric measurement claims", () => {
+  const parsed = parseProviderUsageObservations({ version: 1, observations: [{
+    targetId: "claude-primary", provider: "anthropic",
+    source: "claude-agent-sdk:rate-limit-event", observedAt: "2026-07-18T11:00:00Z",
+    windows: [
+      { limitId: "seven_day", usedPercent: 80, resetsAt: "2026-07-23T02:00:00Z" },
+      { limitId: "five_hour", usedPercent: 72, resetsAt: "2026-07-18T16:00:00Z" },
+    ],
+  }] }).observations[0];
+  expect(parsed.windows).toEqual([
+    { limitId: "five_hour", usedPercent: 72, resetsAt: "2026-07-18T16:00:00Z" },
+  ]);
+  expect(parsed.categoricalSignals).toEqual([
+    { kind: "warning", limitId: "seven_day", resetsAt: "2026-07-23T02:00:00Z" },
+  ]);
+});
+
+test("categorical usage signal schema rejects provider-controlled kinds", () => {
+  expect(() => parseProviderUsageObservations({ version: 1, observations: [{
+    targetId: "claude-primary", provider: "anthropic",
+    source: "claude-agent-sdk:rate-limit-event", observedAt: "2026-07-18T11:00:00Z",
+    categoricalSignals: [{ kind: "provider-secret-warning-text" }],
+  }] })).toThrow("categoricalSignals[0].kind must be warning or rejection");
 });
 
 test("usage observation source is optional for legacy v1 stores but unknown provenance is rejected", () => {

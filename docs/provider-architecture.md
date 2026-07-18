@@ -50,6 +50,8 @@ routing estimate, never a provider quota. The human report labels that estimate
 route-unspecified: model-scoped windows can change the actual share for a
 specific tier/reasoning route. `providers --json` is the stable
 machine-readable status boundary; automation must not parse the human report.
+Its current `schemaVersion` is 3; v3 adds explicit conservative-floor evidence
+so derived routing pressure cannot masquerade as measured utilization.
 Its `diagnosticRouteProbe` is one deterministic health probe for a fixed key,
 not a preferred provider/account and not a prediction of the next run.
 
@@ -117,6 +119,26 @@ knowledge and cannot revive a still-live proven exhaustion; once that exhausted
 window resets it becomes unknown until a successful refresh. Categorical
 fallback weights use the same zero-to-one scale as numeric remaining headroom,
 so telemetry loss is never rewarded with an oversized allocation weight.
+
+Numeric utilization and categorical provider severity are separate evidence.
+Claude's `allowed_warning` rate-limit event is not an 80% measurement. North
+preserves any utilization value carried by the event verbatim, records the
+warning separately, and may apply an explicit **routing-only 80% floor** for
+five minutes. `north providers` labels that floor as derived and, when a
+usage-control measurement names the same window, reports the raw measurement
+separately. The JSON boundary uses `kind: "conservative-floor"` plus
+`routingFloorPercent`; it never puts the derived value in `usedPercent`. Hard
+rejection remains categorical exhaustion through its named reset.
+
+Cross-source window joins are deliberately narrow: Anthropic's optional
+`claude:` prefix is canonicalized, and reset timestamps may differ by at most
+one second to tolerate provider rounding. Different limit IDs or reset
+boundaries remain independent constraints. This keeps a model-scoped warning
+from contaminating another model or account. Historical rate-event observations
+written by older North versions as exact 80/100 numeric floors are read as
+categorical warning/rejection evidence because their persisted form cannot
+honestly prove a provider measurement.
+
 Temporary manual observations are available when the automatic view is missing
 context:
 

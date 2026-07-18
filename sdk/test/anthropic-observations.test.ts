@@ -35,17 +35,41 @@ test("normalizes fractional Claude utilization into an expiring usage window", (
     provider: "anthropic",
     source: "claude-agent-sdk:rate-limit-event",
     observedAt: "2026-07-16T12:00:00.000Z",
-    windows: [{ limitId: "five_hour", usedPercent: 83, resetsAt: "2026-07-17T00:00:00.000Z" }],
+    windows: [{
+      limitId: "five_hour", usedPercent: 83, resetsAt: "2026-07-17T00:00:00.000Z",
+      measurementKind: "provider-measured",
+    }],
   });
 });
 
-test("normalizes terminal/warning status when Claude omits numeric utilization", () => {
+test("keeps terminal/warning severity categorical when Claude omits numeric utilization", () => {
   expect(observationFromAnthropicRateLimit(event({ status: "rejected", resetsAt: Date.parse("2026-07-17T00:00:00Z") / 1_000 }), "anthropic",
     new Date("2026-07-16T12:00:00Z"))).toMatchObject({
-      windows: [{ usedPercent: 100, resetsAt: "2026-07-17T00:00:00.000Z" }],
-    });
+      categoricalSignals: [{ kind: "rejection", resetsAt: "2026-07-17T00:00:00.000Z" }],
+  });
   expect(observationFromAnthropicRateLimit(event({ status: "allowed_warning" }), "anthropic",
-    new Date("2026-07-16T12:00:00Z"))).toMatchObject({ state: "low" });
+    new Date("2026-07-16T12:00:00Z"))).toMatchObject({
+      categoricalSignals: [{ kind: "warning" }],
+    });
+});
+
+test("preserves raw utilization separately from an allowed-warning signal", () => {
+  const observation = observationFromAnthropicRateLimit(event({
+    status: "allowed_warning",
+    utilization: 0.55,
+    resetsAt: Date.parse("2026-07-23T02:00:00Z") / 1_000,
+    rateLimitType: "seven_day",
+  }), "anthropic", new Date("2026-07-18T11:19:33Z"));
+  expect(observation).toMatchObject({
+    windows: [{
+      limitId: "seven_day", usedPercent: 55, resetsAt: "2026-07-23T02:00:00.000Z",
+      measurementKind: "provider-measured",
+    }],
+    categoricalSignals: [{
+      kind: "warning", limitId: "seven_day", resetsAt: "2026-07-23T02:00:00.000Z",
+    }],
+  });
+  expect(JSON.stringify(observation)).not.toContain('"usedPercent":80');
 });
 
 test("status-only model rejection remains scoped and unknown type text stays private", () => {
@@ -72,7 +96,7 @@ test("status-only model rejection remains scoped and unknown type text stays pri
   const opaque = observationFromAnthropicRateLimit(event({
     status: "rejected", resetsAt, rateLimitType: "secret-canary-model-bucket" as any,
   }), "claude", now);
-  expect(opaque.windows?.[0].limitId).toBe("claude:model:opaque-event");
+  expect(opaque.categoricalSignals?.[0]?.limitId).toBe("claude:model:opaque-event");
   expect(JSON.stringify(opaque)).not.toContain("secret-canary");
   const opaquePolicy = { ...policy, automatedPressureObservationSets: { claude: [opaque] } };
   expect(balancedAllocationEstimates(

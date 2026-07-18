@@ -9,6 +9,7 @@ import type {
   ProviderId,
   ProviderUsageObservation,
   ProviderUsageObservationStore,
+  ProviderUsageCategoricalSignal,
   ProviderUsageCollectionFailureReason,
   ProviderUsageSource,
   ProviderUsageUnavailableComponent,
@@ -53,6 +54,10 @@ const PORTABLE_PROFILE_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 export const PRESSURE_TTL_MS = 24 * 60 * 60 * 1000;
 export const OBSERVATION_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const COLLECTION_FAILURE_TTL_MS = 5 * 60 * 1000;
+/** Advisory warnings affect routing briefly; hard rejections live through reset. */
+export const RATE_LIMIT_WARNING_TTL_MS = 5 * 60 * 1000;
+/** Provider surfaces commonly round one reset boundary to adjacent milliseconds. */
+export const PROVIDER_WINDOW_RESET_JITTER_MS = 1_000;
 export const DEFAULT_ROUTING_POLICY_PATH = resolve(homedir(), ".config/north/routing-policy.json");
 export const DEFAULT_PROVIDER_OBSERVATIONS_PATH = resolve(homedir(), ".local/state/north/provider-usage-observations.json");
 
@@ -195,6 +200,98 @@ export function pressureFromUsageWindows(windows: ProviderUsageWindow[], now = n
   return "plenty";
 }
 
+export function canonicalProviderWindowId(provider: ProviderId, limitId: string | undefined): string | undefined {
+  if (!limitId) return undefined;
+  const normalized = limitId.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return provider === "anthropic" && normalized.startsWith("claude:")
+    ? normalized.slice("claude:".length)
+    : normalized;
+}
+
+export function sameProviderWindow(
+  provider: ProviderId,
+  left: Pick<ProviderUsageWindow, "limitId" | "resetsAt">,
+  right: Pick<ProviderUsageCategoricalSignal, "limitId" | "resetsAt">,
+): boolean {
+  const leftId = canonicalProviderWindowId(provider, left.limitId);
+  const rightId = canonicalProviderWindowId(provider, right.limitId);
+  if (!leftId || !rightId || leftId !== rightId || !right.resetsAt) return false;
+  return Math.abs(Date.parse(left.resetsAt) - Date.parse(right.resetsAt))
+    <= PROVIDER_WINDOW_RESET_JITTER_MS;
+}
+
+export function categoricalSignalExpiresAt(
+  observation: Pick<ProviderUsageObservation, "observedAt" | "until">,
+  signal: ProviderUsageCategoricalSignal,
+): string | undefined {
+  const observedAt = Date.parse(observation.observedAt);
+  if (!Number.isFinite(observedAt)) return undefined;
+  const candidates = [
+    signal.resetsAt === undefined ? undefined : Date.parse(signal.resetsAt),
+    observation.until === undefined ? undefined : Date.parse(observation.until),
+    signal.kind === "warning" ? observedAt + RATE_LIMIT_WARNING_TTL_MS
+      : signal.resetsAt === undefined && observation.until === undefined
+        ? observedAt + PRESSURE_TTL_MS
+        : undefined,
+  ].filter((value): value is number => value !== undefined && Number.isFinite(value));
+  if (!candidates.length) return undefined;
+  return new Date(Math.min(...candidates)).toISOString();
+}
+
+export function categoricalSignalIsActive(
+  observation: Pick<ProviderUsageObservation, "observedAt" | "until">,
+  signal: ProviderUsageCategoricalSignal,
+  now = new Date(),
+): boolean {
+  const observedAt = Date.parse(observation.observedAt);
+  if (!Number.isFinite(observedAt) || observedAt > now.getTime() + OBSERVATION_CLOCK_SKEW_MS)
+    return false;
+  const expiresAt = categoricalSignalExpiresAt(observation, signal);
+  return expiresAt !== undefined && now.getTime() <= Date.parse(expiresAt);
+}
+
+export function pressureFromCategoricalSignals(
+  observation: Pick<ProviderUsageObservation, "observedAt" | "until">,
+  signals: ProviderUsageCategoricalSignal[],
+  now = new Date(),
+): EntitlementPressure | undefined {
+  const active = signals.filter((signal) => categoricalSignalIsActive(observation, signal, now));
+  if (active.some(({ kind }) => kind === "rejection")) return "exhausted";
+  if (active.some(({ kind }) => kind === "warning")) return "low";
+  return undefined;
+}
+
+/** Reinterpret the lossy pre-signal rate-event format without claiming measurement. */
+export function normalizeLegacyRateLimitObservation(
+  observation: ProviderUsageObservation,
+): ProviderUsageObservation {
+  if (observation.source !== "claude-agent-sdk:rate-limit-event"
+      || observation.categoricalSignals?.length
+      || !observation.windows?.length)
+    return observation;
+  const categoricalSignals: ProviderUsageCategoricalSignal[] = [];
+  const windows: ProviderUsageWindow[] = [];
+  for (const window of observation.windows) {
+    const kind = window.measurementKind === "provider-measured" ? undefined
+      : window.usedPercent === 80 ? "warning"
+        : window.usedPercent === 100 ? "rejection"
+          : undefined;
+    if (kind) categoricalSignals.push({
+      kind,
+      ...(window.limitId ? { limitId: window.limitId } : {}),
+      resetsAt: window.resetsAt,
+    });
+    else windows.push(window);
+  }
+  if (!categoricalSignals.length) return observation;
+  return {
+    ...observation,
+    ...(windows.length ? { windows } : { windows: undefined }),
+    categoricalSignals,
+  };
+}
+
 export function automatedPressure(
   observation: ProviderUsageObservation | undefined,
   now = new Date(),
@@ -203,7 +300,10 @@ export function automatedPressure(
     const windowPressure = observation?.windows?.length
       ? pressureFromUsageWindows(observation.windows, now)
       : undefined;
-    const priorPressure = [windowPressure, observation?.state]
+    const signalPressure = observation?.categoricalSignals?.length
+      ? pressureFromCategoricalSignals(observation, observation.categoricalSignals, now)
+      : undefined;
+    const priorPressure = [windowPressure, signalPressure, observation?.state]
       .filter((value): value is EntitlementPressure => value !== undefined)
       .sort((left, right) => PRESSURE_RANK[right] - PRESSURE_RANK[left])[0];
     return priorPressure === "exhausted" ? "exhausted" : "unknown";
@@ -214,11 +314,21 @@ export function automatedPressure(
       : undefined;
     // A proven rejection/exhaustion is monotonic through its provider reset.
     // Lesser stale percentages are not precise enough to steer new work.
-    return liveWindowPressure === "exhausted" ? "exhausted" : undefined;
+    const liveSignalPressure = observation?.categoricalSignals?.length
+      ? pressureFromCategoricalSignals(observation, observation.categoricalSignals, now)
+      : undefined;
+    return liveWindowPressure === "exhausted" || liveSignalPressure === "exhausted"
+      ? "exhausted"
+      : liveSignalPressure;
   }
-  if (observation?.windows?.length) {
-    const windowPressure = pressureFromUsageWindows(observation.windows, now);
-    return [windowPressure, observation.state]
+  if (observation?.windows?.length || observation?.categoricalSignals?.length) {
+    const windowPressure = observation.windows?.length
+      ? pressureFromUsageWindows(observation.windows, now)
+      : undefined;
+    const signalPressure = observation.categoricalSignals?.length
+      ? pressureFromCategoricalSignals(observation, observation.categoricalSignals, now)
+      : undefined;
+    return [windowPressure, signalPressure, observation.state]
       .filter((value): value is EntitlementPressure => value !== undefined)
       .sort((left, right) => PRESSURE_RANK[right] - PRESSURE_RANK[left])[0];
   }
@@ -245,7 +355,7 @@ export function parseProviderUsageObservations(input: unknown, path = "<memory>"
   const observations = input.observations.map((entry, index) => {
     const label = `observations[${index}]`;
     if (!object(entry)) failObservations(path, `${label} must be an object`);
-    const unknownFields = Object.keys(entry).filter((key) => !["targetId", "provider", "source", "state", "windows", "unavailableComponents", "collectionFailure", "observedAt", "until"].includes(key));
+    const unknownFields = Object.keys(entry).filter((key) => !["targetId", "provider", "source", "state", "windows", "categoricalSignals", "unavailableComponents", "collectionFailure", "observedAt", "until"].includes(key));
     if (unknownFields.length) failObservations(path, `${label} has unknown field(s): ${unknownFields.join(", ")}`);
     if (typeof entry.targetId !== "string" || !entry.targetId.trim())
       failObservations(path, `${label}.targetId must be a non-empty string`);
@@ -267,19 +377,69 @@ export function parseProviderUsageObservations(input: unknown, path = "<memory>"
       windows = entry.windows.map((window, windowIndex) => {
         const windowLabel = `${label}.windows[${windowIndex}]`;
         if (!object(window)) failObservations(path, `${windowLabel} must be an object`);
-        const unknownWindowFields = Object.keys(window).filter((key) => !["limitId", "usedPercent", "resetsAt"].includes(key));
+        const unknownWindowFields = Object.keys(window).filter((key) =>
+          !["limitId", "usedPercent", "resetsAt", "measurementKind"].includes(key));
         if (unknownWindowFields.length)
           failObservations(path, `${windowLabel} has unknown field(s): ${unknownWindowFields.join(", ")}`);
         if (window.limitId !== undefined && (typeof window.limitId !== "string" || !window.limitId.trim()))
           failObservations(path, `${windowLabel}.limitId must be a non-empty string`);
         if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent) || window.usedPercent < 0)
           failObservations(path, `${windowLabel}.usedPercent must be a non-negative number`);
+        if (window.measurementKind !== undefined && window.measurementKind !== "provider-measured")
+          failObservations(path, `${windowLabel}.measurementKind must be provider-measured`);
         return {
           ...(window.limitId === undefined ? {} : { limitId: window.limitId }),
           usedPercent: window.usedPercent,
           resetsAt: observationTimestamp(path, window.resetsAt, `${windowLabel}.resetsAt`),
+          ...(window.measurementKind === undefined ? {} : { measurementKind: "provider-measured" as const }),
         } as ProviderUsageWindow;
       });
+    }
+    let categoricalSignals: ProviderUsageCategoricalSignal[] | undefined;
+    if (entry.categoricalSignals !== undefined) {
+      if (!Array.isArray(entry.categoricalSignals) || entry.categoricalSignals.length === 0)
+        failObservations(path, `${label}.categoricalSignals must be a non-empty array`);
+      categoricalSignals = entry.categoricalSignals.map((signal, signalIndex) => {
+        const signalLabel = `${label}.categoricalSignals[${signalIndex}]`;
+        if (!object(signal)) failObservations(path, `${signalLabel} must be an object`);
+        const unknownSignalFields = Object.keys(signal).filter((key) =>
+          !["kind", "limitId", "resetsAt"].includes(key));
+        if (unknownSignalFields.length)
+          failObservations(path, `${signalLabel} has unknown field(s): ${unknownSignalFields.join(", ")}`);
+        if (signal.kind !== "warning" && signal.kind !== "rejection")
+          failObservations(path, `${signalLabel}.kind must be warning or rejection`);
+        if (signal.limitId !== undefined && (typeof signal.limitId !== "string" || !signal.limitId.trim()))
+          failObservations(path, `${signalLabel}.limitId must be a non-empty string`);
+        return {
+          kind: signal.kind,
+          ...(signal.limitId === undefined ? {} : { limitId: signal.limitId }),
+          ...(signal.resetsAt === undefined ? {} : {
+            resetsAt: observationTimestamp(path, signal.resetsAt, `${signalLabel}.resetsAt`),
+          }),
+        } as ProviderUsageCategoricalSignal;
+      });
+    }
+    // v1 rate-event observations encoded categorical floors as if they were
+    // measurements. Exact 80/100 values are irrecoverably ambiguous, so migrate
+    // them to the conservative categorical interpretation instead of claiming
+    // provider-measured utilization.
+    if (entry.source === "claude-agent-sdk:rate-limit-event" && categoricalSignals === undefined && windows) {
+      const legacySignals: ProviderUsageCategoricalSignal[] = [];
+      const measuredWindows: ProviderUsageWindow[] = [];
+      for (const window of windows) {
+        const kind = window.measurementKind === "provider-measured" ? undefined
+          : window.usedPercent === 80 ? "warning"
+            : window.usedPercent === 100 ? "rejection"
+            : undefined;
+        if (kind) legacySignals.push({
+          kind,
+          ...(window.limitId ? { limitId: window.limitId } : {}),
+          resetsAt: window.resetsAt,
+        });
+        else measuredWindows.push(window);
+      }
+      if (legacySignals.length) categoricalSignals = legacySignals;
+      windows = measuredWindows.length ? measuredWindows : undefined;
     }
     let unavailableComponents: ProviderUsageUnavailableComponent[] | undefined;
     if (entry.unavailableComponents !== undefined) {
@@ -317,8 +477,8 @@ export function parseProviderUsageObservations(input: unknown, path = "<memory>"
         reason: entry.collectionFailure.reason as ProviderUsageCollectionFailureReason,
       };
     }
-    if (entry.state === undefined && windows === undefined)
-      failObservations(path, `${label} must contain state or windows`);
+    if (entry.state === undefined && windows === undefined && categoricalSignals === undefined)
+      failObservations(path, `${label} must contain state, windows, or categoricalSignals`);
     const observedAt = observationTimestamp(path, entry.observedAt, `${label}.observedAt`);
     return {
       targetId: entry.targetId,
@@ -327,6 +487,7 @@ export function parseProviderUsageObservations(input: unknown, path = "<memory>"
       observedAt,
       ...(entry.state === undefined ? {} : { state: entry.state as EntitlementPressure }),
       ...(windows === undefined ? {} : { windows }),
+      ...(categoricalSignals === undefined ? {} : { categoricalSignals }),
       ...(unavailableComponents === undefined ? {} : { unavailableComponents }),
       ...(collectionFailure === undefined ? {} : { collectionFailure }),
       ...(entry.until === undefined ? {} : { until: observationTimestamp(path, entry.until, `${label}.until`) }),

@@ -63,7 +63,7 @@ test("providers JSON schema groups targets and exposes normalized balanced estim
   const second = document();
   expect(second).toEqual(first);
   expect(first).toMatchObject({
-    schemaVersion: 2,
+    schemaVersion: 3,
     source: "checkout abc123 dirty",
     allocationMode: "balanced",
     providers: [
@@ -103,7 +103,7 @@ test("human provider rendering labels estimates as non-quotas and the chooser as
   expect(rendered).toContain("allocation mode  balanced");
   expect(rendered).toContain("balanced estimate (route unspecified): weight 0.2 · approximately 20.0% of eligible auto routes (not a quota)");
   expect(rendered).toContain("balanced estimate (route unspecified): weight 0.8 · approximately 80.0% of eligible auto routes (not a quota)");
-  expect(rendered).toContain(`allocation evidence: legacy-observation · observed ${observedAt} · claude:seven_day · 80% used`);
+  expect(rendered).toContain(`allocation evidence: legacy-observation · observed ${observedAt} · claude:seven_day · provider-measured 80% used`);
   expect(rendered).toContain("diagnostic route probe (not a preference; stable key: fixture-key)");
   expect(rendered).toContain("one deterministic probe only; per-account estimates above are conservative without a tier/model and may vary by route");
   expect(rendered).not.toContain("sample auto route");
@@ -137,4 +137,45 @@ test("categorical allocation reports the actual driving source and exhausted rou
     headroom: "exhausted", routing: "exhausted",
     allocation: { eligible: false, effectiveWeight: 0 },
   });
+});
+
+test("status JSON and prose distinguish a routing floor from provider-measured utilization", () => {
+  const calibrated: ResourcePolicy = {
+    ...policy,
+    automatedPressureObservations: undefined,
+    automatedPressureObservationSets: {
+      "claude-personal": [
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:usage-control-experimental", observedAt,
+          windows: [{
+            limitId: "claude:seven_day", usedPercent: 55,
+            resetsAt: "2099-01-01T01:59:59.671Z",
+          }],
+        },
+        {
+          targetId: "claude-personal", provider: "anthropic",
+          source: "claude-agent-sdk:rate-limit-event", observedAt,
+          categoricalSignals: [{
+            kind: "warning", limitId: "seven_day", resetsAt: "2099-01-01T02:00:00.000Z",
+          }],
+        },
+      ],
+    },
+  };
+  const result = buildProvidersStatusDocument({
+    source: "fixture", accountUsage: [], policy: calibrated, availability,
+  });
+  const evidence = result.providers[0]!.targets[0]!.allocation!.evidence;
+  expect(evidence).toMatchObject({
+    kind: "conservative-floor",
+    routingFloorPercent: 80,
+    measuredUsedPercent: 55,
+    measurementSource: "claude-agent-sdk:usage-control-experimental",
+  });
+  expect(evidence.usedPercent).toBeUndefined();
+  const rendered = renderProvidersStatus(result);
+  expect(rendered).toContain("routing-only categorical floor 80%");
+  expect(rendered).toContain("separate provider measurement 55% via claude-agent-sdk:usage-control-experimental");
+  expect(rendered).not.toContain("provider-measured 80%");
 });

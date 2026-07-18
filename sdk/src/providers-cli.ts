@@ -55,7 +55,7 @@ export interface ProviderTargetStatus {
 }
 
 export interface ProvidersStatusDocument {
-  schemaVersion: 2;
+  schemaVersion: 3;
   source: string;
   allocationMode: AllocationMode;
   providers: Array<{
@@ -185,7 +185,7 @@ export function buildProvidersStatusDocument(input: {
     };
   }
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     source: input.source,
     allocationMode: input.policy.mode,
     providers: ([
@@ -201,6 +201,23 @@ export function buildProvidersStatusDocument(input: {
 
 function displayNumber(value: number): string {
   return Number(value.toFixed(3)).toString();
+}
+
+function renderAllocationEvidence(evidence: AllocationEvidence): string {
+  const pieces = [
+    evidence.source,
+    ...(evidence.observedAt ? [`observed ${evidence.observedAt}`] : []),
+    ...(evidence.limitId ? [evidence.limitId] : []),
+  ];
+  if (evidence.kind === "conservative-floor") {
+    pieces.push(`routing-only categorical floor ${evidence.routingFloorPercent}%`);
+    if (evidence.routingFloorExpiresAt) pieces.push(`expires ${evidence.routingFloorExpiresAt}`);
+    if (evidence.measuredUsedPercent !== undefined)
+      pieces.push(`separate provider measurement ${evidence.measuredUsedPercent}% via ${evidence.measurementSource ?? "unknown source"}${evidence.measurementObservedAt ? ` at ${evidence.measurementObservedAt}` : ""}`);
+  } else if (evidence.usedPercent !== undefined) {
+    pieces.push(`provider-measured ${evidence.usedPercent}% used`);
+  }
+  return pieces.join(" · ");
 }
 
 export function renderProvidersStatus(document: ProvidersStatusDocument): string {
@@ -222,7 +239,7 @@ export function renderProvidersStatus(document: ProvidersStatusDocument): string
         else
           lines.push(`    balanced estimate (route unspecified): ineligible · weight ${displayNumber(target.allocation.effectiveWeight)}`);
         const evidence = target.allocation.evidence;
-        lines.push(`    allocation evidence: ${evidence.source}${evidence.observedAt ? ` · observed ${evidence.observedAt}` : ""}${evidence.limitId ? ` · ${evidence.limitId}` : ""}${evidence.usedPercent === undefined ? "" : ` · ${evidence.usedPercent}% used`}`);
+        lines.push(`    allocation evidence: ${renderAllocationEvidence(evidence)}`);
         if (evidence.collectionFailure)
           lines.push(`      latest collection failure: ${evidence.collectionFailure.reason} · attempted ${evidence.collectionFailure.observedAt}`);
       }
@@ -242,7 +259,7 @@ export function renderProvidersStatus(document: ProvidersStatusDocument): string
       for (const scoped of target.scopedConstraints) {
         const evidence = scoped.evidence;
         lines.push(`    route-dependent: ${scoped.family} (${scoped.model}) is ${scoped.routing}; headroom ${scoped.headroom}`);
-        lines.push(`      evidence: ${evidence.source}${evidence.observedAt ? ` · observed ${evidence.observedAt}` : ""}${evidence.limitId ? ` · ${evidence.limitId}` : ""}${evidence.usedPercent === undefined ? "" : ` · ${evidence.usedPercent}% used`}`);
+        lines.push(`      evidence: ${renderAllocationEvidence(evidence)}`);
       }
     }
   }
