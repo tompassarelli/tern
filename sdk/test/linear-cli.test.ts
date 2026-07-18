@@ -2,8 +2,14 @@ import { expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runLinearCommand, type LinearCliDependencies } from "../src/integrations/linear/cli";
-import { NorthGraphStore, northThreadIdForIdentity, type GraphFact, type GraphStore, type SyncLease, type SyncLeaseManager } from "../src/integrations/linear/north-state";
+import {
+  LINEAR_LEASE_TIMEOUT_SAFETY_FACTOR, LINEAR_MCP_CALL_TIMEOUT_MS,
+  runLinearCommand, type LinearCliDependencies,
+} from "../src/integrations/linear/cli";
+import {
+  CoordinatorSyncLeaseManager, LINEAR_SYNC_LEASE_TTL_MS, NorthGraphStore, northThreadIdForIdentity,
+  type GraphFact, type GraphStore, type SyncLease, type SyncLeaseManager,
+} from "../src/integrations/linear/north-state";
 import { createLinearSyncBaseline } from "../src/integrations/linear/reconcile";
 import type { LinearGateway, LinearCallEnvelope } from "../src/integrations/linear/gateway";
 import type { ModelFreeTransportReceipt } from "../src/integrations/linear/mcp-broker";
@@ -16,6 +22,7 @@ class FakeGraph implements GraphStore {
   failSubjectPrefix?: string;
   failPredicate?: string;
   failAfter = Infinity;
+  afterPut?: (subject: string, predicate: string, value: string) => void;
   private matchingWrites = 0;
 
   async show(subject: string): Promise<readonly GraphFact[]> {
@@ -48,6 +55,12 @@ class FakeGraph implements GraphStore {
     if (!next.some((fact) => fact.predicate === predicate && fact.value === value)) next.push({ predicate, value });
     this.rows.set(subject, next);
     this.writes.push({ subject, predicate, value });
+    this.afterPut?.(subject, predicate, value);
+  }
+
+  async putFenced(lease: SyncLease, subject: string, predicate: string, value: string): Promise<void> {
+    await lease.fence();
+    await this.put(subject, predicate, value);
   }
 
   seed(subject: string, predicate: string, value: string) {
@@ -58,15 +71,66 @@ class FakeGraph implements GraphStore {
 }
 
 class FakeLeases implements SyncLeaseManager {
-  private active = new Set<string>();
+  private active = new Map<string, { holder: string; epoch: number }>();
+  private nextEpoch = 0;
+  private renewalCount = 0;
+  private loseAtRenewal?: number;
+  private throwAtRenewal?: number;
+  releaseFailure?: string;
+
+  loseOnNthNextRenewal(n: number): void {
+    this.loseAtRenewal = this.renewalCount + n;
+  }
+
+  throwOnNthNextRenewal(n: number): void {
+    this.throwAtRenewal = this.renewalCount + n;
+  }
+
+  takeoverActive(): void {
+    for (const [resource] of this.active)
+      this.active.set(resource, { holder: `successor:${resource}`, epoch: ++this.nextEpoch });
+  }
+
+  clearTakeovers(): void {
+    for (const [resource, state] of this.active)
+      if (state.holder.startsWith("successor:")) this.active.delete(resource);
+  }
+
   async acquire(resource: string): Promise<SyncLease> {
     while (this.active.has(resource)) await new Promise((done) => setTimeout(done, 1));
-    this.active.add(resource);
+    const holder = `fake:${resource}:${this.nextEpoch + 1}`;
+    let epoch = ++this.nextEpoch;
+    this.active.set(resource, { holder, epoch });
     let released = false;
     return {
-      resource, holder: `fake:${resource}`, epoch: 1,
-      fence: async () => { if (released || !this.active.has(resource)) throw new Error("lost fake lease"); },
-      release: async () => { released = true; this.active.delete(resource); },
+      resource, holder,
+      get epoch() { return epoch; },
+      renew: async () => {
+        this.renewalCount++;
+        if (this.renewalCount === this.throwAtRenewal) {
+          this.throwAtRenewal = undefined;
+          throw new Error("renewal sentinel");
+        }
+        if (this.renewalCount === this.loseAtRenewal) this.takeoverActive();
+        const current = this.active.get(resource);
+        if (released || current?.holder !== holder || current.epoch !== epoch) throw new Error("lost fake lease");
+        epoch = ++this.nextEpoch;
+        this.active.set(resource, { holder, epoch });
+      },
+      fence: async () => {
+        const current = this.active.get(resource);
+        if (released || current?.holder !== holder || current.epoch !== epoch) throw new Error("lost fake lease");
+      },
+      release: async () => {
+        const current = this.active.get(resource);
+        if (current?.holder === holder && current.epoch === epoch) this.active.delete(resource);
+        released = true;
+        if (this.releaseFailure) {
+          const message = this.releaseFailure;
+          this.releaseFailure = undefined;
+          throw new Error(message);
+        }
+      },
     };
   }
 }
@@ -106,6 +170,16 @@ class FakeGateway implements LinearGateway {
   rejectOldKey = false;
   falsePositive = issue("NOISE-1", "not the marker");
   duplicateExact = false;
+  infiniteCommentPages = false;
+  oversizedCommentPage = false;
+  commentPageCalls = 0;
+  infiniteIssuePages = false;
+  oversizedIssueCandidates = false;
+  duplicateIssueKey = false;
+  issuePageCalls = 0;
+  malformedComment?: "blank-id" | "non-string-body";
+  afterIssueWrite?: () => void;
+  afterWrittenIssueRead?: () => void;
   constructor(readonly server = "linear-test") {}
 
   async call(envelope: LinearCallEnvelope): Promise<unknown> {
@@ -117,14 +191,32 @@ class FakeGateway implements LinearGateway {
   }
   async readIssue(args: Record<string, unknown>): Promise<unknown> {
     const key = String(args.id);
-    if (key === this.issue.id || (!this.rejectOldKey && key === "MSA-236")) return structuredClone(this.issue);
+    if (key === this.issue.id || (!this.rejectOldKey && key === "MSA-236")) {
+      const result = structuredClone(this.issue);
+      if (this.issueWrites > 0) this.afterWrittenIssueRead?.();
+      return result;
+    }
     if (key === this.falsePositive.id) return structuredClone(this.falsePositive);
     if (key === "DUP-1" && this.duplicateExact) return { ...structuredClone(this.issue), id: "DUP-1" };
     throw new Error(`missing issue ${key}`);
   }
   async listIssues(): Promise<unknown> {
+    if (this.infiniteIssuePages) {
+      const page = ++this.issuePageCalls;
+      return { issues: [], hasNextPage: true, nextCursor: `issues-${page}` };
+    }
+    if (this.oversizedIssueCandidates) {
+      return {
+        issues: Array.from({ length: 26 }, (_, index) => ({
+          ...issue(`NOISE-${index}`, "not the marker"),
+          createdAt: `2026-07-16T14:08:${String(index % 60).padStart(2, "0")}.639Z`,
+        })),
+        hasNextPage: false,
+      };
+    }
     return {
       issues: [structuredClone(this.falsePositive), structuredClone(this.issue),
+        ...(this.duplicateIssueKey ? [structuredClone(this.issue)] : []),
         ...(this.duplicateExact ? [{ ...structuredClone(this.issue), id: "DUP-1" }] : [])],
       hasNextPage: false,
     };
@@ -136,10 +228,27 @@ class FakeGateway implements LinearGateway {
       this.issue.description = this.normalizeManagedMarkdown
         ? normalizeLinearManagedMarkdown(args.description) : args.description;
     }
+    this.afterIssueWrite?.();
     if (this.throwAfterIssueWrite) { this.throwAfterIssueWrite = false; throw new Error("transport vanished after commit"); }
     return structuredClone(this.issue);
   }
-  async listComments(): Promise<unknown> { return { comments: structuredClone(this.comments), hasNextPage: false }; }
+  async listComments(): Promise<unknown> {
+    if (this.malformedComment === "blank-id")
+      return { comments: [{ id: " ", body: "managed-looking" }], hasNextPage: false };
+    if (this.malformedComment === "non-string-body")
+      return { comments: [{ id: "comment-malformed", body: 42 }], hasNextPage: false };
+    if (this.infiniteCommentPages) {
+      const page = ++this.commentPageCalls;
+      return { comments: [], hasNextPage: true, nextCursor: `comments-${page}` };
+    }
+    if (this.oversizedCommentPage) {
+      return {
+        comments: Array.from({ length: 5_001 }, (_, index) => ({ id: `comment-${index}`, body: "" })),
+        hasNextPage: false,
+      };
+    }
+    return { comments: structuredClone(this.comments), hasNextPage: false };
+  }
   async writeComment(args: Record<string, unknown>): Promise<unknown> {
     this.commentWrites++;
     let comment;
@@ -552,6 +661,260 @@ test("concurrent apply serializes and emits one remote issue mutation", async ()
   expect(h.gateway.issueWrites).toBe(1);
 });
 
+test("lease renewal advances the exact epoch and release uses only the latest token", async () => {
+  const calls: string[][] = [];
+  const manager = new CoordinatorSyncLeaseManager(
+    "7977", "/unused/lease-cli.clj", 5_000, 1,
+    async (args) => {
+      calls.push([...args]);
+      if (args[0] === "acquire")
+        return JSON.stringify({ ok: 10, holder: args[2], exp: 1_000, epoch: 10 });
+      if (args[0] === "renew" && args[3] === "10")
+        return JSON.stringify({ ok: 11, holder: args[2], exp: 2_000, epoch: 11 });
+      if (args[0] === "fence" && args[3] === "11") return JSON.stringify({ "fence-ok": true });
+      if (args[0] === "release" && args[3] === "11") return JSON.stringify({ ok: 12 });
+      return JSON.stringify({ reject: "fence-lost", version: 12 });
+    },
+  );
+  const lease = await manager.acquire("linear-sync:test");
+  expect(lease.epoch).toBe(10);
+  await lease.renew();
+  expect(lease.epoch).toBe(11);
+  await lease.fence();
+  await lease.release();
+  expect(calls.map(([verb]) => verb)).toEqual(["acquire", "renew", "fence", "release"]);
+  expect(calls.at(-1)).toEqual(["release", "linear-sync:test", lease.holder, "11"]);
+});
+
+test("a lost renewal response never advances the local epoch or triggers reacquisition", async () => {
+  const calls: string[][] = [];
+  const manager = new CoordinatorSyncLeaseManager(
+    "7977", "/unused/lease-cli.clj", 5_000, 1,
+    async (args) => {
+      calls.push([...args]);
+      if (args[0] === "acquire")
+        return JSON.stringify({ ok: 10, holder: args[2], exp: 1_000, epoch: 10 });
+      if (args[0] === "renew") throw new Error("renewal response lost");
+      if (args[0] === "release") return JSON.stringify({ ok: 11, noop: true });
+      throw new Error("unexpected lease operation");
+    },
+  );
+  const lease = await manager.acquire("linear-sync:lost-response");
+  await expect(lease.renew()).rejects.toThrow("renewal response lost");
+  expect(lease.epoch).toBe(10);
+  await lease.release();
+  expect(calls.map(([verb]) => verb)).toEqual(["acquire", "renew", "release"]);
+  expect(calls.at(-1)?.[3]).toBe("10");
+});
+
+test("lease responses use exact JSON envelopes with coherent safe epochs", async () => {
+  const invalidResponses: readonly ((holder: string) => string)[] = [
+    (holder) => `{"ok":10,"holder":"${holder}","exp":1000,"epoch":10} trailing`,
+    (holder) => JSON.stringify({ ok: 10, holder, exp: 1_000, epoch: 10, surplus: true }),
+    (holder) => JSON.stringify({ ok: 10, holder, exp: 1_000, epoch: 11 }),
+    (holder) => JSON.stringify({ ok: 9_007_199_254_740_992, holder, exp: 1_000, epoch: 9_007_199_254_740_992 }),
+    (holder) => `{"ok":10,"ok":10,"holder":"${holder}","exp":1000,"epoch":10}`,
+    (holder) => JSON.stringify({ ok: 10, holder, exp: 1_000, epoch: 10, reject: "held" }),
+  ];
+  for (const response of invalidResponses) {
+    const manager = new CoordinatorSyncLeaseManager(
+      "7977", "/unused/lease-cli.clj", 5_000, 1,
+      async (args) => response(args[2]!),
+    );
+    await expect(manager.acquire("linear-sync:hostile"))
+      .rejects.toThrow("invalid acquire response");
+  }
+
+  let call = 0;
+  const nonAdvancing = new CoordinatorSyncLeaseManager(
+    "7977", "/unused/lease-cli.clj", 5_000, 1,
+    async (args) => {
+      call++;
+      return JSON.stringify({ ok: 10, holder: args[2], exp: 1_000, epoch: 10 });
+    },
+  );
+  const lease = await nonAdvancing.acquire("linear-sync:non-advancing");
+  await expect(lease.renew()).rejects.toThrow("invalid renewal response");
+  expect(call).toBe(2);
+});
+
+test("fenced graph writes classify exact JSON success, lease loss, rejection, and malformed output", async () => {
+  const lease: SyncLease = {
+    resource: "linear-sync:test", holder: "holder", epoch: 10,
+    renew: async () => {}, fence: async () => {}, release: async () => {},
+  };
+  const response = { value: JSON.stringify({ ok: 11 }) };
+  const store = new NorthGraphStore(
+    "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977",
+    async () => response.value,
+  );
+  await store.putFenced(lease, "link:x", "sync_manifest", "{}");
+
+  response.value = JSON.stringify({ reject: "fence-lost", version: 11 });
+  await expect(store.putFenced(lease, "link:x", "sync_manifest", "{}"))
+    .rejects.toThrow("lost Linear sync lease");
+
+  response.value = JSON.stringify({ reject: ["reserved predicate"], version: 11 });
+  await expect(store.putFenced(lease, "link:x", "sync_manifest", "{}"))
+    .rejects.toThrow("coordinator rejected fenced Linear graph write");
+
+  response.value = JSON.stringify({ ok: 12, surplus: true });
+  await expect(store.putFenced(lease, "link:x", "sync_manifest", "{}"))
+    .rejects.toThrow("invalid fenced-write response");
+});
+
+test("lease configuration rejects hostile bounds and dominates every remote call", () => {
+  expect(() => new CoordinatorSyncLeaseManager("7977", "/unused", 0, 1))
+    .toThrow("TTL must be a positive safe integer");
+  expect(() => new CoordinatorSyncLeaseManager("7977", "/unused", 5_000, 0))
+    .toThrow("attempts must be a positive safe integer");
+  expect(LINEAR_SYNC_LEASE_TTL_MS)
+    .toBeGreaterThanOrEqual(LINEAR_MCP_CALL_TIMEOUT_MS * LINEAR_LEASE_TIMEOUT_SAFETY_FACTOR);
+});
+
+test("takeover after pending intent prevents the stale holder from starting a remote side effect", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  h.graph.afterPut = (_subject, predicate, value) => {
+    if (predicate === "sync_manifest" && JSON.parse(value).pending) h.leases.takeoverActive();
+  };
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies)).rejects.toThrow("lost fake lease");
+  expect(h.gateway.issueWrites).toBe(0);
+  const link = (await h.graph.show(thread)).find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  const pending = JSON.parse((await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value);
+  expect(pending.pending).toMatchObject({ kind: "issue" });
+
+  h.graph.afterPut = undefined;
+  h.leases.clearTakeovers();
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("prior issue write has unknown outcome and is not observable; refusing to retry");
+  expect(h.gateway.issueWrites).toBe(0);
+});
+
+test("takeover during a remote call leaves intent for a successor to reconcile without a duplicate", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  h.gateway.afterIssueWrite = () => h.leases.takeoverActive();
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies)).rejects.toThrow("lost fake lease");
+  expect(h.gateway.issueWrites).toBe(1);
+  const link = (await h.graph.show(thread)).find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  expect(JSON.parse((await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value).pending)
+    .toMatchObject({ kind: "issue" });
+
+  h.gateway.afterIssueWrite = undefined;
+  h.leases.clearTakeovers();
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  expect(h.gateway.issueWrites).toBe(1);
+  expect(await runLinearCommand(["plan", thread], h.dependencies))
+    .toMatchObject({ state: "in-sync", actions: [] });
+});
+
+test("takeover after readback prevents stale finalization and the successor confirms the pending write", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  h.gateway.afterWrittenIssueRead = () => {
+    h.gateway.afterWrittenIssueRead = undefined;
+    h.leases.takeoverActive();
+  };
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies)).rejects.toThrow("lost fake lease");
+  expect(h.gateway.issueWrites).toBe(1);
+  const link = (await h.graph.show(thread)).find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  expect(JSON.parse((await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value).pending)
+    .toMatchObject({ kind: "issue" });
+
+  h.leases.clearTakeovers();
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  expect(h.gateway.issueWrites).toBe(1);
+  expect(await runLinearCommand(["plan", thread], h.dependencies))
+    .toMatchObject({ state: "in-sync", actions: [] });
+});
+
+test("lease loss during paginated reads aborts before any remote or graph mutation", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const graphWritesBeforeApply = h.graph.writes.length;
+  h.gateway.infiniteCommentPages = true;
+  h.leases.loseOnNthNextRenewal(5);
+
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("lost fake lease");
+  expect(h.gateway.commentPageCalls).toBe(2);
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+  expect(h.graph.writes.length).toBe(graphWritesBeforeApply);
+  h.leases.clearTakeovers();
+});
+
+test("lease renewal failure at stored-key lookup is never reclassified as backlink relocation", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  h.leases.throwOnNthNextRenewal(2);
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("renewal sentinel");
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+});
+
+test("release cleanup never masks a primary failure but still fails a successful operation", async () => {
+  const primary = harness();
+  const primaryThread = await importThread(primary);
+  primary.gateway.infiniteCommentPages = true;
+  primary.leases.releaseFailure = "release transport failed";
+  await expect(runLinearCommand(["sync", primaryThread, "--apply"], primary.dependencies))
+    .rejects.toThrow("Linear list_comments exceeded 20 pages");
+
+  const successful = harness();
+  const successfulThread = await importThread(successful);
+  successful.leases.releaseFailure = "release transport failed";
+  await expect(runLinearCommand(["sync", successfulThread, "--apply"], successful.dependencies))
+    .rejects.toThrow("release transport failed");
+});
+
+for (const malformed of ["blank-id", "non-string-body"] as const) {
+  test(`malformed Linear comment ${malformed} fails closed`, async () => {
+    const h = harness();
+    const thread = await importThread(h);
+    h.gateway.malformedComment = malformed;
+    await expect(runLinearCommand(["plan", thread], h.dependencies))
+      .rejects.toThrow(malformed === "blank-id" ? "non-blank id" : "string body");
+    expect(h.gateway.commentWrites).toBe(0);
+  });
+}
+
+test("Linear issue and comment pagination has explicit page and item ceilings", async () => {
+  const comments = harness();
+  const commentsThread = await importThread(comments);
+  comments.gateway.infiniteCommentPages = true;
+  await expect(runLinearCommand(["plan", commentsThread], comments.dependencies))
+    .rejects.toThrow("Linear list_comments exceeded 20 pages");
+  expect(comments.gateway.commentPageCalls).toBe(20);
+
+  const commentItems = harness();
+  const commentItemsThread = await importThread(commentItems);
+  commentItems.gateway.oversizedCommentPage = true;
+  await expect(runLinearCommand(["plan", commentItemsThread], commentItems.dependencies))
+    .rejects.toThrow("Linear list_comments exceeded 5000 comments");
+
+  const issues = harness();
+  const issuesThread = await importThread(issues);
+  await runLinearCommand(["sync", issuesThread, "--apply"], issues.dependencies);
+  issues.gateway.issue = { ...issues.gateway.issue, id: "NEW-1" };
+  issues.gateway.rejectOldKey = true;
+  issues.gateway.infiniteIssuePages = true;
+  await expect(runLinearCommand(["plan", issuesThread], issues.dependencies))
+    .rejects.toThrow("Linear list_issues exceeded 20 pages");
+  expect(issues.gateway.issuePageCalls).toBe(20);
+
+  const issueItems = harness();
+  const issueItemsThread = await importThread(issueItems);
+  await runLinearCommand(["sync", issueItemsThread, "--apply"], issueItems.dependencies);
+  issueItems.gateway.issue = { ...issueItems.gateway.issue, id: "NEW-1" };
+  issueItems.gateway.rejectOldKey = true;
+  issueItems.gateway.oversizedIssueCandidates = true;
+  await expect(runLinearCommand(["plan", issueItemsThread], issueItems.dependencies))
+    .rejects.toThrow("managed Linear backlink resolution exceeded 25 candidates");
+});
+
 test("legacy aliases are never auto-matched", async () => {
   const h = harness();
   h.graph.seed("legacy-a", "title", "old A");
@@ -587,6 +950,17 @@ test("marker relocation rejects duplicate exact matches", async () => {
   h.gateway.rejectOldKey = true;
   h.gateway.duplicateExact = true;
   await expect(runLinearCommand(["plan", thread], h.dependencies)).rejects.toThrow("found 2 exact issue");
+});
+
+test("marker relocation rejects duplicate issue keys before last-write-wins collection", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  h.gateway.issue = { ...h.gateway.issue, id: "NEW-1" };
+  h.gateway.rejectOldKey = true;
+  h.gateway.duplicateIssueKey = true;
+  await expect(runLinearCommand(["plan", thread], h.dependencies))
+    .rejects.toThrow("duplicate issue key NEW-1");
 });
 
 test("doctor bootstraps graph schema exactly once; get stays read-only and irrelevant flags fail closed", async () => {

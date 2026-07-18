@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
@@ -40,6 +41,35 @@ function sendResult(request, result) {
       })}\n`);
       return;
     }
+    if (config.afterResponse.type === "invalidUtf8") {
+      process.stdout.write(`${JSON.stringify(response)}\n`);
+      process.stdout.write(Buffer.from([
+        0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x0a,
+      ]));
+      return;
+    }
+    if (config.afterResponse.type === "partialEof") {
+      process.stdout.write(`${JSON.stringify(response)}\n{"method":"thread/started"`);
+      setImmediate(() => process.exit(0));
+      return;
+    }
+    if (["exitBeforeEndPartial", "exitBeforeEndPartialLong"].includes(config.afterResponse.type)) {
+      process.stdout.write(`${JSON.stringify(response)}\n{"method":"thread/started"`);
+      const delay = config.afterResponse.type === "exitBeforeEndPartialLong" ? 500 : 75;
+      spawn(process.execPath, ["-e", `setTimeout(() => {}, ${delay})`], {
+        stdio: ["ignore", 1, "ignore"],
+      }).unref();
+      process.exit(0);
+    }
+    if (config.afterResponse.type === "splitUtf8") {
+      const encoded = Buffer.from(`${JSON.stringify(response)}\n`);
+      const scalar = Buffer.from("é");
+      const scalarAt = encoded.indexOf(scalar);
+      if (scalarAt < 0) throw new Error("splitUtf8 response lacks the expected scalar");
+      process.stdout.write(encoded.subarray(0, scalarAt + 1));
+      setImmediate(() => process.stdout.write(encoded.subarray(scalarAt + 1)));
+      return;
+    }
   }
   send(response);
 }
@@ -73,8 +103,22 @@ input.on("line", (line) => {
   if (request.method === "initialize") return sendResult(request, { userAgent: "fake-linear" });
   if (request.method === "initialized" && request.id === undefined) return;
   if (request.method === "thread/start") return sendResult(request, { thread: { id: "ephemeral-thread" } });
-  if (request.method === "mcpServerStatus/list")
-    return sendResult(request, { data: config.servers ?? [], nextCursor: null });
+  if (request.method === "mcpServerStatus/list") {
+    if (config.inventoryInfinite) {
+      const prior = typeof request.params?.cursor === "string"
+        ? Number(request.params.cursor.replace("inventory-", "")) : 0;
+      return sendResult(request, { data: [], nextCursor: `inventory-${prior + 1}` });
+    }
+    if (config.inventoryLoop)
+      return sendResult(request, { data: [], nextCursor: "inventory-loop" });
+    const data = Number.isSafeInteger(config.inventoryServerCount) && config.inventoryServerCount >= 0
+      ? Array.from({ length: config.inventoryServerCount }, (_, index) => ({
+        ...(config.servers?.[0] ?? {}),
+        name: `inventory-server-${index}`,
+      }))
+      : config.servers ?? [];
+    return sendResult(request, { data, nextCursor: null });
+  }
   if (request.method === "mcpServer/tool/call") {
     if (config.rpcToolError) return send({ id: request.id, error: {
       code: -32000,

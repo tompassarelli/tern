@@ -24,17 +24,23 @@ export interface GraphStore {
   showMany?(subjects: readonly string[]): Promise<ReadonlyMap<string, readonly GraphFact[]>>;
   /** Coordinator-serialized graph assertion. Subject is bare; refs retain @. */
   put(subject: string, predicate: string, value: string): Promise<void>;
+  /** Assertion whose lease check and graph mutation share one coordinator turn. */
+  putFenced(lease: SyncLease, subject: string, predicate: string, value: string): Promise<void>;
 }
 
 export interface SyncLease {
   readonly resource: string;
   readonly holder: string;
   readonly epoch: number;
+  /** Extend the lease and advance its fencing epoch. */
+  renew(): Promise<void>;
   fence(): Promise<void>;
   release(): Promise<void>;
 }
 
 export interface SyncLeaseManager { acquire(resource: string): Promise<SyncLease> }
+
+export const LINEAR_SYNC_LEASE_TTL_MS = 300_000;
 
 async function command(file: string, args: readonly string[], options: { timeout?: number } = {}): Promise<string> {
   const result = await execFileAsync(file, [...args], {
@@ -45,10 +51,96 @@ async function command(file: string, args: readonly string[], options: { timeout
   return result.stdout.trim();
 }
 
+function coordinatorObject(output: string): Record<string, unknown> | undefined {
+  try {
+    const keys = new Set<string>();
+    let depth = 0;
+    let stringStart = -1;
+    let escaped = false;
+    for (let index = 0; index < output.length; index++) {
+      const character = output[index]!;
+      if (stringStart >= 0) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === "\"") {
+          let next = index + 1;
+          while (/\s/.test(output[next] ?? "")) next++;
+          if (depth === 1 && output[next] === ":") {
+            const key = JSON.parse(output.slice(stringStart, index + 1)) as string;
+            if (keys.has(key)) return undefined;
+            keys.add(key);
+          }
+          stringStart = -1;
+        }
+      } else if (character === "\"") stringStart = index;
+      else if (character === "{" || character === "[") depth++;
+      else if (character === "}" || character === "]") depth--;
+    }
+    const parsed: unknown = JSON.parse(output);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function nonnegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function coordinatorRejection(value: Record<string, unknown> | undefined): string | readonly string[] | undefined {
+  if (!value || !hasExactKeys(value, ["reject", "version"]) || !nonnegativeSafeInteger(value.version))
+    return undefined;
+  if (typeof value.reject === "string" && value.reject) return value.reject;
+  if (Array.isArray(value.reject) && value.reject.length
+      && value.reject.every((reason) => typeof reason === "string" && reason))
+    return value.reject as string[];
+  return undefined;
+}
+
+function heldCoordinatorLease(value: Record<string, unknown> | undefined): boolean {
+  return Boolean(value
+    && hasExactKeys(value, ["reject", "holder", "exp", "version"])
+    && value.reject === "held"
+    && typeof value.holder === "string"
+    && value.holder
+    && positiveSafeInteger(value.exp)
+    && nonnegativeSafeInteger(value.version));
+}
+
+function successfulCoordinatorEpoch(
+  value: Record<string, unknown> | undefined,
+  expectedHolder: string,
+): { epoch: number; expiry: number } | undefined {
+  return value
+    && hasExactKeys(value, ["ok", "holder", "exp", "epoch"])
+    && positiveSafeInteger(value.ok)
+    && positiveSafeInteger(value.epoch)
+    && value.ok === value.epoch
+    && positiveSafeInteger(value.exp)
+    && value.holder === expectedHolder
+    ? { epoch: value.epoch, expiry: value.exp }
+    : undefined;
+}
+
 export class NorthGraphStore implements GraphStore {
   constructor(
     private northBin = process.env.NORTH_BIN ?? resolve(NORTH_ROOT, "bin/north"),
     private framBin = process.env.FRAM_BIN ?? resolve(process.env.FRAM_HOME ?? resolve(NORTH_ROOT, "../fram"), "bin/fram"),
+    private leaseCli = resolve(NORTH_ROOT, "cli/lease-cli.clj"),
+    private port = process.env.NORTH_PORT ?? "7977",
+    private leaseInvokeOverride?: (args: readonly string[]) => Promise<string>,
   ) {}
 
   async show(subject: string): Promise<readonly GraphFact[]> {
@@ -83,43 +175,101 @@ export class NorthGraphStore implements GraphStore {
     if (!output.startsWith("committed via coordinator"))
       throw new Error(`coordinator rejected @${bare} ${predicate}: ${output || "no response"}`);
   }
+
+  async putFenced(lease: SyncLease, subject: string, predicate: string, value: string): Promise<void> {
+    const bare = subject.replace(/^@/, "");
+    const args = [
+      "put-fenced",
+      lease.resource, lease.holder, String(lease.epoch),
+      bare, predicate, value,
+    ];
+    const output = this.leaseInvokeOverride
+      ? await this.leaseInvokeOverride(args)
+      : await command("bb", [this.leaseCli, this.port, "--json", ...args]);
+    const response = coordinatorObject(output);
+    if (response && hasExactKeys(response, ["ok"]) && positiveSafeInteger(response.ok)) return;
+    const rejection = coordinatorRejection(response);
+    if (rejection === "fence-lost")
+      throw new Error(`lost Linear sync lease before writing @${bare} ${predicate}`);
+    if (rejection)
+      throw new Error(`coordinator rejected fenced Linear graph write @${bare} ${predicate}`);
+    throw new Error(`Linear lease coordinator returned an invalid fenced-write response for @${bare} ${predicate}`);
+  }
 }
 
 export class CoordinatorSyncLeaseManager implements SyncLeaseManager {
   constructor(
     private port = process.env.NORTH_PORT ?? "7977",
     private leaseCli = resolve(NORTH_ROOT, "cli/lease-cli.clj"),
-    private ttlMs = 300_000,
+    private ttlMs = LINEAR_SYNC_LEASE_TTL_MS,
     private attempts = 50,
-  ) {}
+    private invokeOverride?: (args: readonly string[]) => Promise<string>,
+  ) {
+    if (!positiveSafeInteger(ttlMs))
+      throw new Error("Linear sync lease TTL must be a positive safe integer");
+    if (!positiveSafeInteger(attempts))
+      throw new Error("Linear sync lease acquisition attempts must be a positive safe integer");
+  }
 
   private invoke(args: readonly string[]): Promise<string> {
-    return command("bb", [this.leaseCli, this.port, ...args]);
+    return this.invokeOverride
+      ? this.invokeOverride(args)
+      : command("bb", [this.leaseCli, this.port, "--json", ...args]);
   }
 
   async acquire(resource: string): Promise<SyncLease> {
+    if (!resource.trim()) throw new Error("Linear sync lease resource must not be blank");
     const holder = `linear-${process.pid}-${randomUUID()}`;
     for (let attempt = 0; attempt < this.attempts; attempt++) {
       const output = await this.invoke(["acquire", resource, holder, String(this.ttlMs)]);
-      const epoch = /:epoch\s+(\d+)/.exec(output)?.[1];
-      if (epoch && /:ok\s+\d+/.test(output)) {
+      const response = coordinatorObject(output);
+      const acquired = successfulCoordinatorEpoch(response, holder);
+      if (acquired) {
         const manager = this;
         let released = false;
+        let epoch = acquired.epoch;
         return {
-          resource, holder, epoch: Number(epoch),
+          resource, holder,
+          get epoch() { return epoch; },
+          async renew() {
+            if (released) throw new Error(`Linear sync lease ${resource} was already released`);
+            const renewed = await manager.invoke([
+              "renew", resource, holder, String(epoch), String(manager.ttlMs),
+            ]);
+            const renewedResponse = coordinatorObject(renewed);
+            const next = successfulCoordinatorEpoch(renewedResponse, holder);
+            const rejection = coordinatorRejection(renewedResponse);
+            if (rejection === "fence-lost")
+              throw new Error(`lost Linear sync lease ${resource}`);
+            if (!next || next.epoch <= epoch)
+              throw new Error(`Linear lease coordinator returned an invalid renewal response for ${resource}`);
+            epoch = next.epoch;
+          },
           async fence() {
             if (released) throw new Error(`Linear sync lease ${resource} was already released`);
-            const fenced = await manager.invoke(["fence", resource, holder, epoch]);
-            if (!/:fence-ok\s+true/.test(fenced)) throw new Error(`lost Linear sync lease ${resource}`);
+            const fenced = coordinatorObject(await manager.invoke(["fence", resource, holder, String(epoch)]));
+            if (fenced && hasExactKeys(fenced, ["fence-ok"]) && fenced["fence-ok"] === false)
+              throw new Error(`lost Linear sync lease ${resource}`);
+            if (!fenced || !hasExactKeys(fenced, ["fence-ok"]) || fenced["fence-ok"] !== true)
+              throw new Error(`Linear lease coordinator returned an invalid fence response for ${resource}`);
           },
           async release() {
             if (released) return;
+            const releasedResponse = coordinatorObject(
+              await manager.invoke(["release", resource, holder, String(epoch)]),
+            );
+            const exactRelease = releasedResponse
+              && (hasExactKeys(releasedResponse, ["ok"])
+                || (hasExactKeys(releasedResponse, ["ok", "noop"]) && releasedResponse.noop === true))
+              && positiveSafeInteger(releasedResponse.ok);
+            if (!exactRelease)
+              throw new Error(`Linear lease coordinator returned an invalid release response for ${resource}`);
             released = true;
-            await manager.invoke(["release", resource, holder, String(epoch)]);
           },
         };
       }
-      if (!/:reject\s+:held/.test(output)) throw new Error(`could not acquire Linear sync lease ${resource}: ${output}`);
+      if (!heldCoordinatorLease(response))
+        throw new Error(`Linear lease coordinator returned an invalid acquire response for ${resource}`);
       await new Promise((done) => setTimeout(done, 50));
     }
     throw new Error(`timed out waiting for Linear sync lease ${resource}`);
@@ -406,7 +556,9 @@ export async function inspectPartialLinearLink(graph: GraphStore, subject: strin
   return { exists: true, complete, threadId, manifest };
 }
 
-export async function ensureLinearLinkFacts(graph: GraphStore, expected: LinearLinkState): Promise<LinearLinkState> {
+export async function ensureLinearLinkFacts(
+  graph: GraphStore, lease: SyncLease, expected: LinearLinkState,
+): Promise<LinearLinkState> {
   const current = await graph.show(expected.subject);
   const required: readonly (readonly [string, string])[] = [
     // The prepared manifest is first: it carries the deterministic thread id and
@@ -426,7 +578,7 @@ export async function ensureLinearLinkFacts(graph: GraphStore, expected: LinearL
     const mutable = ["remote_key", "remote_scope", "remote_workspace_slug"].includes(predicate);
     if (!mutable && values.some((found) => found !== value))
       throw new Error(`partial Linear link @${expected.subject} conflicts on ${predicate}`);
-    if (!values.includes(value)) await graph.put(expected.subject, predicate, value);
+    if (!values.includes(value)) await graph.putFenced(lease, expected.subject, predicate, value);
   }
   const loaded = await loadLinkBySubject(graph, expected.subject);
   if (!loaded) throw new Error(`failed to heal Linear link @${expected.subject}`);
@@ -472,8 +624,10 @@ export async function loadLinkForThread(graph: GraphStore, threadId: string): Pr
   return link;
 }
 
-export async function writeManifest(graph: GraphStore, link: LinearLinkState, manifest: LinearSyncManifest): Promise<void> {
-  await graph.put(link.subject, "sync_manifest", canonicalJson(manifest));
+export async function writeManifest(
+  graph: GraphStore, lease: SyncLease, link: LinearLinkState, manifest: LinearSyncManifest,
+): Promise<void> {
+  await graph.putFenced(lease, link.subject, "sync_manifest", canonicalJson(manifest));
   link.manifest = manifest;
 }
 
@@ -529,7 +683,7 @@ export function northThreadIdForIdentity(identity: LinearIssueIdentity): string 
 }
 
 export async function createImportedThread(
-  graph: GraphStore, threadId: string, issue: LinearIssueDocument, owner: string, now: Date,
+  graph: GraphStore, lease: SyncLease, threadId: string, issue: LinearIssueDocument, owner: string, now: Date,
 ): Promise<void> {
   const date = now.toISOString().slice(0, 10);
   const author = (process.env.NORTH_AUTHOR ?? "tom_passarelli").replace(/^@/, "");
@@ -541,7 +695,7 @@ export async function createImportedThread(
     ["proposed_by", `@${proposed}`], ["created_at", now.toISOString()], ["updated_at", date],
     ["committed", date], ["body", issue.description],
   ];
-  for (const [predicate, value] of facts) await graph.put(threadId, predicate, value);
+  for (const [predicate, value] of facts) await graph.putFenced(lease, threadId, predicate, value);
 }
 
 export function assertImportableDescription(description: string): void {

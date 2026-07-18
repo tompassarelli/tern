@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { AppServerMcpBroker } from "../src/integrations/linear/app-server-broker";
+import { AppServerMcpBroker, StrictJsonlFrames } from "../src/integrations/linear/app-server-broker";
 import { runLinearCommand } from "../src/integrations/linear/cli";
 import { openLinearGateway } from "../src/integrations/linear/gateway";
 
@@ -97,6 +97,38 @@ function requests(path: string): any[] {
   if (!existsSync(path)) return [];
   return readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
+
+test("strict JSONL framing preserves split UTF-8 scalars without an aggregate-buffer false positive", () => {
+  const split = new StrictJsonlFrames();
+  const encoded = Buffer.from('{"value":"café"}\n');
+  const scalar = Buffer.from("é");
+  const scalarAt = encoded.indexOf(scalar);
+  expect(scalarAt).toBeGreaterThan(0);
+  expect(split.push(encoded.subarray(0, scalarAt + 1))).toEqual([]);
+  expect(split.push(encoded.subarray(scalarAt + 1))).toEqual(['{"value":"café"}']);
+  split.finish();
+
+  const many = new StrictJsonlFrames();
+  const line = `${JSON.stringify({ value: "x".repeat(10_000) })}\n`;
+  const aggregate = Buffer.from(line.repeat(128));
+  expect(aggregate.length).toBeGreaterThan(1024 * 1024);
+  expect(many.push(aggregate)).toHaveLength(128);
+  many.finish();
+});
+
+test("strict JSONL framing rejects invalid UTF-8, oversized lines, and partial EOF", () => {
+  const invalid = new StrictJsonlFrames();
+  expect(() => invalid.push(Buffer.from([0x7b, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x0a])))
+    .toThrow("invalid UTF-8 JSONL output");
+
+  const oversized = new StrictJsonlFrames();
+  expect(() => oversized.push(Buffer.alloc(1024 * 1024 + 1, 0x78)))
+    .toThrow("JSONL response exceeded 1 MiB");
+
+  const partial = new StrictJsonlFrames();
+  expect(partial.push(Buffer.from('{"id":1'))).toEqual([]);
+  expect(() => partial.finish()).toThrow("partial JSONL frame");
+});
 
 test("uses stable app-server MCP calls without starting a model turn", async () => {
   const notifications: string[] = [];
@@ -246,6 +278,62 @@ test("a late duplicate app-server error response invalidates the command receipt
   })).rejects.toThrow("response for an unknown request");
 });
 
+test("split UTF-8 app-server output survives transport framing", async () => {
+  const { broker } = harness({
+    servers: [linearServer()],
+    afterResponse: { method: "mcpServer/tool/call", type: "splitUtf8" },
+    results: {
+      get_issue: {
+        structuredContent: {
+          issue: {
+            id: "MSA-123",
+            title: "Café receipt",
+            description: "",
+            url: "https://linear.app/msa/issue/MSA-123/split-utf8",
+            createdAt: "2026-07-18T00:00:00.000Z",
+          },
+        },
+        content: [],
+      },
+    },
+  });
+  const result = await runLinearCommand(["get", "MSA-123"], {
+    openGateway: ({ server }) => openLinearGateway(broker, { server }),
+  }) as { issue: { title: string } };
+  expect(result.issue.title).toBe("Café receipt");
+});
+
+for (const [type, message] of [
+  ["invalidUtf8", "invalid UTF-8 JSONL output"],
+  ["partialEof", "partial JSONL frame"],
+  ["exitBeforeEndPartial", "partial JSONL frame"],
+  ["exitBeforeEndPartialLong", "partial JSONL frame"],
+] as const) {
+  test(`${type} after a valid response invalidates the command receipt`, async () => {
+    const { broker } = harness({
+      servers: [linearServer()],
+      afterResponse: { method: "mcpServer/tool/call", type },
+      results: {
+        get_issue: {
+          structuredContent: {
+            issue: {
+              id: "MSA-123",
+              title: "Receipt must fail closed",
+              description: "",
+              url: "https://linear.app/msa/issue/MSA-123/invalid-transport",
+              createdAt: "2026-07-18T00:00:00.000Z",
+            },
+          },
+          content: [],
+        },
+      },
+    });
+    await expect(runLinearCommand(["get", "MSA-123"], {
+      openGateway: ({ server }) => openLinearGateway(broker, { server }),
+    })).rejects.toThrow(message);
+  });
+}
+
 for (const notification of [
   "turn/started",
   "response/started",
@@ -317,6 +405,17 @@ test("requires an unambiguous capability match unless a server is explicit", asy
   const explicit = await openLinearGateway(explicitHarness.broker, { server: "linear-b" });
   expect(explicit.server).toBe("linear-b");
   await explicit.close();
+});
+
+test("MCP inventory traversal rejects cursor loops and explicit page/item ceilings", async () => {
+  await expect(openLinearGateway(harness({ inventoryInfinite: true }).broker))
+    .rejects.toThrow("MCP inventory exceeded 20 pages");
+  await expect(openLinearGateway(harness({ inventoryLoop: true }).broker))
+    .rejects.toThrow("invalid MCP inventory cursor");
+  await expect(openLinearGateway(harness({
+    servers: [linearServer()],
+    inventoryServerCount: 101,
+  }).broker)).rejects.toThrow("more than 100 MCP servers");
 });
 
 test("runtime allowlist rejects an advertised extra tool despite TypeScript erasure", async () => {

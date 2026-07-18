@@ -54,6 +54,14 @@ including one observed after a successful tool response. This protocol
 receipt—not a process-wide account usage sample—is the evidence that the command
 used no model turn or model tokens.
 
+The app-server transport parses newline-delimited JSON as raw bytes. UTF-8 is
+decoded fatally only after a complete frame is present; a split multibyte
+character is preserved, while invalid UTF-8, a line larger than 1 MiB, or any
+partial frame at EOF invalidates the session. The byte limit is per line, not
+per read buffer, so a large chunk containing many individually bounded frames
+is valid. MCP inventory traversal stops at 20 pages or 100 servers and rejects
+missing, empty, or repeated cursors.
+
 Import creates one deterministic integration-link entity and either adopts the
 explicit North thread or deterministically creates one. The thread retains a
 `linear <KEY>` compatibility alias, but aliases are never used as identity or
@@ -75,6 +83,9 @@ requires exactly one exact hidden marker plus matching creation evidence. The
 binding write is mandatory even when an explicitly adopted North thread has no
 ordinary field delta. Existing unmanaged description text is retained
 byte-for-byte and the managed block is appended exactly once.
+Linear issue/comment traversal is bounded independently: 20 pages, 5,000
+comments, and 25 fully inspected backlink candidates. Pagination requires a
+new non-empty cursor on every continued page.
 
 ## Projection policy
 
@@ -101,11 +112,36 @@ After adoption, text outside the managed block is preserved byte-for-byte.
 
 ## Conflicts and recovery
 
-Every apply acquires the coordinator's external-resource lease and fences
-immediately before each remote call. Before a non-idempotent call, North writes a
-compact operation intent containing hashes and operation IDs, never copied issue
-or comment bodies. It does not blindly retry an unknown write. Instead it reads
-Linear again:
+Every apply acquires a coordinator lease for the immutable Linear identity.
+Renewal is an atomic coordinator operation: it succeeds only for the exact
+current holder and expected epoch while the lease remains unexpired, persists a
+new expiry, and returns a globally fresh epoch. Any lapse, takeover, stale
+epoch, or lost renewal response aborts the caller; it never silently reacquires
+and continues. Reads that may paginate or inspect multiple backlink candidates
+renew before each provider call.
+
+The production lease TTL is 300 seconds and every app-server request has a hard
+20-second timeout. Startup enforces at least a 10× lease-to-call margin (the
+current margin is 15×), so one bounded provider call cannot ordinarily consume
+the lease it just renewed. A lease cannot cancel an already in-flight external
+call; suspension or an extreme clock jump can therefore still let Linear commit
+after local expiry. The mandatory post-call renewal then fails, graph
+finalization is fenced out, and the persisted intent is left for successor
+reconciliation.
+
+Graph assertions made while synchronizing are fenced inside the same
+coordinator turn as the mutation. A stale holder therefore cannot publish a
+pending intent, receipt, baseline, link fact, or synchronization timestamp
+after losing the lease. The bridge also renews on both sides of each Linear
+write and before final graph publication.
+
+A local coordinator lease cannot be atomic with a call to an external Linear
+server. North closes that unavoidable boundary with a durable protocol. Before
+a non-idempotent call, it atomically writes a compact operation intent
+containing hashes and operation IDs, never copied issue or comment bodies. If
+the Linear call commits and the lease or transport is then lost, the intent
+remains. North does not blindly retry an unknown write. A successor reads
+Linear and reconciles the intent first:
 
 - if the intended title/description or marked comment is observable, North
   records the receipt and continues;

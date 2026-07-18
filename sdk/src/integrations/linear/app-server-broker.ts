@@ -8,6 +8,8 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_INVENTORY_PAGES = 20;
+const MAX_MCP_SERVERS = 100;
 const MODEL_FREE_PROTOCOL_POLICY = "codex-app-server-linear-v1";
 const SAFE_OUTGOING_METHODS = new Map<string, "request" | "notification">([
   ["initialize", "request"],
@@ -44,6 +46,39 @@ interface PendingRequest {
   reject(error: Error): void;
 }
 
+export class StrictJsonlFrames {
+  private buffer = Buffer.alloc(0);
+  private decoder = new TextDecoder("utf-8", { fatal: true });
+
+  push(chunk: Uint8Array): readonly string[] {
+    this.buffer = Buffer.concat([
+      this.buffer,
+      Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength),
+    ]);
+    const lines: string[] = [];
+    for (;;) {
+      const newline = this.buffer.indexOf(0x0a);
+      if (newline < 0) break;
+      if (newline > MAX_LINE_BYTES)
+        throw new Error("Codex app-server JSONL response exceeded 1 MiB");
+      const rawLine = this.buffer.subarray(0, newline);
+      this.buffer = this.buffer.subarray(newline + 1);
+      let line: string;
+      try { line = this.decoder.decode(rawLine).trim(); }
+      catch { throw new Error("Codex app-server emitted invalid UTF-8 JSONL output"); }
+      if (line) lines.push(line);
+    }
+    if (this.buffer.length > MAX_LINE_BYTES)
+      throw new Error("Codex app-server JSONL response exceeded 1 MiB");
+    return lines;
+  }
+
+  finish(): void {
+    if (this.buffer.length)
+      throw new Error("Codex app-server closed with a partial JSONL frame");
+  }
+}
+
 function increment(counter: Map<string, number>, method: string): void {
   counter.set(method, (counter.get(method) ?? 0) + 1);
 }
@@ -77,9 +112,11 @@ function toolDefinition(name: string, value: unknown): McpToolDefinition {
 class JsonlRpcClient {
   private nextId = 0;
   private pending = new Map<RpcId, PendingRequest>();
-  private buffer = "";
+  private frames = new StrictJsonlFrames();
   private terminalError?: Error;
   private closed = false;
+  private childExited = false;
+  private stdoutEnded = false;
   private outgoingMethods = new Map<string, number>();
   private incomingNotifications = new Map<string, number>();
 
@@ -88,14 +125,15 @@ class JsonlRpcClient {
     private timeoutMs: number,
     private onNotification?: (method: string, params: unknown) => void,
   ) {
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
+    child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
+    child.stdout.on("end", () => this.onStdoutEnd());
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", () => { /* drain only; provider diagnostics may contain secrets */ });
     child.on("error", () => this.fail(new Error("could not start Codex app-server")));
-    child.on("exit", () => {
-      if (!this.closed && !this.terminalError)
-        this.fail(new Error("Codex app-server transport exited unexpectedly"));
+    child.on("exit", () => this.onChildExit());
+    child.on("close", () => {
+      this.childExited = true;
+      if (!this.stdoutEnded) this.onStdoutEnd();
     });
   }
 
@@ -168,20 +206,46 @@ class JsonlRpcClient {
     else pending.resolve(message.result);
   }
 
-  private onStdout(chunk: string): void {
-    this.buffer += chunk;
-    if (Buffer.byteLength(this.buffer) > MAX_LINE_BYTES) {
-      this.fail(new Error("Codex app-server JSONL response exceeded 1 MiB"));
+  private onStdout(chunk: Buffer): void {
+    try {
+      for (const line of this.frames.push(chunk)) {
+        this.onLine(line);
+        if (this.terminalError) return;
+      }
+    } catch (error) {
+      this.fail(error instanceof Error ? error : new Error("Codex app-server emitted invalid JSONL output"));
+    }
+  }
+
+  private onStdoutEnd(): void {
+    if (this.stdoutEnded) return;
+    this.stdoutEnded = true;
+    try { this.frames.finish(); }
+    catch (error) {
+      this.fail(error instanceof Error ? error : new Error("Codex app-server closed with a partial JSONL frame"));
       return;
     }
-    for (;;) {
-      const newline = this.buffer.indexOf("\n");
-      if (newline < 0) return;
-      const line = this.buffer.slice(0, newline).trim();
-      this.buffer = this.buffer.slice(newline + 1);
-      if (line) this.onLine(line);
-      if (this.terminalError) return;
+    if (this.childExited && !this.closed && !this.terminalError)
+      this.fail(new Error("Codex app-server transport exited unexpectedly"));
+  }
+
+  private onChildExit(): void {
+    this.childExited = true;
+    // Node may emit `exit` before it has drained the child's stdout. Defer the
+    // generic death classification so a buffered invalid/partial frame remains
+    // the authoritative terminal error when `end` arrives.
+    if (this.stdoutEnded && !this.closed && !this.terminalError)
+      this.fail(new Error("Codex app-server transport exited unexpectedly"));
+  }
+
+  private failUndrainedStdout(): void {
+    if (this.stdoutEnded || this.terminalError) return;
+    try { this.frames.finish(); }
+    catch (error) {
+      this.fail(error instanceof Error ? error : new Error("Codex app-server closed with a partial JSONL frame"));
+      return;
     }
+    this.fail(new Error("Codex app-server stdout did not close after transport exit"));
   }
 
   async request(method: string, params: unknown): Promise<unknown> {
@@ -245,8 +309,16 @@ class JsonlRpcClient {
       pending.reject(new Error("Codex app-server broker closed"));
     }
     this.pending.clear();
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
     const closed = new Promise<void>((resolve) => this.child.once("close", () => resolve()));
+    if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      if (this.stdoutEnded) return;
+      const drained = await Promise.race([
+        closed.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+      ]);
+      if (!drained) this.failUndrainedStdout();
+      return;
+    }
     this.child.kill("SIGTERM");
     const graceful = await Promise.race([
       closed.then(() => true),
@@ -254,8 +326,8 @@ class JsonlRpcClient {
     ]);
     if (!graceful && this.child.exitCode === null && this.child.signalCode === null) {
       this.child.kill("SIGKILL");
-      await closed;
     }
+    if (!graceful) this.failUndrainedStdout();
   }
 }
 
@@ -273,7 +345,7 @@ class AppServerSession implements McpBrokerSession {
     const servers: McpServerInventory[] = [];
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
-    for (;;) {
+    for (let pageNumber = 1; pageNumber <= MAX_INVENTORY_PAGES; pageNumber++) {
       const response = await this.rpc.request("mcpServerStatus/list", {
         threadId: this.threadId,
         detail: "toolsAndAuthOnly",
@@ -287,13 +359,18 @@ class AppServerSession implements McpBrokerSession {
         const tools: Record<string, McpToolDefinition> = {};
         for (const [name, value] of Object.entries(raw.tools)) tools[name] = toolDefinition(name, value);
         servers.push({ name: raw.name, authStatus: raw.authStatus, tools });
+        if (servers.length > MAX_MCP_SERVERS)
+          throw new Error(`Codex app-server returned more than ${MAX_MCP_SERVERS} MCP servers`);
       }
       if (response.nextCursor == null) return servers;
       if (typeof response.nextCursor !== "string" || !response.nextCursor || seenCursors.has(response.nextCursor))
         throw new Error("Codex app-server returned an invalid MCP inventory cursor");
       cursor = response.nextCursor;
       seenCursors.add(cursor);
+      if (pageNumber === MAX_INVENTORY_PAGES)
+        throw new Error(`Codex app-server MCP inventory exceeded ${MAX_INVENTORY_PAGES} pages`);
     }
+    throw new Error(`Codex app-server MCP inventory exceeded ${MAX_INVENTORY_PAGES} pages`);
   }
 
   async callTool(call: McpToolCall): Promise<McpToolResult> {
