@@ -29,8 +29,18 @@ const MANAGED_ENV = [
 ] as const;
 const saved = Object.fromEntries(MANAGED_ENV.map((key) => [key, process.env[key]])) as Record<typeof MANAGED_ENV[number], string | undefined>;
 const savedNorthPort = process.env.NORTH_PORT;
+const savedFramLog = process.env.FRAM_LOG;
+const coordinatorLog = "/tmp/north-providers-test.log";
 const coordinator = createServer((socket) => {
-  socket.once("data", () => socket.end("{:version \"providers-test\"}\n"));
+  socket.once("data", (chunk) => {
+    if (chunk.toString("utf8").includes(":for-log")) {
+      socket.end("{:version 17}\n");
+    } else {
+      socket.end(
+        `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(coordinatorLog)}}\n`,
+      );
+    }
+  });
 });
 beforeAll(async () => {
   await new Promise<void>((resolve, reject) => {
@@ -38,10 +48,13 @@ beforeAll(async () => {
     coordinator.listen(0, "127.0.0.1", resolve);
   });
   process.env.NORTH_PORT = String((coordinator.address() as AddressInfo).port);
+  process.env.FRAM_LOG = coordinatorLog;
 });
 afterAll(async () => {
   if (savedNorthPort === undefined) delete process.env.NORTH_PORT;
   else process.env.NORTH_PORT = savedNorthPort;
+  if (savedFramLog === undefined) delete process.env.FRAM_LOG;
+  else process.env.FRAM_LOG = savedFramLog;
   await new Promise<void>((resolve) => coordinator.close(() => resolve()));
 });
 const available: ProviderAvailability[] = [

@@ -1,6 +1,6 @@
 import { accessSync, constants } from "node:fs";
-import { Socket } from "node:net";
-import { resolve } from "node:path";
+import { spawn as procSpawn } from "node:child_process";
+import { isAbsolute, resolve } from "node:path";
 import type { GafferCapability } from "./gaffer-capabilities";
 import { providerSupportsCapabilities } from "./gaffer-capabilities";
 import { preflightReadonlyShell, ReadonlyShellUnavailableError } from "./readonly-shell";
@@ -9,6 +9,8 @@ import { ProviderRetrySafeError, type ProviderId } from "./providers/types";
 const REPO = resolve(import.meta.dir, "../..");
 const ENGINE = `${REPO}/bin/north`;
 const MCP = `${REPO}/bin/north-mcp`;
+const COORD = `${REPO}/cli/coord.clj`;
+const COORDINATOR_PROBE_OUTPUT_BYTES = 16_384;
 const admissionReceipts = new WeakMap<object, Set<ProviderId>>();
 
 /**
@@ -158,39 +160,80 @@ export function validateManagedExecutionEnvelope(
   }
 }
 
-async function requireCoordinator(portValue: unknown, timeoutMs = 2_000): Promise<void> {
+async function requireCoordinator(
+  portValue: unknown,
+  logValue: unknown,
+  timeoutMs = 2_000,
+): Promise<void> {
   if (typeof portValue !== "string" || !portValue.trim())
     throw new ExecutionAdmissionError("north_coordination_port_missing");
   const port = Number(portValue);
   if (!Number.isInteger(port) || port < 1 || port > 65_535)
     throw new ExecutionAdmissionError("north_coordination_port_invalid");
-  await new Promise<void>((resolveProbe, rejectProbe) => {
-    const socket = new Socket();
+  if (typeof logValue !== "string" || !logValue.trim())
+    throw new ExecutionAdmissionError("north_coordination_log_missing");
+  if (!isAbsolute(logValue) || resolve(logValue) !== logValue)
+    throw new ExecutionAdmissionError("north_coordination_log_identity_invalid");
+  const boundedTimeout = Number.isFinite(timeoutMs)
+    ? Math.max(1, Math.min(999_999, Math.trunc(timeoutMs)))
+    : 2_000;
+  const bb = process.env.NORTH_MCP_BB ?? process.env.NORTH_BB ?? "bb";
+  let child;
+  try {
+    // Keep the wire contract in one place. `strict-probe` proves the fenced
+    // version response, raw-request rejection, canonical served corpus, fatal
+    // UTF-8 decoding, an exact terminal frame, and bounded response bytes.
+    child = procSpawn(bb, [COORD, "strict-probe", String(port), logValue], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        FRAM_LOG: logValue,
+        NORTH_COORD_CONNECT_TIMEOUT_MS: String(boundedTimeout),
+        NORTH_COORD_READ_TIMEOUT_MS: String(boundedTimeout),
+        NORTH_COORD_MAX_RESPONSE_BYTES: "4096",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (cause) {
+    throw new ExecutionAdmissionError("north_coordinator_preflight_failed", { cause });
+  }
+
+  let outputBytes = 0;
+  let outputLimitExceeded = false;
+  let timedOut = false;
+  const countOutput = (chunk: Buffer) => {
+    outputBytes += chunk.length;
+    if (outputBytes <= COORDINATOR_PROBE_OUTPUT_BYTES) return;
+    outputLimitExceeded = true;
+    try { child.kill("SIGKILL"); } catch { /* already terminal */ }
+  };
+  child.stdout.on("data", countOutput);
+  child.stderr.on("data", countOutput);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { child.kill("SIGKILL"); } catch { /* already terminal */ }
+  }, boundedTimeout);
+  timer.unref?.();
+  const terminal = await new Promise<{ code: number | null; cause?: Error }>((resolveTerminal) => {
     let settled = false;
-    let response = "";
-    const finish = (error?: Error) => {
+    const finish = (result: { code: number | null; cause?: Error }) => {
       if (settled) return;
       settled = true;
-      socket.destroy();
-      if (error) rejectProbe(error);
-      else resolveProbe();
+      resolveTerminal(result);
     };
-    socket.setTimeout(timeoutMs);
-    socket.once("timeout", () => finish(new ExecutionAdmissionError("north_coordinator_preflight_timed_out")));
-    socket.once("error", (cause) => finish(
-      new ExecutionAdmissionError("north_coordinator_preflight_failed", { cause }),
-    ));
-    socket.on("data", (chunk) => {
-      response += chunk.toString("utf8");
-      if (!response.includes("\n")) return;
-      if (!response.includes(":version"))
-        finish(new ExecutionAdmissionError("north_coordinator_preflight_invalid_response"));
-      else finish();
-    });
-    socket.connect(port, "127.0.0.1", () => {
-      socket.write("{:op :version}\n");
-    });
+    child.once("error", (cause) => finish({ code: null, cause }));
+    // `close`, unlike `exit`, means both bounded output streams are drained.
+    child.once("close", (code) => finish({ code }));
   });
+  clearTimeout(timer);
+  if (timedOut)
+    throw new ExecutionAdmissionError("north_coordinator_preflight_timed_out");
+  if (outputLimitExceeded)
+    throw new ExecutionAdmissionError("north_coordinator_preflight_output_too_large");
+  if (terminal.cause)
+    throw new ExecutionAdmissionError("north_coordinator_preflight_failed", { cause: terminal.cause });
+  if (terminal.code !== 0)
+    throw new ExecutionAdmissionError("north_coordinator_preflight_invalid_response");
 }
 
 /**
@@ -228,7 +271,10 @@ export async function admitExecution(
   // North MCP is part of every managed lane's identity and reporting surface,
   // not only an orchestrator tool. A worker starting against a dead coordinator
   // would be an unrecorded native run wearing managed metadata.
-  await requireCoordinator(options?.mcpServers?.north?.env?.NORTH_PORT);
+  await requireCoordinator(
+    options?.mcpServers?.north?.env?.NORTH_PORT,
+    options?.mcpServers?.north?.env?.FRAM_LOG,
+  );
 }
 
 export function admitPinnedProvider(

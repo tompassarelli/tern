@@ -13,6 +13,7 @@
 (declare-extern Bun Any)
 (declare-extern JSON Any)
 (declare-extern TextDecoder Any)
+(declare-extern Number Any)
 
 ;; ---- low-level I/O (js/quote — inherently callback-shaped) ------------------
 ;; Open a socket, write one op line, accumulate the reply, resolve the raw line
@@ -30,29 +31,84 @@
   (export (async function framRequestRaw (port op)
     (return (new Promise (=> (resolve)
       (const chunks (array))
-      (const decoder (new TextDecoder))
+      (const decoder (new TextDecoder "utf-8" (object fatal true)))
+      (let received 0)
       (let sock null)
       (let timer null)
+      (let settled false)
       (const settle (=> (v)
+        (if settled (return))
+        (= settled true)
         (if timer (clearTimeout timer))
         (= timer null)
-        (if sock (try (.terminate sock) (catch e null)))
+        (const active sock)
         (= sock null)
-        (resolve v)))
+        (resolve v)
+        (if active (try (.terminate active) (catch e null)))))
       (= timer (setTimeout (=> () (settle null)) 10000))
+      (const acceptChunk (=> (socket chunk)
+        (= received (+ received (dot chunk byteLength)))
+        (if (> received 16777216)
+          (settle null)
+          (try
+            (.push chunks (.decode decoder chunk (object stream true)))
+            (catch e (settle null))))
+        0))
+      (const acceptClose (=> (socket)
+        (let tail null)
+        (try
+          (= tail (.decode decoder))
+          (catch e (return (settle null))))
+        (if tail (.push chunks tail))
+        (const framed (.join chunks ""))
+        ;; Exactly one terminal line: EOF before LF, a second line, or trailing
+        ;; bytes are framing failures. Strip an optional wire CR before LF.
+        (if (! (.endsWith framed "\n")) (return (settle null)))
+        (const line (.slice framed 0 -1))
+        (if (.includes line "\n") (return (settle null)))
+        (settle (? (.endsWith line "\r") (.slice line 0 -1) line))
+        0))
       (const cp (.connect Bun (object
         hostname "127.0.0.1"
         port port
         socket (object
           open (=> (socket) (= sock socket) (.write socket (tpl "" op "\n")))
-          data (=> (socket chunk) (.push chunks (.decode decoder chunk (object stream true))))
-          close (=> (socket) (settle (.join chunks "")))
+          data acceptChunk
+          close acceptClose
           error (=> (socket err) (settle null))))))
       ((bracket cp "catch") (=> (err) (settle null))))))))
   ;; JSON.parse yielding null on a malformed line instead of throwing.
   (export (function safeParse (s)
     (try (return (.parse JSON s))
       (catch e (return null)))))
+  ;; The coordinator canonicalizes corpus paths before comparing a fence. Use
+  ;; the same realpath identity for handshake validation; no FRAM_LOG means no
+  ;; wire request, never an ambient/default corpus fallback.
+  (export (function runtimeCorpusLog ()
+    (const configured (bracket (dot process env) "FRAM_LOG"))
+    (if (! configured) (return null))
+    (try
+      (return (.realpathSync (.getBuiltinModule process "node:fs") configured))
+      (catch e (return null)))))
+  (export (function runtimeWireEnvelope (op)
+    (const log (runtimeCorpusLog))
+    (if (! log) (return null))
+    ;; JSON string literals are valid EDN strings and escape paths safely.
+    (return (tpl "{:op :for-log :expected-log " (.stringify JSON log)
+                 " :request " op " :fmt :json}"))))
+  ;; Fram deliberately emits the long-lived subscription handshake as EDN even
+  ;; when the outer request asks for JSON. Parse only its exact two-field shape;
+  ;; JSON.parse is valid for the quoted Clojure string literal.
+  (export (function runtimeSubscriptionHandshakeValid (line expected)
+    (const match (.match line (new RegExp "^\\{:subscribed\\s+(\\d+),?\\s+:log\\s+(\"(?:\\\\.|[^\"\\\\])*\")\\}$")))
+    (if (! match) (return false))
+    (const version (Number (bracket match 1)))
+    (let log null)
+    (try (= log (.parse JSON (bracket match 2)))
+      (catch e (return false)))
+    (if (! (.isSafeInteger Number version)) (return false))
+    (if (< version 0) (return false))
+    (return (=== log expected))))
   ;; numeric parse helpers (JS Number semantics)
   (export (function parseIntSafe (v)
     (const n (parseInt (String v) 10))
@@ -114,6 +170,9 @@
 
 (declare-extern framRequestRaw [Int String -> (Promise String)])
 (declare-extern safeParse [String -> Any])
+(declare-extern runtimeCorpusLog [-> Any])
+(declare-extern runtimeWireEnvelope [String -> Any])
+(declare-extern runtimeSubscriptionHandshakeValid [String String -> Bool])
 (declare-extern parseIntSafe [Any -> Int])
 (declare-extern parseTokenCount [Any -> Any])
 (declare-extern parseFloatSafe [Any -> Float])
@@ -121,26 +180,31 @@
 (declare-extern runUsageTriplesFromLogs [-> (Promise Any)])
 (declare-extern process Any)
 
-;; ---- ports ------------------------------------------------------------------
+;; ---- corpus selector ---------------------------------------------------------
 
-(js/export (def board-port :- Int 7977))
-(js/export (def agents-port :- Int 7977))
-
-(js/export (defn port-for [(graph :- String)] :- Int
-  (cond
-    (= graph "code") 7979
-    (= graph "attention") 7980
-    :else 7977)))
+(js/export (defn port-for [(graph :- String) (configured-port :- Int)] :- Int
+  ;; Never reinterpret a retired/unknown corpus selector as the board. A zero
+  ;; port is the explicit invalid-domain sentinel consumed by the API boundary.
+  (if (or (nil? graph) (= graph "") (= graph "board")) configured-port 0)))
 
 ;; ---- generic query ----------------------------------------------------------
-;; Append ` :fmt :json` before the op's closing brace, send, JSON-decode. nil on
-;; any transport/parse failure — callers pattern-match on nil like the Elixir.
-(defn as-json [(op :- String)] :- String
-  (str (.slice op 0 -1) " :fmt :json}"))
+;; Wrap every operation in the explicit FRAM_LOG corpus fence and request JSON
+;; at the OUTER connection boundary. Missing/nonexistent FRAM_LOG fails closed.
+(js/export (defn corpus-log [] :- Any
+  (runtimeCorpusLog)))
+
+(js/export (defn wire-envelope [(op :- String)] :- Any
+  (runtimeWireEnvelope op)))
+
+(js/export (defn subscription-handshake-valid? [(line :- String) (expected-log :- String)] :- Bool
+  (runtimeSubscriptionHandshakeValid line expected-log)))
 
 (defn query [(port :- Int) (op :- String)] :- (Promise Any)
-  (let [line (js/await (framRequestRaw port (as-json op)))]
-    (if (nil? line) nil (safeParse line))))
+  (let [wire (wire-envelope op)]
+    (if (nil? wire)
+      nil
+      (let [line (js/await (framRequestRaw port wire))]
+        (if (nil? line) nil (safeParse line))))))
 
 ;; ---- writes (OCC: read version → assert/retract with :base → retry) --------
 

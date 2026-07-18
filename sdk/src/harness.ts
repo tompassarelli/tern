@@ -33,7 +33,7 @@ import {
 } from "./readonly-shell";
 import { managedNorthMcpEnvironment } from "./execution-admission";
 
-// sdk/src/harness.ts -> repo root (~/code/north).
+// sdk/src/harness.ts -> its relocatable runtime root.
 const REPO = resolve(import.meta.dir, "../..");
 const ENGINE = `${REPO}/bin/north`;
 const MCP = `${REPO}/bin/north-mcp`;
@@ -372,7 +372,7 @@ function esoAppendix(): string {
   return "\n\n" +
     "DENSE HANDOFF — when a final report contains a uniform array of ≥10 similar records " +
     "(grep hits, findings, file lists), emit it in ESO format instead of JSON or markdown table.\n" +
-    "Mini-syntax (full spec: ~/code/north/sdk/src/vendor/eso/SPEC.md):\n" +
+    `Mini-syntax (full spec: ${REPO}/sdk/src/vendor/eso/SPEC.md):\n` +
     "  !eso/1              ← required header\n" +
     "  name=value          ← scalar field\n" +
     "  items[N]{a,b,c}     ← N records, schema declared once; N is a checksum\n" +

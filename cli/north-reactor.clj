@@ -452,14 +452,22 @@
   "Open one subscription and pump commit events until the socket drops. Returns on
    disconnect (daemon bounce / restart) so -main can reconnect."
   []
-  (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
-    (.setSoTimeout s 0)                 ; long-lived: block on pushes, no read timeout
+  (with-open [s (north.coord/connect-socket port)]
     (let [w (.getOutputStream s)
-          r (io/reader (.getInputStream s))]
-      (.write w (.getBytes "{:op :subscribe}\n")) (.flush w)
-      (.readLine r)                     ; consume the {:subscribed <seq>} handshake
+          reader (north.coord/coordinator-reader s)]
+      (.write w
+              (.getBytes
+               (str (pr-str
+                     (north.coord/log-envelope {:op :subscribe}))
+                    "\n")
+               java.nio.charset.StandardCharsets/UTF_8))
+      (.flush w)
+      (north.coord/validate-subscription!
+       (north.coord/read-line-bounded! reader))
+      (.setSoTimeout s 0)               ; validated long-lived stream: wait indefinitely for pushes
       (loop []
-        (when-let [line (.readLine r)]
+        (when-let [line
+                   (north.coord/read-stream-line-bounded! reader)]
           (let [ev (try (edn/read-string line) (catch Throwable _ nil))]
             (when (and (map? ev) (= (:event ev) :commit))
               (mark! (:l ev))))

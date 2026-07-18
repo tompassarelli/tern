@@ -16,6 +16,7 @@
 (load-file evidence-writer)
 
 (def checks (atom []))
+(def test-log (atom nil))
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
 (defn free-port [] (with-open [socket (java.net.ServerSocket. 0)] (.getLocalPort socket)))
 (defn port-open? [port]
@@ -41,7 +42,9 @@
             {}
             rows)))
 (defn shell [& args]
-  (apply proc/shell {:out :string :err :string :continue true} args))
+  (apply proc/shell {:out :string :err :string :continue true
+                     :extra-env {"FRAM_LOG" @test-log}}
+         args))
 (defn reserve-request [run thread reporter capability]
   {"run" run "thread" thread "reporter" reporter
    "capabilitySha256" (north.terminal-projection/sha256 capability)})
@@ -148,13 +151,17 @@
       log (io/file tmp "facts.log")
       daemon (do
                (spit log "")
-               (proc/process {:dir fram :out :string :err :string}
+               (proc/process {:dir fram :out :string :err :string
+                              :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"}}
                              "bb" "-cp" "out" "coord_daemon.clj"
                              "serve-flat" (str port) (.getPath log)))
       run "@run-publication-v2"
       thread "@thread-publication-v2"
       reporter "@agent:lane-probe"
       capability (apply str (repeat 64 "a"))]
+  (reset! test-log (.getCanonicalPath log))
+  (alter-var-root #'north.coord/expected-log
+                  (constantly (fn [] @test-log)))
   (try
     (check "throwaway coordinator starts" (eventually #(port-open? port)))
     (let [partial-run "@run-failed-reservation-partial"

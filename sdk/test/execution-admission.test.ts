@@ -34,7 +34,7 @@ test("every managed lane requires a live North coordinator before a provider tur
   ]) {
     await expect(admitExecution(
       "anthropic", capabilities, process.cwd(),
-      { mcpServers: { north: { env: { NORTH_PORT: "65534" } } } },
+      { mcpServers: { north: { env: { NORTH_PORT: "65534", FRAM_LOG: "/tmp/north-admission.log" } } } },
     ))
       .rejects.toMatchObject({
         code: "blocked_preflight",
@@ -70,9 +70,52 @@ test("admission never falls back to a later ambient North port", async () => {
   }
 });
 
-test("admission probes the validated lane coordinator port, never a different ambient instance", async () => {
+test("admission rejects non-canonical corpus identities before opening a socket", async () => {
+  let accepts = 0;
   const server = createServer((socket) => {
-    socket.once("data", () => socket.end("{:version \"test\"}\n"));
+    accepts += 1;
+    socket.end("{:version 1}\n");
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = String((server.address() as AddressInfo).port);
+  try {
+    for (const log of [
+      "relative/facts.log",
+      "/tmp/../tmp/north-admission.log",
+      "/tmp/north-admission.log/",
+    ]) {
+      await expect(admitExecution(
+        "openai",
+        ["filesystem.read", "filesystem.search", "shell.readonly"],
+        process.cwd(),
+        { mcpServers: { north: { env: { NORTH_PORT: port, FRAM_LOG: log } } } },
+      )).rejects.toThrow("north_coordination_log_identity_invalid");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(accepts).toBe(0);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("admission probes the validated lane coordinator port, never a different ambient instance", async () => {
+  const requests: string[] = [];
+  const expectedLog = "/tmp/north admission corpus.log";
+  const server = createServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      requests.push(request);
+      if (request.includes(":for-log")) {
+        socket.end("{:version 7}\n");
+      } else {
+        socket.end(
+          `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(expectedLog)}}\n`,
+        );
+      }
+    });
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -80,7 +123,11 @@ test("admission probes the validated lane coordinator port, never a different am
   });
   const port = String((server.address() as AddressInfo).port);
   process.env.NORTH_PORT = "65534";
-  const options = { mcpServers: { north: { env: { NORTH_PORT: port } } } };
+  const options = {
+    mcpServers: {
+      north: { env: { NORTH_PORT: port, FRAM_LOG: expectedLog } },
+    },
+  };
   try {
     await expect(admitExecution(
       "openai",
@@ -88,12 +135,64 @@ test("admission probes the validated lane coordinator port, never a different am
       process.cwd(),
       options,
     )).resolves.toBeUndefined();
+    expect(requests).toEqual([
+      '{:op :for-log, :expected-log "/tmp/north admission corpus.log", :request {:op :version}}\n',
+      "{:op :version}\n",
+    ]);
     await expect(admitExecution(
       "openai",
       ["filesystem.read", "filesystem.search", "shell.readonly"],
       process.cwd(),
-      { mcpServers: { north: { env: { NORTH_PORT: "not-a-port" } } } },
+      { mcpServers: { north: { env: { NORTH_PORT: "not-a-port", FRAM_LOG: "/tmp/north-admission.log" } } } },
     )).rejects.toThrow("north_coordination_port_invalid");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("admission rejects wrong-log and pre-fence coordinator replies", async () => {
+  for (const reply of [
+    '{:reject ["wrong log"] :code :log-mismatch}\n',
+    '{:error "unknown op"}\n',
+    '{:reject ["not admitted"] :version 7}\n',
+  ]) {
+    const server = createServer((socket) => {
+      socket.once("data", () => socket.end(reply));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = String((server.address() as AddressInfo).port);
+    try {
+      await expect(admitExecution(
+        "openai",
+        ["filesystem.read", "filesystem.search", "shell.readonly"],
+        process.cwd(),
+        { mcpServers: { north: { env: { NORTH_PORT: port, FRAM_LOG: "/tmp/expected.log" } } } },
+      )).rejects.toThrow("north_coordinator_preflight_invalid_response");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+});
+
+test("admission bounds an unterminated coordinator response", async () => {
+  const server = createServer((socket) => {
+    socket.once("data", () => socket.write("x".repeat(4_097)));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = String((server.address() as AddressInfo).port);
+  try {
+    await expect(admitExecution(
+      "openai",
+      ["filesystem.read", "filesystem.search", "shell.readonly"],
+      process.cwd(),
+      { mcpServers: { north: { env: { NORTH_PORT: port, FRAM_LOG: "/tmp/expected.log" } } } },
+    )).rejects.toThrow("north_coordinator_preflight_invalid_response");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

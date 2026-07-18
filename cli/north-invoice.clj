@@ -25,13 +25,16 @@
   (:require [fram.kernel :as k]
             [fram.fold :as fold]
             [fram.rt :as rt]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [babashka.process :as p]))
 
 (def ^:private args *command-line-args*)
 (def ^:private CMD (first args))
 (def ^:private NORTH (or (System/getenv "NORTH_HOME")
-                        (str (System/getenv "HOME") "/code/north")))
+                        (some-> (System/getProperty "babashka.file")
+                                io/file .getCanonicalFile
+                                .getParentFile .getParentFile str)))
 (defn- strip-at [s] (if (and s (str/starts-with? s "@")) (subs s 1) s))
 (defn- tell! [id pred val]
   (p/shell {:dir NORTH :out :string :err :string} (str NORTH "/bin/north") "tell" id pred val))

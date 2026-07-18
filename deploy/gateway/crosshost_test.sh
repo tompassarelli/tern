@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cross-host integration test: proves a coordinator started with FRAM_BIND=0.0.0.0
 # is reachable through the gateway over a NON-loopback address (the multi-host
-# path). Requires a Fram build with FRAM_BIND (>= the pinned FRAM_VERSION).
+# path). Requires the Fram revision locked by North, including FRAM_BIND.
 #   ./crosshost_test.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -13,7 +13,8 @@ HASH="$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)"
 # a non-loopback IPv4 (0.0.0.0 still serves loopback, so this falls back safely)
 IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
 IP="${IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"; IP="${IP:-127.0.0.1}"
-printf '{"acme" {:tokens #{"%s"} :coordinator-port %s :coordinator-host "%s"}}\n' "$HASH" "$CPORT" "$IP" > "$REG"
+printf '{"acme" {:tokens #{"%s"} :coordinator-port %s :coordinator-host "%s" :coordinator-log "%s"}}\n' \
+  "$HASH" "$CPORT" "$IP" "$LOG" > "$REG"
 
 CPID=""; GPID=""
 cleanup(){ [ -n "$GPID" ] && kill "$GPID" 2>/dev/null || true
@@ -21,7 +22,8 @@ cleanup(){ [ -n "$GPID" ] && kill "$GPID" 2>/dev/null || true
 trap cleanup EXIT
 
 echo "coordinator FRAM_BIND=0.0.0.0 on :$CPORT ; gateway routes :coordinator-host=$IP"
-FRAM_BIND=0.0.0.0 "$FRAM/bin/fram-daemon" "$CPORT" "$LOG" >"$TMP/coord.log" 2>&1 &
+FRAM_BIND=0.0.0.0 FRAM_REQUIRE_LOG_FENCE=1 \
+  "$FRAM/bin/fram-daemon" "$CPORT" "$LOG" >"$TMP/coord.log" 2>&1 &
 CPID=$!
 for _ in $(seq 160); do ss -tlnH "sport = :$CPORT" 2>/dev/null | grep -q . && break; sleep 0.25; done  # JVM boot ~40s budget
 
@@ -41,8 +43,11 @@ case "$listen" in
 esac
 
 # 2. the safety warning is logged
-grep -qi UNAUTHENTICATED "$TMP/coord.log" \
-  && check "unauthenticated warning logged" ok ok || check "unauthenticated warning logged" ok missing
+if grep -qi UNAUTHENTICATED "$TMP/coord.log"; then
+  check "unauthenticated warning logged" ok ok
+else
+  check "unauthenticated warning logged" ok missing
+fi
 
 # 3. the gateway forwards to the coordinator over the non-loopback host
 body="$(curl -s -H "Authorization: Bearer $TOKEN" --data '{:op :version}' http://127.0.0.1:$GPORT/v1/rpc)"

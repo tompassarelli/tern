@@ -387,7 +387,11 @@
                            launcher)))
   (doseq [predicate ["provider_target" "requested_target" "fallback_target_path"]]
     (check (str predicate " remains single in the executable legacy fallback")
-           (re-find (re-pattern (str "FRAM_SINGLE_VALUED=.*\\b" predicate "\\b")) launcher))))
+           (re-find (re-pattern (str "FRAM_SINGLE_VALUED=.*\\b" predicate "\\b")) launcher)))
+  (doseq [predicate ["code_port" "code_log"]]
+    (check (str predicate " is single in the executable concern-store fallback")
+           (re-find (re-pattern (str "FRAM_SINGLE_VALUED=.*\\b" predicate "\\b"))
+                    launcher))))
 
 (let [results @checks
       failures (remove :ok results)

@@ -94,8 +94,10 @@
 
 (let [[port verb & args] *command-line-args*
       port (Integer/parseInt port)
-      home (System/getenv "HOME")
-      scratch (str home "/code/north/cli")]
+      scratch (some-> (System/getProperty "babashka.file")
+                      io/file .getCanonicalFile .getParentFile str)
+      root (some-> scratch io/file .getParentFile str)
+      bun (or (System/getenv "NORTH_BUN") "bun")]
   (case verb
 
     "map"          ; <role-template> <N> <task> [K] [<json-schema>]  — register @batch + fan out N workers
@@ -135,7 +137,7 @@
                                    (when has-schema
                                      (str "\nThe payload is schema-validated on acceptance; a non-conforming payload is "
                                           "REJECTED (nonzero exit) and you must re-run the line with a conforming result.")))]
-              (sh "/run/current-system/sw/bin/bun" "run" (str home "/code/north/sdk/src/spawn.ts") full-prompt
+              (sh bun "run" (str root "/sdk/src/spawn.ts") full-prompt
                   :env (north.managed-child-env/child
                         (into {} (System/getenv))
                         (or (System/getenv "AGENT_ID") "north-map")

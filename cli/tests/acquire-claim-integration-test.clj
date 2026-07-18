@@ -12,6 +12,7 @@
 (def fram (str (System/getProperty "user.home") "/code/fram"))
 (def acquire-cli (str root "/cli/acquire-cli.clj"))
 (def checks (atom []))
+(def test-log (atom nil))
 
 (defn check [label ok?]
   (swap! checks conj [label (boolean ok?)]))
@@ -39,7 +40,12 @@
     (.setSoTimeout socket 5000)
     (let [writer (.getOutputStream socket)
           reader (io/reader (.getInputStream socket))]
-      (.write writer (.getBytes (str (pr-str request) "\n")))
+      (.write writer
+              (.getBytes
+               (str (pr-str {:op :for-log
+                             :expected-log @test-log
+                             :request request})
+                    "\n")))
       (.flush writer)
       (edn/read-string (.readLine reader)))))
 
@@ -60,7 +66,8 @@
   (:value (coordinator-op port {:op :resolved :te subject :p predicate})))
 
 (defn acquire [port verb thread holder]
-  (proc/shell {:continue true :out :string :err :string}
+  (proc/shell {:continue true :out :string :err :string
+               :extra-env {"FRAM_LOG" @test-log}}
               "bb" acquire-cli (str port) verb thread holder))
 
 (defn scripted-coordinator [responses]
@@ -94,7 +101,8 @@
       unknown (str "@" unknown-id)
       first-holder "agent:first"
       second-holder "agent:second"
-      daemon-env {"FRAM_SINGLE_VALUED" "title driver"}
+      daemon-env {"FRAM_REQUIRE_LOG_FENCE" "1"
+                  "FRAM_SINGLE_VALUED" "title driver"}
       daemon (do
                (spit log "")
                (proc/process {:dir fram
@@ -103,6 +111,7 @@
                               :extra-env daemon-env}
                              "bb" "-cp" "out" "coord_daemon.clj"
                              "serve-flat" (str port) (.getPath log)))]
+  (reset! test-log (.getCanonicalPath log))
   (try
     (let [started? (await-up port)]
       (check "throwaway Fram coordinator starts" started?)
@@ -177,7 +186,8 @@
                  {:value (str "@" second-holder)}])
       release (acquire (:port scripted) "release" thread-id first-holder)
       completed (deref (:worker scripted) 5000 :timeout)
-      requests @(:requests scripted)
+      envelopes @(:requests scripted)
+      requests (mapv :request envelopes)
       retracts (filter #(= :retract (:op %)) requests)]
   (when (= :timeout completed)
     (.close (:server scripted)))
@@ -186,6 +196,10 @@
               (zero? (:exit release))
               (str/includes? (:out release) "noop")
               (str/includes? (:out release) (str "driver=@" second-holder))
+              (every? #(= {:op :for-log
+                           :expected-log @test-log}
+                          (select-keys % [:op :expected-log]))
+                      envelopes)
               (= 1 (count retracts))
               (= {:op :retract
                   :te (str "@" thread-id)

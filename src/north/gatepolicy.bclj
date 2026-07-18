@@ -8,10 +8,16 @@
   data INTO a typed shape — that is the one honest use of Any.")
 
 (require clojure.string :as str)
+(require clojure.edn :as edn)
+(require cheshire.core :as json)
 (import java.security.MessageDigest)   ; non-java.lang classes need an explicit import
+(import java.io.StringReader)
+(import java.io.PushbackReader)
 
 ;; A tenant the gateway routes to (the typed shape the registry EDN validates into).
-(defrecord Tenant [tid :- String host :- String port :- Int])
+;; `log` is the coordinator's absolute corpus identity. The gateway injects it
+;; into every wire request; an untrusted HTTP client never supplies this field.
+(defrecord Tenant [tid :- String host :- String port :- Int log :- String])
 ;; A per-tenant token-bucket cell (rate limiting state).
 (defrecord Bucket [tokens :- Float ts :- Float ok :- Bool])
 
@@ -33,9 +39,17 @@
 ;; --- validate one untrusted registry entry INTO a typed Tenant (or nil) ------
 ;; cfg is Any: it's raw EDN off disk. This is the boundary — dynamic in, typed out.
 (defn parse-tenant [tid :- String cfg :- Any] :- Any
-  (let [host (:coordinator-host cfg) port (:coordinator-port cfg)]
-    (if (and (some? port))
-      (->Tenant tid (if (some? host) host "127.0.0.1") port)
+  (let [host (:coordinator-host cfg)
+        port (:coordinator-port cfg)
+        log (:coordinator-log cfg)]
+    (if (and (integer? port)
+             (<= 1 port)
+             (<= port 65535)
+             (or (nil? host) (string? host))
+             (string? log)
+             (not (str/blank? log))
+             (str/starts-with? log "/"))
+      (->Tenant tid (if (some? host) host "127.0.0.1") port log)
       nil)))
 
 ;; --- token -> Tenant: hash, look it up in the by-hash index ------------------
@@ -53,10 +67,98 @@
       (->Bucket (- refilled 1.0) now true)
       (->Bucket refilled now false))))
 
-;; --- request validation: body must be an EDN map with a keyword :op ----------
+;; --- request validation: body must be an unfenced EDN op ----------------------
 ;; parsed is Any: untrusted wire EDN. Validating Any -> Bool is the correct boundary.
+;; The gateway, not the caller, owns the :for-log envelope and tenant identity.
 (defn valid-op? [parsed :- Any] :- Bool
-  (and (map? parsed) (keyword? (:op parsed))))
+  (and (map? parsed) (keyword? (:op parsed)) (not (= (:op parsed) :for-log))))
+
+;; The registry-selected Tenant owns corpus identity. Preserve the response
+;; format on the OUTER envelope because Fram formats at the connection boundary.
+(defn fenced-request [tenant :- Tenant parsed :- Any] :- Any
+  (let [envelope {:op :for-log
+                  :expected-log (:log tenant)
+                  :request parsed}]
+    (if (contains? parsed :fmt)
+      (assoc envelope :fmt (:fmt parsed))
+      envelope)))
+
+(defn parse-exact-edn [resp :- String] :- Any
+  (try
+    (with-open [reader (PushbackReader. (StringReader. resp))]
+      (let [value (edn/read reader)
+            trailing?
+            (loop []
+              (let [ch (.read reader)]
+                (cond
+                  [(= ch -1) false]
+                  [(or (= ch 44) (Character/isWhitespace ch)) (recur)]
+                  [:else true])))]
+        (if trailing? nil value)))
+    ;; A byte-bounded adversary can still spend its budget on nesting. Normalize
+    ;; only parser recursion exhaustion into an invalid request; other VM-fatal
+    ;; Errors remain fatal.
+    (catch StackOverflowError _ nil)
+    (catch Exception _ nil)))
+
+(defn- whitespace-tail? [s :- String start :- Int] :- Bool
+  (loop [i start]
+    (if (>= i (count s))
+      true
+      (if (Character/isWhitespace (int (.charAt s i)))
+        (recur (inc i))
+        false))))
+
+(defn- one-json-object? [s :- String] :- Bool
+  (let [n (count s)
+        start (loop [i 0]
+                (if (and (< i n) (Character/isWhitespace (int (.charAt s i))))
+                  (recur (inc i))
+                  i))]
+    (if (or (>= start n) (not= 123 (int (.charAt s start))))
+      false
+      (loop [i start depth 0 in-string false escaped false]
+        (if (>= i n)
+          false
+          (let [ch (int (.charAt s i))]
+            (cond
+              [in-string
+               (cond
+                 [escaped (recur (inc i) depth true false)]
+                 [(= ch 92) (recur (inc i) depth true true)]
+                 [(= ch 34) (recur (inc i) depth false false)]
+                 [:else (recur (inc i) depth true false)])]
+              [(= ch 34) (recur (inc i) depth true false)]
+              [(= ch 123) (recur (inc i) (inc depth) false false)]
+              [(= ch 125)
+               (let [next-depth (dec depth)]
+                 (if (= next-depth 0)
+                   (whitespace-tail? s (inc i))
+                   (if (neg? next-depth)
+                     false
+                     (recur (inc i) next-depth false false))))]
+              [:else (recur (inc i) depth false false)])))))))
+
+;; Detect responses proving that the peer did not understand or honor the
+;; corpus-fence contract. The effects shell bounds the line before calling us;
+;; inspect only top-level EDN/JSON fields so ordinary payload text cannot spoof
+;; a protocol failure. JSON objects are valid EDN maps with string keys.
+(defn protocol-status [resp :- String] :- String
+  (if (nil? resp)
+    "no-response"
+    (let [parsed (or (parse-exact-edn resp)
+                     (when (one-json-object? resp)
+                       (try (json/parse-string resp) (catch Exception _ nil))))]
+      (if (not (map? parsed))
+        "protocol-error"
+        (let [code (or (:code parsed) (get parsed "code"))
+              error (or (:error parsed) (get parsed "error"))]
+          (cond
+            [(or (= code :log-mismatch) (= code "log-mismatch")) "log-mismatch"]
+            [(or (= code :log-fence-required)
+                 (= code "log-fence-required")
+                 (= error "unknown op")) "protocol-error"]
+            [:else "ok"]))))))
 
 ;; --- coarse coordinator-result status for the audit line (never the value) ---
 (defn coord-status [resp :- String] :- String

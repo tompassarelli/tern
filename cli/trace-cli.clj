@@ -21,7 +21,8 @@
 (def lease-of north.coord/lease-of)
 
 (def HOME (System/getenv "HOME"))
-(def NORTH (str HOME "/code/north"))
+(def NORTH (some-> (System/getProperty "babashka.file")
+                   io/file .getCanonicalFile .getParentFile .getParentFile str))
 (def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
 (def PORT (Integer/parseInt (or (System/getenv "NORTH_PORT") "7977")))
 (def NOW (System/currentTimeMillis))

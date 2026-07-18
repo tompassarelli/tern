@@ -7,7 +7,8 @@
 ;; to an unrelated fact invalidates the callback's snapshot, while an
 ;; uncontested retry commits a MULTI marker.
 (require '[babashka.process :as proc]
-         '[clojure.java.io :as io])
+         '[clojure.java.io :as io]
+         '[clojure.string :as str])
 
 (def root (.getCanonicalPath
            (io/file (.getParent (io/file *file*)) "../..")))
@@ -46,15 +47,32 @@
             (make-array java.nio.file.attribute.FileAttribute 0)))
       log (io/file dir "facts.log")
       _ (spit log "")
+      split-log (io/file dir "coordination.log")
+      _ (spit split-log "")
+      explicit-log-probe
+      (proc/shell
+       {:out :string :err :string :continue true
+        :extra-env {"FRAM_LOG" (.getCanonicalPath log)}}
+       "bb" "-e"
+      (str "(load-file " (pr-str (str root "/cli/coord.clj")) ")"
+            "(print (north.coord/expected-log))"))
+      _ (io/delete-file split-log true)
       daemon
       (proc/process
-       {:dir fram :out :string :err :string}
+       {:dir fram :out :string :err :string
+        :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"}}
        "bb" "-cp" "out" "coord_daemon.clj" "serve-flat"
        (str port) (.getPath log))
       checks (atom [])
       check! (fn [label value]
                (swap! checks conj [label (boolean value)]))]
+  (alter-var-root #'north.coord/expected-log
+                  (constantly (fn [] (.getCanonicalPath log))))
   (try
+    (check! "explicit FRAM_LOG wins over a sibling coordination.log"
+            (and (zero? (:exit explicit-log-probe))
+                 (= (.getCanonicalPath log)
+                    (str/trim (:out explicit-log-probe)))))
     (check! "real Fram daemon starts"
             (eventually #(port-open? port)))
 

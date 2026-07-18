@@ -17,10 +17,9 @@
 ;;   bb presence-cli.clj <port> presence-online                      ; bounded live-only projection for cockpit/roster
 ;;   bb presence-cli.clj <port> slackers [minutes]                   ; derived: online + holds no work-lease
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
-         '[cheshire.core :as json] '[clojure.java.shell])
+         '[cheshire.core :as json])
 
 (def TTL 1800000)         ; 30min lease; renewed on every tool call (PostToolUse hook)
-
 ;; shared coord substrate: the cardinality-typed write verbs (move-C) live once in
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 ;; decode-lease/lease-of/online? — the renewable-lease liveness rule — ALSO live there
@@ -319,8 +318,10 @@
         "PINNED" (println "DISPATCH: reuse (pinned — user trusts this context)")
         "GREEN"  (println "DISPATCH: reuse (fresh context)")
         "YELLOW" (println "DISPATCH: reuse with caution — inject rehydration hint")
-        "RED"    (println (str "DISPATCH: consider MIGRATE_FROM — spawn fresh with\n"
-                               "  MIGRATE_FROM=" h " to inherit roles + drain inbox"))))
+        "RED"    (println
+                  (str "DISPATCH: REPLACE — coordinator should delegate a fresh "
+                       "managed lane with an explicit context brief; do not reuse "
+                       h "."))))
 
     "forget"                                ; deregister: retract session facts + release the lease
     (let [[h] args, se (str "@session:" h)]
@@ -360,25 +361,9 @@
                     (str/join ", " (map #(subs % 6) (sort rs))) ", *}  (uuid ∪ held-roles)"))
       (doseq [t (sort ws)] (println (str "  watches " t))))
 
-    "compact"                               ; <uuid> — trigger context rotation for an agent
-    (let [[h] args]
-      (north.topology-authority/require-self-agent! "compact peer agent" h)
-      (let [ae (str "@agent:" h)
-            roles (:values (send-op port {:op :resolved :te ae :p "holds"}))]
-        (if (empty? roles)
-          (do (println (str "no roles for " h " — nothing to rotate")) (System/exit 1))
-          (do (println (str "triggering compact for " h " roles=" (pr-str (map #(subs % 6) roles))))
-              (put! port ae "needs_rotation" "true")   ; single (flag; LWW intent)
-              (let [r (clojure.java.shell/sh "bash"
-                        (str (System/getenv "HOME") "/code/north/sdk/src/compact.sh") h)]
-                (println (:out r))
-                (when (seq (:err r)) (binding [*out* *err*] (println (:err r))))
-                (System/exit (:exit r)))))))
-
     (do (println "usage: presence-cli.clj <port> {register|renew|task|focus|forget|runmeta  (session/run)")
         (println "                                |identify|card  (agent card)")
         (println "                                |define-role|assign|unassign|roles|holders  (roles)")
         (println "                                |watch|unwatch|subscriptions  (thread subs)")
-        (println "                                |compact  (context rotation)")
         (println "                                |presence|slackers}  (projections)")
         (System/exit 2))))

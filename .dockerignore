@@ -1,5 +1,25 @@
-.git
-.github
-**/*.log
-deploy/gateway/tenants.edn
-src/fram
+# Deny by default. This image has two documented roles—Fram coordinator and
+# North gateway—and neither needs the SDK workspace, transcripts, private docs,
+# caches, tests, archived web apps, or provider/account state.
+**
+
+!.dockerignore
+!Dockerfile
+!LICENSE
+!flake.lock
+
+!bin/
+bin/**
+!bin/github-flake-input-pin
+
+!out/
+out/**
+!out/north/
+out/north/**
+!out/north/gatepolicy.clj
+
+!deploy/
+deploy/**
+!deploy/gateway/
+deploy/gateway/**
+!deploy/gateway/gateway.clj

@@ -14,6 +14,7 @@
 (def listener-cli (str root "/cli/north-listen.clj"))
 (def msg-cli (str root "/cli/msg-cli.clj"))
 (def checks (atom []))
+(def test-log (atom nil))
 
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
 (defn free-port [] (with-open [socket (java.net.ServerSocket. 0)] (.getLocalPort socket)))
@@ -34,7 +35,12 @@
     (.setSoTimeout socket 5000)
     (let [writer (.getOutputStream socket)
           reader (io/reader (.getInputStream socket))]
-      (.write writer (.getBytes (str (pr-str request) "\n")))
+      (.write writer
+              (.getBytes
+               (str (pr-str {:op :for-log
+                             :expected-log @test-log
+                             :request request})
+                    "\n")))
       (.flush writer)
       (edn/read-string (.readLine reader)))))
 
@@ -77,7 +83,8 @@
 (defn run-msg [port & args]
   (apply proc/shell
          {:continue true :out :string :err :string
-          :extra-env {"AGENT_TOPOLOGY" "orchestrator"}}
+          :extra-env {"AGENT_TOPOLOGY" "orchestrator"
+                      "FRAM_LOG" @test-log}}
          "bb" msg-cli (str port) args))
 (defn sent-command [result]
   (second (re-find #"sent cmd (@cmd:[^ ]+)" (:out result))))
@@ -92,17 +99,20 @@
       daemon (do
                (spit facts "")
                (proc/process {:dir fram :out :string :err :string
-                              :extra-env {"FRAM_SINGLE_VALUED"
+                              :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"
+                                          "FRAM_SINGLE_VALUED"
                                           "op target from id pred value resource holder title driver retryable"}}
                              "bb" "-cp" "out" "coord_daemon.clj"
                              "serve-flat" (str port) (.getPath facts)))]
+  (reset! test-log (.getCanonicalPath facts))
   (try
     (check "throwaway Fram coordinator starts" (await-predicate #(port-open? port)))
     ;; A stale generation may still have advertised unsafe operations. The next
     ;; producer call must converge vocabulary before validating the request.
     (assert-fact! port "@cmd:vocab" "known_op" "spawn")
     (let [listener (proc/process {:out listener-log :err listener-log
-                                  :extra-env {"AGENT_TOPOLOGY" "orchestrator"}}
+                                  :extra-env {"AGENT_TOPOLOGY" "orchestrator"
+                                              "FRAM_LOG" @test-log}}
                                  "bb" listener-cli (str port) self "--react" "--scoped")]
       (try
         (check "listener establishes its scoped subscription"

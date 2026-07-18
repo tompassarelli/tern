@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Read one exact GitHub source identity from a root flake input lock.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+lock="${1:-$ROOT/flake.lock}"
+input="${2:-}"
+field="${3:-json}"
+
+if [[ ! -r "$lock" ]]; then
+  echo "github-flake-input-pin: lock file is not readable: $lock" >&2
+  exit 2
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "github-flake-input-pin: jq is required" >&2
+  exit 2
+fi
+safe_component='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+if [[ ! "$input" =~ $safe_component ]]; then
+  echo "github-flake-input-pin: input name must be a safe nonblank component" >&2
+  exit 2
+fi
+
+node="$(jq -er --arg input "$input" \
+  '.nodes.root.inputs[$input] | select(type == "string" and length > 0)' "$lock")" ||
+  {
+    echo "github-flake-input-pin: root input '$input' is missing or is not a concrete lock node" >&2
+    exit 1
+  }
+readarray -t locked < <(
+  jq -er --arg node "$node" '
+    .nodes[$node].locked
+    | select(.type == "github")
+    | [.owner, .repo, .rev, .narHash]
+    | select(all(.[]; type == "string" and length > 0))
+    | .[]
+  ' "$lock"
+)
+
+if [[ "${#locked[@]}" -ne 4 ]]; then
+  echo "github-flake-input-pin: input '$input' must have a complete GitHub owner/repo/rev/narHash lock" >&2
+  exit 1
+fi
+
+owner="${locked[0]}"
+repo="${locked[1]}"
+rev="${locked[2]}"
+nar_hash="${locked[3]}"
+
+if [[ ! "$owner" =~ $safe_component || ! "$repo" =~ $safe_component ]]; then
+  echo "github-flake-input-pin: unsafe GitHub owner or repository for '$input' in $lock" >&2
+  exit 1
+fi
+if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "github-flake-input-pin: '$input' revision must be a full lowercase 40-hex commit" >&2
+  exit 1
+fi
+if [[ ! "$nar_hash" =~ ^sha256-[A-Za-z0-9+/=]+$ ]]; then
+  echo "github-flake-input-pin: '$input' narHash has an invalid shape" >&2
+  exit 1
+fi
+
+case "$field" in
+  repository) printf '%s/%s\n' "$owner" "$repo" ;;
+  revision) printf '%s\n' "$rev" ;;
+  url) printf 'https://github.com/%s/%s.git\n' "$owner" "$repo" ;;
+  nar-hash) printf '%s\n' "$nar_hash" ;;
+  json)
+    jq -cn \
+      --arg input "$input" \
+      --arg owner "$owner" \
+      --arg repo "$repo" \
+      --arg rev "$rev" \
+      --arg narHash "$nar_hash" \
+      '{input:$input,owner:$owner,repo:$repo,repository:($owner+"/"+$repo),rev:$rev,narHash:$narHash}'
+    ;;
+  *)
+    echo "usage: github-flake-input-pin [flake.lock] <input> [json|repository|revision|url|nar-hash]" >&2
+    exit 2
+    ;;
+esac

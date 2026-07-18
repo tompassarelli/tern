@@ -15,6 +15,7 @@
 (load-file (str root "/cli/terminal-projection.clj"))
 
 (def checks (atom []))
+(def test-log (atom nil))
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
 (defn free-port [] (with-open [socket (java.net.ServerSocket. 0)] (.getLocalPort socket)))
 (defn port-open? [port]
@@ -30,7 +31,8 @@
    (run-writer port operation subject value {}))
   ([port operation subject value extra-env]
    (let [result (proc/shell {:out :string :err :string :continue true
-                             :extra-env extra-env}
+                             :extra-env (assoc extra-env
+                                               "FRAM_LOG" @test-log)}
                             "bb" writer (str port) operation subject value)]
      {:exit (:exit result) :out (:out result) :err (:err result)})))
 (defn entity-facts [port subject]
@@ -88,6 +90,7 @@
    (let [server (java.net.ServerSocket.
                  0 50 (java.net.InetAddress/getByName "127.0.0.1"))
          requests (atom [])
+         envelopes (atom [])
          injected? (atom false)
          closed? (atom false)
          worker
@@ -97,10 +100,17 @@
                (with-open [client (.accept server)
                            reader (io/reader (.getInputStream client))
                            writer (io/writer (.getOutputStream client))]
-                 (let [request (edn/read-string (.readLine reader))
+                 (let [envelope (edn/read-string (.readLine reader))
+                       request (:request envelope)
+                       _ (swap! envelopes conj envelope)
                        _ (swap! requests conj request)
+                       valid-envelope?
+                       (= {:op :for-log
+                           :expected-log @test-log}
+                          (select-keys envelope [:op :expected-log]))
                        inject-now?
-                       (and (inject? request)
+                       (and valid-envelope?
+                            (inject? request)
                             (compare-and-set! injected? false true))
                        drop-response?
                        (and drop-fence-after-injection?
@@ -108,16 +118,19 @@
                             (= :fence-ok (:op request)))
                        response
                        (when-not drop-response?
-                         (if inject-now?
+                         (if-not valid-envelope?
+                           {:reject :invalid-test-log-fence}
+                           (if inject-now?
                            (injected-response request)
-                           (north.coord/send-op target-port request)))]
+                           (north.coord/send-op target-port request))))]
                    (when-not drop-response?
                      (.write writer (str (pr-str response) "\n"))
                      (.flush writer)))))
              (catch java.net.SocketException error
                (when-not @closed? (throw error)))))]
      {:port (.getLocalPort server)
-      :requests requests
+     :requests requests
+      :envelopes envelopes
       :injected? injected?
       :close!
       (fn []
@@ -159,7 +172,8 @@
       log (io/file tmp "facts.log")
       daemon (do
                (spit log "")
-               (proc/process {:dir fram :out :string :err :string}
+               (proc/process {:dir fram :out :string :err :string
+                              :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"}}
                              "bb" "-cp" "out" "coord_daemon.clj"
                              "serve-flat" (str port) (.getPath log)))
       subject "@agent:identity-publication-probe"
@@ -183,6 +197,9 @@
                "spawned_at" "2026-07-17T01:01:00Z"
                "display_handle" "openai-b-sol-xhigh-gaffer-bespoke-probe"
                "display_name" "openai:codex-b · sol · xhigh · gaffer:bespoke:migration-forensics"}]
+  (reset! test-log (.getCanonicalPath log))
+  (alter-var-root #'north.coord/expected-log
+                  (constantly (fn [] @test-log)))
   (try
     (check "throwaway coordinator starts" (eventually #(port-open? port)))
     (let [first-result (run-writer port "publish" subject (json/generate-string preset))
@@ -1021,7 +1038,8 @@
       (let [attested-result
             (proc/shell {:out :string :err :string :continue true
                          :extra-env {"AGENT_ID" "delivery-verifier"
-                                     "NORTH_PORT" (str port)}}
+                                     "NORTH_PORT" (str port)
+                                     "FRAM_LOG" @test-log}}
                         (str root "/bin/north") "delivery" "attest"
                         "delivery-worker")
             stored (scalar-facts (entity-facts port worker-subject))]

@@ -146,36 +146,46 @@
       (= st "conflict") {"http" 409 "body" {"conflict" true}}
       :else {"http" 502 "body" {"error" (.-reason r)}})))
 
-(js/export (defn api-assert [(body :- Any)] :- (Promise Any)
-  (let [r (js/await (fram/assert! (fram/port-for (d/dget body "graph")) (d/dget body "te") (d/dget body "p") (d/dget body "r")))]
-    (write-http r))))
+(js/export (defn api-assert [(body :- Any) (board-port :- Int)] :- (Promise Any)
+  (let [port (fram/port-for (d/dget body "graph") board-port)]
+    (if (<= port 0)
+      {"http" 400 "body" {"error" "unknown or retired graph"}}
+      (let [r (js/await (fram/assert! port (d/dget body "te") (d/dget body "p") (d/dget body "r")))]
+        (write-http r))))))
 
-(js/export (defn api-retract [(body :- Any)] :- (Promise Any)
-  (let [r (js/await (fram/retract! (fram/port-for (d/dget body "graph")) (d/dget body "te") (d/dget body "p") (d/dget body "r")))]
-    (write-http r))))
+(js/export (defn api-retract [(body :- Any) (board-port :- Int)] :- (Promise Any)
+  (let [port (fram/port-for (d/dget body "graph") board-port)]
+    (if (<= port 0)
+      {"http" 400 "body" {"error" "unknown or retired graph"}}
+      (let [r (js/await (fram/retract! port (d/dget body "te") (d/dget body "p") (d/dget body "r")))]
+        (write-http r))))))
 
-(js/export (defn api-tell [(body :- Any)] :- (Promise Any)
-  (let [port (fram/port-for (d/dget body "graph"))
-        te (js/await (threads/resolve (at (d/dget body "id")) port))
-        obj (d/dget body "obj")
-        r (if (.startsWith obj "@") (js/await (threads/resolve obj port)) obj)
-        res (js/await (fram/assert! port te (d/dget body "pred") r))]
-    (write-http res))))
+(js/export (defn api-tell [(body :- Any) (board-port :- Int)] :- (Promise Any)
+  (let [port (fram/port-for (d/dget body "graph") board-port)]
+    (if (<= port 0)
+      {"http" 400 "body" {"error" "unknown or retired graph"}}
+      (let [te (js/await (threads/resolve (at (d/dget body "id")) port))
+            obj (d/dget body "obj")
+            r (if (.startsWith obj "@") (js/await (threads/resolve obj port)) obj)
+            res (js/await (fram/assert! port te (d/dget body "pred") r))]
+        (write-http res))))))
 
-(js/export (defn api-capture [(body :- Any)] :- (Promise Any)
+(js/export (defn api-capture [(body :- Any) (board-port :- Int)] :- (Promise Any)
   (let [title (d/dget body "title")]
     (if (or (nil? title) (= title ""))
       {"http" 400 "body" {"error" "title required"}}
-      (let [port (fram/port-for (d/dget body "graph"))
+      (let [port (fram/port-for (d/dget body "graph") board-port)
             tid (str "@" (id/uuid7))
-            now (iso-now)
-            r1 (js/await (fram/assert! port tid "title" title))]
-        (if (not= (.-status r1) "ok")
-          (write-http r1)
-          (let [r2 (js/await (fram/assert! port tid "created_at" now))]
-            (js/await (assert-optional! port tid "handle" (d/dget body "handle")))
-            (js/await (assert-optional-ref! port tid "part_of" (d/dget body "part_of") port))
-            {"http" 200 "body" {"ok" (.-value r2) "id" tid}})))))))
+            now (iso-now)]
+        (if (<= port 0)
+          {"http" 400 "body" {"error" "unknown or retired graph"}}
+          (let [r1 (js/await (fram/assert! port tid "title" title))]
+            (if (not= (.-status r1) "ok")
+              (write-http r1)
+              (let [r2 (js/await (fram/assert! port tid "created_at" now))]
+                (js/await (assert-optional! port tid "handle" (d/dget body "handle")))
+                (js/await (assert-optional-ref! port tid "part_of" (d/dget body "part_of") port))
+                {"http" 200 "body" {"ok" (.-value r2) "id" tid}})))))))))
 
 (defn assert-optional! [(port :- Int) (tid :- String) (pred :- String) (v :- Any)] :- (Promise Any)
   (if (or (nil? v) (= v "")) nil (fram/assert! port tid pred v)))
@@ -186,14 +196,13 @@
     (let [resolved (js/await (threads/resolve (at v) rport))]
       (fram/assert! port tid pred resolved))))
 
-(js/export (defn api-steer [(body :- Any)] :- (Promise Any)
+(js/export (defn api-steer [(body :- Any) (board-port :- Int)] :- (Promise Any)
   (let [h (d/dget body "handle") text (d/dget body "text")]
     (if (or (nil? h) (nil? text) (= text ""))
       {"http" 400 "body" {"error" "handle + text required"}}
-      ;; agents-port is a def VALUE (7977), not a getter — reference, don't call.
-      (let [resolved (js/await (threads/resolve (at h) fram/agents-port))
+      (let [resolved (js/await (threads/resolve (at h) board-port))
             handle (if (.startsWith resolved "@") (.slice resolved 1) resolved)
-            r (js/await (fram/assert! fram/agents-port (str "@session:" handle) "steer" text))]
+            r (js/await (fram/assert! board-port (str "@session:" handle) "steer" text))]
         (write-http r))))))
 
 ;; ISO-8601 now — js/quote (Date).

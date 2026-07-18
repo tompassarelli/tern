@@ -1,16 +1,24 @@
 ;; North gateway tenant registry (example).
 ;; Copy to tenants.edn (gitignored) — or let provision.sh manage it.
 ;;
-;; One entry per tenant: a SET of accepted bearer-token hashes (sha-256 hex, never
-;; the plaintext) and the loopback port of that tenant's own coordinator. `:tokens`
-;; is a set so rotation can keep the old + new token valid during a grace window
-;; (provision.sh rotate adds one; revoke drops one). Each tenant is a fully isolated
-;; coordinator + facts.log — the only safe tenancy boundary (the per-assertion
-;; `frame` is provenance, not authorization).
+;; One entry per tenant: a SET of accepted bearer-token hashes (sha-256 hex,
+;; never the plaintext), the loopback port, and the exact canonical absolute log
+;; identity of that tenant's own coordinator. On a remote coordinator host, get
+;; this value there with `realpath -m`; it is a protocol identity, not a path the
+;; gateway resolves locally. The gateway injects `:coordinator-log` into
+;; Fram's wire fence; callers cannot select a corpus. `:tokens` is a set so
+;; rotation can keep the old + new token valid during a grace window
+;; (provision.sh rotate adds one; revoke drops one). Each tenant is a fully
+;; isolated coordinator + facts.log — the only safe tenancy boundary (the
+;; per-assertion `frame` is provenance, not authorization).
 ;;
 ;; Optional per-tenant `:coordinator-host` (default "127.0.0.1") points the gateway
 ;; at a coordinator on a private network instead of loopback.
 ;;
 ;; The legacy single-token form `{:token-sha256 "<hex>" ...}` is still accepted.
-{"acme"   {:tokens #{"REPLACE_WITH_SHA256_OF_AN_ACME_TOKEN"}   :coordinator-port 7801}
- "globex" {:tokens #{"REPLACE_WITH_SHA256_OF_A_GLOBEX_TOKEN"}  :coordinator-port 7802}}
+{"acme"   {:tokens #{"REPLACE_WITH_SHA256_OF_AN_ACME_TOKEN"}
+           :coordinator-port 7801
+           :coordinator-log "/srv/north/tenants/acme/facts.log"}
+ "globex" {:tokens #{"REPLACE_WITH_SHA256_OF_A_GLOBEX_TOKEN"}
+           :coordinator-port 7802
+           :coordinator-log "/srv/north/tenants/globex/facts.log"}}

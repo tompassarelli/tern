@@ -2,9 +2,17 @@
 #   sudo cp deploy/north-coordinator@.service /etc/systemd/system/
 #   # per-tenant env (unique FRAM_PORT + that tenant's log):
 #   sudo install -d /etc/north
+#   # FRAM_LOG must be the remote host's canonical absolute path. The matching
+#   # gateway :coordinator-log value must be byte-for-byte identical.
 #   printf 'FRAM_PORT=7801\nFRAM_LOG=/var/lib/north/tenants/acme/facts.log\n' \
 #     | sudo tee /etc/north/acme.env
 #   sudo systemctl enable --now north-coordinator@acme
+#
+# This template uses one shared `north` Unix account. It isolates coordinator
+# authority and narrows writes per instance, but it is NOT a hostile-tenant
+# filesystem boundary because that account can still read peer-owned files.
+# Use the per-tenant volume/network compose topology for mutually untrusted
+# tenants, or provision a distinct OS identity and unit policy per tenant.
 [Unit]
 Description=North coordinator (tenant %i)
 After=network.target
@@ -14,17 +22,19 @@ Type=simple
 User=north
 Group=north
 Environment=FRAM_HOME=/opt/fram
+Environment=FRAM_REQUIRE_LOG_FENCE=1
 EnvironmentFile=/etc/north/%i.env
 ExecStart=/opt/fram/bin/fram-daemon ${FRAM_PORT} ${FRAM_LOG}
 Restart=on-failure
 RestartSec=2
+UMask=0077
 
 # hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/north
+ReadWritePaths=/var/lib/north/tenants/%i
 
 [Install]
 WantedBy=multi-user.target

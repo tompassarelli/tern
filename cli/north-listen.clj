@@ -124,16 +124,23 @@
   ;; to the firehose listener (full backward-compat).
   (loop []
     (let [reconnect? (atom false)]
-      (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
-        (let [w (.getOutputStream s) r (io/reader (.getInputStream s))
+      (with-open [s (north.coord/connect-socket port)]
+        (let [w (.getOutputStream s)
+              reader (north.coord/coordinator-reader s)
               ;; The daemon still needs "*" in its transport filter to forward
               ;; broadcast trigger commits. Client-side snapshot membership is
               ;; the delivery authority; "*" is never a command/direct address.
               sub (cond-> {:op :subscribe}
                     scoped? (assoc :filter {:addrs (conj @addrs north.message-audience/broadcast-address)
                                             :watch @watched :node node}))]
-          (.write w (.getBytes (str (pr-str sub) "\n"))) (.flush w)
-          (.readLine r)                                              ; consume {:subscribed N}
+          (.write w
+                  (.getBytes
+                   (str (pr-str (north.coord/log-envelope sub)) "\n")
+                   java.nio.charset.StandardCharsets/UTF_8))
+          (.flush w)
+          (north.coord/validate-subscription!
+           (north.coord/read-line-bounded! reader))
+          (.setSoTimeout s 0)            ; validated long-lived stream: wait indefinitely for pushes
           (println (format "● @agent:%s listening%s — addrs %s + %d watched thread(s)%s"
                            uuid (if scoped? " [scoped]" "") (pr-str (sort @addrs)) (count @watched) (if once? "  [--once]" "")))
           (flush)
@@ -141,7 +148,8 @@
           ;; before its terminal marker when a prior listener crashed.
           (when react? (react-pending! port uuid @addrs))
           (loop []
-            (when-let [line (.readLine r)]
+            (when-let [line
+                       (north.coord/read-stream-line-bounded! reader)]
               (let [ev (try (edn/read-string line) (catch Exception _ nil))]
                 (when (and (map? ev) (= :commit (:event ev)))
                   (let [{:keys [op l p r]} ev]

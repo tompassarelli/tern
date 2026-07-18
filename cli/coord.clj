@@ -33,13 +33,342 @@
 ;; default/canonical reference (Part C's pred-cli + future callers read it).
 (def PORT (or (System/getenv "NORTH_PORT") "7977"))
 
-;; one request/response over the daemon socket: write one EDN op + newline, read
-;; one EDN reply line. The atom every other helper is built from.
+(defn- timeout-ms [name default]
+  (let [raw (or (System/getenv name) (str default))]
+    (when-not (re-matches #"[1-9][0-9]{0,5}" raw)
+      (throw (ex-info (str name " must be an integer from 1 through 999999 milliseconds")
+                      {:type :invalid-coordinator-timeout :name name :value raw})))
+    (Integer/parseInt raw)))
+
+(defn- response-byte-limit []
+  (let [raw (or (System/getenv "NORTH_COORD_MAX_RESPONSE_BYTES")
+                "8388608")
+        value (when (re-matches #"[1-9][0-9]{0,7}" raw)
+                (parse-long raw))]
+    (when-not (and value (<= value 67108864))
+      (throw
+       (ex-info
+        "NORTH_COORD_MAX_RESPONSE_BYTES must be an integer from 1 through 67108864"
+        {:type :invalid-coordinator-response-limit :value raw})))
+    (int value)))
+
+(defn connect-socket [port]
+  (let [s (java.net.Socket.)]
+    (try
+      (.connect s
+                (java.net.InetSocketAddress. "127.0.0.1" (int port))
+                (timeout-ms "NORTH_COORD_CONNECT_TIMEOUT_MS" 1000))
+      (.setSoTimeout s (timeout-ms "NORTH_COORD_READ_TIMEOUT_MS" 30000))
+      s
+      (catch Throwable t
+        (.close s)
+        (throw t)))))
+
+(defn- decode-utf8! [bytes]
+  (try
+    (let [decoder
+          (doto (.newDecoder java.nio.charset.StandardCharsets/UTF_8)
+            (.onMalformedInput java.nio.charset.CodingErrorAction/REPORT)
+            (.onUnmappableCharacter java.nio.charset.CodingErrorAction/REPORT))]
+      (str (.decode decoder (java.nio.ByteBuffer/wrap bytes))))
+    (catch java.nio.charset.CharacterCodingException error
+      (throw
+       (ex-info "coordinator response line is not valid UTF-8"
+                {:type :malformed-coordinator-utf8}
+                error)))))
+
+(defn- response-timeout! [timeout cause]
+  (throw
+   (ex-info "coordinator response deadline exceeded"
+            {:type :coordinator-response-timeout
+             :timeout-ms timeout}
+            cause)))
+
+;; North keeps this small stdlib-only client instead of loading fram.rt: hooks
+;; and sibling CLIs load coord.clj directly, without Fram's kernel/fold/Cheshire
+;; classpath. The wire invariants still match Fram's client: bounded UTF-8,
+;; absolute deadlines, exactly one parsed form, and exactly one terminal frame.
+(defrecord CoordinatorReader [socket input buffer bounds])
+
+(defn coordinator-reader [socket]
+  (->CoordinatorReader
+   socket
+   (.getInputStream socket)
+   (byte-array 65536)
+   (int-array 2)))
+
+(defn- as-reader [source]
+  (if (instance? CoordinatorReader source)
+    source
+    (coordinator-reader source)))
+
+(defn- finish-line! [output]
+  (let [line (decode-utf8! (.toByteArray output))]
+    (if (str/ends-with? line "\r")
+      (subs line 0 (dec (count line)))
+      line)))
+
+(defn- arm-deadline! [socket deadline timeout]
+  (let [remaining-ns (- deadline (System/nanoTime))]
+    (when-not (pos? remaining-ns)
+      (response-timeout! timeout nil))
+    (.setSoTimeout
+     socket
+     (int (max 1 (quot (+ remaining-ns 999999) 1000000))))))
+
+(defn- read-line-limited! [source deadline timeout eof-ok?]
+  (let [{:keys [socket input buffer bounds]} (as-reader source)
+        buffer-size (alength buffer)
+        latin1 java.nio.charset.StandardCharsets/ISO_8859_1
+        newline "\n"
+        limit (response-byte-limit)
+        output (java.io.ByteArrayOutputStream.)]
+    (loop []
+      (when (and deadline (not (pos? (- deadline (System/nanoTime)))))
+        (response-timeout! timeout nil))
+      (let [start (aget bounds 0)
+            end (aget bounds 1)]
+        (if (< start end)
+          (let [available (- end start)
+                segment (String. buffer start available latin1)
+                newline-offset (.indexOf segment newline)
+                take-bytes (if (neg? newline-offset)
+                             available
+                             newline-offset)
+                total (+ (.size output) take-bytes)]
+            (when (> total limit)
+              (throw
+               (ex-info
+                (str "coordinator response line exceeds " limit " bytes")
+                {:type :coordinator-response-too-large
+                 :max-bytes limit})))
+            (.write output buffer start take-bytes)
+            (if (neg? newline-offset)
+              (do
+                (aset-int bounds 0 end)
+                (recur))
+              (do
+                (aset-int bounds 0 (+ start newline-offset 1))
+                (finish-line! output))))
+          (do
+            (when deadline
+              (arm-deadline! socket deadline timeout))
+            (let [read-count
+                  (try
+                    (.read input buffer 0 buffer-size)
+                    (catch java.net.SocketTimeoutException error
+                      (response-timeout! timeout error)))]
+              (cond
+                (= -1 read-count)
+                (if (and eof-ok? (zero? (.size output)))
+                  nil
+                  (throw
+                   (ex-info
+                    (if (zero? (.size output))
+                      "coordinator closed before sending a response line"
+                      "coordinator closed during a response line")
+                    {:type (if (zero? (.size output))
+                             :coordinator-response-closed
+                             :coordinator-response-truncated)
+                     :bytes (.size output)})))
+
+                (zero? read-count)
+                (recur)
+
+                :else
+                (do
+                  (aset-int bounds 0 0)
+                  (aset-int bounds 1 read-count)
+                  (recur))))))))))
+
+(defn read-line-bounded!
+  "Read exactly one UTF-8 line through a persistent chunked reader.
+   The deadline is absolute, so a peer cannot stay alive by dripping bytes just
+   under SO_TIMEOUT. The byte cap excludes the line terminator."
+  [source]
+  (let [timeout (timeout-ms "NORTH_COORD_READ_TIMEOUT_MS" 30000)]
+    (read-line-limited!
+     source
+     (+ (System/nanoTime) (* 1000000 (long timeout)))
+     timeout
+     false)))
+
+(defn read-stream-line-bounded!
+  "Read one event-stream line with no idle deadline but the same byte and UTF-8
+   bounds as request responses. The persistent reader retains bytes following
+   the newline for the next event. Clean EOF returns nil; partial EOF is invalid."
+  [source]
+  (let [reader (as-reader source)]
+    (.setSoTimeout (:socket reader) 0)
+    (read-line-limited! reader nil nil true)))
+
+(defn- ensure-terminal-eof! [reader deadline timeout]
+  (let [{:keys [socket input buffer bounds]} reader]
+    (loop []
+      (let [start (aget bounds 0)
+            end (aget bounds 1)]
+        (when (< start end)
+          (throw
+           (ex-info "coordinator sent more than one terminal response frame"
+                    {:type :multiple-coordinator-response-frames
+                     :surplus-bytes (- end start)})))
+        (arm-deadline! socket deadline timeout)
+        (let [read-count
+              (try
+                (.read input buffer 0 (alength buffer))
+                (catch java.net.SocketTimeoutException error
+                  (response-timeout! timeout error)))]
+          (cond
+            (= -1 read-count) nil
+            (zero? read-count) (recur)
+            :else
+            (throw
+             (ex-info "coordinator sent more than one terminal response frame"
+                      {:type :multiple-coordinator-response-frames
+                       :surplus-bytes read-count}))))))))
+
+(defn- read-terminal-line! [reader]
+  (let [timeout (timeout-ms "NORTH_COORD_READ_TIMEOUT_MS" 30000)
+        deadline (+ (System/nanoTime) (* 1000000 (long timeout)))
+        line (read-line-limited! reader deadline timeout false)]
+    (ensure-terminal-eof! reader deadline timeout)
+    line))
+
+(defn- malformed-edn! [line error]
+  (throw
+   (ex-info "coordinator response line is not exactly one valid EDN form"
+            {:type :malformed-coordinator-response
+             :line-bytes (count (.getBytes
+                                 (str line)
+                                 java.nio.charset.StandardCharsets/UTF_8))}
+            error)))
+
+(defn parse-edn-line! [line]
+  (try
+    (with-open [reader
+                (java.io.PushbackReader. (java.io.StringReader. line))]
+      (let [eof (Object.)
+            value (edn/read {:eof eof} reader)
+            trailing (edn/read {:eof eof} reader)]
+        (when (or (identical? eof value)
+                  (not (identical? eof trailing)))
+          (throw (ex-info "not exactly one EDN form" {})))
+        value))
+    ;; Hostile bounded input can still overflow a recursive parser. Normalize
+    ;; that one Error, but let VM-fatal Errors propagate.
+    (catch StackOverflowError error
+      (malformed-edn! line error))
+    (catch Exception error
+      (malformed-edn! line error))))
+
+(defn read-edn-response! [reader]
+  (parse-edn-line! (read-terminal-line! reader)))
+
+;; Every North request carries the exact corpus identity. The distinct :for-log
+;; envelope is a protocol boundary, not optional metadata: a pre-fence daemon
+;; rejects the unknown op, so a new North client can never silently fall back to
+;; an unfenced read or write.
+(defn canonical-log-path [log]
+  (when-not (and (string? log) (not (str/blank? log)))
+    (throw (ex-info "coordinator log identity must be a nonblank path"
+                    {:type :invalid-log-identity :log log})))
+  (.getCanonicalPath (io/file log)))
+
+(defn expected-log []
+  (let [explicit (System/getenv "FRAM_LOG")
+        home (or (System/getenv "HOME") (System/getProperty "user.home"))
+        requested (io/file
+                   (or explicit
+                       (str home "/.local/state/north/facts.log")))
+        split (io/file (.getParentFile requested) "coordination.log")
+        selected (if (and (nil? explicit)
+                          (nil? (System/getenv "FRAM_TELEMETRY_LOG"))
+                          (.isFile split))
+                   split
+                   requested)]
+    (.getCanonicalPath selected)))
+
+(defn log-envelope-for [log op]
+  (when (= :for-log (:op op))
+    (throw (ex-info "nested coordinator log fences are not supported"
+                    {:type :invalid-log-fence})))
+  (cond-> {:op :for-log
+           :expected-log (canonical-log-path log)
+           :request op}
+    (contains? op :fmt) (assoc :fmt (:fmt op))))
+
+(defn log-envelope [op]
+  (log-envelope-for (expected-log) op))
+
+(defn validate-subscription! [line]
+  (let [reply (when (string? line) (parse-edn-line! line))
+        served (:log reply)
+        valid-log? (and (string? served)
+                        (= (expected-log)
+                           (.getCanonicalPath (io/file served))))]
+    (when-not (and (map? reply) (integer? (:subscribed reply)) valid-log?)
+      (throw (ex-info
+              (str "coordinator refused the fenced subscription: "
+                   (if (nil? line) "connection closed before handshake" (pr-str reply)))
+              {:type :invalid-subscription-handshake
+               :expected-log (expected-log)
+               :reply reply})))
+    reply))
+
+;; one fenced request/response over the daemon socket: write one EDN op +
+;; newline, read one EDN reply line. The atom every other helper is built from.
+(defn- send-envelope [port envelope]
+  (with-open [s (connect-socket port)]
+    (let [w (.getOutputStream s)
+          reader (coordinator-reader s)]
+      (.write w
+              (.getBytes (str (pr-str envelope) "\n")
+                         java.nio.charset.StandardCharsets/UTF_8))
+      (.flush w)
+      (read-edn-response! reader))))
+
 (defn send-op [port op]
-  (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
-    (let [w (.getOutputStream s) r (io/reader (.getInputStream s))]
-      (.write w (.getBytes (str (pr-str op) "\n"))) (.flush w)
-      (edn/read-string (.readLine r)))))
+  (send-envelope port (log-envelope op)))
+
+(defn send-op-for-log [port log op]
+  (send-envelope port (log-envelope-for log op)))
+
+(defn send-raw-op
+  "Low-level compatibility/policy probe. Managed North operations must use
+   send-op/send-op-for-log; this exists only to prove that a daemon rejects an
+   unfenced request before north-coord-up declares it strict-ready."
+  [port op]
+  (send-envelope port op))
+
+(defn strict-coordinator-status [port log]
+  (let [expected (canonical-log-path log)]
+    (try
+      (let [fenced (send-op-for-log port expected {:op :version})
+            raw (send-raw-op port {:op :version})
+            served (:served-log raw)
+            served-canonical
+            (when (and (string? served) (not (str/blank? served)))
+              (canonical-log-path served))]
+        (cond
+          (not (integer? (:version fenced)))
+          {:ready false :reason :fenced-version-invalid}
+
+          (not= :log-fence-required (:code raw))
+          {:ready false :reason :raw-request-not-rejected}
+
+          (not= expected served-canonical)
+          {:ready false :reason :strict-probe-served-wrong-log
+           :expected-log expected :served-log served-canonical}
+
+          :else
+          {:ready true :version (:version fenced) :log expected}))
+      ;; read-edn-response! already normalizes parser StackOverflowError into an
+      ;; Exception. Preserve ordinary probe diagnostics without swallowing
+      ;; unrelated VM-fatal Errors.
+      (catch Exception error
+        {:ready false
+         :reason :probe-failed
+         :error (.getMessage error)}))))
 
 ;; the daemon's current global version (only swap!/retract! read it now — the base).
 (defn cur-ver [port] (:version (send-op port {:op :version})))
@@ -289,8 +618,14 @@
                                                 {:rel "settled" :args [{:var "c"}] :neg true}]}]]}})))
 
 (defn -main [& args]
-  (let [port (Integer/parseInt (or (first args) PORT))]
-    (prn (send-op port {:op :version}))))
+  (if (= "strict-probe" (first args))
+    (let [port (Integer/parseInt (or (second args) PORT))
+          log (nth args 2 nil)
+          status (strict-coordinator-status port log)]
+      (prn status)
+      (when-not (:ready status) (System/exit 1)))
+    (let [port (Integer/parseInt (or (first args) PORT))]
+      (prn (send-op port {:op :version})))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (apply -main *command-line-args*))

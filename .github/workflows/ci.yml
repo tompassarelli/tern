@@ -4,30 +4,61 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout North
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           path: north
 
-      # Pin the Fram engine to the commit North's committed out/ was built and
-      # tested against (single source of truth: north/FRAM_VERSION). Fram's main
-      # moves independently; this keeps its churn from silently breaking us.
-      - name: Resolve pinned Fram version
-        id: fram
-        run: echo "ref=$(grep -v '^#' north/FRAM_VERSION | head -1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+      # Resolve the exact source inputs used by North's Nix packages, CI, and
+      # Docker image. There are no second hand-maintained source pointers.
+      - name: Resolve locked source inputs
+        id: sources
+        run: |
+          echo "fram_repository=$(north/bin/github-flake-input-pin north/flake.lock fram repository)" >> "$GITHUB_OUTPUT"
+          echo "fram_ref=$(north/bin/github-flake-input-pin north/flake.lock fram revision)" >> "$GITHUB_OUTPUT"
+          echo "beagle_repository=$(north/bin/github-flake-input-pin north/flake.lock beagle repository)" >> "$GITHUB_OUTPUT"
+          echo "beagle_ref=$(north/bin/github-flake-input-pin north/flake.lock beagle revision)" >> "$GITHUB_OUTPUT"
       - name: Checkout Fram engine (pinned)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          repository: Autonymy/fram
-          ref: ${{ steps.fram.outputs.ref }}
+          repository: ${{ steps.sources.outputs.fram_repository }}
+          ref: ${{ steps.sources.outputs.fram_ref }}
           path: fram
 
+      # web-bjs/out is generated, never trusted from a checkout. Pin the
+      # compiler used to regenerate it just as strictly as the Fram engine.
+      - name: Checkout Beagle compiler (pinned)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ steps.sources.outputs.beagle_repository }}
+          ref: ${{ steps.sources.outputs.beagle_ref }}
+          path: beagle
+
+      - name: Verify locked source identities
+        run: |
+          set -euo pipefail
+          test "$(git -C fram rev-parse HEAD)" = "${{ steps.sources.outputs.fram_ref }}"
+          test "$(git -C beagle rev-parse HEAD)" = "${{ steps.sources.outputs.beagle_ref }}"
+
       - name: Install babashka
-        run: curl -sL https://raw.githubusercontent.com/babashka/babashka/master/install | sudo bash
+        run: |
+          set -euo pipefail
+          asset=babashka-1.12.218-linux-amd64-static.tar.gz
+          curl -fL --retry 5 -o "$asset" \
+            "https://github.com/babashka/babashka/releases/download/v1.12.218/$asset"
+          echo "7bd028cc794732ffde3da31ce4379840893c8e54f1046f92a8dfc4f4b3cddaf8  $asset" \
+            | sha256sum -c -
+          sudo tar -xzf "$asset" -C /usr/local/bin bb
+          test "$(bb --version)" = "babashka v1.12.218"
+          rm -f "$asset"
 
       # Fram's coordinator daemon (bin/fram-daemon) runs on the JVM via `clojure -M`,
       # NOT babashka — bb's native image lacks javax.net.ssl.SSLServerSocket (engine
@@ -35,10 +66,14 @@ jobs:
       # Clojure CLI + a JDK (ubuntu-latest ships a JDK; rlwrap isn't needed for `clojure`).
       - name: Install Clojure CLI (Fram's coordinator daemon is JVM, not bb)
         run: |
-          curl -L -O https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-          chmod +x linux-install.sh
-          sudo ./linux-install.sh
-          clojure --version
+          set -euo pipefail
+          curl -fL --retry 5 -o clojure-install.sh \
+            https://github.com/clojure/brew-install/releases/download/1.12.5.1654/linux-install.sh
+          echo "28f81b0833c0a072f4370ae0eb1e4c5a4f9f4a34035cd7607ea9f253a8b06da1  clojure-install.sh" \
+            | sha256sum -c -
+          sudo bash clojure-install.sh
+          clojure -Sdescribe | grep -F '"1.12.5.1654"'
+          rm -f clojure-install.sh
 
       # Pre-download Fram's JVM deps (cheshire) so the daemon boots within the test
       # poll window instead of racing a cold Maven fetch on first launch.
@@ -46,17 +81,74 @@ jobs:
         working-directory: fram
         run: clojure -P
 
+      - name: Shell source validation
+        working-directory: north
+        run: |
+          set -euo pipefail
+          mapfile -d '' candidates < <(find bin cli/tests deploy/gateway -type f -print0)
+          scripts=()
+          for file in "${candidates[@]}"; do
+            IFS= read -r first < "$file" || true
+            case "$first" in
+              '#!'*bash*|'#!'*'/sh'|'#!'*' env sh') scripts+=("$file") ;;
+            esac
+          done
+          ((${#scripts[@]} > 0))
+          shellcheck "${scripts[@]}"
+
+      - name: Lock and packaged-helper boundaries
+        working-directory: north
+        run: |
+          set -euo pipefail
+          bash bin/tests/github-flake-input-pin-test.sh
+          bash cli/tests/package-helper-smoke-test.sh
+
+      - name: Docker context and runtime closure
+        working-directory: north
+        run: CONTAINER_ENGINE=docker bash bin/tests/docker-context-test.sh
+
       - name: Domain tests (run on the committed out/, no Beagle build needed)
         working-directory: north
         run: |
+          set -euo pipefail
           CP="out:../fram/out"
           bb -cp "$CP" clock_test.clj
+          bb -cp "$CP" cli/tests/coordinator-diagnostic-test.clj
           bb -cp "$CP" staleness_test.clj
           bb reap_test.clj      # reactor reap verdict (daemon-free; guards the @run-join false positive)
           # Fram no longer ships a facts.log, so generate one (and exercise the
           # current log format) before the lifecycle test — otherwise it skips.
           ( cd ../fram && bin/fram import )
           FRAM_LOG=../fram/facts.log bb -cp "$CP" lifecycle_test.clj
+
+      - name: Coordinator policy and startup boundaries
+        working-directory: north
+        run: |
+          set -euo pipefail
+          bb cli/tests/concern-code-response-test.clj
+          bb cli/tests/context-replacement-test.clj
+          bb cli/tests/coord-wire-boundary-test.clj
+          bash cli/tests/north-explicit-log-test.sh
+          FRAM_TEST_CHECKOUT="$GITHUB_WORKSPACE/fram" \
+            bash cli/tests/north-coord-up-test.sh
+
+      - name: Coordinator strict-corpus integration
+        working-directory: north
+        run: |
+          set -euo pipefail
+          FRAM_PATH="$GITHUB_WORKSPACE/fram" \
+            bash cli/tests/coord-log-fence-integration-test.sh
+
+      - name: Gateway policy boundaries
+        working-directory: north
+        run: |
+          set -euo pipefail
+          bb -cp out cli/tests/gateway-policy-test.clj
+          GATEWAY_LIB_ONLY=1 bb -cp out cli/tests/gateway-boundary-test.clj
+
+      - name: Gateway provision transaction boundaries
+        working-directory: north
+        run: bash deploy/gateway/provision_test.sh
 
       - name: Gateway integration smoke test
         working-directory: north
@@ -65,3 +157,95 @@ jobs:
       - name: Gateway cross-host test (FRAM_BIND=0.0.0.0 + :coordinator-host)
         working-directory: north
         run: FRAM_HOME="$GITHUB_WORKSPACE/fram" bash deploy/gateway/crosshost_test.sh
+
+      - name: Arena strict-corpus integration
+        working-directory: north
+        run: FRAM_HOME="$GITHUB_WORKSPACE/fram" bash bin/tests/arena-seed-test.sh
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.13
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+
+      # Ubuntu's runner image does not ship bubblewrap. Resolve it through
+      # North's locked nixpkgs so the full read-only-shell boundary runs instead
+      # of being skipped or depending on a mutable host package.
+      - name: Resolve SDK Linux sandbox dependency
+        working-directory: north
+        run: |
+          set -euo pipefail
+          # Ubuntu 24.04's global AppArmor user-namespace restriction blocks a
+          # Nix-store bwrap path. This is an ephemeral single-job VM; disabling
+          # that host-level restriction lets the tests exercise North's own
+          # mount/network/seccomp sandbox instead of skipping it.
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap="$(nix build --no-link --print-out-paths \
+            --inputs-from . nixpkgs#bubblewrap)/bin/bwrap"
+          test -x "$bwrap"
+          echo "NORTH_BWRAP_BIN=$bwrap" >> "$GITHUB_ENV"
+
+      - name: SDK type, build, and coordination boundaries
+        working-directory: north/sdk
+        run: |
+          set -euo pipefail
+          test "$(bun --version)" = 1.3.13
+          bun install --frozen-lockfile
+          bun run check
+          bun test
+
+      - name: Build pinned Beagle compiler
+        id: beagle
+        working-directory: north
+        run: |
+          set -euo pipefail
+          out="$(nix build --no-link --print-out-paths 'path:../beagle#beagle')"
+          test -x "$out/bin/beagle"
+          test -f "$out/beagle-lib/lib/beagle/core.js"
+          echo "$out/bin" >> "$GITHUB_PATH"
+          echo "runtime=$out/beagle-lib/lib/beagle" >> "$GITHUB_OUTPUT"
+
+      - name: Compile and test Beagle web boundary
+        working-directory: north
+        env:
+          BEAGLE_RUNTIME: ${{ steps.beagle.outputs.runtime }}
+        run: |
+          set -euo pipefail
+          rm -rf web-bjs/out web-bjs/node_modules
+          mkdir -p web-bjs/node_modules
+          ln -s "$BEAGLE_RUNTIME" web-bjs/node_modules/beagle
+          BEAGLE_EMIT_SRCLOC=0 beagle build web-bjs/src --out web-bjs/out
+          while IFS= read -r -d '' js; do
+            node --check "$js"
+          done < <(find web-bjs/out -type f -name '*.js' -print0)
+          bun test web-bjs/test/*.test.js
+
+      - name: Build locked North Nix package
+        working-directory: north
+        run: |
+          set -euo pipefail
+          out="$(nix build --no-link --print-build-logs --print-out-paths \
+            'path:.#packages.x86_64-linux.default')"
+          test -x "$out/bin/north"
+          web_out="$(nix build --no-link --print-build-logs --print-out-paths \
+            'path:.#packages.x86_64-linux.north-web')"
+          test -x "$web_out/bin/north-web"
+          test ! -e "$web_out/libexec/north-web/smoke.js"
+          test -f "$web_out/libexec/north-web/node_modules/beagle/core.js"
+          test -f "$web_out/libexec/north-web/node_modules/beagle/hamt.js"
+          test -f "$web_out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
+          grep -q 'The Cytoscape Consortium' \
+            "$web_out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
+          test ! -e "$web_out/share/north-web/static/assets/js/app.js"
+          test ! -e "$web_out/share/north-web/static/hologram"
+          test ! -e "$web_out/share/north-web/static/images/logo.svg"
+          test ! -e "$web_out/share/north-web/static/js/dag.js"
+          if nix-store -qR "$web_out" |
+            grep -Ei '/[^/]*(beagle|racket|nodejs|babashka)-'; then
+            echo "north-web retained a compiler/test-only runtime dependency" >&2
+            exit 1
+          fi

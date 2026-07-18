@@ -175,8 +175,7 @@
                      ["assign" ["peer-agent" "director"]]
                      ["unassign" ["peer-agent" "director"]]
                      ["watch" ["peer-agent" "@thread-probe"]]
-                     ["unwatch" ["peer-agent" "@thread-probe"]]
-                     ["compact" ["peer-agent"]]]]
+                     ["unwatch" ["peer-agent" "@thread-probe"]]]]
   (let [result (apply proc/shell
                       {:out :string :err :string :continue true
                        :extra-env {"AGENT_TOPOLOGY" "worker" "AGENT_ID" "worker-self"}}

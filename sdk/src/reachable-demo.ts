@@ -4,13 +4,15 @@
 //   AGENT_ID=demo1 MAX_PINGS=1 bun run src/reachable-demo.ts
 //   # then, from anywhere:
 //   bb cli/north-listen... no — to PING it:
-//   bb ~/code/north/cli/msg-cli.clj 7977 send tester demo1 "URGENT" "look at flake.bnix"
+//   bb <north-runtime>/cli/msg-cli.clj 7977 send tester demo1 "URGENT" "look at flake.bnix"
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { resolve } from "node:path";
 import { harnessOptions } from "./harness";
 import { inputChannel, subscribeFeed } from "./coordination";
 
 const self = process.env.AGENT_ID ?? `sdk-reachable-${Date.now().toString(36).slice(-6)}`;
 const maxPings = Number(process.env.MAX_PINGS ?? 1);
+const repo = resolve(import.meta.dir, "../..");
 
 const ch = inputChannel(
   `You are north coordination agent "${self}". Reply with ONE short line acknowledging you are live and listening. ` +
@@ -26,7 +28,7 @@ const stop = subscribeFeed(self, (m) => {
 
 const q = query({ prompt: ch.stream(), options: harnessOptions({ self, model: "haiku", extraTools: ["Bash"] }) });
 
-console.log(`[reachable] @${self} live. Ping it:\n  bb ~/code/north/cli/msg-cli.clj 7977 send tester ${self} "URGENT" "<msg>"\n`);
+console.log(`[reachable] @${self} live. Ping it:\n  bb ${repo}/cli/msg-cli.clj 7977 send tester ${self} "URGENT" "<msg>"\n`);
 for await (const msg of q as any) {
   if (msg.type === "assistant") {
     const txt = (msg.message?.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("");

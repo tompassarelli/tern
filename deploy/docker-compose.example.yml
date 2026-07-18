@@ -14,25 +14,32 @@
 # depth you can ALSO enable engine mTLS (FRAM_TLS_KEYSTORE/TRUSTSTORE/PASS) so the
 # coordinator itself rejects any client without a trusted cert.
 #
-# The tenant registry (/srv/north/tenants.edn) gives each tenant a :coordinator-host
+# The tenant registry (/srv/north/gateway/tenants.edn) gives each tenant a :coordinator-host
 # of its service name, e.g.:
-#   {"acme"   {:tokens #{"<sha256>"} :coordinator-host "coordinator-acme"   :coordinator-port 7801}
-#    "globex" {:tokens #{"<sha256>"} :coordinator-host "coordinator-globex" :coordinator-port 7802}}
+#   {"acme"   {:tokens #{"<sha256>"} :coordinator-host "coordinator-acme"
+#              :coordinator-port 7801 :coordinator-log "/srv/north/tenant/facts.log"}
+#    "globex" {:tokens #{"<sha256>"} :coordinator-host "coordinator-globex"
+#              :coordinator-port 7802 :coordinator-log "/srv/north/tenant/facts.log"}}
+# The repeated coordinator-log is intentional: it is the canonical path inside
+# each isolated coordinator container. The gateway forwards it as protocol data
+# and never resolves it in its own mount namespace.
 #
 # Usage:
 #   docker build -t north:latest ..
 #   docker compose -f docker-compose.example.yml up -d
-#   # provision mints tokens; set :coordinator-host to the service name afterwards
-#   # (provision.sh defaults it to 127.0.0.1 — override in the registry for compose).
+#   # Create /srv/north/tenants/{acme,globex} and /srv/north/gateway first.
+#   # Keep tenants.edn in /srv/north/gateway; mount the DIRECTORY so atomic
+#   # registry renames remain visible to the gateway.
 
 services:
   coordinator-acme:
     image: north:latest
     environment:
       FRAM_BIND: "0.0.0.0"          # reachable by the gateway on acme-net (only)
+      FRAM_REQUIRE_LOG_FENCE: "1"   # reject every unfenced coordinator request
       FRAM_PORT: "7801"
-      FRAM_LOG: /srv/north/tenants/acme/facts.log
-    volumes: ["/srv/north:/srv/north"]
+      FRAM_LOG: /srv/north/tenant/facts.log
+    volumes: ["/srv/north/tenants/acme:/srv/north/tenant"]
     networks: [acme-net]            # isolated: only the gateway also joins acme-net
     restart: unless-stopped         # NOTE: port intentionally NOT published to host
 
@@ -40,9 +47,10 @@ services:
     image: north:latest
     environment:
       FRAM_BIND: "0.0.0.0"
+      FRAM_REQUIRE_LOG_FENCE: "1"
       FRAM_PORT: "7802"
-      FRAM_LOG: /srv/north/tenants/globex/facts.log
-    volumes: ["/srv/north:/srv/north"]
+      FRAM_LOG: /srv/north/tenant/facts.log
+    volumes: ["/srv/north/tenants/globex:/srv/north/tenant"]
     networks: [globex-net]          # isolated: cannot reach coordinator-acme
     restart: unless-stopped
 
@@ -51,11 +59,13 @@ services:
     command: ["bash","-lc","exec bb -cp /opt/north/out /opt/north/deploy/gateway/gateway.clj"]
     environment:
       GATEWAY_PORT: "8088"
-      GATEWAY_TENANTS: /srv/north/tenants.edn
+      GATEWAY_TENANTS: /srv/north/gateway/tenants.edn
       # Optional SSRF allowlist — restrict where the gateway will forward:
       GATEWAY_ALLOWED_COORD_HOSTS: "coordinator-acme,coordinator-globex"
     ports: ["8088:8088"]            # the ONLY published port (front it with TLS)
-    volumes: ["/srv/north:/srv/north"]
+    # Read-only directory mount, not a single-file mount: host-side atomic
+    # replacement of tenants.edn stays visible without exposing tenant logs.
+    volumes: ["/srv/north/gateway:/srv/north/gateway:ro"]
     networks: [edge, acme-net, globex-net]   # bridges the edge to each tenant's net
     depends_on: [coordinator-acme, coordinator-globex]
     restart: unless-stopped

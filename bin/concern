@@ -6,10 +6,12 @@
 # FOOTPRINT = CODE-GRAPH BLAST JOINS (thread 019f1010-2705): on a FLIPPED Beagle repo
 # (a warm fram code daemon is up) footprint rides code-node IDENTITY via the per-repo
 # code store — scope-correct, rename-stable. We discover that repo's code-daemon port
-# here and hand it to the CLI as $NORTH_CODE_PORT (the :7977 board stays the spine).
+# here and hand the exact port/log pair to the CLI (the :7977 board stays the spine).
 # No live code daemon -> the CLI degrades to path-string footprint.
 set -euo pipefail
-BOARD=7977
+ROOT="${NORTH_HOME:-$(cd "$(dirname "$0")/.." && pwd -P)}"
+BOARD="${NORTH_PORT:-7977}"
+BB="${NORTH_BB:-bb}"
 
 # Best-effort repo for code-daemon discovery: `declare` carries it positionally
 # (`declare <agent> <repo> ...` => $3), other verbs read the concern's stored
@@ -19,27 +21,66 @@ if [ "${1:-}" = "declare" ]; then repo="${3:-}"; fi
 [ -z "$repo" ] && repo="$PWD"
 repo="${repo/#\~/$HOME}"
 
-# port of the per-repo warm code daemon, IFF one is actually listening there.
-discover_code_port() {
-  local dir="$1" cand=""
-  [ -d "$dir" ] || return 0
-  # 1) .mcp.json FRAM_CODE_PORT (written by fram-code-on)
-  if [ -f "$dir/.mcp.json" ]; then
-    cand="$(grep -oE '"FRAM_CODE_PORT"[^0-9]*[0-9]+' "$dir/.mcp.json" 2>/dev/null | grep -oE '[0-9]+' | tail -1)"
+# True only when the exact port has a listener, on Linux or Darwin.
+port_listening() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :$port" 2>/dev/null | grep -q .
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | grep -q .
+  else
+    return 1
   fi
-  # 2) else a .fram/coord-<port>.log left by a boot
-  if [ -z "$cand" ] && [ -d "$dir/.fram" ]; then
+}
+
+canonical_file() {
+  local file="$1" parent
+  parent="$(cd "$(dirname "$file")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$parent" "$(basename "$file")"
+}
+
+# Exact port/log pair of the per-repo warm code daemon, IFF one is listening.
+discover_code_target() {
+  local dir="$1" cand="" log="" pair=""
+  [ -d "$dir" ] || return 0
+  # 1) .mcp.json authoritative FRAM_CODE_PORT + FRAM_CODE_LOG pair.
+  if [ -f "$dir/.mcp.json" ]; then
+    pair="$("$BB" -e '
+      (require (quote [cheshire.core :as json]))
+      (try
+        (let [doc (json/parse-string (slurp (first *command-line-args*)))
+              env (or (get-in doc ["mcpServers" "fram" "env"])
+                      (get-in doc ["mcpServers" "fram-code" "env"]))
+              port (get env "FRAM_CODE_PORT")
+              log (get env "FRAM_CODE_LOG")]
+          (when (and (string? port) (string? log))
+            (println (str port "\t" log))))
+        (catch Exception _ nil))' "$dir/.mcp.json" 2>/dev/null || true)"
+    [ -n "$pair" ] || return 0
+    cand="${pair%%	*}"
+    log="${pair#*	}"
+  elif [ -d "$dir/.fram" ]; then
+    # Legacy boot residue is accepted only as a complete conventional pair.
     local f
     for f in "$dir"/.fram/coord-*.log; do
       [ -e "$f" ] || continue
       cand="$(basename "$f" | sed -E 's/coord-([0-9]+)\.log/\1/')"; [ -n "$cand" ] && break
     done
+    log="$dir/.fram/code.log"
   fi
-  # only adopt it if a daemon is genuinely listening (a stale port would hang writes)
-  if [ -n "$cand" ] && ss -ltn 2>/dev/null | grep -q ":$cand "; then echo "$cand"; fi
+  [[ "$cand" =~ ^[0-9]+$ ]] || return 0
+  ((cand >= 1 && cand <= 65535)) || return 0
+  [[ "$log" = /* ]] || return 0
+  [ -e "$log" ] || return 0
+  log="$(canonical_file "$log")" || return 0
+  port_listening "$cand" || return 0
+  printf '%s\t%s\n' "$cand" "$log"
 }
 
-CODE_PORT="$(discover_code_port "$repo" || true)"
-[ -n "${CODE_PORT:-}" ] && export NORTH_CODE_PORT="$CODE_PORT"
+CODE_TARGET="$(discover_code_target "$repo" || true)"
+if [ -n "${CODE_TARGET:-}" ]; then
+  export NORTH_CODE_PORT="${CODE_TARGET%%	*}"
+  export NORTH_CODE_LOG="${CODE_TARGET#*	}"
+fi
 
-exec bb "$HOME/code/north/cli/concern-cli.clj" "$BOARD" "$@"
+exec "$BB" "$ROOT/cli/concern-cli.clj" "$BOARD" "$@"

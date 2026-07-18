@@ -10,7 +10,9 @@
 # caller also configures FRAM_TELEMETRY_LOG).
 set -euo pipefail
 NORTH="$(cd "$(dirname "$0")/.." && pwd)"
-FRAM="${FRAM_HOME:-$HOME/code/fram}"
+FRAM_HOME="${FRAM_HOME:-$HOME/code/fram}"
+FRAM_OUT="${FRAM_OUT:-$FRAM_HOME/out}"
+BB="${NORTH_BB:-bb}"
 if [ -z "${FRAM_LOG:-}" ]; then
   if [ -f "$HOME/.local/state/north/coordination.log" ]; then
     export FRAM_LOG="$HOME/.local/state/north/coordination.log"
@@ -18,4 +20,4 @@ if [ -z "${FRAM_LOG:-}" ]; then
     export FRAM_LOG="$HOME/.local/state/north/facts.log"
   fi
 fi
-exec bb -cp "$NORTH/out:$FRAM/out" "$NORTH/cli/clock-audit.clj" "$@"
+exec "$BB" -cp "$NORTH/out:$FRAM_OUT" "$NORTH/cli/clock-audit.clj" "$@"

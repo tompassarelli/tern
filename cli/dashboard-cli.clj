@@ -18,13 +18,15 @@
 
 (def HOME (System/getenv "HOME"))
 ;; this file lives in north/cli — NORTH is its repo root.
-(def NORTH (str (.getParent (.getParentFile (io/file (or *file* (str HOME "/code/north/cli/dashboard-cli.clj")))))))
-(def FRAM (str HOME "/code/fram"))
-(def NIXCFG (str HOME "/code/nixos-config"))
+(def SCRIPT (or (System/getProperty "babashka.file") *file*))
+(def NORTH (some-> SCRIPT io/file .getCanonicalFile .getParentFile .getParentFile str))
+(def FRAM (or (System/getenv "FRAM_HOME") (str HOME "/code/fram")))
+(def FRAM-BIN (or (System/getenv "FRAM_BIN") (str FRAM "/bin")))
+(def NIXCFG (or (System/getenv "NIXOS_CONFIG_HOME") (str HOME "/code/nixos-config")))
 (def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
 (load-file (str NORTH "/cli/harness-state.clj"))
 (def CACHE-DIR (str HOME "/.cache/north"))
-(def PORT "7977")
+(def PORT (or (System/getenv "NORTH_PORT") "7977"))
 (def CACHE-SCOPE (str (hash (str (or (System/getenv "FRAM_LOG") "default") "|"
                                 (or (System/getenv "FRAM_TELEMETRY_LOG") "") "|" PORT))))
 
@@ -158,18 +160,23 @@
     (catch Exception _ nil))
   val)
 
-;; ---- ss: which ports are listening ------------------------------------------
+;; ---- portable listener discovery: ss on Linux, lsof on Darwin ---------------
 (defn listening-ports []
-  (let [r (run ["ss" "-tlnH"] :timeout 1500)]
-    (if (:out r)
-      (set (map second (re-seq #":(\d+)\s" (:out r))))
-      #{})))
+  (let [ss (run ["ss" "-tlnH"] :timeout 1500)]
+    (if (:ok ss)
+      (set (map second (re-seq #":(\d+)\s" (:out ss))))
+      (let [lsof (run ["lsof" "-nP" "-iTCP" "-sTCP:LISTEN" "-Fn"] :timeout 1500)]
+        (if (:ok lsof)
+          (->> (str/split-lines (:out lsof))
+               (keep #(some-> (re-find #":(\d+)$" %) second))
+               set)
+          #{})))))
 
 (defn daemon-health []
   ;; Two daemons is the whole surface (2026-07-09): the fact coordinator and
   ;; the web cockpit. :7978/:7980 retired — modules deleted in nixos-config.
   (let [ports (listening-ports)]
-    {:north (contains? ports "7977")   ; fact coordinator (the canonical log)
+    {:north (contains? ports PORT)     ; fact coordinator (the canonical log)
      :web  (contains? ports "8088")   ; bjs/Bun cockpit
      :ports ports}))
 
@@ -329,7 +336,7 @@
 (defn code-status
   "fram-code-status for cwd -> parsed key=val map (level, canonical, coord...)."
   []
-  (let [r (run [(str FRAM "/bin/fram-code-status")] :timeout 3000)]
+  (let [r (run [(str FRAM-BIN "/fram-code-status")] :timeout 3000)]
     (when (:ok r)
       (into {} (for [[_ k v] (re-seq #"(\w+)=(\S+)" (:out r))] [k v])))))
 
@@ -354,13 +361,27 @@
     {:mode mode :daemons dh :level level :canonical canon :owned owned
      :p1 p1? :p2 p2? :rung rung :code-status cs}))
 
+(defn source-revision
+  "Packaged runtimes identify their immutable inputs; source runs use checkout HEAD."
+  [name repo]
+  (let [git-result (run ["git" "-C" repo "rev-parse" "--short" "HEAD"] :timeout 2000)
+        git-rev (when (:ok git-result) (not-empty (str/trim (:out git-result))))
+        package-rev (case name
+                      "north" (System/getenv "NORTH_PACKAGE_REV")
+                      "fram" (System/getenv "FRAM_PACKAGE_REV")
+                      nil)]
+    (cond
+      (not-empty package-rev) {:revision package-rev :origin "package rev"}
+      git-rev {:revision git-rev :origin "tree HEAD"}
+      :else {:revision "?" :origin "source rev"})))
+
 ;; ============================================================================
 ;; COMMANDS
 ;; ============================================================================
 
 (defn cmd-dashboard [_]
   ;; Two probe classes, sized to where the work actually happens:
-  ;;   NON-coordinator probes parallelize freely — ss (daemon-health), a log-file
+  ;;   NON-coordinator probes parallelize freely — listener health, a log-file
   ;;   read (agent-facts), fram-code-status (profile). None touches :7977, so futures
   ;;   genuinely run at once.
   ;;   COORDINATOR-bound probes (board, presence, concern, health) all hit the SINGLE-
@@ -418,7 +439,7 @@
     (println)
     ;; daemons
     (println (bold "daemons"))
-    (println (str "  7977 facts " (ok-x (:north dh))
+    (println (str "  " PORT " facts " (ok-x (:north dh))
                   "   8088 web " (ok-x (:web dh))))
     (println)
     ;; health — north health condensed (lanes ran/died + STALE concerns)
@@ -473,7 +494,7 @@
   ;; daemons
   (let [dh (daemon-health)]
     (println (bold "  daemons"))
-    (doseq [[label k crit] [["7977 facts (the coordinator — everything reads/writes here)" :north true]
+    (doseq [[label k crit] [[(str PORT " facts (the coordinator — everything reads/writes here)") :north true]
                             ["8088 web (bjs/Bun cockpit)" :web false]]]
       (let [up (get dh k)]
         (println (str "    " (if up (grn "[ok]  ") (if crit (red "[ERR] ") (ylw "[warn]")))
@@ -495,19 +516,25 @@
         (println (str "    " (grn "[ok]  ") " "
                       (or lanes-ran-24h "?") " ran" died-part " (24h)"
                       "   concerns  " (or concerns-active "?") " active" stale-part)))))
-  ;; installed-vs-tree rev skew (north + fram)
-  (println (bold "  installed-vs-tree skew"))
+  ;; Runtime source identity (north + fram). A package revision identifies the
+  ;; installed closure; a checkout HEAD is only source context, not proof that a
+  ;; separately installed store path contains that tree.
+  (println (bold "  runtime source identity"))
   (doseq [[name repo] [["north" NORTH] ["fram" FRAM]]]
-    (let [head (some-> (run ["git" "-C" repo "rev-parse" "--short" "HEAD"] :timeout 2000)
-                       :out str/trim)
-          which (some-> (run ["sh" "-c" (str "readlink -f \"$(command -v " name ")\"")] :timeout 1500)
-                        :out str/trim)
+    (let [{:keys [revision origin]} (source-revision name repo)
+          command-result (run ["bash" "-c" "command -v \"$1\"" "north-doctor" name] :timeout 1500)
+          which (when (:ok command-result)
+                  (some-> (:out command-result) str/trim not-empty
+                          io/file .getCanonicalPath))
           store (some->> which (re-find #"/nix/store/[^/]+"))]
-      (println (str "    " (cyn name) "  tree HEAD " (or head "?")
+      (println (str "    " (cyn name) "  " origin " " revision
                     "  installed " (or store which "?")))
       (when (and store (not (str/includes? (or which "") repo)))
-        (println (dim (str "         (installed via nix store; git rev not embedded — "
-                           "compare after `firn rebuild` if HEAD moved)"))))))
+        (println
+         (dim
+          (if (= origin "package rev")
+            "         (installed via nix store; embedded package revision shown above)"
+            "         (installed via nix store; tree HEAD is checkout context, not the store closure identity)"))))))
   ;; stale FRAM_LOG env pointing at a claims-named path
   (println (bold "  env hygiene"))
   (let [fl (System/getenv "FRAM_LOG")]

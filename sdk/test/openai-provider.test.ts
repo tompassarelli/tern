@@ -16,6 +16,7 @@ import { selectProviderFromAvailability } from "../src/provider-routing";
 const savedBin = process.env.NORTH_CODEX_BIN;
 const savedHome = process.env.HOME;
 const savedPort = process.env.NORTH_PORT;
+const savedFramLog = process.env.FRAM_LOG;
 const savedLaws = process.env.AGENT_LAWS;
 const savedGaffer = process.env.GAFFER_HOME;
 const northRoot = realpathSync(join(import.meta.dir, "../.."));
@@ -27,6 +28,8 @@ afterEach(() => {
   else process.env.HOME = savedHome;
   if (savedPort === undefined) delete process.env.NORTH_PORT;
   else process.env.NORTH_PORT = savedPort;
+  if (savedFramLog === undefined) delete process.env.FRAM_LOG;
+  else process.env.FRAM_LOG = savedFramLog;
   if (savedLaws === undefined) delete process.env.AGENT_LAWS;
   else process.env.AGENT_LAWS = savedLaws;
   if (savedGaffer === undefined) delete process.env.GAFFER_HOME;
@@ -376,8 +379,17 @@ test("the executable Codex adapter rejects orchestrator authority before startin
 });
 
 test("selected Codex account bootstrap fails during admission before onRoute or provider spawn", async () => {
+  let coordinatorLog = "";
   const server = createServer((socket) => {
-    socket.once("data", () => socket.end("{:version \"target-admission\"}\n"));
+    socket.once("data", (chunk) => {
+      if (chunk.toString("utf8").includes(":for-log")) {
+        socket.end("{:version 23}\n");
+      } else {
+        socket.end(
+          `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(coordinatorLog)}}\n`,
+        );
+      }
+    });
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -389,6 +401,8 @@ test("selected Codex account bootstrap fails during admission before onRoute or 
   process.env.AGENT_LAWS = "on";
   process.env.GAFFER_HOME = realpathSync(join(northRoot, "../gaffer"));
   process.env.NORTH_PORT = String((server.address() as AddressInfo).port);
+  process.env.FRAM_LOG = join(home, "north target admission.log");
+  coordinatorLog = process.env.FRAM_LOG;
   const codexHome = join(home, ".codex");
   mkdirSync(codexHome);
   writeFileSync(join(codexHome, "AGENTS.md"), "TARGET_ADMISSION_CANONICAL\n");

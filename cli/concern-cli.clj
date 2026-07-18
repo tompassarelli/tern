@@ -12,7 +12,7 @@
 ;; :query (the daemon's :concern-overlap) — scope-correct (same-named fns in different
 ;; modules never false-overlap), rename-stable (keyed on node identity), and it SEES a
 ;; peer's committed-but-unrendered footprint fact with no render and no merge. The spine
-;; (title/intent/agent/driver/repo/code_port + monotone `reached` maturity) lives on the
+;; (title/intent/agent/driver/repo/code_port/code_log + monotone `reached` maturity) lives on the
 ;; :7977 board; the high-frequency footprint facts shard onto the per-repo code daemon —
 ;; the shared @concern:<id> string bridges the two jurisdictions, no distributed tx.
 ;; A NON-flipped repo (no code daemon) DEGRADES to the path-string footprint + intersection.
@@ -37,6 +37,7 @@
 ;; cli/coord.clj. append! = MULTI coexist; put! = SINGLE last-writer-wins.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
 (def send-op  north.coord/send-op)
+(def send-op-for-log north.coord/send-op-for-log)
 (def append!  north.coord/append!)
 (def put!     north.coord/put!)
 (def many     north.coord/many)
@@ -91,11 +92,115 @@
 
 (defn with-liveness [port m] (merge m (owner-liveness port m)))
 
-;; port coercion: coord/send-op does (int port), so every port must be a NUMBER, never a
-;; string (env vars + the stored code_port fact arrive as strings).
-(defn ->port [p] (cond (nil? p) nil (number? p) p :else (Integer/parseInt (str p))))
-;; the per-repo CODE daemon port (bin/concern discovers + exports it); nil => path fallback.
-(def code-port (let [p (System/getenv "NORTH_CODE_PORT")] (when (and p (seq p)) (->port p))))
+(defn configuration-error! [message]
+  (binding [*out* *err*]
+    (println (str "concern: " message)))
+  (System/exit 2))
+(defn ->port [value]
+  (when-not (nil? value)
+    (let [text (str value)]
+      (when-not (re-matches #"[0-9]+" text)
+        (configuration-error!
+         (str "code-store port must be an integer from 1 through 65535, got "
+              (pr-str text))))
+      (let [port (parse-long text)]
+        (when-not (and port (<= 1 port 65535))
+          (configuration-error!
+           (str "code-store port must be an integer from 1 through 65535, got "
+                (pr-str text))))
+        (int port)))))
+(defn env-value [name]
+  (let [value (System/getenv name)]
+    (when-not (str/blank? value) value)))
+
+;; A code-store port is not an identity. The wrapper must supply the exact log
+;; served on that port; accepting only one half would let a concern write into
+;; whichever corpus happened to be listening there.
+(def raw-code-port (env-value "NORTH_CODE_PORT"))
+(def raw-code-log (env-value "NORTH_CODE_LOG"))
+(when (not= (boolean raw-code-port) (boolean raw-code-log))
+  (configuration-error!
+   "NORTH_CODE_PORT and NORTH_CODE_LOG must be supplied together"))
+(when (and raw-code-log (not (.isAbsolute (io/file raw-code-log))))
+  (configuration-error! "NORTH_CODE_LOG must be an absolute path"))
+(def code-port (some-> raw-code-port ->port))
+(def code-log (some-> raw-code-log north.coord/canonical-log-path))
+
+(defn code-store-error! [message]
+  (binding [*out* *err*]
+    (println (str "concern: code-store safety check failed: " message)))
+  (System/exit 3))
+
+(defn exact-keys? [value expected]
+  (and (map? value) (= expected (set (keys value)))))
+
+(defn strings? [value]
+  (and (vector? value) (every? string? value)))
+
+(defn valid-code-response? [operation response]
+  (case (:op operation)
+    :version
+    (and (exact-keys? response #{:version})
+         (integer? (:version response)))
+
+    :assert
+    (and (exact-keys? response #{:ok})
+         (integer? (:ok response)))
+
+    :blast
+    (or
+     (and (exact-keys? response #{:node :blast :count :version})
+          (string? (:node response))
+          (strings? (:blast response))
+          (integer? (:count response))
+          (= (:count response) (count (:blast response)))
+          (integer? (:version response)))
+     ;; `:blast` documents one resolvability miss. Preserve only that exact
+     ;; envelope; an arbitrary `{:error ...}` is a protocol failure.
+     (and (exact-keys? response #{:error :te :module :name :version})
+          (= "no such binding" (:error response))
+          (= (:te operation) (:te response))
+          (= (:module operation) (:module response))
+          (= (:name operation) (:name response))
+          (integer? (:version response))))
+
+    :concern-overlap
+    (and (exact-keys? response #{:concern :footprint :overlaps :version})
+         (= (:te operation) (:concern response))
+         (strings? (:footprint response))
+         (vector? (:overlaps response))
+         (every?
+          (fn [overlap]
+            (and (exact-keys? overlap #{:concern :shared :footprint})
+                 (string? (:concern overlap))
+                 (strings? (:shared overlap))
+                 (strings? (:footprint overlap))))
+          (:overlaps response))
+         (integer? (:version response)))
+
+    false))
+
+(defn code-op [port log operation]
+  (when-not (and (string? log) (.isAbsolute (io/file log)))
+    (code-store-error! "code log identity must be an absolute path"))
+  (let [response
+        (try
+          (send-op-for-log port log operation)
+          ;; coord.clj already converts parser StackOverflowError into a bounded
+          ;; protocol exception. Catch ordinary failures here without swallowing
+          ;; VM-fatal Errors.
+          (catch Exception error
+            (code-store-error!
+             (str "coordinator request failed: " (.getMessage error)))))]
+    (when (:reject response)
+      (code-store-error! (pr-str response)))
+    (when-not (valid-code-response? operation response)
+      (code-store-error!
+       (str "invalid " (name (:op operation)) " response " (pr-str response))))
+    response))
+
+(defn validate-code-store! [port log]
+  (code-op port log {:op :version}))
 
 ;; concern-id args arrive from humans/agents in either form; every fact subject in
 ;; the log carries the @ sigil, so a bare id here writes to a PHANTOM bare node —
@@ -146,12 +251,12 @@
 ;; "module/name" resolves via the daemon's binding tables (the SAME resolution rename/
 ;; who-calls use, so concern and code agree on which node a name denotes). Returns the
 ;; node's @mod#int identity, or nil (unresolvable — caller keeps it as a path-string).
-(defn resolve-node [cport arg]
+(defn resolve-node [cport clog arg]
   (let [req (cond (str/starts-with? arg "@") {:op :blast :te arg}
                   (str/includes? arg "/")    (let [[m n] (str/split arg #"/" 2)]
                                                {:op :blast :module m :name n})
                   :else                       nil)
-        resp (when req (send-op cport req))]
+        resp (when req (code-op cport clog req))]
     (when (and resp (not (:error resp))) (:node resp))))
 
 ;; ---- spine reads (:7977 board) ----------------------------------------------
@@ -169,6 +274,7 @@
    :status (status-of port c)
    :abandoned (abandoned? port c)
    :code-port (resolved port c "code_port")
+   :code-log (resolved port c "code_log")
    :touches (touches-of port c)})
 
 ;; `ls` is a whole-corpus view. Reading seven fields per concern made its runtime
@@ -176,7 +282,8 @@
 ;; each required predicate once from LIVE coordinator state instead. This keeps
 ;; declared-single supersession exact and preserves all live multi values.
 (def concern-list-predicates
-  ["kind" "agent" "repo" "intent" "reached" "code_port" "touches" "lease"])
+  ["kind" "agent" "repo" "intent" "reached" "code_port" "code_log"
+   "touches" "lease"])
 
 (defn add-live-rows [facts predicate rows]
   (reduce (fn [current [entity value]]
@@ -228,6 +335,7 @@
       :status (status-from-live facts concern)
       :abandoned (contains? reached "abandoned-stale")
       :code-port (singleton-live facts concern "code_port")
+      :code-log (singleton-live facts concern "code_log")
       :touches (get-in facts [concern "touches"] #{})}
      (liveness-from-live facts concern agent now))))
 
@@ -263,8 +371,9 @@
 ;; CODE-GRAPH path: ask the code daemon which peer concerns' blast CLOSURE intersects
 ;; mine (recursive reaches over calls_defn), then map each peer's @concern:<id> back to
 ;; its :7977 spine for display. The path-string intersection is GONE on this path.
-(defn surface-code [spine cport c statuses none-msg]
-  (let [resp (send-op cport {:op :concern-overlap :te (concern-subj c)})
+(defn surface-code [spine cport clog c statuses none-msg]
+  (let [resp (code-op cport clog
+                      {:op :concern-overlap :te (concern-subj c)})
         hits (->> (:overlaps resp)
                   (keep (fn [o]
                           (let [sid (subj->id (:concern o))
@@ -300,11 +409,34 @@
             (println "       [likely-to-land] — build against this"))
           (println (str "       SHARES: " (str/join " " (sort (set/intersection mine (:touches m)))))))))))
 
-;; the effective code port for THIS concern: its own stored code_port (set at declare,
-;; so overlap/shape work from any cwd), else the ambient $NORTH_CODE_PORT. nil => path.
+;; New concerns store both halves of the code-store identity. For a pre-fence
+;; concern that only stored code_port, derive the historical repo-local code log;
+;; never silently substitute the spine corpus or a cwd-relative log.
+(defn expand-home [path]
+  (cond
+    (= path "~") (System/getProperty "user.home")
+    (str/starts-with? (or path "") "~/")
+    (str (System/getProperty "user.home") (subs path 1))
+    :else path))
+
+(defn legacy-code-log [spine c]
+  (when-let [repo (resolved spine c "repo")]
+    (north.coord/canonical-log-path
+     (.getPath (io/file (expand-home repo) ".fram" "code.log")))))
+
+;; The effective code-store pair for THIS concern comes from its stored identity,
+;; then the legacy deterministic repo path, then the ambient explicit pair.
 (defn surface [spine c statuses none-msg]
-  (let [cport (or (->port (resolved spine c "code_port")) code-port)]
-    (if cport (surface-code spine cport c statuses none-msg)
+  (let [stored-port (some-> (resolved spine c "code_port") ->port)
+        cport (or stored-port code-port)
+        clog (when cport
+               (or (resolved spine c "code_log")
+                   (when stored-port (legacy-code-log spine c))
+                   code-log))]
+    (when (and cport (str/blank? clog))
+      (code-store-error!
+       (str c " has a code_port but no reproducible code_log identity")))
+    (if cport (surface-code spine cport clog c statuses none-msg)
               (surface-path spine c statuses none-msg))))
 
 ;; one concept, one word (vocabulary pass, thread 019f2032): `overlap` is THE footprint
@@ -326,6 +458,8 @@
           ;; @ sigil: every thread id in the facts log carries it; a bare id here made
           ;; fram's export strip the wrong char. Old bare-id concerns are tolerated, not rewritten.
           id (str "@concern-" (System/currentTimeMillis) "-" (subs (str (java.util.UUID/randomUUID)) 0 4))]
+      ;; Validate the exact code corpus before the first spine or code mutation.
+      (when code-port (validate-code-store! code-port code-log))
       ;; spine on the :7977 board (low-frequency declare/maturity); footprint NEVER lands here.
       ;; Mint a missing person label, but never overwrite a managed lane's
       ;; publisher-owned identity cache. Roster names are derived from axes.
@@ -340,14 +474,20 @@
       (put! port id "repo"   repo)                         ; single
       (put! port id "intent" intent)                       ; single
       (when code-port (put! port id "code_port" (str code-port)))   ; so a reader finds the code store
+      (when code-log (put! port id "code_log" code-log))            ; exact corpus identity
       (doseq [f fs] (append! port id "touches" f))         ; display labels (+ the fallback footprint)
       (append! port id "reached" "building")               ; monotone maturity — NOT set-single!
       ;; footprint = code-node bridge facts, on the CODE port (flipped repos only).
       (if code-port
-        (let [resolved-pairs (map (fn [f] [f (resolve-node code-port f)]) fs)
+        (let [resolved-pairs (map (fn [f] [f (resolve-node code-port code-log f)]) fs)
               hits (filter second resolved-pairs)
               misses (->> resolved-pairs (remove second) (map first))]
-          (doseq [[_ node] hits] (append! code-port (concern-subj id) "footprint" node))
+          (doseq [[_ node] hits]
+            (code-op code-port code-log
+                     {:op :assert
+                      :te (concern-subj id)
+                      :p "footprint"
+                      :r node}))
           (println (str "✓ concern " id))
           (println (str "  @" agent "  building  [" repo "]  footprint(code) {"
                         (str/join " " (map second hits)) "}"))

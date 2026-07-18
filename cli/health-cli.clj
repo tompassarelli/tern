@@ -22,7 +22,6 @@
 (def send-op  north.coord/send-op)
 
 (def HOME (System/getenv "HOME"))
-(def NORTH (str HOME "/code/north"))
 (def PORT (Integer/parseInt (or (System/getenv "NORTH_PORT") "7977")))
 
 ;; ANSI only on a real TTY; piped/captured (the convoy pane parses this) stays plain.

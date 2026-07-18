@@ -48,8 +48,14 @@ No build step (runs on the committed `out/`), no network exposure, no auth neede
 Same as Mode 1 on a server, with one of:
 
 - **SSH tunnel (zero new components):** run the coordinator on the box; forward the
-  loopback port to your workstation: `ssh -L 7977:127.0.0.1:7977 you@box`. Your
-  local CLI/MCP talks to `127.0.0.1:7977` as if local. Good for one person.
+  loopback port to your workstation: `ssh -L 7977:127.0.0.1:7977 you@box`. Before
+  using the local CLI/MCP, obtain the remote corpus identity with
+  `ssh you@box realpath -m /var/lib/north/facts.log`, then set local `FRAM_LOG`
+  to that exact canonical absolute string. Every managed request carries this
+  fence and the strict remote coordinator rejects a mismatch. If the same string
+  canonicalizes differently on the workstation (for example through a local
+  symlink), use the gateway instead; it injects the remote registry-owned identity.
+  Good for one person.
 - **The auth gateway (for non-SSH clients / an AI over HTTP):** put `deploy/gateway`
   in front (bearer token → your single tenant → the coordinator), TLS via a reverse
   proxy. This is the same component the SaaS mode uses, with one tenant.
@@ -74,6 +80,10 @@ Coordinators run either **co-located** with the gateway (loopback, the default) 
 on **separate hosts/containers** — set `FRAM_BIND=0.0.0.0` on the coordinator and
 the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 (`deploy/gateway/smoke_test.sh` loopback; `crosshost_test.sh` non-loopback).
+In either topology, run the coordinator with `FRAM_REQUIRE_LOG_FENCE=1` and set
+`:coordinator-log` to the coordinator host's canonical absolute `FRAM_LOG`
+exactly. A remote corpus path is protocol data; the gateway must not translate
+it to its own mount namespace.
 
 ### Why instance-per-tenant (not one shared graph)
 
@@ -99,6 +109,9 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 
 - The raw coordinator protocol is **unauthenticated** — it must never be exposed.
   Only the gateway is reachable, and only behind TLS.
+- Deployed coordinators require a corpus fence (`FRAM_REQUIRE_LOG_FENCE=1`).
+  The gateway supplies the authenticated tenant's exact identity; raw or
+  mismatched requests fail closed before a read or write.
 - The gateway authenticates a **bearer token**, stored **hashed** (sha-256) in the
   registry; it maps the token to exactly one tenant's coordinator.
 - Coordinators default to **loopback** (same host). To run them on separate
@@ -114,11 +127,19 @@ the tenant's `:coordinator-host` in the registry. Both paths are exercised in CI
 - **Backups:** each tenant's `facts.log` is append-only plain text — back it up
   with `git`/snapshots/object storage. `import`/`export` round-trips are lossless.
 - **Supervision:** systemd template unit per tenant (`north-coordinator@<id>`)
-  + the gateway unit; both `Restart=on-failure`. Or one container per coordinator.
+  + the gateway unit; both `Restart=on-failure`. The example template shares one
+  `north` Unix identity, so it is a same-trust-host convenience, not a
+  hostile-tenant filesystem boundary. For mutually untrusted tenants, use one
+  container per coordinator with only that tenant's directory mounted; the
+  gateway mounts only its registry directory. Start a supervised coordinator
+  first, then use `provision.sh register-existing` to prove strict same-log
+  readiness and publish its route; the standalone create mode owns its own
+  daemon and must not share a port with systemd.
 - **Upgrades:** pull the repos (or a new image tag) and restart; the log format is
   stable and forward-only.
-- **Health:** gateway `GET /healthz`; coordinator liveness via `north coord-doctor` /
-  an `{:op :status}` RPC.
+- **Health:** gateway `GET /healthz`; coordinator readiness via a fenced
+  `north coord-doctor`. A raw `{:op :version}` must return
+  `:code :log-fence-required`; mere socket liveness is not strict readiness.
 
 ---
 
@@ -162,5 +183,5 @@ wire protocol. The durable contract-of-record lives in Fram at
 `docs/coordinator-bind-and-wire.md` (the seam, the protocol surface, the
 `FRAM_BIND` security invariant, and the topology). North consumes that protocol
 through the gateway and links Fram's library API for projections (pinned via
-[`FRAM_VERSION`](../FRAM_VERSION)); it never reaches past the protocol into engine
-internals.
+the `fram` input in [`flake.lock`](../flake.lock)); it never reaches past the
+protocol into engine internals.

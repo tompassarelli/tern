@@ -15,11 +15,13 @@
     (catch Exception _ true)))
 (def port (or (some #(when (port-free? %) %) [7630 7631 7632])
               (throw (ex-info "no test port available" {}))))
-(def log (str (System/getProperty "java.io.tmpdir")
-              "/concern-cli-validation-" (System/nanoTime) ".log"))
+(def log (.getCanonicalPath
+          (io/file (System/getProperty "java.io.tmpdir")
+                   (str "concern-cli-validation-" (System/nanoTime) ".log"))))
 (spit log "")
 (def daemon
-  (p/process {:dir fram :out :string :err :string}
+  (p/process {:dir fram :out :string :err :string
+              :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"}}
              "bb" "-cp" "out" "coord_daemon.clj" "serve-flat" (str port) log))
 (defn cleanup []
   (try (p/destroy-tree daemon) (catch Throwable _ nil))
@@ -40,11 +42,17 @@
 (defn op [request]
   (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
     (let [w (.getOutputStream s) r (io/reader (.getInputStream s))]
-      (.write w (.getBytes (str (pr-str request) "\n")))
+      (.write w
+              (.getBytes
+               (str (pr-str {:op :for-log
+                             :expected-log log
+                             :request request})
+                    "\n")))
       (.flush w)
       (edn/read-string (.readLine r)))))
 (defn run-concern [& args]
-  @(apply p/process {:dir root :out :string :err :string}
+  @(apply p/process {:dir root :out :string :err :string
+                     :extra-env {"FRAM_LOG" log}}
           "bb" "cli/concern-cli.clj" (str port) args))
 (defn reached-rows []
   (:ok (op {:op :query
@@ -85,7 +93,8 @@
         :let [id (str "@concern-1700000000000-bulk" index)]
         [predicate value] [["kind" "concern"] ["reached" "building"]]]
   (op {:op :assert :te id :p predicate :r value}))
-(let [proc (p/process {:dir root :out :string :err :string}
+(let [proc (p/process {:dir root :out :string :err :string
+                       :extra-env {"FRAM_LOG" log}}
                       "bb" "cli/concern-cli.clj" (str port) "ls")
       started (System/nanoTime)
       result (deref proc 2000 ::timeout)

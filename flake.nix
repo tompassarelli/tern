@@ -5,17 +5,16 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
 
-    # The Fram engine is north's runtime library: bin/north puts
-    # $FRAM/out on the bb classpath (fram.kernel/fold/import/export/rt) and
-    # shells $FRAM/bin/fram for engine verbs. Fram ships its compiled Clojure
-    # in out/ (committed, runs on bare bb — no Beagle at runtime), so we consume
-    # it as a plain source tree (flake = false) and wrap it the same way.
-    # Pinned via this flake's lock; bump with `nix flake update fram`. (Must be a
-    # fetchable URL, never a local path — a path: leaks the author's machine into
-    # the published flake and breaks every other consumer + CI.)
+    # Fram owns and verifies its complete runtime closure. North consumes that
+    # package directly and uses its published runtime/classpath contract; it
+    # must not maintain a second partial Fram packager.
     fram = {
       url = "github:tompassarelli/fram";
-      flake = false;
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    beagle = {
+      url = "github:tompassarelli/beagle";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
     gaffer = {
       url = "github:tompassarelli/gaffer";
@@ -23,7 +22,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, fram, gaffer }:
+  outputs = { self, nixpkgs, flake-utils, fram, beagle, gaffer }:
     # nixpkgs' current Babashka no longer supports x86_64-darwin. Publish only
     # the three systems whose complete North runtime closure is evaluable.
     flake-utils.lib.eachSystem [
@@ -54,11 +53,27 @@
           pkgs.coreutils
           pkgs.bash
           pkgs.bun
+          pkgs.findutils
+          pkgs.gawk
+          pkgs.git
+          pkgs.gnugrep
+          pkgs.gnused
           pkgs.util-linux
         ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
           pkgs.iproute2
+        ] ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+          pkgs.lsof
         ];
         runtimePath = lib.makeBinPath runtimePackages;
+        framPkg = fram.packages.${system}.default;
+        framRuntimeRoot =
+          framPkg.runtimeRoot or
+            (throw "Fram package must publish passthru.runtimeRoot");
+        framBabashkaClasspath =
+          framPkg.babashkaClasspath or
+            (throw "Fram package must publish passthru.babashkaClasspath");
+        beaglePkg = beagle.packages.${system}.default;
+        beagleSource = beagle.outPath;
         sdkPlatform =
           if pkgs.stdenv.hostPlatform.isLinux then
             if pkgs.stdenv.hostPlatform.isx86_64 then
@@ -90,30 +105,39 @@
         sdkPlatformSource = pkgs.fetchurl {
           inherit (sdkPlatform) url hash;
         };
-
-        # Fram engine packaged as a relocatable tree: $out/out (classpath) +
-        # $out/bin/{fram,fram-up}. Each bin script does `dirname "$0"/..` to find
-        # its repo root, so preserving the bin/ + out/ layout keeps that working;
-        # wrapProgram only injects bb (+ daemon tools) onto PATH.
-        framPkg = pkgs.stdenvNoCC.mkDerivation {
-          pname = "fram-engine";
-          version = builtins.substring 0 12 (fram.rev or "local");
-          src = fram;
-          nativeBuildInputs = [ pkgs.makeWrapper ];
-          dontConfigure = true;
-          dontBuild = true;
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out/bin $out/out
-            cp -r out/. $out/out/
-            for f in fram fram-up fram-daemon; do
-              [ -f bin/$f ] && cp bin/$f $out/bin/$f
-            done
-            for f in $out/bin/*; do
-              wrapProgram "$f" --prefix PATH : ${runtimePath}
-            done
-            runHook postInstall
-          '';
+        runtimeSource = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./out
+            (lib.fileset.difference ./cli ./cli/tests)
+            ./sdk/src
+            ./bin/north
+            ./bin/north-mcp
+            ./bin/north-clock-audit
+            ./bin/north-coord-up
+            ./bin/north-stream-sync
+            ./bin/concern
+            ./bin/ensure-private-docs
+          ];
+        };
+        webRuntimeSource = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./web-bjs/src
+            ./web/priv/static/assets/css/app.css
+            ./web/priv/static/favicon.ico
+            ./web/priv/static/js/board-write.js
+            ./web/priv/static/js/cytoscape.min.js
+            ./web/priv/static/js/north-agents.js
+            ./web/priv/static/js/north-app.js
+            ./web/priv/static/js/north-arena.js
+            ./web/priv/static/js/north-board.js
+            ./web/priv/static/js/north-list.js
+            ./web/priv/static/js/north-ui.js
+            ./web/priv/static/js/wake-mounts.js
+            ./web/priv/static/robots.txt
+            ./LICENSE
+          ];
         };
 
         # Runtime-only Gaffer contract. Generated adapters, authoring scripts,
@@ -159,6 +183,246 @@
           '';
         };
 
+        # The web cockpit is compiled from Beagle/JS by the exact locked
+        # compiler, but its runtime closure contains only emitted JavaScript,
+        # static assets, Beagle's two small JS runtime files, and Bun.
+        northWebPkg = pkgs.stdenvNoCC.mkDerivation {
+          pname = "north-web";
+          version = "0.1.0";
+          src = webRuntimeSource;
+          nativeBuildInputs = [
+            beaglePkg
+            pkgs.babashka
+            pkgs.makeWrapper
+            pkgs.nodejs
+            pkgs.ripgrep
+          ];
+          disallowedReferences = [
+            beaglePkg
+            beagleSource
+            pkgs.babashka
+            pkgs.nodejs
+          ];
+          dontConfigure = true;
+          buildPhase = ''
+            runHook preBuild
+            export HOME="$TMPDIR/home"
+            mkdir -p "$HOME" build
+            BEAGLE_EMIT_SRCLOC=0 \
+              ${beaglePkg}/bin/beagle build web-bjs/src --out build/out
+            # smoke.bjs is a developer probe, not part of the boot import
+            # graph. Keep the source tool while making the production graph
+            # exact and reviewable.
+            rm build/out/smoke.js
+            actual_modules="$(${pkgs.findutils}/bin/find \
+              build/out -type f -name "*.js" -printf "%P\n" \
+              | LC_ALL=C ${pkgs.coreutils}/bin/sort)"
+            expected_modules="$(cat <<'EOF'
+north/arena.js
+north/boot.js
+north/dict.js
+north/fram.js
+north/id.js
+north/presence.js
+north/server.js
+north/stream.js
+north/threads.js
+EOF
+)"
+            if [ "$actual_modules" != "$expected_modules" ]; then
+              echo "north-web emitted module manifest drifted" >&2
+              ${pkgs.diffutils}/bin/diff -u \
+                <(printf "%s\n" "$expected_modules") \
+                <(printf "%s\n" "$actual_modules") >&2 || true
+              exit 1
+            fi
+            while IFS= read -r -d "" js; do
+              ${pkgs.nodejs}/bin/node --check "$js"
+            done < <(${pkgs.findutils}/bin/find build/out -type f -name "*.js" -print0)
+            if ${pkgs.ripgrep}/bin/rg -n \
+              '\bor\(|\b(?:await|if|new)[$]|delete[$]' build/out; then
+              echo "north-web compiler emitted an unresolved helper" >&2
+              exit 1
+            fi
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p \
+              "$out/bin" \
+              "$out/libexec/north-web/node_modules/beagle" \
+              "$out/share/licenses/north-web" \
+              "$out/share/north-web/static/assets/css" \
+              "$out/share/north-web/static/js"
+            cp -r build/out/. "$out/libexec/north-web/"
+            cp \
+              ${beaglePkg}/beagle-lib/lib/beagle/core.js \
+              ${beaglePkg}/beagle-lib/lib/beagle/hamt.js \
+              "$out/libexec/north-web/node_modules/beagle/"
+            cp web/priv/static/assets/css/app.css \
+              "$out/share/north-web/static/assets/css/"
+            cp \
+              web/priv/static/js/board-write.js \
+              web/priv/static/js/cytoscape.min.js \
+              web/priv/static/js/north-agents.js \
+              web/priv/static/js/north-app.js \
+              web/priv/static/js/north-arena.js \
+              web/priv/static/js/north-board.js \
+              web/priv/static/js/north-list.js \
+              web/priv/static/js/north-ui.js \
+              web/priv/static/js/wake-mounts.js \
+              "$out/share/north-web/static/js/"
+            cp \
+              web/priv/static/favicon.ico \
+              web/priv/static/robots.txt \
+              "$out/share/north-web/static/"
+            cp LICENSE "$out/share/licenses/north-web/NORTH-LICENSE"
+            cp ${beagleSource}/LICENSE \
+              "$out/share/licenses/north-web/BEAGLE-LICENSE"
+            # Cytoscape's vendored bundle begins with its complete MIT notice.
+            # Publish that header separately while retaining it in the asset.
+            ${pkgs.gnused}/bin/sed -n '1,21p' \
+              web/priv/static/js/cytoscape.min.js \
+              > "$out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
+            ${pkgs.gnugrep}/bin/grep -q \
+              'Copyright (c) 2016-2024, The Cytoscape Consortium' \
+              "$out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
+            test "$(${pkgs.findutils}/bin/find \
+              "$out/share/north-web/static" -type f | wc -l)" -eq 12
+            makeWrapper ${pkgs.bun}/bin/bun "$out/bin/north-web" \
+              --add-flags "$out/libexec/north-web/north/boot.js" \
+              --set-default NORTH_WEB_BIND 127.0.0.1 \
+              --set-default STATIC_DIR "$out/share/north-web/static"
+
+            impurity_pattern='/(home|Users)/|/run/current-system/sw|/code/north(?:/|\b)|~/code/north|[$]HOME/code/north|[.]m2|[.]cpcache|[.]cache/babashka'
+            if LC_ALL=C ${pkgs.ripgrep}/bin/rg --hidden --no-ignore -l \
+              "$impurity_pattern" "$out"; then
+              echo "north-web package contains a checkout/home/cache path" >&2
+              exit 1
+            fi
+            if LC_ALL=C ${pkgs.ripgrep}/bin/rg --hidden --no-ignore -l -F \
+              '${beaglePkg}' "$out"; then
+              echo "north-web package retains the Beagle compiler" >&2
+              exit 1
+            fi
+            runHook postInstall
+          '';
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+
+            # The runtime module graph must import with no HOME, PATH, checkout,
+            # compiler, or ambient node_modules.
+            ${pkgs.coreutils}/bin/env -i \
+              PATH= NORTH_WEB_NO_AUTOSTART=1 \
+              ${pkgs.bun}/bin/bun -e \
+                'await import(process.argv[1])' \
+                "$out/libexec/north-web/north/boot.js"
+
+            smoke="$TMPDIR/north-web-smoke"
+            mkdir -p "$smoke"
+            : > "$smoke/facts.log"
+            web_port="$(${pkgs.babashka}/bin/bb -e \
+              '(with-open [s (java.net.ServerSocket. 0)]
+                 (println (.getLocalPort s)))')"
+            coord_port="$(${pkgs.babashka}/bin/bb -e \
+              '(with-open [s (java.net.ServerSocket. 0)]
+                 (println (.getLocalPort s)))')"
+            web_pid=
+            cleanup_web_smoke() {
+              if [ -n "$web_pid" ]; then
+                kill "$web_pid" 2>/dev/null || true
+                wait "$web_pid" 2>/dev/null || true
+              fi
+            }
+            trap cleanup_web_smoke EXIT
+            ${pkgs.coreutils}/bin/env -i \
+              PATH= \
+              FRAM_LOG="$smoke/facts.log" \
+              NORTH_PORT="$coord_port" \
+              PORT="$web_port" \
+              "$out/bin/north-web" \
+              > "$smoke/server.out" 2> "$smoke/server.err" &
+            web_pid=$!
+
+            ready=0
+            for _ in $(seq 1 100); do
+              if ${pkgs.bun}/bin/bun -e \
+                'try {
+                   const response = await fetch(process.argv[1]);
+                   process.exit(response.status === 200 ? 0 : 1);
+                 } catch {
+                   process.exit(1);
+                 }' \
+                "http://127.0.0.1:$web_port/"; then
+                ready=1
+                break
+              fi
+              sleep 0.05
+            done
+            if [ "$ready" -ne 1 ]; then
+              cat "$smoke/server.err" >&2
+              echo "north-web package smoke: server did not become ready" >&2
+              exit 1
+            fi
+
+            ${pkgs.bun}/bin/bun -e \
+              'const base = process.argv[1];
+               const html = await fetch(base + "/");
+               if (html.status !== 200
+                   || !(await html.text()).includes("<!doctype html>")) {
+                 process.exit(1);
+               }
+               const assets = [
+                 "/assets/css/app.css",
+                 "/favicon.ico",
+                 "/js/board-write.js",
+                 "/js/cytoscape.min.js",
+                 "/js/north-agents.js",
+                 "/js/north-app.js",
+                 "/js/north-arena.js",
+                 "/js/north-board.js",
+                 "/js/north-list.js",
+                 "/js/north-ui.js",
+                 "/js/wake-mounts.js",
+                 "/robots.txt",
+               ];
+               for (const path of assets) {
+                 const response = await fetch(base + path);
+                 if (response.status !== 200
+                     || (await response.arrayBuffer()).byteLength === 0) {
+                   process.exit(1);
+                 }
+               }
+               for (const retired of [
+                 "/assets/js/app.js",
+                 "/hologram/runtime.js",
+                 "/images/logo.svg",
+                 "/js/dag.js",
+               ]) {
+                 if ((await fetch(base + retired)).status !== 404) {
+                   process.exit(1);
+                 }
+               }' \
+              "http://127.0.0.1:$web_port"
+            kill "$web_pid"
+            wait "$web_pid" 2>/dev/null || true
+            web_pid=
+            runHook postInstallCheck
+          '';
+
+          meta = with lib; {
+            description = "North local web cockpit";
+            license = [ licenses.asl20 licenses.mit ];
+            mainProgram = "north-web";
+            platforms = [
+              "x86_64-linux"
+              "aarch64-linux"
+              "aarch64-darwin"
+            ];
+          };
+        };
+
         # north CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
         # packaged engine so the CLI is self-contained; an explicit env override
         # still wins (the script reads ${FRAM_HOME:-...}). NORTH_BIN points the
@@ -166,11 +430,14 @@
         northPkg = pkgs.stdenvNoCC.mkDerivation {
           pname = "north";
           version = "0.1.0";
-          src = self;
+          # Keep the package derivation tied only to files copied into the
+          # runtime. Archived web sources, tests, and docs cannot invalidate or
+          # leak into the closure.
+          src = runtimeSource;
           # Babashka must be present while patchShebangs runs. Otherwise the
           # copied `#!/usr/bin/env bb` survives into `.north-mcp-wrapped`, where
           # the Nix build sandbox has no `/usr/bin/env` to execute.
-          nativeBuildInputs = [ pkgs.makeWrapper pkgs.babashka ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.babashka pkgs.ripgrep ];
           dontConfigure = true;
           dontBuild = true;
           installPhase = ''
@@ -181,11 +448,14 @@
             # route through $root/cli — without this every non-engine verb dies
             # on the packaged binary with "File does not exist: .../cli/*.clj".
             cp -r cli $out/cli
+            test ! -e "$out/cli/tests"
             # Package the complete TypeScript runtime tree. Hand-maintained
             # transitive import lists inevitably rot as provider adapters grow.
             cp -r sdk/src $out/sdk/src
             ln -s ${sdkRuntimeDependencies}/node_modules $out/sdk/node_modules
-            cp bin/north bin/north-mcp bin/concern $out/bin/
+            cp bin/north bin/north-mcp bin/north-clock-audit \
+              bin/north-coord-up bin/north-stream-sync bin/concern \
+              bin/ensure-private-docs $out/bin/
             patchShebangs $out/bin
 
             # The Linear route is spread across these load-bearing runtime
@@ -197,21 +467,82 @@
 
             wrapProgram $out/bin/north \
               --prefix PATH : ${runtimePath} \
-              --set-default FRAM_HOME ${framPkg} \
+              --set-default FRAM_HOME ${framRuntimeRoot} \
+              --set-default FRAM_BIN ${framPkg}/bin \
+              --set-default FRAM_OUT ${framBabashkaClasspath} \
               --set-default GAFFER_HOME ${gafferContract} \
+              --set-default NORTH_HOME $out \
+              --set-default NORTH_BIN $out/bin/north \
+              --set-default NORTH_BB ${pkgs.babashka}/bin/bb \
+              --set-default NORTH_BUN ${pkgs.bun}/bin/bun \
+              --set-default NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
+              --set-default NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
+              --set-default NORTH_MCP_BUN ${pkgs.bun}/bin/bun \
               --set-default NORTH_PACKAGE_MODE nix-store \
-              --set-default NORTH_PACKAGE_REV ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")}
+              --set-default NORTH_PACKAGE_REV ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")} \
+              --set-default FRAM_PACKAGE_REV ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}
 
             wrapProgram $out/bin/north-mcp \
               --prefix PATH : ${runtimePath} \
-              --set-default FRAM_HOME ${framPkg} \
+              --set-default FRAM_HOME ${framRuntimeRoot} \
+              --set-default FRAM_BIN ${framPkg}/bin \
+              --set-default FRAM_OUT ${framBabashkaClasspath} \
               --set-default GAFFER_HOME ${gafferContract} \
-              --set-default NORTH_BIN $out/bin/north
+              --set-default NORTH_HOME $out \
+              --set-default NORTH_BIN $out/bin/north \
+              --set-default NORTH_BB ${pkgs.babashka}/bin/bb \
+              --set-default NORTH_BUN ${pkgs.bun}/bin/bun \
+              --set-default NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
+              --set-default NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
+              --set-default NORTH_MCP_BUN ${pkgs.bun}/bin/bun
+
+            wrapProgram $out/bin/north-clock-audit \
+              --prefix PATH : ${runtimePath} \
+              --set-default FRAM_HOME ${framRuntimeRoot} \
+              --set-default FRAM_OUT ${framBabashkaClasspath} \
+              --set-default NORTH_HOME $out \
+              --set-default NORTH_BB ${pkgs.babashka}/bin/bb
+
+            wrapProgram $out/bin/north-stream-sync \
+              --prefix PATH : ${runtimePath} \
+              --set-default NORTH_PACKAGE_MODE nix-store
+
+            wrapProgram $out/bin/north-coord-up \
+              --prefix PATH : ${runtimePath} \
+              --set-default FRAM_HOME ${framRuntimeRoot} \
+              --set-default FRAM_BIN ${framPkg}/bin \
+              --set-default NORTH_HOME $out
+
+            wrapProgram $out/bin/concern \
+              --prefix PATH : ${runtimePath} \
+              --set-default NORTH_HOME $out \
+              --set-default NORTH_BB ${pkgs.babashka}/bin/bb
+
+            wrapProgram $out/bin/ensure-private-docs \
+              --prefix PATH : ${runtimePath} \
+              --set-default NORTH_HOME $out
+
+            impurity_pattern='/(home|Users)/|/run/current-system/sw|/code/north(?:/|\b)|~/code/north|[$]HOME/code/north|[.]m2|[.]cpcache|[.]cache/babashka'
+            if LC_ALL=C rg --hidden -n "$impurity_pattern" "$out"; then
+              echo "north package contains a checkout/home/cache path" >&2
+              exit 1
+            fi
 
             # Exercise every packaged TypeScript CLI entrypoint with hermetic
             # subscription/auth fixtures. These probes never make a model turn.
             smoke=$(mktemp -d)
-            trap 'rm -rf "$smoke"' EXIT
+            coord_pid=
+            cleanup_smoke() {
+              if [ -n "$coord_pid" ]; then
+                kill "$coord_pid" 2>/dev/null || true
+                for _ in $(seq 1 40); do
+                  kill -0 "$coord_pid" 2>/dev/null || break
+                  sleep 0.1
+                done
+              fi
+              rm -rf "$smoke"
+            }
+            trap cleanup_smoke EXIT
             mkdir -p "$smoke/bin" "$smoke/home"
             cat > "$smoke/bin/claude" <<'EOF'
 #!${pkgs.bash}/bin/bash
@@ -226,6 +557,161 @@ if [ "$1 $2" = "login status" ]; then echo 'Logged in using ChatGPT'; exit 0; fi
 exit 2
 EOF
             chmod +x "$smoke/bin/claude" "$smoke/bin/codex"
+            mkdir -p "$smoke/home/.local/state/north/threads"
+            : > "$smoke/home/.local/state/north/facts.log"
+            client_repo="$smoke/home/code/client/smoke/widget"
+            mkdir -p "$client_repo"
+            ${pkgs.git}/bin/git -C "$client_repo" init -q
+            printf 'package clock audit\n' > "$client_repo/probe.txt"
+            ${pkgs.git}/bin/git -C "$client_repo" add probe.txt
+            ${pkgs.git}/bin/git -C "$client_repo" \
+              -c user.name='North Package Smoke' \
+              -c user.email='north-package-smoke@example.invalid' \
+              commit -qm 'exercise packaged clock audit'
+            # Every public executable must work with no ambient PATH or checkout.
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= \
+              $out/bin/north help > "$smoke/help.out"
+            grep -q 'north — your one card' "$smoke/help.out"
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= NORTH_DASHBOARD_LIB=1 \
+              $out/bin/north dashboard
+            if ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= \
+              $out/bin/concern > "$smoke/concern-usage.out" 2>&1; then
+              echo "north package smoke: bare concern unexpectedly succeeded" >&2
+              exit 1
+            fi
+            grep -q 'usage: concern-cli.clj' "$smoke/concern-usage.out"
+            if ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= \
+              $out/bin/north-coord-up --invalid \
+              > "$smoke/north-coord-up-usage.out" 2>&1; then
+              echo "north package smoke: invalid north-coord-up unexpectedly succeeded" >&2
+              exit 1
+            fi
+            grep -q 'usage: north up' "$smoke/north-coord-up-usage.out"
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= \
+              $out/bin/ensure-private-docs "$client_repo"
+            grep -qxF 'docs/private/' "$client_repo/.gitignore"
+            # Empty PATH proves the packaged wrapper supplies bb + git itself.
+            if ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= \
+              $out/bin/north clock audit > "$smoke/clock-audit.out"; then
+              echo "north package smoke: uncovered commit unexpectedly passed clock audit" >&2
+              exit 1
+            fi
+            grep -q '1 uncovered' "$smoke/clock-audit.out"
+
+            stream_src="$smoke/source with spaces/project"
+            mkdir -p "$stream_src" "$smoke/xdg"
+            printf '{"type":"package-stream-probe"}\n' \
+              > "$stream_src/12345678-1234-1234-1234-123456789abc.jsonl"
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" XDG_STATE_HOME="$smoke/xdg" PATH= \
+              $out/bin/north stream-sync --days 30 --min-bytes 1 \
+                --src-dir "$smoke/source with spaces"
+            stream_raw="$smoke/xdg/north/streams/raw"
+            stream_dest="$(${pkgs.findutils}/bin/find "$stream_raw" -maxdepth 1 \
+              -type f -name '*.jsonl' -print -quit)"
+            test -n "$stream_dest"
+            ${pkgs.diffutils}/bin/cmp \
+              "$stream_src/12345678-1234-1234-1234-123456789abc.jsonl" \
+              "$stream_dest"
+            cursor_hash="$(${pkgs.coreutils}/bin/sha256sum "$stream_raw/.cursors")"
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" XDG_STATE_HOME="$smoke/xdg" PATH= \
+              $out/bin/north stream-sync --days 30 --min-bytes 1 \
+                --src-dir "$smoke/source with spaces"
+            test "$cursor_hash" = \
+              "$(${pkgs.coreutils}/bin/sha256sum "$stream_raw/.cursors")"
+            ${pkgs.diffutils}/bin/cmp \
+              "$stream_src/12345678-1234-1234-1234-123456789abc.jsonl" \
+              "$stream_dest"
+            test ! -e "$out/streams/raw"
+            # Load North's compiled namespace graph against Fram's published bb
+            # classpath. This is the seam the old partial packager left untested.
+            HOME="$smoke/home" FRAM_PORT=39123 \
+              $out/bin/north validate > "$smoke/validate.out"
+            grep -q 'no violations' "$smoke/validate.out"
+            # Exercise the composed lifecycle seam, not merely namespace
+            # loading: North's public revive command must start Fram's packaged
+            # daemon through its public wrapper and verify the exact temp log.
+            coord_port="$(${pkgs.babashka}/bin/bb -e \
+              '(with-open [socket (java.net.ServerSocket. 0)] (println (.getLocalPort socket)))')"
+            coord_log="$smoke/state with spaces/facts.log"
+            HOME="$smoke/home" FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" \
+              NORTH_COORD_PID_FILE="$smoke/coord.pid" \
+              $out/bin/north up > "$smoke/up.out"
+            coord_pid=$(cat "$smoke/coord.pid")
+            kill -0 "$coord_pid"
+            HOME="$smoke/home" FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" \
+              $out/bin/north coord-doctor > "$smoke/coord-doctor.out"
+            grep -q 'serving the canonical log' "$smoke/coord-doctor.out"
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH= NO_COLOR=1 \
+              NORTH_PORT="$coord_port" FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" \
+              $out/bin/north doctor > "$smoke/doctor.out"
+            grep -Eq 'north  package rev [^? ]+' "$smoke/doctor.out"
+            grep -Eq 'fram  package rev [^? ]+' "$smoke/doctor.out"
+            # North-managed daemons require the log-fence protocol. Exercise
+            # the shared CLI seam against strict mode, then prove a mismatched
+            # corpus and a raw bypass are both rejected without changing either
+            # file.
+            HOME="$smoke/home" FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" \
+              ${pkgs.babashka}/bin/bb $out/cli/coord.clj "$coord_port" \
+              > "$smoke/strict-shared.out"
+            grep -Eq ':version [0-9]+' "$smoke/strict-shared.out"
+            wrong_log="$smoke/state with spaces/wrong.log"
+            : > "$wrong_log"
+            cp "$coord_log" "$smoke/coord.before"
+            cp "$wrong_log" "$smoke/wrong.before"
+            HOME="$smoke/home" NORTH_ROOT="$out" FRAM_PORT="$coord_port" \
+              FRAM_LOG="$wrong_log" ${pkgs.babashka}/bin/bb -e \
+              '(load-file (str (System/getenv "NORTH_ROOT") "/cli/coord.clj"))
+               (prn (north.coord/append!
+                     (Integer/parseInt (System/getenv "FRAM_PORT"))
+                     "@package-fence" "note" "must-not-land"))' \
+              > "$smoke/wrong-log.out"
+            grep -q ':code :log-mismatch' "$smoke/wrong-log.out"
+            NORTH_TEST_PORT="$coord_port" ${pkgs.babashka}/bin/bb -e \
+              '(require (quote [clojure.edn :as edn])
+                        (quote [clojure.java.io :as io]))
+               (with-open [s (java.net.Socket.
+                              "127.0.0.1"
+                              (Integer/parseInt
+                               (System/getenv "NORTH_TEST_PORT")))]
+                 (let [w (.getOutputStream s)
+                       r (io/reader (.getInputStream s))]
+                   (.write w (.getBytes
+                              (str (pr-str {:op :assert
+                                            :te "@raw-package-fence"
+                                            :p "note"
+                                            :r "must-not-land"})
+                                   "\n")))
+                   (.flush w)
+                   (prn (edn/read-string (.readLine r)))))' \
+              > "$smoke/raw-fence.out"
+            grep -q ':code :log-fence-required' "$smoke/raw-fence.out"
+            ${pkgs.diffutils}/bin/cmp "$smoke/coord.before" "$coord_log"
+            ${pkgs.diffutils}/bin/cmp "$smoke/wrong.before" "$wrong_log"
+            ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              ${pkgs.iproute2}/bin/ss -tlnH "sport = :$coord_port" | grep -q .
+            ''}
+            ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              test "$(${pkgs.lsof}/bin/lsof -nP -iTCP:"$coord_port" -sTCP:LISTEN -t)" = "$coord_pid"
+            ''}
+            kill "$coord_pid"
+            for _ in $(seq 1 40); do
+              kill -0 "$coord_pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            kill -0 "$coord_pid" 2>/dev/null && {
+              echo "north package smoke: coordinator ignored SIGTERM" >&2
+              exit 1
+            }
+            coord_pid=
             # Import the public SDK and prove npm selected an executable native
             # Claude binary for this exact Nix system. This resolves no account
             # and makes no model turn.
@@ -271,6 +757,7 @@ EOF
             grep -q '^## worker$' ${gafferContract}/docs/topologies.md
             grep -q '^## universal$' ${gafferContract}/docs/comms.md
             printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | \
+              ${pkgs.coreutils}/bin/env -i HOME="$smoke/home" PATH= \
               $out/bin/north-mcp > "$smoke/north-mcp-tools.json"
             ${pkgs.jq}/bin/jq -e \
               '([.result.tools[] | select(.name | startswith("linear_")) | .name] | sort) == ["linear_get", "linear_import", "linear_plan", "linear_sync"]' \
@@ -302,6 +789,7 @@ EOF
         packages = {
           default = northPkg;
           north = northPkg;
+          north-web = northWebPkg;
           fram-engine = framPkg;
         };
 
@@ -309,14 +797,22 @@ EOF
           default = {
             type = "app";
             program = "${northPkg}/bin/north";
+            meta.description = "North provider-neutral coordination CLI";
           };
           north = {
             type = "app";
             program = "${northPkg}/bin/north";
+            meta.description = "North provider-neutral coordination CLI";
           };
           north-mcp = {
             type = "app";
             program = "${northPkg}/bin/north-mcp";
+            meta.description = "North fact and coordination MCP server";
+          };
+          north-web = {
+            type = "app";
+            program = "${northWebPkg}/bin/north-web";
+            meta.description = "North local web cockpit";
           };
         };
 

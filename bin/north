@@ -4,8 +4,10 @@
 # Both operate on the same private XDG fact data. Supplies the life domain config
 # (cardinality vocab §1.1 + capture provenance).
 #
-#   engine: ~/code/fram   data: ~/code/north-data (XDG ~/.local/state/north)
+#   engine: FRAM_HOME (checkout fallback: sibling fram)   data: XDG state
 export FRAM_THREADS="${FRAM_THREADS:-$HOME/.local/state/north/threads}"
+_north_fram_log_explicit=0
+if [ -n "${FRAM_LOG:-}" ]; then _north_fram_log_explicit=1; fi
 export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
 # --- the log split: kind-routed telemetry segregation (OPT-IN; off => byte-identical) -
 # When enabled the coordinator splits persistence per log: coordination facts
@@ -16,7 +18,7 @@ export FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
 # --execute` writes) — so the split IS the switch, and rollback is "restore
 # facts.log / remove coordination.log". Neither present => FRAM_TELEMETRY_LOG stays
 # unset and the engine reads the single FRAM_LOG, byte-identical to pre-split.
-if [ -z "${FRAM_TELEMETRY_LOG:-}" ]; then
+if [ "$_north_fram_log_explicit" -eq 0 ] && [ -z "${FRAM_TELEMETRY_LOG:-}" ]; then
   _north_log_dir="$(dirname "$FRAM_LOG")"
   if [ -f "$_north_log_dir/coordination.log" ]; then
     export FRAM_LOG="$_north_log_dir/coordination.log"
@@ -24,8 +26,9 @@ if [ -z "${FRAM_TELEMETRY_LOG:-}" ]; then
   fi
   unset _north_log_dir
 fi
+unset _north_fram_log_explicit
 export FRAM_TIME_DIR="${FRAM_TIME_DIR:-$HOME/.local/state/north/time}"
-export FRAM_SINGLE_VALUED="${FRAM_SINGLE_VALUED:-title owner lead driver source part_of do_on valid_until estimate_hours created_at updated_at name display_name body created_by committed outcome abandoned superseded_by merged_into session_of start_time end_time clocked_by clock_orphaned clockify_id rate invoice_id invoice_state linear kind coordinator provider_target requested_target fallback_target_path broadcast_audience_version}"
+export FRAM_SINGLE_VALUED="${FRAM_SINGLE_VALUED:-title owner lead driver source part_of do_on valid_until estimate_hours created_at updated_at name display_name body created_by committed outcome abandoned superseded_by merged_into session_of start_time end_time clocked_by clock_orphaned clockify_id rate invoice_id invoice_state linear kind coordinator provider_target requested_target fallback_target_path broadcast_audience_version code_port code_log}"
 # North DECLARES its lifecycle vocab to the (now genericized) Fram kernel —
 # value-identical to the kernel default, so this is the explicit-config form of
 # what was previously baked in (Fram >= ec7ef90: FRAM_TERMINAL_PREDS/WITHDRAWN_PREDS).
@@ -39,7 +42,11 @@ export NORTH_DRIVER="${NORTH_DRIVER:-tom_passarelli}"
 export NORTH_PROPOSED_BY="${NORTH_PROPOSED_BY:-tom_passarelli}"
 
 FRAM="${FRAM_HOME:-$HOME/code/fram}"
+FRAM_BIN="${FRAM_BIN:-$FRAM/bin}"
+FRAM_OUT="${FRAM_OUT:-$FRAM/out}"
 NORTH="$(cd "$(dirname "$0")/.." && pwd)"
+BB="${NORTH_BB:-bb}"
+BUN="${NORTH_BUN:-bun}"
 
 # A worker still needs ordinary THREAD fact writes. Agent identity/lifecycle is
 # harness evidence, not agent-authored data: generic fact verbs may not mutate
@@ -145,83 +152,83 @@ CARD
     # `clock audit` is a standalone read-only report (commits-vs-sessions coverage,
     # bin/north-clock-audit); every other clock verb is engine-side in north.main.
     if [ "${2:-}" = "audit" ]; then exec "$NORTH/bin/north-clock-audit" "${@:3}"; fi
-    exec bb -cp "$NORTH/out:$FRAM/out" -m north.main "$@" ;;
+    exec "$BB" -cp "$NORTH/out:$FRAM_OUT" -m north.main "$@" ;;
   threads)
     # Kind-scoped noun command: the THREAD-kind overview (threads are one kind
     # among several in the store — see `north schema`; people/concerns/runs are
     # not threads). Same projection the kanban-metaphor aliases render: active
     # drivers + top-ready by leverage + counts. `board`/`plate` = legacy aliases.
     # Future kinds follow the pattern (`north people` when a person registry lands).
-    exec bb -cp "$NORTH/out:$FRAM/out" -m north.main board "${@:2}" ;;
+    exec "$BB" -cp "$NORTH/out:$FRAM_OUT" -m north.main board "${@:2}" ;;
   ready|blocked|leverage|next|agenda|board|plate|capture|json|needs-review|audit|resolve|validate|schema|schema-seed|tools|heal|boot)
     # `validate` runs north's FULL check (engine-generic ++ north work rules,
     # north.validate) — the fram CLI `validate` is generic-only since the work
     # rules moved out of the kernel. The MCP validate tool shells through here too.
-    exec bb -cp "$NORTH/out:$FRAM/out" -m north.main "$@" ;;
+    exec "$BB" -cp "$NORTH/out:$FRAM_OUT" -m north.main "$@" ;;
   coord-doctor)
     # Engine-level coordinator SAFETY handshake + log-hygiene diff (north.main
     # cmd-doctor): tell/untell safe? daemon state matches on-disk log? This is the
     # raw primitive the cockpit `north doctor` leads with. Renamed from the old bare
     # `north doctor` (2026-07-10) when the convoy cockpit doctor folded in.
-    exec bb -cp "$NORTH/out:$FRAM/out" -m north.main doctor "${@:2}" ;;
+    exec "$BB" -cp "$NORTH/out:$FRAM_OUT" -m north.main doctor "${@:2}" ;;
   dashboard|doctor)
     # The cockpit (ported from convoy/bin/my-agents, 2026-07-10): `dashboard` =
     # what is happening (agents/concerns/board/daemons/health/profile); `doctor` =
     # is everything healthy (coordinator handshake + daemons/health/rev-skew/env/
     # guard-hooks). Both teach the primitive they wrap. cli/dashboard-cli.clj.
-    exec bb "$NORTH/cli/dashboard-cli.clj" "$@" ;;
+    exec "$BB" "$NORTH/cli/dashboard-cli.clj" "$@" ;;
   config)
     # Personal-stack posture + durable provider routing policy.
     # + the no-arg full report. Ported from dotfiles/bin/my-agent-config (bash)
     # 2026-07-10: north is the settings surface. Provider-neutral state lives at
     # ~/.local/state/north/harness.conf; the Claude-era path is a read-only
     # migration fallback. cli/config-cli.clj.
-    exec bb "$NORTH/cli/config-cli.clj" "${@:2}" ;;
+    exec "$BB" "$NORTH/cli/config-cli.clj" "${@:2}" ;;
   providers)
-    exec bun run "$NORTH/sdk/src/providers-cli.ts" "${@:2}" ;;
+    exec "$BUN" run "$NORTH/sdk/src/providers-cli.ts" "${@:2}" ;;
   account)
     # Isolated Claude Code / Codex subscription account homes. The TypeScript
     # CLI owns path validation, allowlisted config links, and normalized auth.
-    exec bun run "$NORTH/sdk/src/account-cli.ts" "${@:2}" ;;
+    exec "$BUN" run "$NORTH/sdk/src/account-cli.ts" "${@:2}" ;;
   delivery)
     # Historical attestation surface. Shared-UID agents cannot establish an
     # independent verifier boundary, so promotion fails closed.
-    exec bun run "$NORTH/sdk/src/delivery-attest.ts" "${@:2}" ;;
+    exec "$BUN" run "$NORTH/sdk/src/delivery-attest.ts" "${@:2}" ;;
   evidence)
     # Capability-bound self-reporting surface. Run/thread/reporter are inherited
     # from the managed child environment; callers supply only exact bar + result.
-    exec bun run "$NORTH/sdk/src/delivery-evidence.ts" "${@:2}" ;;
+    exec "$BUN" run "$NORTH/sdk/src/delivery-evidence.ts" "${@:2}" ;;
   linear)
     # Zero-turn Linear adapter over Codex app-server MCP. `sync` defaults to a
     # read-only plan; only an explicit `sync <thread> --apply` writes remotely.
-    exec bun run "$NORTH/sdk/src/integrations/linear/cli.ts" "${@:2}" ;;
+    exec "$BUN" run "$NORTH/sdk/src/integrations/linear/cli.ts" "${@:2}" ;;
   provider-observe)
     # Hidden machine-ingestion surface. Interactive adapters feed provider
     # telemetry here; it is intentionally silent and best-effort.
-    exec bun run "$NORTH/sdk/src/provider-observations-cli.ts" "${@:2}" ;;
+    exec "$BUN" run "$NORTH/sdk/src/provider-observations-cli.ts" "${@:2}" ;;
   up)
-    exec "$FRAM/bin/fram-up" "${@:2}" ;;
+    exec "$NORTH/bin/north-coord-up" "${@:2}" ;;
   agents|templates|spawn|delegate|request|fork|req|watch|steer|retask)
     # Agent verbs — agents are a north concern (spawn/presence/facts live here).
     # Implementation: cli/agents-cli.clj (ported from the convoy cockpit 2026-07-09).
-    exec bb "$NORTH/cli/agents-cli.clj" "$@" ;;
+    exec "$BB" "$NORTH/cli/agents-cli.clj" "$@" ;;
   trace)
     # Single-agent lifecycle diagnosis — walk the invariant-spine checklist for one id,
     # flag the first failing stage (F1–F7). Read-only. cli/trace-cli.clj.
-    exec bb "$NORTH/cli/trace-cli.clj" "${@:2}" ;;
+    exec "$BB" "$NORTH/cli/trace-cli.clj" "${@:2}" ;;
   health)
     # Aggregate coordination rollup — one durable log fold (lane outcomes, stale
     # concerns, ping-loss, zombie forks, died-unreported). Read-only. cli/health-cli.clj.
-    exec bb "$NORTH/cli/health-cli.clj" "${@:2}" ;;
+    exec "$BB" "$NORTH/cli/health-cli.clj" "${@:2}" ;;
   dials)
     # Compatibility bridge to the evidence-aware report. Dollar-centric dial
     # scoring is intentionally retired for subscription entitlement routing.
-    exec bb "$NORTH/cli/dials-cli.clj" "${@:2}" ;;
+    exec "$BB" "$NORTH/cli/dials-cli.clj" "${@:2}" ;;
   routing)
     # Empirical routing feedback joins run telemetry to its exact proof-carrying
     # lane terminal, with current thread facts retained only as review context.
     # It never claims causal model quality or auto-promotes bespoke recurrence.
-    exec bb "$NORTH/cli/routing-report.clj" "${@:2}" ;;
+    exec "$BB" "$NORTH/cli/routing-report.clj" "${@:2}" ;;
   stream-sync)
     # Zero-AI cursor-based transcript log-shipping (streams/CLAUDE.md) — a
     # plain bash script, not a north.main verb, so it execs directly.
@@ -230,14 +237,14 @@ CARD
     # Real-time interrupt listener — RUN AS A BACKGROUND TASK. Dormant (zero
     # tokens) until a peer addresses you, then prints the message and exits:
     # that exit is the interrupt. Read it, act, re-arm. bin/north-arm = alias.
-    exec bb "$NORTH/cli/north-listen.clj" 7977 "${2:?usage: north listen <agent-id>}" --once --ack "${@:3}" ;;
+    exec "$BB" "$NORTH/cli/north-listen.clj" "${NORTH_PORT:-7977}" "${2:?usage: north listen <agent-id>}" --once --ack "${@:3}" ;;
   reactor)
     # Coordinator AUTO-EXPORT sidecar — RUN AS A LONG-LIVED BACKGROUND TASK next to
     # the daemon. Subscribes to the coordinator commit firehose and re-projects
     # touched threads (`heal`, debounced) so threads/*.md never lag the log. Rides
     # the existing :subscribe seam — no daemon change. Inherits FRAM_LOG/FRAM_THREADS.
     #   north reactor [port] [debounce-ms]   (defaults: 7977, 400)
-    exec bb "$NORTH/cli/north-reactor.clj" "${2:-7977}" "${@:3}" ;;
+    exec "$BB" "$NORTH/cli/north-reactor.clj" "${2:-${NORTH_PORT:-7977}}" "${@:3}" ;;
   tell|untell|retract)
     # `retract` is the primary agent-facing retraction verb (R&N TELL/RETRACT);
     # `untell` is an accepted legacy alias. Both map onto fram's `untell` CLI verb
@@ -252,7 +259,7 @@ CARD
       # FAIL-CLOSED: an unresolvable id-like ref (or a dead resolver) aborts the
       # write — passing the raw ref through would mint a phantom subject under a
       # truncated id and strand the facts (2026-07-03 incident: 19 orphans).
-      canon="$(bb -cp "$NORTH/out:$FRAM/out" -m north.main resolve "$2" 2>/dev/null)"
+      canon="$("$BB" -cp "$NORTH/out:$FRAM_OUT" -m north.main resolve "$2" 2>/dev/null)"
       case "$canon" in
         ERROR*) echo "north: $1 REFUSED — ${canon#ERROR }" >&2; exit 1 ;;
         "")     echo "north: $1 REFUSED — subject resolver unavailable for '$2' (build out/? daemon?)" >&2; exit 1 ;;
@@ -264,9 +271,9 @@ CARD
     # at the moment of judgment — a reminder, never a reject. cmd-done-bars is
     # silent for bar-less threads; failures never block the write.
     if [ "$framverb" = tell ] && [ "${3:-}" = outcome ]; then
-      bb -cp "$NORTH/out:$FRAM/out" -m north.main done-bars "$2" 2>/dev/null || true
+      "$BB" -cp "$NORTH/out:$FRAM_OUT" -m north.main done-bars "$2" 2>/dev/null || true
     fi
-    exec "$FRAM/bin/fram" "$framverb" "${@:2}" ;;
+    exec "$FRAM_BIN/fram" "$framverb" "${@:2}" ;;
   *)  # engine verbs: import/export/show/set/merge/watch
-    exec "$FRAM/bin/fram" "$@" ;;
+    exec "$FRAM_BIN/fram" "$@" ;;
 esac

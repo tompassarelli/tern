@@ -109,13 +109,26 @@
 (defn- live-idx [^String log]
   (k/build-index (live-facts log)))
 
-(defn- ^String tell-once [port ^String op ^String te ^String pred ^String rv]
-  (let [v (fram.rt/coord-version port)]
-  (if (< v 0) "nodaemon" (if (= op "assert") (fram.rt/coord-assert port te pred rv v) (fram.rt/coord-retract port te pred rv v)))))
+(defn ^String coordinator-failure-message [code port ^String log ^String consequence]
+  (let [summary (cond
+  (= code -1) (str "coordinator UNREACHABLE on 127.0.0.1:" port)
+  (= code -2) (str "coordinator CORPUS MISMATCH on 127.0.0.1:" port " (this command requires " log ")")
+  (= code -3) (str "coordinator PROTOCOL INCOMPATIBLE on 127.0.0.1:" port)
+  :else (str "coordinator preflight failed on 127.0.0.1:" port " (code " code ")"))
+   remedy (cond
+  (= code -1) "Run `north up`"
+  (= code -2) "Stop the coordinator serving the other corpus, then run `north up`"
+  (= code -3) "Rebuild and restart North + Fram from one matched release"
+  :else "Inspect `north doctor` before retrying")]
+  (str summary (if (str/blank? consequence) "" (str " — " consequence)) ". " remedy ".")))
 
-(defn- ^String tell-retry [port ^String op ^String te ^String pred ^String rv tries]
-  (let [resp (tell-once port op te pred rv)]
-  (if (and (= resp "conflict") (> tries 0)) (tell-retry port op te pred rv (- tries 1)) resp)))
+(defn- ^String tell-once [port ^String log ^String op ^String te ^String pred ^String rv]
+  (let [v (fram.rt/coord-version-for-log port log)]
+  (if (< v 0) (if (= v -2) "log-mismatch" (if (= v -3) "protocol-incompatible" "nodaemon")) (if (= op "assert") (fram.rt/coord-assert-for-log port log te pred rv v) (fram.rt/coord-retract-for-log port log te pred rv v)))))
+
+(defn- ^String tell-retry [port ^String log ^String op ^String te ^String pred ^String rv tries]
+  (let [resp (tell-once port log op te pred rv)]
+  (if (and (= resp "conflict") (> tries 0)) (tell-retry port log op te pred rv (- tries 1)) resp)))
 
 (defn- ^Boolean ctrl? [^String s]
   (or (str/includes? s "\n") (str/includes? s "\r")))
@@ -156,9 +169,10 @@
    created-at (fram.rt/now-iso)
    te (str "@" id)
    path (str threads-dir "/" id "-" slug ".md")
-   port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `north up`.") (let [facts (capture-facts te title owner source author lead proposed created-at today)
-   results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) facts)
+   port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "capture was not recorded")) (let [facts (capture-facts te title owner source author lead proposed created-at today)
+   results (mapv (fn [c] (tell-retry port log "assert" (:l c) (:p c) (:r c) 5)) facts)
    oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
   (if (= oks (count facts)) (do
   (fram.rt/spit-file path (exp/thread-md (:facts (fold/fold (fram.rt/read-log log))) te))
@@ -509,42 +523,43 @@
   (cond
   (nil? (k/one-i idx te "title")) (println (str "no such thread: " id))
   (some? run) (println (str "already clocked in on " (short-id (session-thread idx run)) " (session " (short-id run) ", agent " me ") — `clock stop` first"))
-  :else (let [port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up`") (let [sid (fresh-sid idx (fram.rt/now-id))
+  :else (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "clock start was not recorded")) (let [sid (fresh-sid idx (fram.rt/now-id))
    ssub (str "@" sid)
    now (fram.rt/now-iso)
-   r1 (tell-retry port "assert" ssub "session_of" te 5)
-   r2 (tell-retry port "assert" ssub "start_time" now 5)
-   r3 (tell-retry port "assert" ssub "clocked_by" me 5)]
+   r1 (tell-retry port log "assert" ssub "session_of" te 5)
+   r2 (tell-retry port log "assert" ssub "start_time" now 5)
+   r3 (tell-retry port log "assert" ssub "clocked_by" me 5)]
   (if (and (str/starts-with? r1 "ok:") (and (str/starts-with? r2 "ok:") (str/starts-with? r3 "ok:"))) (println (str "clocked in on " id " at " now "  (session " sid ", agent " me ")")) (println (str "clock start FAILED to record (" r1 "/" r2 "/" r3 ") — retry")))))))))
 
 (defn cmd-clock-stop [^String log]
   (let [idx (live-idx log)
    me (agent-id)
-   run (clk/running-session-for idx me)
-   port (fram.rt/coord-port)]
+   run (clk/running-session-for idx me)]
   (cond
   (nil? run) (println (str "not clocked in (agent " me ")"))
-  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up` (still clocked in)")
-  :else (let [now (fram.rt/now-iso)
+  :else (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "still clocked in")) (let [now (fram.rt/now-iso)
    st (k/one-i idx run "start_time")
    te (session-thread idx run)
    dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)
-   resp (tell-retry port "assert" run "end_time" now 5)]
-  (if (str/starts-with? resp "ok:") (println (str "clocked out of " (short-id te) " — this session " (fmt-hm dur))) (println (str "clock stop FAILED to record end_time (" resp ") — still clocked in, retry")))))))
+   resp (tell-retry port log "assert" run "end_time" now 5)]
+  (if (str/starts-with? resp "ok:") (println (str "clocked out of " (short-id te) " — this session " (fmt-hm dur))) (println (str "clock stop FAILED to record end_time (" resp ") — still clocked in, retry")))))))))
 
 (defn cmd-clock-orphan [^String log ^String agent]
   (let [idx (live-idx log)
-   run (clk/running-session-for idx agent)
-   port (fram.rt/coord-port)]
+   run (clk/running-session-for idx agent)]
   (cond
   (nil? run) (println (str "no open session for agent " agent " — nothing to orphan"))
-  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up`")
-  :else (let [now (fram.rt/now-iso)
+  :else (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "orphan close was not recorded")) (let [now (fram.rt/now-iso)
    te (session-thread idx run)
-   r1 (tell-retry port "assert" run "end_time" now 5)
-   r2 (tell-retry port "assert" run "clock_orphaned" "true" 5)]
-  (if (and (str/starts-with? r1 "ok:") (str/starts-with? r2 "ok:")) (println (str "orphan-closed " (short-id run) " on " (short-id te) " at " now "  (agent " agent ", clock_orphaned)")) (println (str "clock orphan FAILED (" r1 "/" r2 ") — retry")))))))
+   r1 (tell-retry port log "assert" run "end_time" now 5)
+   r2 (tell-retry port log "assert" run "clock_orphaned" "true" 5)]
+  (if (and (str/starts-with? r1 "ok:") (str/starts-with? r2 "ok:")) (println (str "orphan-closed " (short-id run) " on " (short-id te) " at " now "  (agent " agent ", clock_orphaned)")) (println (str "clock orphan FAILED (" r1 "/" r2 ") — retry")))))))))
 
 (defn cmd-clock-status [^String log]
   (let [idx (live-idx log)
@@ -577,10 +592,11 @@
   (let [idx (live-idx log)
    dir (fram.rt/time-dir)
    sessions (clk/syncable-sessions idx)
-   port (fram.rt/coord-port)]
+   port (fram.rt/coord-port)
+   coord-v (if (empty? sessions) 0 (fram.rt/coord-version-for-log port log))]
   (cond
   (empty? sessions) (println "nothing to sync — no closed, unsynced sessions")
-  (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — run `north up` (sync records clockify_id, so it must be up first)")
+  (< coord-v 0) (println (coordinator-failure-message coord-v port log "sync cannot record clockify_id"))
   :else (let [ws (cf/default-workspace)]
   (println (str "syncing " (count sessions) " session(s) to clockify (workspace " ws ")"))
   (doseq [s sessions]
@@ -594,7 +610,7 @@
   (nil? proj) (println (str "  – skip " (short-id s) "  (owner '" owner "' unmapped — `clock map " owner " <project-id>`)"))
   (or (nil? st) (nil? en)) (println (str "  ! skip " (short-id s) "  (missing start/end)"))
   :else (let [cid (cf/create-entry ws proj st en (title-of idx te))]
-  (if (= cid "") (println (str "  ! " (short-id s) "  (clockify returned no id)")) (let [wb (tell-retry port "assert" s "clockify_id" cid 5)]
+  (if (= cid "") (println (str "  ! " (short-id s) "  (clockify returned no id)")) (let [wb (tell-retry port log "assert" s "clockify_id" cid 5)]
   (if (str/starts-with? wb "ok:") (println (str "  ✓ " (short-id te) "  " st " → " en "  (clockify " cid ")")) (println (str "  !! " (short-id s) " PUSHED to clockify (" cid ") but failed to record it (" wb ") — set manually to avoid a double-push: tell " (short-id s) " clockify_id " cid)))))))))
   (println "done.")))))
 
@@ -646,14 +662,14 @@
 
 (defn- ^Probe probe [^String threads-dir ^String log]
   (let [port (fram.rt/coord-port)
-   status (fram.rt/coord-status port)
-   up (not (= status "down"))
-   serving (str/includes? status log)
+   status (fram.rt/coord-status-for-log port log)
    ops (read-logs-merged log)
    f (fold/fold ops)
    log-facts (:facts f)
    log-v (:version f)
-   daemon-v (fram.rt/coord-version port)
+   daemon-v (fram.rt/coord-version-for-log port log)
+   up (not (= daemon-v -1))
+   serving (>= daemon-v 0)
    fresh (>= daemon-v log-v)
    idx (k/build-index log-facts)
    file-facts (:facts (fold/fold (imp/load-corpus threads-dir)))
@@ -778,7 +794,7 @@
 (defn- ^Boolean adoptable? [c]
   (and (not (str/blank? (:p c))) (not (str/blank? (:r c)))))
 
-(defn- ^AdoptResult adopt-hand-facts [port live hand]
+(defn- ^AdoptResult adopt-hand-facts [port ^String log live hand]
   (reduce (fn [acc c] (cond
   (not (adoptable? c)) (do
   (println (str "  drop (parse artifact) " (short-id (:l c)) "  pred=<" (:p c) "> val=<" (trunc (:r c) 40) ">"))
@@ -787,7 +803,7 @@
   (and (some? v) (not (= v (:r c)))))) (do
   (println (str "  skip (log won) " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 56)))
   (->AdoptResult (:adopted acc) (+ (:skipped acc) 1) (:failed acc) (:dropped acc)))
-  :else (let [r (tell-retry port "assert" (:l c) (:p c) (:r c) 5)]
+  :else (let [r (tell-retry port log "assert" (:l c) (:p c) (:r c) 5)]
   (if (str/starts-with? r "ok:") (do
   (println (str "  adopted " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 56)))
   (->AdoptResult (+ (:adopted acc) 1) (:skipped acc) (:failed acc) (:dropped acc))) (do
@@ -811,10 +827,11 @@
   (doseq [c (:hand p)]
   (println (str "    " (short-id (:l c)) "  " (:p c) "  " (trunc (:r c) 72))))
   (report-tombstoned (:tombstoned p)))
-  :else (if (and (or adopt resurrect) has-adoptable) (let [port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — adopt needs the daemon to serialize writes. Run `north up`.") (do
+  :else (if (and (or adopt resurrect) has-adoptable) (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "heal --adopt was not recorded")) (do
   (if (not resurrect) (report-tombstoned (:tombstoned p)) nil)
-  (let [res (adopt-hand-facts port (live-idx log) adopt-list)]
+  (let [res (adopt-hand-facts port log (live-idx log) adopt-list)]
   (println (str "heal --adopt: " (:adopted res) " adopted, " (:skipped res) " skipped (log won), " (:dropped res) " dropped (parse artifact), " (:failed res) " failed via coordinator."))
   (heal-project threads-dir (probe threads-dir log)))))) (do
   (report-tombstoned (:tombstoned p))
@@ -901,8 +918,9 @@
   (println "    Writing predicate metadata onto these would pollute real threads:")
   (doseq [s collisions]
   (println (str "      " s "  (has a `title` fact — is a thread)")))
-  (println "    No facts written. Rename the colliding thread(s) or exclude the pred(s).")) (let [port (fram.rt/coord-port)]
-  (if (< (fram.rt/coord-version port) 0) (println "no coordinator on 127.0.0.1:7977 — writes won't serialize. Run `north up`.") (let [results (mapv (fn [c] (tell-retry port "assert" (:l c) (:p c) (:r c) 5)) seeds)
+  (println "    No facts written. Rename the colliding thread(s) or exclude the pred(s).")) (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "schema seed was not recorded")) (let [results (mapv (fn [c] (tell-retry port log "assert" (:l c) (:p c) (:r c) 5)) seeds)
    oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
   (println (str "schema-seed EXECUTED — " oks "/" (count seeds) " fact(s) committed via coordinator."))))))))))
 

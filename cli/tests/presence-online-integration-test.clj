@@ -14,6 +14,7 @@
 (def fram (str (System/getProperty "user.home") "/code/fram"))
 (def presence-cli (str root "/cli/presence-cli.clj"))
 (def checks (atom []))
+(def test-log (atom nil))
 
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
 (defn free-port []
@@ -34,11 +35,17 @@
     (.setSoTimeout socket 5000)
     (let [writer (.getOutputStream socket)
           reader (io/reader (.getInputStream socket))]
-      (.write writer (.getBytes (str (pr-str request) "\n")))
+      (.write writer
+              (.getBytes
+               (str (pr-str {:op :for-log
+                             :expected-log @test-log
+                             :request request})
+                    "\n")))
       (.flush writer)
       (edn/read-string (.readLine reader)))))
 (defn run-presence [port & args]
-  (apply proc/sh {:out :string :err :string :continue true}
+  (apply proc/sh {:out :string :err :string :continue true
+                  :extra-env {"FRAM_LOG" @test-log}}
          "bb" presence-cli (str port) args))
 
 (let [port (free-port)
@@ -49,9 +56,11 @@
       daemon (do
                (spit facts "")
                (proc/process {:dir fram :out :string :err :string
-                              :extra-env {"FRAM_SINGLE_VALUED" "agent dir session_id started_at"}}
+                              :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"
+                                          "FRAM_SINGLE_VALUED" "agent dir session_id started_at"}}
                              "bb" "-cp" "out" "coord_daemon.clj"
                              "serve-flat" (str port) (.getPath facts)))]
+  (reset! test-log (.getCanonicalPath facts))
   (try
     (check "throwaway Fram coordinator starts" (await-port port))
     (check "live session registers"

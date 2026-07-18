@@ -20,6 +20,11 @@
 # source.
 set -euo pipefail
 
+file_size() {
+  # POSIX on both Linux and Darwin; avoids platform-specific stat dialects.
+  wc -c < "$1" | tr -d '[:space:]'
+}
+
 usage() {
   cat <<'EOF'
 usage: north-stream-sync [--days N] [--min-bytes N] [--src-dir DIR] [--raw-dir DIR]
@@ -27,7 +32,8 @@ usage: north-stream-sync [--days N] [--min-bytes N] [--src-dir DIR] [--raw-dir D
   --days N        only sync sources modified within the last N days (default 2)
   --min-bytes N   skip sources smaller than N bytes (default 65536)
   --src-dir DIR   override source root (default: ~/.claude/projects)
-  --raw-dir DIR   override dest root (default: <north-repo>/streams/raw)
+  --raw-dir DIR   override dest root (checkout: <repo>/streams/raw;
+                  packaged: $XDG_STATE_HOME/north/streams/raw)
 EOF
 }
 
@@ -35,7 +41,14 @@ DAYS=2
 MIN_BYTES=65536
 SRC_DIR="$HOME/.claude/projects"
 NORTH_REPO="$(cd "$(dirname "$0")/.." && pwd)"
-RAW_DIR="$NORTH_REPO/streams/raw"
+if [ -n "${NORTH_STREAM_RAW_DIR:-}" ]; then
+  RAW_DIR="$NORTH_STREAM_RAW_DIR"
+elif [ "${NORTH_PACKAGE_MODE:-}" = nix-store ]; then
+  state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+  RAW_DIR="$state_home/north/streams/raw"
+else
+  RAW_DIR="$NORTH_REPO/streams/raw"
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,7 +86,7 @@ trap 'rm -f "$TMP_CURSOR"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 cp "$CURSOR_FILE" "$TMP_CURSOR"
 
 while IFS= read -r -d '' src; do
-  src_size=$(stat -c%s "$src")
+  src_size="$(file_size "$src")"
   [ "$src_size" -ge "$MIN_BYTES" ] || continue
 
   proj_dir="$(basename "$(dirname "$src")")"
@@ -100,7 +113,7 @@ while IFS= read -r -d '' src; do
     if [ -n "$adopt" ]; then
       dest="$adopt"
       dest_date="$(basename "$dest" | cut -c1-10)"
-      cur_bytes=$(stat -c%s "$dest")
+      cur_bytes="$(file_size "$dest")"
     else
       dest_date="$(date +%F)"
       dest="$RAW_DIR/${dest_date}-${slug}.${session_short}.jsonl"
@@ -109,7 +122,7 @@ while IFS= read -r -d '' src; do
   fi
 
   dest_size=0
-  [ -f "$dest" ] && dest_size=$(stat -c%s "$dest")
+  [ -f "$dest" ] && dest_size="$(file_size "$dest")"
 
   # crash recovery: a prior run appended past the recorded cursor and then
   # died before updating the cursor file. Truncate back to the last known-good

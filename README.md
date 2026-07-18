@@ -56,10 +56,10 @@ committed in `out/` (no Beagle required at runtime), same as Fram. You need the
 Fram engine checked out too (`FRAM_HOME`, default `~/code/fram`); `bin/north`
 puts both on the classpath.
 
-North links Fram's library API, so it's **pinned** to a specific Fram commit in
-[`FRAM_VERSION`](FRAM_VERSION) (CI and the Dockerfile read it). Fram's `main` moves
-independently; bump the pin deliberately when you rebuild `out/` against a newer
-engine.
+North links Fram's library API, so its exact source is pinned by the `fram`
+node in [`flake.lock`](flake.lock). The Nix package, CI, and Docker image all
+consume that one lock record mechanically; there is no second revision file to
+update or let drift.
 
 To **rebuild** from the `.bclj` sources you also need
 [Beagle](https://github.com/tompassarelli/beagle) (the Lisp North is written

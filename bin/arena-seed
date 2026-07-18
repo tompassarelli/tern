@@ -7,14 +7,33 @@
 ;; renders + updates live. The graph arm uses fewer tokens and less wall time;
 ;; the control arm burns extra attempts and usage, one task blocks, one fails.
 ;;
-;; One process, one short-lived TCP socket per op straight to the board daemon
-;; on :7977 (OCC via :base) — fast, unlike the CLI (which cold-starts a JVM per
-;; call). Re-drivable: each run mints a FRESH exp id unless one is passed.
+;; One process, one short-lived TCP socket per op through North's shared,
+;; corpus-fenced coordinator transport. Re-drivable: each run mints a FRESH exp
+;; id unless one is passed.
 ;;
 ;;   usage: bin/arena-seed [exp_id]
-(require '[clojure.edn :as edn])
+(require '[clojure.java.io :as io])
 
-(def PORT 7977)
+(def ROOT
+  (some-> (System/getProperty "babashka.file")
+          io/file .getCanonicalFile .getParentFile .getParentFile str))
+(load-file (str ROOT "/cli/coord.clj"))
+
+(defn parse-port [raw]
+  (when-not (and (string? raw) (re-matches #"[1-9][0-9]{0,4}" raw))
+    (throw (ex-info "NORTH_PORT/FRAM_PORT must be an integer from 1 through 65535"
+                    {:port raw})))
+  (let [port (parse-long raw)]
+    (when (> port 65535)
+      (throw (ex-info "NORTH_PORT/FRAM_PORT must be an integer from 1 through 65535"
+                      {:port raw})))
+    (int port)))
+
+(def PORT
+  (parse-port
+   (or (System/getenv "NORTH_PORT")
+       (System/getenv "FRAM_PORT")
+       north.coord/PORT)))
 (def exp (or (first *command-line-args*)
              (str "EXP-025-demo-"
                   (.format (java.time.LocalTime/now)
@@ -24,27 +43,12 @@
   (.format (java.time.OffsetDateTime/now java.time.ZoneOffset/UTC)
            (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd'T'HH:mm:ss'Z'")))
 
-(defn send-op [op]
-  (let [s (java.net.Socket. "127.0.0.1" PORT)]
-    (.setSoTimeout s 6000)
-    (let [o (.getOutputStream s)
-          i (clojure.java.io/reader (.getInputStream s))]
-      (.write o (.getBytes (str op "\n"))) (.flush o)
-      (let [r (.readLine i)] (.close s) (edn/read-string r)))))
-
-(defn version [] (:version (send-op "{:op :version}")))
-
-(defn esc [x] (-> (str x) (clojure.string/replace "\\" "\\\\") (clojure.string/replace "\"" "\\\"")))
-
 (defn assert! [te p r]
-  (loop [tries 5]
-    (let [v (version)
-          resp (send-op (format "{:op :assert :te \"%s\" :p \"%s\" :r \"%s\" :base %d}"
-                                 (esc te) (esc p) (esc r) v))]
-      (cond
-        (or (:ok resp) (:version resp)) resp
-        (and (pos? tries) (or (:reject resp) (:conflict resp))) (recur (dec tries))
-        :else resp))))
+  (let [resp (north.coord/swap! PORT te p r)]
+    (when-not (or (:ok resp) (:version resp))
+      (throw (ex-info (str "arena seed write rejected for " te " " p)
+                      {:response resp :subject te :predicate p})))
+    resp))
 
 (def task-ids ["PR-142" "PR-153" "PR-188" "PR-201" "PR-219"])
 (def titles ["fix cljs reader edge case" "nil-safe transducer arity"
@@ -80,7 +84,10 @@
 (doseq [idx (range 5) arm ["control" "graph"]] (capture! arm idx))
 (println "seeded. driving states (~60s)…")
 
-(defn step [t ms] (println (str "  t+" t "s")) (Thread/sleep ms))
+(defn step [t ms]
+  (println (str "  t+" t "s"))
+  (when-not (= "1" (System/getenv "NORTH_ARENA_NO_SLEEP"))
+    (Thread/sleep ms)))
 
 ;; kick everything to running
 (doseq [idx (range 5)] (mut "graph" idx "running" "50" "3"))

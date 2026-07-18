@@ -51,7 +51,7 @@
 (defn north-daemon []
   (try (with-open [s (java.net.Socket.)]
          (.connect s (java.net.InetSocketAddress. "127.0.0.1" 7977) 300))
-       "up"
+       "reachable (corpus health is checked by `north doctor`)"
        (catch Exception _ "DOWN")))
 
 (defn linear-mcp []

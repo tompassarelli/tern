@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Start North's Fram coordinator against the configured North log.
+set -euo pipefail
+
+NORTH_HOME="${NORTH_HOME:-$(cd "$(dirname "$0")/.." && pwd -P)}"
+FRAM_HOME="${FRAM_HOME:-$HOME/code/fram}"
+FRAM_BIN="${FRAM_BIN:-$FRAM_HOME/bin}"
+FRAM_PORT="${FRAM_PORT:-7977}"
+FRAM_LOG="${FRAM_LOG:-$HOME/.local/state/north/facts.log}"
+if [[ ! "$FRAM_PORT" =~ ^[0-9]+$ ]] ||
+   (( 10#$FRAM_PORT < 1 || 10#$FRAM_PORT > 65535 )); then
+  echo "north up: FRAM_PORT must be an integer from 1 through 65535 (got '$FRAM_PORT')" >&2
+  exit 2
+fi
+FRAM_PORT="$((10#$FRAM_PORT))"
+FRAM_REQUIRE_LOG_FENCE=1
+export FRAM_PORT FRAM_LOG FRAM_REQUIRE_LOG_FENCE
+
+fram="$FRAM_BIN/fram"
+daemon="$FRAM_BIN/fram-daemon"
+north_bb="${NORTH_BB:-${NORTH_MCP_BB:-bb}}"
+restart=0
+
+case "${1:-}" in
+  "") ;;
+  --restart) restart=1 ;;
+  *)
+    echo "usage: north up [--restart]" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$north_bb" != */* ]]; then
+  north_bb="$(command -v "$north_bb" 2>/dev/null || true)"
+fi
+
+for executable in "$fram" "$daemon" "$north_bb"; do
+  if [[ ! -x "$executable" ]]; then
+    echo "north up: required Fram executable is missing: $executable" >&2
+    exit 2
+  fi
+done
+
+doctor_output=
+doctor_healthy() {
+  local rc=0 first_line
+  doctor_output="$("$fram" doctor 2>&1)" || rc=$?
+  first_line="${doctor_output%%$'\n'*}"
+  [[ "$rc" -eq 0 &&
+     "$first_line" =~ ^coordinator\ UP\ on\ 127\.0\.0\.1:${FRAM_PORT}\ \(v[0-9]+\)$ ]]
+}
+
+strict_probe_output=
+strict_ready() {
+  local rc=0
+  strict_probe_output="$(
+    "$north_bb" "$NORTH_HOME/cli/coord.clj" strict-probe "$FRAM_PORT" "$FRAM_LOG" 2>&1
+  )" || rc=$?
+  [[ "$rc" -eq 0 ]]
+}
+
+# Return listener PIDs in stable order. `ss` is in North's Linux closure;
+# macOS ships `lsof`. Absence is acceptable for a normal start, but a restart
+# must never guess which process to kill.
+listener_pids() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnpH "sport = :$FRAM_PORT" 2>/dev/null \
+      | grep -oE 'pid=[0-9]+' \
+      | cut -d= -f2 \
+      | sort -nu \
+      || true
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$FRAM_PORT" -sTCP:LISTEN -t 2>/dev/null \
+      | sort -nu \
+      || true
+    return 0
+  fi
+  return 127
+}
+
+same_log=0
+if doctor_healthy; then
+  same_log=1
+fi
+strict=0
+if [[ "$same_log" -eq 1 ]] && strict_ready; then
+  strict=1
+fi
+
+if [[ "$strict" -eq 1 && "$restart" -eq 0 ]]; then
+  echo "coordinator already up on :$FRAM_PORT (use \`north up --restart\` to reload it)"
+  exit 0
+fi
+
+before_pids=
+have_pid_probe=0
+if before_pids="$(listener_pids)"; then
+  have_pid_probe=1
+fi
+
+if [[ "$same_log" -eq 1 && "$strict" -eq 0 && "$restart" -eq 0 ]]; then
+  echo "north up: coordinator on :$FRAM_PORT serves the configured log but does not enforce corpus fences; run \`north up --restart\` to replace it safely" >&2
+  [[ -z "$strict_probe_output" ]] || printf '%s\n' "$strict_probe_output" >&2
+  exit 1
+fi
+
+if [[ -n "$before_pids" ]]; then
+  if [[ "$same_log" -eq 0 ]]; then
+    echo "north up: :$FRAM_PORT is occupied, but Fram did not verify that it serves $FRAM_LOG; refusing to replace it" >&2
+    [[ -z "$doctor_output" ]] || printf '%s\n' "$doctor_output" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$restart" -eq 1 && "$same_log" -eq 1 ]]; then
+  if [[ "$have_pid_probe" -ne 1 || -z "$before_pids" ]]; then
+    echo "north up: coordinator is healthy, but its listener PID cannot be identified safely; refusing restart" >&2
+    exit 1
+  fi
+
+  after_pids="$(listener_pids)"
+  if [[ "$before_pids" != "$after_pids" ]]; then
+    echo "north up: listener on :$FRAM_PORT changed during the health check; refusing restart" >&2
+    exit 1
+  fi
+
+  echo "stopping coordinator on :$FRAM_PORT"
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] || kill "$pid"
+  done <<<"$before_pids"
+
+  for _ in $(seq 1 40); do
+    [[ -z "$(listener_pids)" ]] && break
+    sleep 0.1
+  done
+  if [[ -n "$(listener_pids)" ]]; then
+    echo "north up: coordinator on :$FRAM_PORT did not stop after SIGTERM; refusing to force-kill it" >&2
+    exit 1
+  fi
+fi
+
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+diagnostic_log="${FRAM_DAEMON_LOG:-$state_home/north/fram-daemon-$FRAM_PORT.log}"
+mkdir -p "$(dirname "$FRAM_LOG")" "$(dirname "$diagnostic_log")"
+
+echo "starting coordinator on :$FRAM_PORT  (log: $FRAM_LOG)"
+export FRAM_SNAPSHOT_BOOT="${FRAM_SNAPSHOT_BOOT:-1}"
+nohup "$daemon" "$FRAM_PORT" "$FRAM_LOG" \
+  </dev/null >"$diagnostic_log" 2>&1 &
+daemon_pid=$!
+if [[ -n "${NORTH_COORD_PID_FILE:-}" ]]; then
+  mkdir -p "$(dirname "$NORTH_COORD_PID_FILE")"
+  pid_tmp="$NORTH_COORD_PID_FILE.tmp.$$"
+  (umask 077; printf '%s\n' "$daemon_pid" >"$pid_tmp")
+  mv -f "$pid_tmp" "$NORTH_COORD_PID_FILE"
+fi
+
+# JVM startup includes folding the fact log. Poll BOTH the log-aware doctor and
+# the strict raw-wire policy probe for at most 30 seconds. When listener PID
+# inspection exists, the socket must belong to the child we just spawned; this
+# prevents an old compatibility peer from winning the readiness race.
+for _ in $(seq 1 120); do
+  if doctor_healthy && strict_ready; then
+    listener_owned=1
+    if [[ "$have_pid_probe" -eq 1 ]]; then
+      listener_owned=0
+      while IFS= read -r pid; do
+        if [[ "$pid" == "$daemon_pid" ]]; then
+          listener_owned=1
+          break
+        fi
+      done < <(listener_pids)
+    fi
+    if [[ "$listener_owned" -eq 1 ]]; then
+      echo "coordinator up on :$FRAM_PORT"
+      exit 0
+    fi
+  fi
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    wait "$daemon_pid" || true
+    echo "north up: coordinator exited during startup — see $diagnostic_log" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
+
+kill "$daemon_pid" 2>/dev/null || true
+echo "north up: coordinator did not become healthy — see $diagnostic_log" >&2
+[[ -z "$doctor_output" ]] || printf '%s\n' "$doctor_output" >&2
+exit 1

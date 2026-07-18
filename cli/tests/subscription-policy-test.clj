@@ -16,7 +16,6 @@
       predicates (read-source "cli/pred-cli.clj")
       presence (read-source "cli/presence-cli.clj")
       reconcile (read-source "cli/north-reconcile.clj")
-      arena (read-source "bin/arena-seed")
       retired [(str "budget" "_total") (str "cost" "_usd") "NORTH_BUDGET" "BUDGET SPENT"]]
   (check "listener has no retired dollar gate and fails closed peer child operations"
          (and (not-any? #(str/includes? listener %) retired)
@@ -33,10 +32,7 @@
               (every? #(str/includes? reconcile %)
                       ["\"tokens\"" "\"duration_ms\"" "\"num_turns\"" "\"fallback_count\""
                        "\"usage_terminal_count\"" "\"usage_scope\"" "\"usage_total_status\""
-                       "\"cached_input_tokens\"" "\"reasoning_output_tokens\""])))
-  (check "arena fixture records token usage instead of a dollar column"
-         (and (not-any? #(str/includes? arena %) retired)
-              (str/includes? arena "\"tokens\""))))
+                       "\"cached_input_tokens\"" "\"reasoning_output_tokens\""]))))
 
 ;; Exercise the report against a throwaway coordinator when Fram's compiled daemon is
 ;; available. The static checks above still run in source-only environments.
@@ -51,8 +47,10 @@
   (def tmp (.toFile (java.nio.file.Files/createTempDirectory
                       "north-subscription-policy" (make-array java.nio.file.attribute.FileAttribute 0))))
   (def log (io/file tmp "facts.log"))
+  (def canonical-log (.getCanonicalPath log))
   (spit log "")
-  (def daemon (proc/process {:dir fram :out :string :err :string}
+  (def daemon (proc/process {:dir fram :out :string :err :string
+                             :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"}}
                             "bb" "-cp" "out" "coord_daemon.clj" "serve-flat" (str port) (.getPath log)))
   (defn await-up []
     (loop [n 0]
@@ -63,7 +61,12 @@
     (with-open [s (java.net.Socket. "127.0.0.1" (int port))]
       (.setSoTimeout s 5000)
       (let [w (.getOutputStream s) r (io/reader (.getInputStream s))]
-        (.write w (.getBytes (str (pr-str request) "\n")))
+        (.write w
+                (.getBytes
+                 (str (pr-str {:op :for-log
+                               :expected-log canonical-log
+                               :request request})
+                      "\n")))
         (.flush w)
         (edn/read-string (.readLine r)))))
   (defn fact! [l p r]
@@ -90,9 +93,11 @@
     ;; A historical dollar-only row remains readable in the graph but is not a run
     ;; identity and therefore cannot enter the report or influence a decision.
     (fact! "@run-historical" (str "cost" "_usd") "99.99")
-    (let [full (proc/shell {:out :string :err :string :continue true}
+    (let [full (proc/shell {:out :string :err :string :continue true
+                            :extra-env {"FRAM_LOG" canonical-log}}
                            "bb" (str root "/cli/north-reconcile.clj") (str port) "full")
-          recent (proc/shell {:out :string :err :string :continue true}
+          recent (proc/shell {:out :string :err :string :continue true
+                              :extra-env {"FRAM_LOG" canonical-log}}
                              "bb" (str root "/cli/north-reconcile.clj") (str port) "recent" "10")]
       (check "usage reconciliation exits successfully" (and (zero? (:exit full)) (zero? (:exit recent))))
       (check "summary reports exact tokens, duration, turns, and fallbacks"

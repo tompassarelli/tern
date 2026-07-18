@@ -96,7 +96,7 @@
    ["spawned_at"     "single" "literal" "instant an agent was spawned"]
    ["prev_input_tokens"      "single" "literal" "input tokens of the previous run"]
    ["playbook_count_at_boot" "single" "literal" "playbook size at boot (drift baseline)"]
-   ["needs_rotation" "single" "literal" "flag: agent context should be compacted"]
+   ["needs_rotation" "single" "literal" "legacy flag: do not reuse; replace with a fresh managed lane"]
    ["pinned"         "single" "literal" "flag: agent surfaces first in the roster"]
    ["pin_reason"     "single" "literal" "why an agent is pinned"]
    ["current_thread" "single" "literal" "the agent's current thread focus"]
@@ -174,6 +174,7 @@
    ["touches" "multi"  "literal" "file paths a concern touches (display label + the path-string footprint fallback for non-flipped repos)"]
    ["footprint" "multi" "ref"    "code NODE (@mod#n) in a concern's footprint — the cross-frame bridge (thread 019f1010-2705); asserted on the repo's warm CODE port, joined via the daemon's calls_defn blast closure (calls_defn itself is a fram daemon-internal derived edge, not a :7977 fact)"]
    ["code_port" "single" "literal" "port of the repo's warm code daemon, so a reader finds where a concern's footprint code store lives"]
+   ["code_log" "single" "literal" "canonical log identity served by a concern's per-repo code daemon"]
    ;; --- fan-out / barrier (north-map) ---
    ["batch_kind"     "single" "literal" "kind of fan-out batch"]
    ["expected_count" "single" "literal" "N workers expected in a fan-out batch"]

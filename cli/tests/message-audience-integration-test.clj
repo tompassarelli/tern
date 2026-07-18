@@ -18,6 +18,7 @@
 (def north-arm (str root "/bin/north-arm"))
 (def checks (atom []))
 (def children (atom []))
+(def test-log (atom nil))
 
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
 (defn free-port [] (with-open [socket (java.net.ServerSocket. 0)] (.getLocalPort socket)))
@@ -37,7 +38,12 @@
     (.setSoTimeout socket 5000)
     (let [writer (.getOutputStream socket)
           reader (io/reader (.getInputStream socket))]
-      (.write writer (.getBytes (str (pr-str request) "\n")))
+      (.write writer
+              (.getBytes
+               (str (pr-str {:op :for-log
+                             :expected-log @test-log
+                             :request request})
+                    "\n")))
       (.flush writer)
       (edn/read-string (.readLine reader)))))
 (defn assert-fact! [port subject predicate value]
@@ -48,7 +54,8 @@
 (defn values-of [port subject predicate]
   (set (:values (coordinator-op port {:op :resolved :te subject :p predicate}))))
 (defn run-cli [path port & args]
-  (apply proc/shell {:continue true :out :string :err :string}
+  (apply proc/shell {:continue true :out :string :err :string
+                     :extra-env {"FRAM_LOG" @test-log}}
          "bb" path (str port) args))
 (defn run-msg [port & args] (apply run-cli msg-cli port args))
 (defn register! [port handle]
@@ -58,7 +65,8 @@
 (defn inbox-has? [port handle subject]
   (str/includes? (:out (run-msg port "inbox" handle)) subject))
 (defn start-listener! [port handle log & flags]
-  (let [child (apply proc/process {:out log :err log}
+  (let [child (apply proc/process {:out log :err log
+                                   :extra-env {"FRAM_LOG" @test-log}}
                      "bb" listener-cli (str port) handle flags)]
     (swap! children conj child)
     child))
@@ -80,10 +88,12 @@
                (spit facts "")
                (proc/process
                 {:dir fram :out :string :err :string
-                 :extra-env {"FRAM_SINGLE_VALUED"
+                 :extra-env {"FRAM_REQUIRE_LOG_FENCE" "1"
+                             "FRAM_SINGLE_VALUED"
                              "from subject body sent_at to acked_at broadcast_audience_version agent dir session_id started_at"}}
                 "bb" "-cp" "out" "coord_daemon.clj"
                 "serve-flat" (str port) (.getPath facts)))]
+  (reset! test-log (.getCanonicalPath facts))
   (try
     (check "throwaway Fram coordinator starts" (await-predicate #(port-open? port)))
     (check "north listen wrapper acknowledges before its one-shot exit"
@@ -189,7 +199,8 @@
                      send-result (run-msg port "send" "sender" "racer" token "simultaneous body")
                      message (sent-subject send-result)
                      peeks (mapv (fn [_]
-                                   (proc/process {:out :string :err :string}
+                                   (proc/process {:out :string :err :string
+                                                  :extra-env {"FRAM_LOG" @test-log}}
                                                  "bb" peek-cli (str port) "racer"))
                                  (range 4))
                      peek-results (mapv deref peeks)]
@@ -239,7 +250,8 @@
                (await-predicate #(log-has? log "listening"))))
       (let [producers
             (mapv (fn [i]
-                    (proc/process {:out :string :err :string}
+                    (proc/process {:out :string :err :string
+                                   :extra-env {"FRAM_LOG" @test-log}}
                                   "bb" msg-cli (str port) "send" "sender" "*"
                                   (str "burst-" i) (str "body-" i)))
                   (range 8))
