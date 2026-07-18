@@ -317,13 +317,26 @@
 
 ;; one fenced request/response over the daemon socket: write one EDN op +
 ;; newline, read one EDN reply line. The atom every other helper is built from.
+(def ^:private max-request-line-bytes (* 1024 1024))
+
 (defn- send-envelope [port envelope]
   (with-open [s (connect-socket port)]
-    (let [w (.getOutputStream s)
+    (let [payload (pr-str envelope)
+          payload-bytes (.getBytes payload java.nio.charset.StandardCharsets/UTF_8)
+          _ (when (> (alength payload-bytes) max-request-line-bytes)
+              (throw
+               (ex-info
+                (str "coordinator request line exceeds "
+                     max-request-line-bytes " bytes")
+                {:type :coordinator-request-too-large
+                 :max-bytes max-request-line-bytes})))
+          ;; One write preserves the line-frame boundary for peers that answer
+          ;; and close as soon as the complete request arrives.
+          wire (.getBytes (str payload "\n")
+                          java.nio.charset.StandardCharsets/UTF_8)
+          w (.getOutputStream s)
           reader (coordinator-reader s)]
-      (.write w
-              (.getBytes (str (pr-str envelope) "\n")
-                         java.nio.charset.StandardCharsets/UTF_8))
+      (.write w wire)
       (.flush w)
       (read-edn-response! reader))))
 

@@ -1,17 +1,30 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createServer } from "node:net";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   LINEAR_LEASE_TIMEOUT_SAFETY_FACTOR, LINEAR_MCP_CALL_TIMEOUT_MS,
   runLinearCommand, type LinearCliDependencies,
 } from "../src/integrations/linear/cli";
 import {
-  CoordinatorSyncLeaseManager, LINEAR_SYNC_LEASE_TTL_MS, NorthGraphStore, northThreadIdForIdentity,
+  compactLinearReceipts, CoordinatorSyncLeaseManager, ensureLinearLinkFacts,
+  LINEAR_GRAPH_VALUE_MAX_BYTES,
+  LINEAR_SYNC_LEASE_TTL_MS, MAX_LINEAR_MANIFEST_RECEIPTS, NorthGraphStore,
+  legacyBootstrapIdentityForIssue, linkSubject, loadLinkBySubject,
+  normalizeLinearIssueDocument, northThreadIdForIdentity, recordLinearReceipt,
   type GraphFact, type GraphStore, type SyncLease, type SyncLeaseManager,
 } from "../src/integrations/linear/north-state";
+import {
+  canonicalJson, MAX_LINEAR_CONNECTOR_BYTES, MAX_LINEAR_REMOTE_KEY_BYTES,
+  MAX_LINEAR_THREAD_ID_BYTES, normalizeBody, sha256Canonical,
+} from "../src/integrations/linear/normalize";
 import { createLinearSyncBaseline } from "../src/integrations/linear/reconcile";
-import type { LinearGateway, LinearCallEnvelope } from "../src/integrations/linear/gateway";
+import { replaceManagedLinearDescription } from "../src/integrations/linear/projection";
+import {
+  LinearGatewayError, type LinearGateway, type LinearCallEnvelope,
+} from "../src/integrations/linear/gateway";
 import type { ModelFreeTransportReceipt } from "../src/integrations/linear/mcp-broker";
 
 class FakeGraph implements GraphStore {
@@ -38,6 +51,24 @@ class FakeGraph implements GraphStore {
       const bare = subject.replace(/^@/, "");
       return [bare, [...(this.rows.get(bare) ?? [])]] as const;
     }));
+  }
+
+  async findBootstrapLinkSubjects(connector: string, createdAt: string): Promise<readonly string[]> {
+    return [...this.rows.entries()].flatMap(([subject, facts]) => {
+      const manifests = facts.filter((fact) => fact.predicate === "sync_manifest");
+      if (!manifests.length) {
+        return facts.some((fact) => fact.predicate === "linked_thread")
+            && subject.startsWith(
+              `link:linear:mcp-bootstrap-v1:${encodeURIComponent(connector)}:`,
+            )
+          ? [subject] : [];
+      }
+      if (manifests.length !== 1)
+        throw new Error("malformed Linear manifest set during bootstrap lookup");
+      const manifest = JSON.parse(manifests[0]!.value);
+      return manifest.evidence?.connector === connector && manifest.evidence?.createdAt === createdAt
+        ? [subject] : [];
+    }).sort();
   }
 
   async put(subjectInput: string, predicate: string, value: string): Promise<void> {
@@ -67,6 +98,7 @@ class FakeGraph implements GraphStore {
 
   async reserveLinearBinding(
     lease: SyncLease, linkInput: string, threadInput: string, remoteServer: string,
+    bootstrapInitialKey?: string,
   ): Promise<void> {
     await lease.fence();
     const link = linkInput.replace(/^@/, "");
@@ -90,7 +122,14 @@ class FakeGraph implements GraphStore {
       .filter(({ predicate }) => predicate === "remote_server").map(({ value }) => value));
     if (servers.size > 1 || (servers.size === 1 && !servers.has(remoteServer)))
       throw new Error("partial Linear link conflicts on remote_server");
+    const bootstrapKeys = new Set((this.rows.get(link) ?? [])
+      .filter(({ predicate }) => predicate === "bootstrap_initial_key").map(({ value }) => value));
+    if (bootstrapKeys.size > 1
+        || (bootstrapInitialKey && bootstrapKeys.size === 1 && !bootstrapKeys.has(bootstrapInitialKey)))
+      throw new Error("partial Linear link conflicts on bootstrap_initial_key");
     await this.beforeReservationPut?.();
+    if (bootstrapInitialKey && !bootstrapKeys.has(bootstrapInitialKey))
+      await this.put(link, "bootstrap_initial_key", bootstrapInitialKey);
     if (!existing.has(threadRef)) await this.put(link, "linked_thread", threadRef);
     this.reservations.push({ link, thread });
   }
@@ -221,15 +260,21 @@ class FakeGateway implements LinearGateway {
   infiniteCommentPages = false;
   oversizedCommentPage = false;
   commentPageCalls = 0;
+  commentReadCalls = 0;
   infiniteIssuePages = false;
   oversizedIssueCandidates = false;
   duplicateIssueKey = false;
   issuePageCalls = 0;
+  issueReadCalls = 0;
+  issueListCalls = 0;
+  transientIssueReadFailure = false;
   malformedComment?: "blank-id" | "non-string-body";
+  closeFailure?: string;
   afterIssueWrite?: () => void;
   afterWrittenIssueRead?: () => void;
   afterCommentPage?: () => void;
   beforeFirstIssueRead?: () => Promise<void>;
+  afterIssueRead?: () => void;
   constructor(readonly server = "linear-test") {}
 
   async call(envelope: LinearCallEnvelope): Promise<unknown> {
@@ -245,17 +290,24 @@ class FakeGateway implements LinearGateway {
       this.beforeFirstIssueRead = undefined;
       await before();
     }
+    this.issueReadCalls++;
+    if (this.transientIssueReadFailure) throw new Error("temporary Linear provider outage");
     const key = String(args.id);
-    if (key === this.issue.id || (!this.rejectOldKey && key === "MSA-236")) {
-      const result = structuredClone(this.issue);
+    let result: unknown;
+    if (key === this.issue.id
+        || key === (this.issue as { identifier?: string }).identifier
+        || (!this.rejectOldKey && key === "MSA-236")) {
+      result = structuredClone(this.issue);
       if (this.issueWrites > 0) this.afterWrittenIssueRead?.();
-      return result;
-    }
-    if (key === this.falsePositive.id) return structuredClone(this.falsePositive);
-    if (key === "DUP-1" && this.duplicateExact) return { ...structuredClone(this.issue), id: "DUP-1" };
-    throw new Error(`missing issue ${key}`);
+    } else if (key === this.falsePositive.id) result = structuredClone(this.falsePositive);
+    else if (key === "DUP-1" && this.duplicateExact)
+      result = { ...structuredClone(this.issue), id: "DUP-1" };
+    else throw new LinearGatewayError("not-found", `missing issue ${key}`);
+    this.afterIssueRead?.();
+    return result;
   }
   async listIssues(): Promise<unknown> {
+    this.issueListCalls++;
     if (this.infiniteIssuePages) {
       const page = ++this.issuePageCalls;
       return { issues: [], hasNextPage: true, nextCursor: `issues-${page}` };
@@ -288,6 +340,7 @@ class FakeGateway implements LinearGateway {
     return structuredClone(this.issue);
   }
   async listComments(): Promise<unknown> {
+    this.commentReadCalls++;
     if (this.malformedComment === "blank-id")
       return { comments: [{ id: " ", body: "managed-looking" }], hasNextPage: false };
     if (this.malformedComment === "non-string-body")
@@ -328,7 +381,9 @@ class FakeGateway implements LinearGateway {
       modelTurnsStarted: 0, usageEvents: 0, tokenTotalStatus: "exact-zero-protocol",
     };
   }
-  async close(): Promise<void> {}
+  async close(): Promise<void> {
+    if (this.closeFailure) throw new Error(this.closeFailure);
+  }
 }
 
 function harness(server = "linear-test") {
@@ -348,6 +403,149 @@ function harness(server = "linear-test") {
   return { graph, gateway, leases, opened, dependencies };
 }
 
+function seedLegacyBootstrapLink(
+  h: ReturnType<typeof harness>,
+  key = "MSA-51",
+): { link: string; thread: string } {
+  h.gateway.issue = {
+    ...issue(key),
+    id: key,
+    teamId: "aaaaaaaa-aaaa-8aaa-8aaa-aaaaaaaaaaaa",
+  };
+  const normalized = normalizeLinearIssueDocument(h.gateway.issue);
+  const identity = legacyBootstrapIdentityForIssue(normalized, h.gateway.server);
+  const link = linkSubject(identity);
+  const thread = northThreadIdForIdentity(identity);
+  const fields = {
+    title: normalized.title,
+    body: "Imported body",
+    doneWhen: [],
+    barEvidence: [],
+    repos: [],
+    lifecycle: "ready" as const,
+  };
+  const description = replaceManagedLinearDescription("", thread, fields);
+  h.gateway.issue.description = description;
+  const manifest = {
+    version: 1 as const,
+    phase: "adopted" as const,
+    baseline: createLinearSyncBaseline(identity, thread, fields),
+    evidence: {
+      connector: h.gateway.server,
+      createdAt: normalized.createdAt,
+      initialKey: key,
+      workspace: normalized.workspace,
+      importedAt: "2026-07-16T15:00:00.000Z",
+      createdThread: true,
+      owner: "personal",
+      markerBound: true,
+      adoptRawDescription: false,
+      importedRawDescriptionHash: "a".repeat(64),
+      importedTitleHash: "b".repeat(64),
+    },
+    receipts: {},
+  };
+  for (const [predicate, value] of [
+    ["kind", "integration_link"],
+    ["linked_thread", `@${thread}`],
+    ["remote_key", key],
+    ["remote_server", h.gateway.server],
+    ["remote_workspace_slug", normalized.workspace],
+    ["remote_scope", normalized.teamId ?? ""],
+    ["identity_kind", identity.identityKind],
+    ["remote_fingerprint", identity.fingerprint],
+    ["sync_policy", "north-primary"],
+    ["sync_schema", "linear-sync-v1"],
+    ["sync_manifest", canonicalJson(manifest)],
+  ] as const) {
+    if (value) h.graph.seed(link, predicate, value);
+  }
+  h.graph.seed(thread, "title", normalized.title);
+  h.graph.seed(thread, "linear_link", `@${link}`);
+  return { link, thread };
+}
+
+async function fakeCoordinator() {
+  const requests: Buffer[] = [];
+  let connections = 0;
+  const server = createServer((socket) => {
+    connections++;
+    const chunks: Buffer[] = [];
+    let replied = false;
+    socket.on("data", (chunk: Buffer) => {
+      chunks.push(Buffer.from(chunk));
+      const request = Buffer.concat(chunks);
+      if (!replied && request.includes(0x0a)) {
+        replied = true;
+        requests.push(request);
+        socket.end("{:ok 11}\n");
+      }
+    });
+  });
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolvePromise());
+  });
+  const address = server.address() as { port: number };
+  return {
+    port: String(address.port),
+    requests,
+    connections: () => connections,
+    close: () => new Promise<void>((resolvePromise, reject) => {
+      server.close((error) => error ? reject(error) : resolvePromise());
+    }),
+  };
+}
+
+async function fakeCoordinatorReplies(replies: readonly string[]) {
+  const requests: Buffer[] = [];
+  let nextReply = 0;
+  const server = createServer((socket) => {
+    const chunks: Buffer[] = [];
+    let replied = false;
+    socket.on("data", (chunk: Buffer) => {
+      chunks.push(Buffer.from(chunk));
+      const request = Buffer.concat(chunks);
+      if (replied || !request.includes(0x0a)) return;
+      replied = true;
+      requests.push(request);
+      socket.end(replies[nextReply++] ?? "{:error \"unexpected query\"}\n");
+    });
+  });
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolvePromise());
+  });
+  const address = server.address() as { port: number };
+  return {
+    port: String(address.port),
+    requests,
+    close: () => new Promise<void>((resolvePromise, reject) => {
+      server.close((error) => error ? reject(error) : resolvePromise());
+    }),
+  };
+}
+
+async function runProcessWithInput(
+  command: string,
+  args: readonly string[],
+  chunks: readonly Buffer[],
+): Promise<{ code: number | null; stdout: Buffer; stderr: Buffer }> {
+  const child = spawn(command, [...args], { stdio: ["pipe", "pipe", "pipe"] });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
+  child.stdin.on("error", () => {});
+  for (const chunk of chunks) child.stdin.write(chunk);
+  child.stdin.end();
+  const code = await new Promise<number | null>((resolvePromise, reject) => {
+    child.once("error", reject);
+    child.once("close", resolvePromise);
+  });
+  return { code, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+}
+
 async function importThread(h: ReturnType<typeof harness>): Promise<string> {
   const result = await runLinearCommand(["import", "MSA-236"], h.dependencies) as { thread: string };
   return result.thread.replace(/^@/, "");
@@ -362,6 +560,115 @@ test("import dry-run is stable and read-only", async () => {
   expect(h.graph.writes).toHaveLength(before);
 });
 
+test("import dry-run enforces real binding preconditions and reports healing instead of reuse", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const writes = h.graph.writes.length;
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--thread", "different-thread", "--dry-run"],
+    h.dependencies,
+  )).rejects.toThrow(`already prepared for @${thread}`);
+
+  h.graph.rows.set(
+    thread,
+    h.graph.rows.get(thread)!.filter(({ predicate }) => predicate !== "linear_link"),
+  );
+  const healing = await runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    h.dependencies,
+  ) as { actions: string[] };
+  expect(healing.actions).toContain("write-canonical-reverse-link");
+  expect(healing.actions).not.toContain("reuse-link");
+  expect(h.graph.writes).toHaveLength(writes);
+
+  const missing = harness();
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--thread", "missing-thread", "--dry-run"],
+    missing.dependencies,
+  )).rejects.toThrow("does not exist");
+
+  const conflicting = harness();
+  conflicting.graph.seed("occupied-thread", "title", "Occupied");
+  conflicting.graph.seed("occupied-thread", "linear_link", "@link:someone-else");
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--thread", "occupied-thread", "--dry-run"],
+    conflicting.dependencies,
+  )).rejects.toThrow("different canonical Linear link");
+
+  const reserved = harness();
+  reserved.gateway.issue.description = "<!-- north:thread:someone-else -->";
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    reserved.dependencies,
+  )).rejects.toThrow("unclosed North-managed Linear block");
+});
+
+test("import dry-run checks schema, fresh identity, and prepared-manifest drift without writes", async () => {
+  const schemaConflict = harness();
+  schemaConflict.graph.seed("linked_thread", "cardinality", "multi");
+  const schemaWrites = schemaConflict.graph.writes.length;
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    schemaConflict.dependencies,
+  )).rejects.toThrow("Linear graph schema conflicts");
+  expect(schemaConflict.graph.writes).toHaveLength(schemaWrites);
+
+  const identityDrift = harness();
+  let drifted = false;
+  identityDrift.gateway.afterIssueRead = () => {
+    if (drifted) return;
+    drifted = true;
+    identityDrift.gateway.issue.createdAt = "2026-07-16T14:08:21.639Z";
+  };
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    identityDrift.dependencies,
+  )).rejects.toThrow("identity changed during import");
+  expect(identityDrift.graph.writes).toHaveLength(0);
+
+  const preparedDrift = harness();
+  const preview = await runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    preparedDrift.dependencies,
+  ) as { link: string };
+  preparedDrift.graph.failSubjectPrefix = preview.link.replace(/^@/, "");
+  // Bootstrap key and linked_thread are mutations one/two. Let the prepared
+  // manifest land as mutation three, then crash before the remaining link facts.
+  preparedDrift.graph.failAfter = 3;
+  await expect(importThread(preparedDrift)).rejects.toThrow("injected graph crash");
+  preparedDrift.gateway.issue.title = "Changed during prepared import";
+  const preparedWrites = preparedDrift.graph.writes.length;
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    preparedDrift.dependencies,
+  )).rejects.toThrow("title/description changed");
+  expect(preparedDrift.graph.writes).toHaveLength(preparedWrites);
+});
+
+test("minted import fails closed when its deterministic thread id is already occupied", async () => {
+  const h = harness();
+  const preview = await runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    h.dependencies,
+  ) as { thread: string };
+  h.graph.seed(preview.thread.replace(/^@/, ""), "title", "Unrelated existing thread");
+  const writes = h.graph.writes.length;
+
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    h.dependencies,
+  )).rejects.toThrow("already exists without its canonical Linear link");
+  expect(h.graph.writes).toHaveLength(writes);
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+
+  await expect(runLinearCommand(["import", "MSA-236"], h.dependencies))
+    .rejects.toThrow("already exists without its canonical Linear link");
+  expect(h.graph.writes).toHaveLength(writes);
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+});
+
 test("representative mechanical lifecycle converges, no-ops, and recovers from conflict", async () => {
   const h = harness();
   const doctorBefore = await runLinearCommand(["doctor"], h.dependencies) as {
@@ -370,7 +677,7 @@ test("representative mechanical lifecycle converges, no-ops, and recovers from c
   };
   expect(doctorBefore).toMatchObject({
     modelTurn: false, oauth: true, graphSchema: { ok: true, missing: [], conflicting: [] },
-    graphSchemaBootstrap: { applied: true, assertions: 19 },
+    graphSchemaBootstrap: { applied: true, assertions: 20 },
   });
   const fetched = await runLinearCommand(["get", "MSA-236"], h.dependencies) as {
     issue: { key: string }; identity: unknown;
@@ -402,12 +709,14 @@ test("representative mechanical lifecycle converges, no-ops, and recovers from c
   expect(h.gateway.issueWrites).toBe(0);
   expect(h.gateway.commentWrites).toBe(0);
 
+  const commentReadsBeforeApply = h.gateway.commentReadCalls;
   const applied = await runLinearCommand(["sync", thread, "--apply"], h.dependencies) as {
     writes: number; state: string;
   };
   expect(applied).toMatchObject({ writes: 2, state: "in-sync" });
   expect(h.gateway.issueWrites).toBe(1);
   expect(h.gateway.commentWrites).toBe(1);
+  expect(h.gateway.commentReadCalls - commentReadsBeforeApply).toBe(1);
   expect(await runLinearCommand(["plan", thread], h.dependencies)).toMatchObject({
     state: "in-sync", conflicts: [], actions: [],
   });
@@ -446,6 +755,213 @@ test("repeated import converges on one deterministic thread and singleton manife
   expect((await h.graph.show(link)).filter(({ predicate }) => predicate === "sync_manifest")).toHaveLength(1);
 });
 
+test("repeated UUID import preserves identity across mutable Linear metadata", async () => {
+  const h = harness();
+  const issueUuid = "11111111-1111-8111-8111-111111111111";
+  const workspaceUuid = "22222222-2222-8222-8222-222222222222";
+  h.gateway.issue = Object.assign(issue("MSA-236"), {
+    id: issueUuid,
+    identifier: "MSA-236",
+    workspaceId: workspaceUuid,
+  });
+  const first = await runLinearCommand(["import", "MSA-236"], h.dependencies) as {
+    link: string; thread: string;
+  };
+  h.gateway.issue = {
+    ...h.gateway.issue,
+    identifier: "PLATFORM-9",
+    workspaceId: workspaceUuid.toUpperCase(),
+    teamId: "team-b",
+    url: "https://linear.app/renamed-workspace/issue/PLATFORM-9/mechanical-linear-bridge",
+  };
+
+  const repeated = await runLinearCommand(["import", "PLATFORM-9"], h.dependencies) as {
+    link: string; thread: string; reused: boolean;
+  };
+  expect(repeated).toMatchObject({
+    link: first.link,
+    thread: first.thread,
+    reused: true,
+  });
+  const linkFacts = await h.graph.show(first.link);
+  expect(linkFacts.find(({ predicate }) => predicate === "remote_key")?.value)
+    .toBe("PLATFORM-9");
+  expect(linkFacts.find(({ predicate }) => predicate === "remote_scope")?.value)
+    .toBe("team-b");
+  expect(linkFacts.find(({ predicate }) => predicate === "remote_workspace_slug")?.value)
+    .toBe("renamed-workspace");
+
+  h.gateway.issue.workspaceId = "33333333-3333-8333-8333-333333333333";
+  await expect(runLinearCommand(["plan", first.thread], h.dependencies))
+    .rejects.toThrow("could not be verified before backlink adoption");
+});
+
+test("conflicting native issue UUID evidence fails before graph mutation", async () => {
+  const h = harness();
+  h.gateway.issue = Object.assign(issue("MSA-236"), {
+    id: "11111111-1111-8111-8111-111111111111",
+    identifier: "MSA-236",
+    uuid: "33333333-3333-8333-8333-333333333333",
+    workspaceId: "22222222-2222-8222-8222-222222222222",
+  });
+  await expect(runLinearCommand(["import", "MSA-236"], h.dependencies))
+    .rejects.toThrow("conflicting native UUID evidence");
+  expect(h.graph.writes).toHaveLength(0);
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+});
+
+test("helper-bound connector, thread, and remote-key metadata reject oversized argv inputs", async () => {
+  const native = harness("x".repeat(MAX_LINEAR_CONNECTOR_BYTES + 1));
+  native.gateway.issue = Object.assign(issue("MSA-236"), {
+    id: "11111111-1111-8111-8111-111111111111",
+    identifier: "MSA-236",
+    workspaceId: "22222222-2222-8222-8222-222222222222",
+  });
+  await expect(runLinearCommand(["import", "MSA-236"], native.dependencies))
+    .rejects.toThrow("connector must be canonical");
+  expect(native.graph.writes).toHaveLength(0);
+  expect(native.leases.requestedResources).toHaveLength(0);
+
+  const thread = harness();
+  await expect(runLinearCommand([
+    "import",
+    "MSA-236",
+    "--thread",
+    "t".repeat(MAX_LINEAR_THREAD_ID_BYTES + 1),
+  ], thread.dependencies)).rejects.toThrow("threadId is not safe");
+  expect(thread.opened).toHaveLength(0);
+  expect(thread.graph.writes).toHaveLength(0);
+
+  const key = "K".repeat(MAX_LINEAR_REMOTE_KEY_BYTES + 1);
+  const remote = harness();
+  remote.gateway.issue = issue(key);
+  await expect(runLinearCommand(["import", key], remote.dependencies))
+    .rejects.toThrow("issue key must be canonical");
+  expect(remote.graph.writes).toHaveLength(0);
+  expect(remote.leases.requestedResources).toHaveLength(0);
+});
+
+test("provider timestamps canonicalize equivalent instants and reject invalid evidence", async () => {
+  const h = harness();
+  const first = await runLinearCommand(["import", "MSA-236"], h.dependencies) as {
+    link: string; thread: string;
+  };
+  h.gateway.issue.createdAt = "2026-07-16T10:08:20.639-04:00";
+  const repeated = await runLinearCommand(["import", "MSA-236"], h.dependencies) as {
+    link: string; thread: string; reused: boolean;
+  };
+  expect(repeated).toMatchObject({
+    link: first.link,
+    thread: first.thread,
+    reused: true,
+  });
+
+  const invalid = harness();
+  invalid.gateway.issue.createdAt = "not-an-instant";
+  await expect(runLinearCommand(["import", "MSA-236"], invalid.dependencies))
+    .rejects.toThrow("createdAt is not a valid timestamp");
+  expect(invalid.graph.writes).toHaveLength(0);
+  expect(invalid.gateway.issueWrites).toBe(0);
+  expect(invalid.gateway.commentWrites).toBe(0);
+});
+
+test("bootstrap-v2 collisions fail closed until an exact managed marker proves reuse", async () => {
+  const h = harness();
+  const first = await runLinearCommand(["import", "MSA-236"], h.dependencies) as {
+    link: string; thread: string;
+  };
+  h.gateway.issue = {
+    ...h.gateway.issue,
+    id: "PLATFORM-9",
+    url: "https://linear.app/renamed/issue/PLATFORM-9/same-created-at",
+  };
+  const writes = h.graph.writes.length;
+  await expect(runLinearCommand(["import", "PLATFORM-9"], h.dependencies))
+    .rejects.toThrow("exact managed marker is required");
+  expect(h.graph.writes).toHaveLength(writes);
+  expect([...h.graph.rows.keys()].filter((subject) =>
+    subject.startsWith("link:linear:mcp-bootstrap-v2:"))).toHaveLength(1);
+
+  h.gateway.issue.description = replaceManagedLinearDescription(
+    "",
+    first.thread.replace(/^@/, ""),
+    {
+      title: h.gateway.issue.title,
+      body: "Imported body",
+      doneWhen: [],
+      barEvidence: [],
+      repos: [],
+      lifecycle: "ready",
+    },
+  );
+  const proven = await runLinearCommand(["import", "PLATFORM-9"], h.dependencies) as {
+    link: string; thread: string;
+  };
+  expect(proven).toMatchObject({ link: first.link, thread: first.thread });
+});
+
+test("live-shaped bootstrap-v1 marker reimport preserves the old canonical subject", async () => {
+  const h = harness();
+  const legacy = seedLegacyBootstrapLink(h);
+  h.gateway.issue = {
+    ...h.gateway.issue,
+    id: "PLATFORM-51",
+    url: "https://linear.app/renamed/issue/PLATFORM-51/live-shaped",
+  };
+
+  const imported = await runLinearCommand(["import", "PLATFORM-51"], h.dependencies) as {
+    identity: { identityKind: string };
+    link: string;
+    thread: string;
+  };
+  expect(imported).toMatchObject({
+    identity: { identityKind: "mcp-bootstrap-v1" },
+    link: `@${legacy.link}`,
+    thread: `@${legacy.thread}`,
+  });
+  expect([...h.graph.rows.keys()].filter((subject) =>
+    subject.startsWith("link:linear:mcp-bootstrap-v2:"))).toHaveLength(0);
+  expect((await h.graph.show(legacy.link))
+    .find((fact) => fact.predicate === "remote_key")?.value).toBe("PLATFORM-51");
+  expect((await h.graph.show(legacy.link))
+    .find((fact) => fact.predicate === "bootstrap_initial_key")?.value).toBe("MSA-51");
+});
+
+test("renamed bootstrap-v1 evidence without a marker cannot mint a v2 identity", async () => {
+  const h = harness();
+  const legacy = seedLegacyBootstrapLink(h);
+  h.gateway.issue = {
+    ...h.gateway.issue,
+    id: "PLATFORM-51",
+    description: "No managed marker yet",
+    url: "https://linear.app/renamed/issue/PLATFORM-51/pre-marker",
+  };
+  const writes = h.graph.writes.length;
+  await expect(runLinearCommand(["import", "PLATFORM-51"], h.dependencies))
+    .rejects.toThrow("bootstrap evidence already exists under another identity");
+  expect(h.graph.writes).toHaveLength(writes);
+  expect(h.graph.rows.has(legacy.link)).toBe(true);
+  expect([...h.graph.rows.keys()].filter((subject) =>
+    subject.startsWith("link:linear:mcp-bootstrap-v2:"))).toHaveLength(0);
+
+  const partial = harness();
+  const oldIssue = normalizeLinearIssueDocument(partial.gateway.issue);
+  const oldIdentity = legacyBootstrapIdentityForIssue(oldIssue, partial.gateway.server);
+  const partialLink = linkSubject(oldIdentity);
+  partial.graph.seed(partialLink, "linked_thread", "@legacy-crash-thread");
+  partial.gateway.issue = {
+    ...partial.gateway.issue,
+    id: "RENAMED-236",
+    description: "Still no marker",
+    url: "https://linear.app/renamed/issue/RENAMED-236/partial-v1",
+  };
+  await expect(runLinearCommand(["import", "RENAMED-236"], partial.dependencies))
+    .rejects.toThrow("bootstrap evidence already exists under another identity");
+  expect([...partial.graph.rows.keys()].filter((subject) =>
+    subject.startsWith("link:linear:mcp-bootstrap-v2:"))).toHaveLength(0);
+});
+
 test("concurrent imports deduplicate identity and report the post-lease reuse truth", async () => {
   const h = harness();
   const results = await Promise.all([
@@ -461,17 +977,23 @@ test("concurrent imports deduplicate identity and report the post-lease reuse tr
   expect((await h.graph.show(link)).filter(({ predicate }) => predicate === "sync_manifest")).toHaveLength(1);
 });
 
-test("identity then thread acquisition is canonical, lexical, and reservation is the first mutation", async () => {
+test("bootstrap, identity, and thread acquisition is canonical with durable collision evidence first", async () => {
   const h = harness();
   const imported = await runLinearCommand(["import", "MSA-236"], h.dependencies) as {
     link: string; thread: string;
   };
-  const [identityResource, threadResource] = h.leases.requestedResources;
+  const [bootstrapResource, identityResource, threadResource] = h.leases.requestedResources;
+  expect(bootstrapResource).toStartWith("linear-sync:bootstrap:");
   expect(identityResource).toStartWith("linear-sync:identity:");
   expect(threadResource).toBe(`linear-sync:thread:${encodeURIComponent(imported.thread.replace(/^@/, ""))}`);
   expect(identityResource! < threadResource!).toBe(true);
   expect(identityResource).toContain("%3A");
   expect(h.graph.writes[0]).toEqual({
+    subject: imported.link.replace(/^@/, ""),
+    predicate: "bootstrap_initial_key",
+    value: "MSA-236",
+  });
+  expect(h.graph.writes[1]).toEqual({
     subject: imported.link.replace(/^@/, ""),
     predicate: "linked_thread",
     value: imported.thread,
@@ -606,6 +1128,7 @@ test("thread takeover inside the identity-fenced reservation leaves only healabl
     .filter(({ predicate, value }) => predicate === "linked_thread" && value === `@${thread}`))
     .toHaveLength(1);
   expect(h.graph.writes).toEqual([
+    { subject: link, predicate: "bootstrap_initial_key", value: "MSA-236" },
     { subject: link, predicate: "linked_thread", value: `@${thread}` },
   ]);
   expect(h.gateway.issueWrites).toBe(0);
@@ -855,6 +1378,32 @@ test("persisted comment intent reconciles a lost response without duplicate comm
   expect(await runLinearCommand(["plan", thread], h.dependencies)).toMatchObject({ state: "in-sync", actions: [] });
 });
 
+test("pending comment recovery canonicalizes the provider comment identifier", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  await h.graph.put(thread, "progress", "Canonical remote comment identity.");
+  const link = (await h.graph.show(thread))
+    .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  h.graph.failSubjectPrefix = link;
+  h.graph.failPredicate = "sync_manifest";
+  h.graph.failAfter = 1;
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("injected graph crash");
+  expect(h.gateway.comments).toHaveLength(1);
+  h.gateway.comments[0]!.id = ` ${h.gateway.comments[0]!.id} `;
+
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  const recovered = JSON.parse(
+    (await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value,
+  );
+  expect(recovered.pending).toBeUndefined();
+  expect(Object.values(recovered.receipts).some(
+    (receipt: any) => receipt.remoteId === "comment-1",
+  )).toBe(true);
+  expect(h.gateway.commentWrites).toBe(1);
+});
+
 test("pending comment recovery rejects duplicate managed markers before graph or remote writes", async () => {
   const h = harness();
   const thread = await importThread(h);
@@ -873,6 +1422,294 @@ test("pending comment recovery rejects duplicate managed markers before graph or
     .rejects.toThrow("duplicate North-managed marker");
   expect(h.graph.writes).toHaveLength(graphWritesBeforeRecovery);
   expect(h.gateway.commentWrites).toBe(1);
+});
+
+test("pending manifests are exact, operation-specific, and reject before remote or graph work", async () => {
+  const malformedPending = [
+    {
+      key: "bad-issue", kind: "issue", payloadHash: "a".repeat(64),
+      startedAt: "2026-07-16T15:00:00.000Z",
+    },
+    {
+      key: "bad-comment", kind: "comment", payloadHash: "a".repeat(64),
+      bodyHash: "b".repeat(64), startedAt: "2026-07-16T15:00:00.000Z",
+    },
+    {
+      key: "crossed-fields", kind: "comment", payloadHash: "a".repeat(64),
+      bodyHash: "b".repeat(64), marker: "north:comment:x", titleHash: "c".repeat(64),
+      startedAt: "2026-07-16T15:00:00.000Z",
+    },
+  ];
+  for (const pending of malformedPending) {
+    const h = harness();
+    const thread = await importThread(h);
+    const link = (await h.graph.show(thread))
+      .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+    h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) => {
+      if (fact.predicate !== "sync_manifest") return fact;
+      return {
+        ...fact,
+        value: JSON.stringify({ ...JSON.parse(fact.value), pending }),
+      };
+    }));
+    const reads = h.gateway.issueReadCalls;
+    const writes = h.graph.writes.length;
+    await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+      .rejects.toThrow("pending");
+    expect(h.gateway.issueReadCalls).toBe(reads);
+    expect(h.gateway.issueWrites).toBe(0);
+    expect(h.gateway.commentWrites).toBe(0);
+    expect(h.graph.writes).toHaveLength(writes);
+  }
+
+  for (const foreign of ["thread", "identity"] as const) {
+    const h = harness();
+    const thread = await importThread(h);
+    const link = (await h.graph.show(thread))
+      .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+    h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) => {
+      if (fact.predicate !== "sync_manifest") return fact;
+      const manifest = JSON.parse(fact.value);
+      const identity = foreign === "identity"
+        ? {
+          identityKind: "mcp-bootstrap-v1",
+          connector: manifest.baseline.identity.connector,
+          fingerprint: "f".repeat(64),
+        }
+        : manifest.baseline.identity;
+      const threadId = foreign === "thread" ? "foreign-thread" : manifest.baseline.threadId;
+      const baselineAfter = {
+        ...manifest.baseline,
+        identity,
+        threadId,
+        hash: sha256Canonical({ identity, threadId, fieldHashes: manifest.baseline.fieldHashes }),
+      };
+      return {
+        ...fact,
+        value: JSON.stringify({
+          ...manifest,
+          pending: {
+            key: `foreign-${foreign}`,
+            kind: "issue",
+            payloadHash: "a".repeat(64),
+            titleHash: "b".repeat(64),
+            baselineAfter,
+            startedAt: "2026-07-16T15:00:00.000Z",
+          },
+        }),
+      };
+    }));
+    const reads = h.gateway.issueReadCalls;
+    const writes = h.graph.writes.length;
+    await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+      .rejects.toThrow("pending issue baseline does not match its canonical link");
+    expect(h.gateway.issueReadCalls).toBe(reads);
+    expect(h.gateway.issueWrites).toBe(0);
+    expect(h.gateway.commentWrites).toBe(0);
+    expect(h.graph.writes).toHaveLength(writes);
+  }
+});
+
+test("legacy underspecified comment pending fails before its first provider read", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const link = (await h.graph.show(thread))
+    .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) => {
+    if (fact.predicate !== "sync_manifest") return fact;
+    const manifest = JSON.parse(fact.value);
+    manifest.pending = {
+      key: "legacy-comment",
+      kind: "comment",
+      payloadHash: "a".repeat(64),
+      bodyHash: "b".repeat(64),
+      marker: `<!-- north:comment:progress:${"c".repeat(64)} -->`,
+      startedAt: "2026-07-16T15:00:00.000Z",
+    };
+    return { ...fact, value: JSON.stringify(manifest) };
+  }));
+  const reads = h.gateway.issueReadCalls;
+  const writes = h.graph.writes.length;
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("pending comment operation has an unsupported shape");
+  expect(h.gateway.issueReadCalls).toBe(reads);
+  expect(h.graph.writes).toHaveLength(writes);
+});
+
+test("pending comment identity cannot be rebound to another thread's managed marker", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  await h.graph.put(thread, "progress", "Original pending comment.");
+  const link = (await h.graph.show(thread))
+    .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  h.graph.failSubjectPrefix = link;
+  h.graph.failPredicate = "sync_manifest";
+  h.graph.failAfter = 1;
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("injected graph crash");
+  expect(h.gateway.comments).toHaveLength(1);
+
+  const foreignKind = "progress";
+  const foreignSourceId = "foreign-source";
+  const foreignMarker = `<!-- north:comment:${foreignKind}:${
+    sha256Canonical({
+      threadId: "different-thread",
+      kind: foreignKind,
+      sourceId: foreignSourceId,
+    })
+  } -->`;
+  const foreignBody = `Original pending comment.\n\n${foreignMarker}`;
+  h.gateway.comments[0]!.body = foreignBody;
+  h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) => {
+    if (fact.predicate !== "sync_manifest") return fact;
+    const manifest = JSON.parse(fact.value);
+    manifest.pending.marker = foreignMarker;
+    manifest.pending.commentKind = foreignKind;
+    manifest.pending.commentSourceId = foreignSourceId;
+    manifest.pending.bodyHash = sha256Canonical(normalizeBody(foreignBody));
+    return { ...fact, value: JSON.stringify(manifest) };
+  }));
+  const reads = h.gateway.issueReadCalls;
+  const writes = h.graph.writes.length;
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("pending comment operation has an unsupported shape");
+  expect(h.gateway.issueReadCalls).toBe(reads);
+  expect(h.gateway.commentWrites).toBe(1);
+  expect(h.graph.writes).toHaveLength(writes);
+});
+
+test("receipt retention stays constant through 1000 operations and pending recovery survives compaction", async () => {
+  let receipts = {};
+  let cumulativeBytes = 0;
+  let maximumBytes = 0;
+  for (let index = 0; index < 1_000; index++) {
+    receipts = recordLinearReceipt(receipts, `operation-${String(index).padStart(4, "0")}`, {
+      confirmedAt: new Date(Date.UTC(2026, 6, 16, 15, 0, 0, index)).toISOString(),
+      remoteId: `remote-${index}`,
+    });
+    const bytes = Buffer.byteLength(JSON.stringify(receipts));
+    cumulativeBytes += bytes;
+    maximumBytes = Math.max(maximumBytes, bytes);
+    expect(Object.keys(receipts).length).toBeLessThanOrEqual(MAX_LINEAR_MANIFEST_RECEIPTS);
+  }
+  expect(maximumBytes).toBeLessThan(8 * 1024);
+  expect(cumulativeBytes).toBeLessThan(8 * 1024 * 1_000);
+
+  const equalTimestamp = "2026-07-16T15:00:00.000Z";
+  const forward = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [
+    `equal-${String(index).padStart(3, "0")}`, { confirmedAt: equalTimestamp },
+  ]));
+  const reverse = Object.fromEntries(Object.entries(forward).reverse());
+  expect(compactLinearReceipts(forward)).toEqual(compactLinearReceipts(reverse));
+  const tiedAtCapacity = Object.fromEntries(Array.from(
+    { length: MAX_LINEAR_MANIFEST_RECEIPTS },
+    (_, index) => [
+      `zz-existing-${String(index).padStart(3, "0")}`,
+      { confirmedAt: equalTimestamp },
+    ],
+  ));
+  const withCurrent = recordLinearReceipt(
+    tiedAtCapacity,
+    "aa-current-confirmation",
+    { confirmedAt: equalTimestamp, remoteId: "current-remote" },
+  );
+  expect(Object.keys(withCurrent)).toHaveLength(MAX_LINEAR_MANIFEST_RECEIPTS);
+  expect(withCurrent["aa-current-confirmation"]).toEqual({
+    confirmedAt: equalTimestamp,
+    remoteId: "current-remote",
+  });
+  expect(() => compactLinearReceipts({
+    valid: { confirmedAt: equalTimestamp },
+    invalid: { confirmedAt: "not-a-timestamp" },
+  })).toThrow("unsupported shape");
+
+  const h = harness();
+  const thread = await importThread(h);
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  const link = (await h.graph.show(thread))
+    .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  const historicalReceipts = Object.fromEntries(Array.from({ length: 1_000 }, (_, index) => [
+    `historical-${String(index).padStart(4, "0")}`,
+    {
+      confirmedAt: new Date(Date.UTC(2026, 6, 15, 0, 0, 0, index)).toISOString(),
+      remoteId: `historical-remote-${index}`,
+    },
+  ]));
+  h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) => {
+    if (fact.predicate !== "sync_manifest") return fact;
+    return {
+      ...fact,
+      value: JSON.stringify({ ...JSON.parse(fact.value), receipts: historicalReceipts }),
+    };
+  }));
+  const writesBeforePreview = h.graph.writes.length;
+  const receiptPreview = await runLinearCommand(
+    ["import", "MSA-236", "--dry-run"],
+    h.dependencies,
+  ) as { actions: string[] };
+  expect(receiptPreview.actions).toContain("compact-receipts");
+  expect(receiptPreview.actions).not.toContain("reuse-link");
+  expect(h.graph.writes).toHaveLength(writesBeforePreview);
+
+  const expected = (await loadLinkBySubject(h.graph, link))!;
+  const historicalManifest = h.graph.rows.get(link)!
+    .find(({ predicate }) => predicate === "sync_manifest")!.value;
+  h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) => {
+    if (fact.predicate !== "sync_manifest") return fact;
+    const concurrent = JSON.parse(fact.value);
+    concurrent.evidence.owner = "concurrent-writer";
+    return { ...fact, value: JSON.stringify(concurrent) };
+  }));
+  const compactionLease = await h.leases.acquire("linear-sync:identity:compaction-test");
+  const writesBeforeConflict = h.graph.writes.length;
+  await expect(ensureLinearLinkFacts(h.graph, compactionLease, expected))
+    .rejects.toThrow("conflicts on sync_manifest");
+  expect(h.graph.writes).toHaveLength(writesBeforeConflict);
+  await compactionLease.release();
+  h.graph.rows.set(link, h.graph.rows.get(link)!.map((fact) =>
+    fact.predicate === "sync_manifest"
+      ? { ...fact, value: historicalManifest }
+      : fact));
+
+  const graphWritesBeforeCompaction = h.graph.writes.length;
+  const compacted = await runLinearCommand(["sync", thread, "--apply"], h.dependencies) as {
+    writes: number;
+  };
+  expect(compacted.writes).toBe(0);
+  expect(h.gateway.issueWrites).toBe(1);
+  expect(h.graph.writes).toHaveLength(graphWritesBeforeCompaction + 1);
+  const storedCompacted = JSON.parse(
+    (await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value,
+  );
+  expect(Object.keys(storedCompacted.receipts ?? {})).toHaveLength(
+    MAX_LINEAR_MANIFEST_RECEIPTS,
+  );
+
+  await h.graph.put(thread, "progress", "Compaction survives pending recovery.");
+  h.graph.failSubjectPrefix = link;
+  h.graph.failPredicate = "sync_manifest";
+  h.graph.failAfter = 1;
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("injected graph crash");
+  expect(h.gateway.issueWrites).toBe(1);
+  expect(h.gateway.commentWrites).toBe(1);
+  const interrupted = JSON.parse(
+    (await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value,
+  );
+  expect(Object.keys(interrupted.receipts ?? {})).toHaveLength(MAX_LINEAR_MANIFEST_RECEIPTS);
+  expect(interrupted.pending).toMatchObject({ kind: "comment" });
+
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  expect(h.gateway.issueWrites).toBe(1);
+  expect(h.gateway.commentWrites).toBe(1);
+  const recovered = JSON.parse(
+    (await h.graph.show(link)).find(({ predicate }) => predicate === "sync_manifest")!.value,
+  );
+  expect(recovered.pending).toBeUndefined();
+  expect(Object.keys(recovered.receipts ?? {}).length).toBeLessThanOrEqual(MAX_LINEAR_MANIFEST_RECEIPTS);
+  expect(await runLinearCommand(["plan", thread], h.dependencies))
+    .toMatchObject({ state: "in-sync", actions: [] });
 });
 
 test("concurrent apply serializes and emits one remote issue mutation", async () => {
@@ -1040,7 +1877,7 @@ test("fenced graph writes classify exact JSON success, lease loss, rejection, an
   const response = { value: JSON.stringify({ ok: 11 }) };
   const store = new NorthGraphStore(
     "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977",
-    async () => response.value,
+    { leaseInvokeOverride: async () => response.value },
   );
   await store.putFenced(lease, "link:x", "sync_manifest", "{}");
 
@@ -1066,11 +1903,13 @@ test("binding reservation accepts only exact coordinator envelopes", async () =>
   };
   const response = { value: JSON.stringify({ ok: 11 }) };
   const store = new NorthGraphStore(
-    "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977", undefined,
-    "/unused/reserve-link.clj",
-    async (args) => {
-      calls.push([...args]);
-      return response.value;
+    "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977",
+    {
+      reservationCli: "/unused/reserve-link.clj",
+      reservationInvokeOverride: async (args) => {
+        calls.push([...args]);
+        return response.value;
+      },
     },
   );
   await store.reserveLinearBinding(
@@ -1079,7 +1918,7 @@ test("binding reservation accepts only exact coordinator envelopes", async () =>
   );
   expect(calls[0]).toEqual([
     "7977", lease.resource, lease.holder, "10",
-    "link:linear:uuid:ws:11111111-1111-8111-8111-111111111111", "thread-a", "linear-test",
+    "link:linear:uuid:ws:11111111-1111-8111-8111-111111111111", "thread-a", "linear-test", "-",
   ]);
   response.value = JSON.stringify({ reject: "reservation collision" });
   await expect(store.reserveLinearBinding(lease, "link:x", "thread-a", "linear-test"))
@@ -1087,6 +1926,234 @@ test("binding reservation accepts only exact coordinator envelopes", async () =>
   response.value = JSON.stringify({ ok: 12, surplus: true });
   await expect(store.reserveLinearBinding(lease, "link:x", "thread-a", "linear-test"))
     .rejects.toThrow("invalid reservation response");
+});
+
+test("fenced graph values use bounded private stdin and accept payloads beyond argv limits", async () => {
+  const coordinator = await fakeCoordinator();
+  const leaseCli = resolve(import.meta.dir, "../../cli/lease-cli.clj");
+  const lease: SyncLease = {
+    resource: "linear-sync:private", holder: "holder", epoch: 10,
+    renew: async () => {}, fence: async () => {}, release: async () => {},
+  };
+  try {
+    const escapeUnit = "\"\\\n";
+    const value = escapeUnit.repeat(Math.floor(LINEAR_GRAPH_VALUE_MAX_BYTES / 3))
+      + "x".repeat(LINEAR_GRAPH_VALUE_MAX_BYTES % 3);
+    expect(Buffer.byteLength(value, "utf8")).toBe(LINEAR_GRAPH_VALUE_MAX_BYTES);
+    const store = new NorthGraphStore(
+      "/unused/north", "/unused/fram", leaseCli, coordinator.port,
+    );
+    await store.putFenced(lease, "link:x", "sync_manifest", value);
+    expect(coordinator.requests).toHaveLength(1);
+    expect(coordinator.requests[0]!.byteLength).toBeGreaterThan(value.length);
+    expect(coordinator.requests[0]!.byteLength).toBeLessThanOrEqual(1024 * 1024 + 1);
+    expect(coordinator.requests[0]!.includes(Buffer.from(':te "@link:x"'))).toBe(true);
+
+    let invoked = false;
+    const bounded = new NorthGraphStore(
+      "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977",
+      {
+        leaseInvokeOverride: async () => {
+          invoked = true;
+          return JSON.stringify({ ok: 12 });
+        },
+      },
+    );
+    await expect(bounded.putFenced(
+      lease,
+      "link:x",
+      "sync_manifest",
+      "x".repeat(LINEAR_GRAPH_VALUE_MAX_BYTES + 1),
+    )).rejects.toThrow(`exceeds ${LINEAR_GRAPH_VALUE_MAX_BYTES} bytes`);
+    expect(invoked).toBe(false);
+
+    let capturedArgs: readonly string[] = [];
+    let capturedStdin = "";
+    const canary = "private-manifest-canary";
+    const inspected = new NorthGraphStore(
+      "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977",
+      {
+        leaseInvokeOverride: async (args, stdin) => {
+          capturedArgs = args;
+          capturedStdin = stdin ?? "";
+          return JSON.stringify({ ok: 13 });
+        },
+      },
+    );
+    await inspected.putFenced(lease, "link:x", "sync_manifest", canary);
+    expect(capturedArgs).toEqual([
+      "put-fenced-stdin", lease.resource, lease.holder, "10", "@link:x", "sync_manifest",
+    ]);
+    expect(JSON.stringify(capturedArgs)).not.toContain(canary);
+    expect(capturedStdin).toBe(canary);
+  } finally {
+    await coordinator.close();
+  }
+});
+
+test("bootstrap evidence helper bounds scans and validates exact coordinator metadata", async () => {
+  const finder = resolve(
+    import.meta.dir,
+    "../src/integrations/linear/find-bootstrap-links.clj",
+  );
+  const createdAt = "2026-07-16T14:08:20.639Z";
+  const oversizedRows = Array.from(
+    { length: 10_001 },
+    () => '["@link:linear:mcp-bootstrap-v1:linear-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "{}"]',
+  ).join(" ");
+  const duplicateManifest = JSON.stringify(
+    `{"evidence":{"connector":"linear-test","connector":"linear-test","createdAt":"${createdAt}"}}`,
+  );
+  const cases = [
+    '{:ok [] :version -1 :engine "index"}\n',
+    '{:ok [] :version 1 :engine "unreviewed"}\n',
+    `{:ok [${oversizedRows}] :version 1 :engine "index"}\n`,
+    `{:ok [["@link:linear:mcp-bootstrap-v1:linear-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ${
+      JSON.stringify("x".repeat(LINEAR_GRAPH_VALUE_MAX_BYTES + 1))
+    }]] :version 1 :engine "index"}\n`,
+    `{:ok [["@link:linear:mcp-bootstrap-v1:linear-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ${
+      duplicateManifest
+    }]] :version 1 :engine "index"}\n`,
+  ];
+  for (const reply of cases) {
+    const coordinator = await fakeCoordinatorReplies([reply]);
+    try {
+      const result = await runProcessWithInput(
+        "bb",
+        [finder, coordinator.port, "linear-test", createdAt],
+        [],
+      );
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout.toString("utf8"))).toEqual({
+        reject: "Linear bootstrap evidence lookup failed",
+      });
+      expect(coordinator.requests).toHaveLength(1);
+    } finally {
+      await coordinator.close();
+    }
+  }
+});
+
+test("lease helper enforces its own byte/UTF-8 boundary before coordinator mutation", async () => {
+  const coordinator = await fakeCoordinator();
+  const leaseCli = resolve(import.meta.dir, "../../cli/lease-cli.clj");
+  const args = [
+    leaseCli, coordinator.port, "--json", "put-fenced-stdin",
+    "linear-sync:private", "holder", "10", "@link:x", "sync_manifest",
+  ];
+  try {
+    const scalar = Buffer.from("é");
+    const value = Buffer.from(`${"x".repeat(130 * 1024)}é-tail`);
+    const scalarAt = value.indexOf(scalar);
+    const split = await runProcessWithInput("bb", args, [
+      value.subarray(0, scalarAt + 1),
+      value.subarray(scalarAt + 1),
+    ]);
+    expect(split.code).toBe(0);
+    expect(JSON.parse(split.stdout.toString("utf8"))).toEqual({ ok: 11 });
+    expect(coordinator.connections()).toBe(1);
+    expect(coordinator.requests[0]!.includes(value)).toBe(true);
+
+    const beforeOversize = coordinator.connections();
+    const oversized = await runProcessWithInput(
+      "bb", args, [Buffer.alloc(LINEAR_GRAPH_VALUE_MAX_BYTES + 1, 0x78)],
+    );
+    expect(oversized.code).toBe(2);
+    expect(oversized.stderr.toString("utf8")).toContain(
+      `fenced value exceeds ${LINEAR_GRAPH_VALUE_MAX_BYTES} bytes`,
+    );
+    expect(coordinator.connections()).toBe(beforeOversize);
+
+    const invalid = await runProcessWithInput("bb", args, [
+      Buffer.from([0x7b, 0xc3, 0x28, 0x7d]),
+    ]);
+    expect(invalid.code).toBe(2);
+    expect(invalid.stderr.toString("utf8")).toContain("fenced value must be valid UTF-8");
+    expect(coordinator.connections()).toBe(beforeOversize);
+  } finally {
+    await coordinator.close();
+  }
+});
+
+test("private helper failures are sanitized, fatally decoded, and reap stubborn children", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-linear-private-helper-"));
+  try {
+    const canary = "manifest-canary-never-surface";
+    const echoFailure = join(directory, "echo-failure");
+    const echoPid = join(directory, "echo-failure.pid");
+    writeFileSync(echoFailure, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.argv[2], String(process.pid));
+let value = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { value += chunk; });
+process.stdin.on("end", () => {
+  setTimeout(() => { process.stderr.write(value); process.exit(17); }, 100);
+});
+`);
+    chmodSync(echoFailure, 0o700);
+    const lease: SyncLease = {
+      resource: "linear-sync:private", holder: "holder", epoch: 10,
+      renew: async () => {}, fence: async () => {}, release: async () => {},
+    };
+    const failing = new NorthGraphStore(
+      "/unused/north", "/unused/fram", echoPid, "7977",
+      { leaseHelperCommand: echoFailure },
+    );
+    const failure = failing.putFenced(lease, "link:x", "sync_manifest", canary);
+    for (let attempt = 0; attempt < 50 && !existsSync(echoPid); attempt++)
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    const echoHelperPid = Number(readFileSync(echoPid, "utf8"));
+    const commandLine = readFileSync(`/proc/${echoHelperPid}/cmdline`);
+    expect(commandLine.includes(Buffer.from(canary))).toBe(false);
+    try {
+      await failure;
+      throw new Error("expected private helper failure");
+    } catch (error) {
+      expect((error as Error).message).toBe(
+        "Linear fenced graph helper failed for @link:x sync_manifest",
+      );
+      expect(String(error)).not.toContain(canary);
+    }
+
+    const invalidUtf8 = join(directory, "invalid-utf8");
+    writeFileSync(invalidUtf8, `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(Buffer.from([0x7b, 0xc3, 0x28, 0x7d]));
+});
+`);
+    chmodSync(invalidUtf8, 0o700);
+    const invalid = new NorthGraphStore(
+      "/unused/north", "/unused/fram", "/unused/lease-cli.clj", "7977",
+      { leaseHelperCommand: invalidUtf8 },
+    );
+    await expect(invalid.putFenced(lease, "link:x", "sync_manifest", "safe"))
+      .rejects.toThrow("Linear fenced graph helper failed");
+
+    const pidPath = join(directory, "stubborn.pid");
+    const stubborn = join(directory, "stubborn");
+    writeFileSync(stubborn, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.argv[2], String(process.pid));
+process.on("SIGTERM", () => {});
+process.stdout.write(Buffer.alloc(${4 * 1024 * 1024 + 1}, 0x78));
+setInterval(() => {}, 1000);
+`);
+    chmodSync(stubborn, 0o700);
+    const reaping = new NorthGraphStore(
+      "/unused/north", "/unused/fram", pidPath, "7977",
+      { leaseHelperCommand: stubborn },
+    );
+    const startedAt = Date.now();
+    await expect(reaping.putFenced(lease, "link:x", "sync_manifest", "safe"))
+      .rejects.toThrow("Linear fenced graph helper failed");
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    const pid = Number(readFileSync(pidPath, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("lease configuration rejects hostile bounds and dominates every remote call", () => {
@@ -1198,6 +2265,20 @@ test("release cleanup never masks a primary failure but still fails a successful
   expect(successful.leases.activeResources()).toEqual([]);
 });
 
+test("gateway close never masks a primary failure but fails an otherwise successful command", async () => {
+  const primary = harness();
+  const primaryThread = await importThread(primary);
+  primary.gateway.infiniteCommentPages = true;
+  primary.gateway.closeFailure = "gateway close failed";
+  await expect(runLinearCommand(["plan", primaryThread], primary.dependencies))
+    .rejects.toThrow("Linear list_comments exceeded 20 pages");
+
+  const successful = harness();
+  successful.gateway.closeFailure = "gateway close failed";
+  await expect(runLinearCommand(["get", "MSA-236"], successful.dependencies))
+    .rejects.toThrow("gateway close failed");
+});
+
 for (const malformed of ["blank-id", "non-string-body"] as const) {
   test(`malformed Linear comment ${malformed} fails closed`, async () => {
     const h = harness();
@@ -1270,6 +2351,19 @@ test("stored server drives marker relocation after mutable key/team/workspace ch
   expect(h.opened.at(-1)).toBe("linear-special");
 });
 
+test("transient stored-key outage is one failed read and never amplifies into backlink search", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  h.gateway.issueReadCalls = 0;
+  h.gateway.issueListCalls = 0;
+  h.gateway.transientIssueReadFailure = true;
+  await expect(runLinearCommand(["plan", thread], h.dependencies))
+    .rejects.toThrow("temporary Linear provider outage");
+  expect(h.gateway.issueReadCalls).toBe(1);
+  expect(h.gateway.issueListCalls).toBe(0);
+});
+
 test("marker relocation rejects duplicate exact matches", async () => {
   const h = harness();
   const thread = await importThread(h);
@@ -1296,9 +2390,9 @@ test("doctor bootstraps graph schema exactly once; get stays read-only and irrel
   const first = await runLinearCommand(["doctor"], h.dependencies);
   expect(first).toMatchObject({
     graphSchema: { ok: true, missing: [], conflicting: [] },
-    graphSchemaBootstrap: { applied: true, assertions: 19 },
+    graphSchemaBootstrap: { applied: true, assertions: 20 },
   });
-  expect(h.graph.writes).toHaveLength(19);
+  expect(h.graph.writes).toHaveLength(20);
   expect(h.graph.bulkReads).toBe(2);
   expect(h.graph.showReads).toBe(0);
   const readsBeforeSecondDoctor = h.graph.bulkReads;
@@ -1307,7 +2401,7 @@ test("doctor bootstraps graph schema exactly once; get stays read-only and irrel
     graphSchema: { ok: true, missing: [], conflicting: [] },
     graphSchemaBootstrap: { applied: false, assertions: 0 },
   });
-  expect(h.graph.writes).toHaveLength(19);
+  expect(h.graph.writes).toHaveLength(20);
   expect(h.graph.bulkReads - readsBeforeSecondDoctor).toBe(1);
   expect(h.graph.showReads).toBe(0);
   const beforeGet = h.graph.writes.length;
@@ -1334,7 +2428,7 @@ test("doctor mechanically migrates the adapter-owned integration handle from lit
   const result = await runLinearCommand(["doctor"], h.dependencies);
   expect(result).toMatchObject({
     graphSchema: { ok: true, missing: [], conflicting: [] },
-    graphSchemaBootstrap: { applied: true, assertions: 19 },
+    graphSchemaBootstrap: { applied: true, assertions: 20 },
   });
   expect((await h.graph.show("linear_link")).filter(({ predicate }) => predicate === "value_kind"))
     .toEqual([{ predicate: "value_kind", value: "ref" }]);
@@ -1359,7 +2453,40 @@ test("corrupted partial manifest evidence fails closed instead of being healed",
       adoptRawDescription: true, markerBound: false,
     },
   }));
-  await expect(runLinearCommand(["import", "MSA-236"], h.dependencies)).rejects.toThrow("does not match the current import");
+  await expect(runLinearCommand(["import", "MSA-236"], h.dependencies))
+    .rejects.toThrow("bootstrap link evidence does not match");
+});
+
+test("stored manifests reject unknown fields, noncanonical instants, and duplicate JSON keys", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const link = (await h.graph.show(thread))
+    .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  const rows = h.graph.rows.get(link)!;
+  const manifestIndex = rows.findIndex(({ predicate }) => predicate === "sync_manifest");
+  const original = rows[manifestIndex]!.value;
+  const parsed = JSON.parse(original);
+  const variants = [
+    JSON.stringify({ ...parsed, unsupportedTopLevel: true }),
+    JSON.stringify({
+      ...parsed,
+      evidence: { ...parsed.evidence, unsupportedEvidence: true },
+    }),
+    JSON.stringify({
+      ...parsed,
+      evidence: {
+        ...parsed.evidence,
+        importedAt: "2026-07-16T11:00:00-04:00",
+      },
+    }),
+    original.replace(/"version":1}$/, '"version":1,"version":1}'),
+  ];
+  for (const value of variants) {
+    rows[manifestIndex] = { predicate: "sync_manifest", value };
+    await expect(loadLinkBySubject(h.graph, link)).rejects.toThrow(/manifest|JSON/);
+  }
+  rows[manifestIndex] = { predicate: "sync_manifest", value: original };
+  expect((await loadLinkBySubject(h.graph, link))?.threadId).toBe(thread);
 });
 
 test("NorthGraphStore never mistakes a no-coordinator message for a commit", async () => {
@@ -1374,6 +2501,30 @@ test("NorthGraphStore never mistakes a no-coordinator message for a commit", asy
     await expect(new NorthGraphStore(north, fram).put("link:x", "kind", "integration_link"))
       .rejects.toThrow("coordinator rejected");
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("NorthGraphStore resolves FRAM_BIN as its public bin-directory contract", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-linear-fram-bin-"));
+  const previousFramBin = process.env.FRAM_BIN;
+  try {
+    const north = join(directory, "north");
+    const framBin = join(directory, "bin");
+    const fram = join(framBin, "fram");
+    const calls = join(directory, "fram-calls");
+    mkdirSync(framBin);
+    writeFileSync(north, "#!/bin/sh\nprintf '[]\\n'\n");
+    writeFileSync(fram, `#!/bin/sh\nprintf '%s\\n' "$*" > '${calls}'\nprintf '%s\\n' 'committed via coordinator v1'\n`);
+    chmodSync(north, 0o700);
+    chmodSync(fram, 0o700);
+    process.env.FRAM_BIN = framBin;
+
+    await new NorthGraphStore(north).put("link:x", "kind", "integration_link");
+    expect(readFileSync(calls, "utf8").trim()).toBe("tell link:x kind integration_link");
+  } finally {
+    if (previousFramBin === undefined) delete process.env.FRAM_BIN;
+    else process.env.FRAM_BIN = previousFramBin;
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("NorthGraphStore reads a multi-subject graph snapshot with one CLI process", async () => {

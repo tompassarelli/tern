@@ -93,6 +93,17 @@ function assertSafeOutgoingMethod(method: string, kind: "request" | "notificatio
   }
 }
 
+function encodeOutgoingJsonl(value: unknown): string {
+  let encoded: string | undefined;
+  try { encoded = JSON.stringify(value); }
+  catch { throw new Error("Codex app-server request is not JSON-serializable"); }
+  if (encoded === undefined)
+    throw new Error("Codex app-server request is not JSON-serializable");
+  if (Buffer.byteLength(encoded, "utf8") > MAX_LINE_BYTES)
+    throw new Error("Codex app-server JSONL request exceeded 1 MiB");
+  return `${encoded}\n`;
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -114,9 +125,14 @@ class JsonlRpcClient {
   private pending = new Map<RpcId, PendingRequest>();
   private frames = new StrictJsonlFrames();
   private terminalError?: Error;
+  private closePromise?: Promise<void>;
+  private closingByClient = false;
   private closed = false;
   private childExited = false;
+  private childClosed = false;
   private stdoutEnded = false;
+  private childClose: Promise<void>;
+  private resolveChildClose!: () => void;
   private outgoingMethods = new Map<string, number>();
   private incomingNotifications = new Map<string, number>();
 
@@ -125,15 +141,27 @@ class JsonlRpcClient {
     private timeoutMs: number,
     private onNotification?: (method: string, params: unknown) => void,
   ) {
+    this.childClose = new Promise((resolve) => { this.resolveChildClose = resolve; });
     child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.stdout.on("end", () => this.onStdoutEnd());
+    child.stdout.on("error", () => {
+      if (!this.closingByClient && !this.closed)
+        this.fail(new Error("Codex app-server stdout failed"));
+    });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", () => { /* drain only; provider diagnostics may contain secrets */ });
+    child.stderr.on("error", () => { /* diagnostics are non-authoritative; prevent an unhandled stream error */ });
+    child.stdin.on("error", () => {
+      if (!this.closingByClient && !this.closed)
+        this.fail(new Error("Codex app-server stdin failed"));
+    });
     child.on("error", () => this.fail(new Error("could not start Codex app-server")));
     child.on("exit", () => this.onChildExit());
     child.on("close", () => {
       this.childExited = true;
       if (!this.stdoutEnded) this.onStdoutEnd();
+      this.childClosed = true;
+      this.resolveChildClose();
     });
   }
 
@@ -145,7 +173,11 @@ class JsonlRpcClient {
       pending.reject(error);
     }
     this.pending.clear();
-    if (!this.closed && this.child.exitCode === null && this.child.signalCode === null) this.child.kill("SIGTERM");
+    if (!this.closed && !this.closingByClient
+        && this.child.exitCode === null && this.child.signalCode === null) {
+      try { this.child.kill("SIGTERM"); }
+      catch { /* the original terminal error remains authoritative */ }
+    }
   }
 
   private rejectServerRequest(id: RpcId, _method: string): void {
@@ -225,7 +257,7 @@ class JsonlRpcClient {
       this.fail(error instanceof Error ? error : new Error("Codex app-server closed with a partial JSONL frame"));
       return;
     }
-    if (this.childExited && !this.closed && !this.terminalError)
+    if (this.childExited && !this.closingByClient && !this.terminalError)
       this.fail(new Error("Codex app-server transport exited unexpectedly"));
   }
 
@@ -234,7 +266,7 @@ class JsonlRpcClient {
     // Node may emit `exit` before it has drained the child's stdout. Defer the
     // generic death classification so a buffered invalid/partial frame remains
     // the authoritative terminal error when `end` arrives.
-    if (this.stdoutEnded && !this.closed && !this.terminalError)
+    if (this.stdoutEnded && !this.closingByClient && !this.terminalError)
       this.fail(new Error("Codex app-server transport exited unexpectedly"));
   }
 
@@ -250,10 +282,11 @@ class JsonlRpcClient {
 
   async request(method: string, params: unknown): Promise<unknown> {
     if (this.terminalError) throw this.terminalError;
-    if (this.closed) throw new Error("Codex app-server broker is closed");
+    if (this.closePromise || this.closed) throw new Error("Codex app-server broker is closed");
     assertSafeOutgoingMethod(method, "request");
-    increment(this.outgoingMethods, method);
     const id = ++this.nextId;
+    const line = encodeOutgoingJsonl({ id, method, params });
+    increment(this.outgoingMethods, method);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(id);
@@ -265,7 +298,7 @@ class JsonlRpcClient {
       }, this.timeoutMs);
       timer.unref?.();
       this.pending.set(id, { method, timer, resolve, reject });
-      this.child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, (error) => {
+      this.child.stdin.write(line, (error) => {
         if (!error) return;
         this.fail(new Error(`Codex app-server ${method} write failed`));
       });
@@ -274,11 +307,12 @@ class JsonlRpcClient {
 
   notify(method: string, params?: unknown): void {
     if (this.terminalError) throw this.terminalError;
-    if (this.closed) throw new Error("Codex app-server broker is closed");
+    if (this.closePromise || this.closed) throw new Error("Codex app-server broker is closed");
     assertSafeOutgoingMethod(method, "notification");
-    increment(this.outgoingMethods, method);
     const notification = params === undefined ? { method } : { method, params };
-    this.child.stdin.write(`${JSON.stringify(notification)}\n`, (error) => {
+    const line = encodeOutgoingJsonl(notification);
+    increment(this.outgoingMethods, method);
+    this.child.stdin.write(line, (error) => {
       if (error) this.fail(new Error(`Codex app-server ${method} notification failed`));
     });
   }
@@ -301,33 +335,72 @@ class JsonlRpcClient {
     };
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
+  close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
+    if (this.closed) {
+      if (this.terminalError) throw this.terminalError;
+      return;
+    }
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Codex app-server broker closed"));
     }
     this.pending.clear();
-    const closed = new Promise<void>((resolve) => this.child.once("close", () => resolve()));
-    if (this.child.exitCode !== null || this.child.signalCode !== null) {
-      if (this.stdoutEnded) return;
-      const drained = await Promise.race([
-        closed.then(() => true),
+
+    const waitForClose = async (): Promise<boolean> => {
+      if (this.childClosed) return true;
+      return Promise.race([
+        this.childClose.then(() => true),
         new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
       ]);
-      if (!drained) this.failUndrainedStdout();
-      return;
+    };
+
+    let live = !this.childExited
+      && this.child.exitCode === null
+      && this.child.signalCode === null;
+    if (!this.terminalError && live) {
+      // A response and the provider's own exit can be queued in adjacent I/O
+      // callbacks. Give that already-initiated exit one bounded turn to become
+      // observable before deciding that North owns shutdown.
+      await Promise.race([
+        this.childClose,
+        new Promise<void>((resolve) => setTimeout(resolve, 10)),
+      ]);
+      live = !this.childExited
+        && this.child.exitCode === null
+        && this.child.signalCode === null;
     }
-    this.child.kill("SIGTERM");
-    const graceful = await Promise.race([
-      closed.then(() => true),
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
-    ]);
-    if (!graceful && this.child.exitCode === null && this.child.signalCode === null) {
-      this.child.kill("SIGKILL");
+    if (!this.terminalError && live) {
+      let signalled = false;
+      try { signalled = this.child.kill("SIGTERM"); }
+      catch { signalled = false; }
+      // `kill(true)` is the only evidence that shutdown was initiated by this
+      // client. Merely entering close() must not launder a provider self-exit
+      // into a valid transport receipt.
+      if (signalled) this.closingByClient = true;
     }
-    if (!graceful) this.failUndrainedStdout();
+
+    let drained = await waitForClose();
+    if (!drained && this.child.exitCode === null && this.child.signalCode === null) {
+      // A terminal protocol failure may already have sent SIGTERM from fail().
+      // Escalate it too, without relabeling that failure cleanup as a
+      // client-initiated successful shutdown.
+      try { this.child.kill("SIGKILL"); }
+      catch { /* classified below if the close event still never arrives */ }
+      drained = await waitForClose();
+    }
+    if (!drained && !this.terminalError) {
+      if (!this.stdoutEnded) this.failUndrainedStdout();
+      else this.fail(new Error("Codex app-server transport did not close after termination"));
+    }
+    if (!this.closingByClient && !this.terminalError)
+      this.fail(new Error("Codex app-server transport exited unexpectedly"));
+    this.closed = true;
+    if (this.terminalError) throw this.terminalError;
   }
 }
 
@@ -446,7 +519,8 @@ export class AppServerMcpBroker implements McpBroker {
         throw new Error("Codex app-server returned an invalid ephemeral thread");
       return new AppServerSession(rpc, started.thread.id);
     } catch (error) {
-      await rpc.close();
+      try { await rpc.close(); }
+      catch { /* preserve the handshake/capability failure */ }
       throw error;
     }
   }

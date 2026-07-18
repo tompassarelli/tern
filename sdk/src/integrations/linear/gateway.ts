@@ -2,6 +2,8 @@ import type {
   McpAccess, McpBroker, McpBrokerOpenOptions, McpBrokerSession, McpServerInventory,
   McpToolDefinition, McpToolResult, ModelFreeTransportReceipt,
 } from "./mcp-broker";
+import { normalizeLinearConnector } from "./normalize";
+import { normalizeLinearRemoteKey } from "./normalize";
 
 export const LINEAR_READ_TOOL = "get_issue";
 export const LINEAR_LIST_ISSUES_TOOL = "list_issues";
@@ -40,6 +42,18 @@ export interface LinearGateway {
   close(): Promise<void>;
 }
 
+export type LinearGatewayErrorKind = "not-found";
+
+export class LinearGatewayError extends Error {
+  constructor(
+    readonly kind: LinearGatewayErrorKind,
+    message: string,
+  ) {
+    super(message);
+    this.name = "LinearGatewayError";
+  }
+}
+
 type Schema = Record<string, unknown>;
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -59,6 +73,7 @@ function propertyAllowsString(value: unknown): boolean {
 }
 
 function gateLinearCapabilities(server: McpServerInventory): void {
+  normalizeLinearConnector(server.name);
   if (server.authStatus !== "oAuth")
     throw new Error(`Linear MCP server ${server.name} is not OAuth-ready (auth: ${server.authStatus})`);
   const read = server.tools[LINEAR_READ_TOOL];
@@ -121,12 +136,14 @@ function supportsLinear(server: McpServerInventory): boolean {
 
 export function discoverLinearServer(servers: readonly McpServerInventory[], explicit?: string): McpServerInventory {
   if (explicit) {
-    const matches = servers.filter(({ name }) => name === explicit);
-    if (matches.length !== 1) throw new Error(`Configured Linear MCP server ${explicit} was not found exactly once`);
+    const canonicalExplicit = normalizeLinearConnector(explicit);
+    const matches = servers.filter(({ name }) => name === canonicalExplicit);
+    if (matches.length !== 1) throw new Error(`Configured Linear MCP server ${canonicalExplicit} was not found exactly once`);
     gateLinearCapabilities(matches[0]);
     return matches[0];
   }
   const candidates = servers.filter(supportsLinear);
+  for (const candidate of candidates) normalizeLinearConnector(candidate.name);
   if (candidates.length !== 1) {
     const names = candidates.map(({ name }) => name).sort().join(", ") || "none";
     throw new Error(`Expected exactly one Linear MCP server with issue/comment sync capabilities; found ${candidates.length} (${names})`);
@@ -189,9 +206,55 @@ function textContent(result: McpToolResult): string[] {
 }
 
 /** Normalize MCP output mechanically; no model is involved. */
-export function normalizeLinearResult(result: McpToolResult): unknown {
+function observedGetIssueNotFound(result: McpToolResult): boolean {
+  if (result.structuredContent !== undefined || result.content.length !== 1) return false;
+  const [entry] = result.content;
+  if (!record(entry) || entry.type !== "text" || typeof entry.text !== "string"
+      || Buffer.byteLength(entry.text, "utf8") > 4096)
+    return false;
+  let parsed: unknown;
+  try { parsed = JSON.parse(entry.text); }
+  catch { return false; }
+  // `invalid_request` plus HTTP 400 is the connector's generic validation
+  // class. Its exact observed missing-Issue message is therefore load-bearing:
+  // wording drift must fail closed instead of authorizing backlink fanout for
+  // an unrelated validation or policy error.
+  if (!record(parsed)
+      || Object.keys(parsed).sort().join(",") !== "error,message,requestId,status"
+      || parsed.error !== "invalid_request"
+      || parsed.status !== 400
+      || parsed.message !== "Could not find referenced Issue."
+      || typeof parsed.requestId !== "string"
+      || !parsed.requestId.trim()
+      || parsed.requestId !== parsed.requestId.trim()
+      || Buffer.byteLength(parsed.requestId, "utf8") > 256)
+    return false;
+  return true;
+}
+
+function structuredGetIssueNotFound(value: unknown): boolean {
+  if (!record(value) || Object.keys(value).length !== 1 || !Object.hasOwn(value, "error")
+      || !record(value.error))
+    return false;
+  const error = value.error;
+  return Object.keys(error).sort().join(",") === "code,message"
+    && error.code === "NOT_FOUND"
+    && typeof error.message === "string"
+    && Buffer.byteLength(error.message, "utf8") <= 4096;
+}
+
+export function normalizeLinearResult(
+  result: McpToolResult,
+  method?: string,
+): unknown {
   const text = textContent(result);
-  if (result.isError) throw new Error("Linear MCP tool failed");
+  if (result.isError) {
+    if (method === LINEAR_READ_TOOL
+        && (structuredGetIssueNotFound(result.structuredContent)
+          || observedGetIssueNotFound(result)))
+      throw new LinearGatewayError("not-found", "Linear MCP issue was not found");
+    throw new Error("Linear MCP tool failed");
+  }
   if (result.structuredContent !== undefined) return result.structuredContent;
   if (!text.length) throw new Error("Linear MCP tool returned neither structuredContent nor JSON text");
   try { return JSON.parse(text.join("\n")); }
@@ -217,12 +280,14 @@ class ConnectedLinearGateway implements LinearGateway {
     const tool = this.inventory.tools[method];
     if (!tool) throw new Error(`Linear MCP method ${method} is not available`);
     validateArguments(tool, envelope.arguments);
+    if (method === LINEAR_READ_TOOL)
+      normalizeLinearRemoteKey(envelope.arguments.id as string);
     return normalizeLinearResult(await this.session.callTool({
       access: envelope.access,
       server: this.server,
       tool: method,
       arguments: envelope.arguments,
-    }));
+    }), method);
   }
 
   readIssue(arguments_: Record<string, unknown>): Promise<unknown> {
@@ -258,7 +323,8 @@ export async function openLinearGateway(broker: McpBroker, options: LinearGatewa
     const server = discoverLinearServer(await session.listServers(), options.server);
     return new ConnectedLinearGateway(session, server);
   } catch (error) {
-    await session.close();
+    try { await session.close(); }
+    catch { /* preserve the capability/discovery failure */ }
     throw error;
   }
 }

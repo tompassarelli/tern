@@ -10,6 +10,9 @@ import type {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const RESERVED_MARKER = /<!--\s*\/?north:/i;
+export const MAX_LINEAR_CONNECTOR_BYTES = 256;
+export const MAX_LINEAR_REMOTE_KEY_BYTES = 512;
+export const MAX_LINEAR_THREAD_ID_BYTES = 512;
 const LIFECYCLES = new Set<NorthLifecycleCategory>([
   "speculative", "ready", "blocked", "active", "dormant", "done", "abandoned",
 ]);
@@ -24,7 +27,8 @@ export function normalizeText(value: Nullable<string>): string {
 
 export function normalizeThreadId(value: Nullable<string>): string {
   const normalized = normalizeText(value);
-  if (!THREAD_ID.test(normalized)) {
+  if (value !== normalized || !THREAD_ID.test(normalized)
+      || utf8Bytes(normalized) > MAX_LINEAR_THREAD_ID_BYTES) {
     throw new Error(`North threadId is not safe for a managed marker: ${JSON.stringify(value)}`);
   }
   return normalized;
@@ -51,6 +55,26 @@ function requireNonempty(name: string, value: Nullable<string>): string {
   return normalized;
 }
 
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+export function normalizeLinearConnector(value: Nullable<string>): string {
+  const normalized = requireNonempty("connector", value);
+  if (value !== normalized || /\s|[\u0000-\u001f\u007f]/u.test(normalized)
+      || utf8Bytes(normalized) > MAX_LINEAR_CONNECTOR_BYTES)
+    throw new Error(`Linear connector must be canonical and at most ${MAX_LINEAR_CONNECTOR_BYTES} UTF-8 bytes`);
+  return normalized;
+}
+
+export function normalizeLinearRemoteKey(value: Nullable<string>): string {
+  const normalized = requireNonempty("issue key", value);
+  if (value !== normalized || /\s|[\u0000-\u001f\u007f]/u.test(normalized)
+      || utf8Bytes(normalized) > MAX_LINEAR_REMOTE_KEY_BYTES)
+    throw new Error(`Linear issue key must be canonical and at most ${MAX_LINEAR_REMOTE_KEY_BYTES} UTF-8 bytes`);
+  return normalized;
+}
+
 export function normalizeLinearIdentity(value: LinearIssueReference): LinearIssueIdentity {
   if (value.identityKind === "linear-uuid") {
     const workspaceId = requireNonempty("workspace UUID", value.workspaceId).toLowerCase();
@@ -60,11 +84,15 @@ export function normalizeLinearIdentity(value: LinearIssueReference): LinearIssu
     if (!UUID.test(issueId)) throw new Error(`Linear issueId must be a UUID, received ${JSON.stringify(value.issueId)}`);
     return { identityKind: "linear-uuid", workspaceId, issueId };
   }
-  if (value.identityKind === "mcp-bootstrap-v1") {
+  if (value.identityKind === "mcp-bootstrap-v1" || value.identityKind === "mcp-bootstrap-v2") {
     const fingerprint = requireNonempty("connector fingerprint", value.fingerprint).toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(fingerprint))
       throw new Error(`Linear connector fingerprint must be 64 lowercase hex characters, received ${JSON.stringify(value.fingerprint)}`);
-    return { identityKind: "mcp-bootstrap-v1", connector: requireNonempty("connector", value.connector), fingerprint };
+    return {
+      identityKind: value.identityKind,
+      connector: normalizeLinearConnector(value.connector),
+      fingerprint,
+    };
   }
   throw new Error(`unknown Linear identity kind: ${String((value as { identityKind?: unknown }).identityKind)}`);
 }
@@ -73,7 +101,7 @@ export function linearIdentityKey(value: LinearIssueReference): string {
   const identity = normalizeLinearIdentity(value);
   return identity.identityKind === "linear-uuid"
     ? `linear:uuid:${encodeURIComponent(identity.workspaceId)}:${identity.issueId}`
-    : `linear:mcp-bootstrap-v1:${encodeURIComponent(identity.connector)}:${identity.fingerprint}`;
+    : `linear:${identity.identityKind}:${encodeURIComponent(identity.connector)}:${identity.fingerprint}`;
 }
 
 export function sameLinearIdentity(left: LinearIssueReference, right: LinearIssueReference): boolean {

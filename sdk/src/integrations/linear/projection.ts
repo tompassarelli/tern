@@ -112,6 +112,22 @@ function findManagedBlocks(description: string): readonly ManagedBlockRange[] {
   return blocks;
 }
 
+/** Return the one structurally valid managed thread marker, or null. */
+export function managedLinearThreadId(
+  descriptionInput: string | null | undefined,
+): string | null {
+  const description = descriptionInput ?? "";
+  const blocks = findManagedBlocks(description);
+  if (!blocks.length) {
+    assertNoReservedNorthMarker("Linear unmanaged description", description);
+    return null;
+  }
+  if (blocks.length > 1) throw new Error("Linear issue contains multiple North-managed blocks");
+  const threadId = normalizeThreadId(blocks[0]!.threadId);
+  parseManagedLinearDescription(description, threadId);
+  return threadId;
+}
+
 /**
  * Hash the description as Linear is allowed to store it after a bridge write.
  *

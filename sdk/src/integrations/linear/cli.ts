@@ -1,27 +1,30 @@
 import { AppServerMcpBroker } from "./app-server-broker";
-import { openLinearGateway, type LinearGateway } from "./gateway";
+import { LinearGatewayError, openLinearGateway, type LinearGateway } from "./gateway";
 import {
   CoordinatorSyncLeaseManager, NorthGraphStore, assertImportableDescription, baselineFromRemote,
   createImportedThread, ensureLinearLinkFacts, ensureLinearSchema, identityForIssue,
   inspectLinearSchema, inspectPartialLinearLink, isKnownLinearSchemaMigration, issueSnapshot,
-  linkSubject, loadLinkBySubject, loadLinkForThread, loadNorthThread, markerForThread,
+  legacyBootstrapIdentityForIssue,
+  linearManifestNeedsReceiptCompaction, linkSubject, loadLinkBySubject, loadLinkForThread, loadNorthThread, markerForThread,
   northThreadIdForIdentity, normalizeLinearIssueDocument, writeManifest, LINEAR_SYNC_LEASE_TTL_MS,
+  recordLinearReceipt,
 } from "./north-state";
 import type {
-  GraphStore, LinearIssueDocument, LinearLinkState, LinearSyncManifest, SyncLease,
+  GraphStore, LinearIssueDocument, LinearLinkState, LinearSyncManifest, PendingLinearOperation, SyncLease,
   SyncLeaseManager,
 } from "./north-state";
 import {
-  canonicalJson, linearIdentityKey, normalizeBody, normalizeThreadId, sha256Canonical, sha256Text,
+  canonicalJson, linearIdentityKey, normalizeBody, normalizeLinearConnector, normalizeThreadId,
+  sha256Canonical, sha256Text,
 } from "./normalize";
 import {
-  indexManagedLinearComments, managedLinearDescriptionReceiptHash, projectNorthThread,
+  indexManagedLinearComments, managedLinearDescriptionReceiptHash, managedLinearThreadId, projectNorthThread,
   replaceManagedLinearDescription,
 } from "./projection";
 import { createLinearSyncBaseline, reconcileLinearIssue } from "./reconcile";
 import type {
   LinearApplyPlan, LinearIssueIdentity, LinearRemoteComment, LinearReconciliationResult,
-  LinearThreadProjection,
+  LinearThreadProjection, ProjectedLinearComment,
 } from "./types";
 
 const HELP = `north linear — deterministic North ↔ Linear projection
@@ -81,7 +84,7 @@ function parseOptions(args: readonly string[]): ParsedOptions {
       if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value`);
       if (arg === "--server") result.server = value;
       else if (arg === "--owner") result.owner = value;
-      else result.thread = value.replace(/^@/, "");
+      else result.thread = normalizeThreadId(value.replace(/^@/, ""));
     } else if (arg.startsWith("--")) throw new Error(`unknown option ${arg}`);
     else result.positional.push(arg);
   }
@@ -100,8 +103,8 @@ function normalizeComments(input: unknown): { comments: LinearRemoteComment[]; n
   const comments = values.map((value) => {
     const comment = record(value, "Linear comment");
     if (typeof comment.id !== "string" || !comment.id.trim()) throw new Error("Linear comment lacks a non-blank id");
-    if (typeof comment.body !== "string") throw new Error(`Linear comment ${comment.id} lacks a string body`);
-    return { id: comment.id, body: comment.body };
+    if (typeof comment.body !== "string") throw new Error("Linear comment lacks a string body");
+    return { id: comment.id.trim(), body: comment.body };
   });
   return {
     comments, nextCursor: typeof raw.cursor === "string" ? raw.cursor
@@ -145,12 +148,76 @@ function normalizeIssueList(input: unknown): { issues: LinearIssueDocument[]; ne
 
 function identityMatchesEvidence(issue: LinearIssueDocument, link: LinearLinkState): boolean {
   if (issue.createdAt !== link.manifest.evidence.createdAt) return false;
-  if (link.identity.identityKind === "linear-uuid") return issue.uuid === link.identity.issueId;
+  if (link.identity.identityKind === "linear-uuid")
+    return issue.uuid === link.identity.issueId
+      && issue.workspaceId?.toLowerCase() === link.identity.workspaceId;
+  if (link.identity.identityKind === "mcp-bootstrap-v2")
+    return sha256Canonical({
+      connector: link.manifest.evidence.connector,
+      createdAt: issue.createdAt,
+    }) === link.identity.fingerprint;
   return sha256Canonical({
     connector: link.manifest.evidence.connector,
     createdAt: issue.createdAt,
     initialKey: link.manifest.evidence.initialKey,
   }) === link.identity.fingerprint;
+}
+
+function bootstrapEvidenceLeaseResource(issue: LinearIssueDocument, connector: string): string {
+  return `linear-sync:bootstrap:${encodeURIComponent(sha256Canonical({
+    connector,
+    createdAt: issue.createdAt,
+  }))}`;
+}
+
+function bootstrapEvidenceMatches(
+  issue: LinearIssueDocument,
+  link: LinearLinkState,
+  connector: string,
+): boolean {
+  return link.identity.identityKind !== "linear-uuid"
+    && link.remoteServer === connector
+    && link.manifest.evidence.connector === connector
+    && link.manifest.evidence.createdAt === issue.createdAt;
+}
+
+async function resolveImportIdentity(
+  issue: LinearIssueDocument,
+  connector: string,
+  graph: GraphStore,
+): Promise<{ identity: LinearIssueIdentity; markerThread: string | null }> {
+  const candidate = identityForIssue(issue, connector);
+  if (candidate.identityKind === "linear-uuid")
+    return { identity: candidate, markerThread: null };
+
+  const markerThread = managedLinearThreadId(issue.description);
+  if (markerThread) {
+    const link = await loadLinkForThread(graph, markerThread);
+    if (!bootstrapEvidenceMatches(issue, link, connector))
+      throw new Error("Linear managed marker does not prove the current bootstrap issue identity");
+    return { identity: link.identity, markerThread };
+  }
+
+  const legacy = legacyBootstrapIdentityForIssue(issue, connector);
+  for (const identity of [legacy, candidate]) {
+    const partial = await inspectPartialLinearLink(graph, linkSubject(identity));
+    if (!partial.exists) continue;
+    const initialKey = partial.bootstrapInitialKey ?? partial.manifest?.evidence.initialKey;
+    if (identity.identityKind === "mcp-bootstrap-v2" && !initialKey)
+      throw new Error("partial Linear bootstrap-v2 link lacks immutable initial-key evidence");
+    if (initialKey && initialKey !== issue.key)
+      throw new Error("Linear bootstrap evidence collides with another key; an exact managed marker is required");
+    if (partial.manifest
+        && (partial.manifest.evidence.connector !== connector
+          || partial.manifest.evidence.createdAt !== issue.createdAt))
+      throw new Error("Linear bootstrap link evidence does not match the current issue");
+    return { identity, markerThread: null };
+  }
+
+  const evidenceLinks = await graph.findBootstrapLinkSubjects(connector, issue.createdAt);
+  if (evidenceLinks.length)
+    throw new Error("Linear bootstrap evidence already exists under another identity; an exact managed marker is required");
+  return { identity: candidate, markerThread: null };
 }
 
 async function searchByManagedBacklink(
@@ -199,7 +266,8 @@ async function resolveLinkedIssue(
   let rawIssue: unknown;
   try {
     rawIssue = await gateway.readIssue({ id: link.remoteKey });
-  } catch {
+  } catch (error) {
+    if (!(error instanceof LinearGatewayError) || error.kind !== "not-found") throw error;
     if (!link.manifest.evidence.markerBound)
       throw new Error("stored Linear key could not be verified before backlink adoption");
     return searchByManagedBacklink(gateway, link, heartbeat);
@@ -218,8 +286,16 @@ async function resolveLinkedIssue(
 
 async function readRemote(gateway: LinearGateway, link: LinearLinkState, lease?: SyncLease) {
   const heartbeat = lease ? () => lease.renew() : undefined;
-  const issue = await resolveLinkedIssue(gateway, link, heartbeat);
+  const issue = await readRemoteIssue(gateway, link, lease);
   return { issue, comments: await allComments(gateway, issue.key, heartbeat) };
+}
+
+async function readRemoteIssue(
+  gateway: LinearGateway,
+  link: LinearLinkState,
+  lease?: SyncLease,
+): Promise<LinearIssueDocument> {
+  return resolveLinkedIssue(gateway, link, lease ? () => lease.renew() : undefined);
 }
 
 function identityLeaseResource(identity: LinearIssueIdentity): string {
@@ -238,8 +314,13 @@ interface EndpointLeaseScope {
   renew(): Promise<void>;
 }
 
-function endpointLeaseScope(rawIdentity: SyncLease, rawThread: SyncLease): EndpointLeaseScope {
+function endpointLeaseScope(
+  rawIdentity: SyncLease,
+  rawThread: SyncLease,
+  additional: readonly SyncLease[] = [],
+): EndpointLeaseScope {
   const renew = async () => {
+    for (const lease of additional) await lease.renew();
     await rawIdentity.renew();
     await rawThread.renew();
   };
@@ -320,11 +401,15 @@ function verifyPreparedManifest(
   manifest: LinearSyncManifest, identity: LinearIssueIdentity, threadId: string,
   issue: LinearIssueDocument, server: string,
 ): void {
+  const provenMarkerThread = identity.identityKind === "linear-uuid"
+    ? null : managedLinearThreadId(issue.description);
   if (canonicalJson(manifest.baseline.identity) !== canonicalJson(identity)
       || manifest.baseline.threadId !== threadId
       || manifest.evidence.connector !== server
       || manifest.evidence.createdAt !== issue.createdAt
-      || manifest.evidence.initialKey !== issue.key)
+      || (identity.identityKind !== "linear-uuid"
+        && manifest.evidence.initialKey !== issue.key
+        && provenMarkerThread !== threadId))
     throw new Error("prepared Linear link manifest does not match the current import identity/thread evidence");
   if (manifest.phase === "prepared" && manifest.evidence.createdThread
       && (manifest.evidence.importedTitleHash !== sha256Text(issue.title)
@@ -332,29 +417,106 @@ function verifyPreparedManifest(
     throw new Error("Linear title/description changed during a partially prepared import; refusing unstable thread seeding");
 }
 
+function assertImportThreadPreconditions(
+  options: ParsedOptions,
+  threadId: string,
+  subject: string,
+  threadFacts: readonly { predicate: string; value: string }[],
+  manifest: LinearSyncManifest | undefined,
+  issue: LinearIssueDocument,
+): void {
+  if (options.thread && threadId !== options.thread)
+    throw new Error(`Linear issue is already prepared for @${threadId}, not @${options.thread}`);
+  const otherLinks = [...new Set(threadFacts.filter((fact) => fact.predicate === "linear_link")
+    .map((fact) => fact.value.replace(/^@/, "")))];
+  if (otherLinks.length && (otherLinks.length !== 1 || otherLinks[0] !== subject))
+    throw new Error(`requested North thread @${threadId} already has a different canonical Linear link`);
+  const hasTitle = threadFacts.some((fact) => fact.predicate === "title");
+  if (!manifest) {
+    assertImportableDescription(issue.description);
+    if (options.thread && !hasTitle)
+      throw new Error(`requested North thread @${threadId} does not exist`);
+    if (!options.thread && hasTitle)
+      throw new Error(`deterministic North thread @${threadId} already exists without its canonical Linear link`);
+  } else if (!manifest.evidence.createdThread && !hasTitle) {
+    throw new Error(`canonical link points to missing pre-existing thread @${threadId}`);
+  }
+}
+
 async function importIssue(
   key: string, options: ParsedOptions, gateway: LinearGateway, deps: LinearCliDependencies,
 ): Promise<unknown> {
   const issue = normalizeLinearIssueDocument(await gateway.readIssue({ id: key }));
-  const identity = identityForIssue(issue, gateway.server);
+  const resolved = await resolveImportIdentity(issue, gateway.server, deps.graph);
+  const identity = resolved.identity;
   const subject = linkSubject(identity);
   if (options.dryRun) {
-    const partial = await inspectPartialLinearLink(deps.graph, subject);
-    if (partial.manifest && partial.threadId)
-      verifyPreparedManifest(partial.manifest, identity, partial.threadId, issue, gateway.server);
-    const existing = partial.complete ? await loadLinkBySubject(deps.graph, subject) : null;
+    const schema = await inspectLinearSchema(deps.graph);
+    const migratable = isKnownLinearSchemaMigration(schema);
+    if (schema.conflicting.length && !migratable)
+      throw new Error(`Linear graph schema conflicts: ${schema.conflicting.join("; ")}`);
+    const freshIssue = normalizeLinearIssueDocument(await gateway.readIssue({ id: key }));
+    const freshIdentity = (await resolveImportIdentity(
+      freshIssue, gateway.server, deps.graph,
+    )).identity;
+    if (linearIdentityKey(freshIdentity) !== linearIdentityKey(identity))
+      throw new Error("Linear issue identity changed during import");
+    const latest = await inspectPartialLinearLink(deps.graph, subject);
+    if (latest.manifest && latest.threadId)
+      verifyPreparedManifest(
+        latest.manifest,
+        freshIdentity,
+        latest.threadId,
+        freshIssue,
+        gateway.server,
+      );
+    const existing = latest.complete ? await loadLinkBySubject(deps.graph, subject) : null;
+    const threadId = latest.threadId ?? options.thread ?? deps.mintThreadId(freshIdentity);
+    const threadFacts = await deps.graph.show(threadId);
+    assertImportThreadPreconditions(
+      options, threadId, subject, threadFacts, latest.manifest, freshIssue,
+    );
+    const actions: string[] = [];
+    if (!schema.ok) actions.push(migratable ? "migrate-graph-schema" : "seed-graph-schema");
+    if (!latest.exists) actions.push("prepare-link");
+    else if (!latest.complete) actions.push("heal-link");
+    if (!latest.manifest) actions.push(options.thread ? "adopt-thread" : "mint-thread");
+    else if (latest.manifest.evidence.createdThread
+        && (latest.manifest.phase === "prepared"
+          || !threadFacts.some((fact) => fact.predicate === "title")))
+      actions.push("heal-thread");
+    if (!threadFacts.some((fact) => fact.predicate === "linear" && fact.value === freshIssue.key))
+      actions.push("write-compatibility-alias");
+    if (!threadFacts.some((fact) =>
+      fact.predicate === "linear_link" && fact.value.replace(/^@/, "") === subject))
+      actions.push("write-canonical-reverse-link");
+    if (latest.manifest?.phase === "prepared") actions.push("adopt-link");
+    if (latest.manifest && linearManifestNeedsReceiptCompaction(latest.manifest))
+      actions.push("compact-receipts");
+    if (!actions.length) actions.push("reuse-link");
     return {
-      command: "import", dryRun: true, server: gateway.server, key: issue.key, identity,
-      link: `@${subject}`, thread: `@${existing?.threadId ?? partial.threadId ?? options.thread ?? deps.mintThreadId(identity)}`,
-      actions: existing ? ["reuse-link"] : partial.exists ? ["heal-link", "heal-thread", "write-compatibility-alias"]
-        : ["prepare-link", options.thread ? "adopt-thread" : "mint-thread", "write-compatibility-alias"],
+      command: "import", dryRun: true, server: gateway.server, key: freshIssue.key, identity: freshIdentity,
+      link: `@${subject}`, thread: `@${existing?.threadId ?? threadId}`, actions,
     };
   }
 
-  const identityLease = await deps.leases.acquire(identityLeaseResource(identity));
+  let bootstrapLease: SyncLease | undefined;
+  let identityLease: SyncLease | undefined;
   let threadLease: SyncLease | undefined;
   let operationCompleted = false;
   try {
+    if (identity.identityKind !== "linear-uuid") {
+      bootstrapLease = await deps.leases.acquire(
+        bootstrapEvidenceLeaseResource(issue, gateway.server),
+      );
+      const lockedIdentity = (await leaseBoundary(
+        bootstrapLease,
+        () => resolveImportIdentity(issue, gateway.server, deps.graph),
+      )).identity;
+      if (linearIdentityKey(lockedIdentity) !== linearIdentityKey(identity))
+        throw new Error("Linear issue identity changed while acquiring its bootstrap evidence lease");
+    }
+    identityLease = await deps.leases.acquire(identityLeaseResource(identity));
     await identityLease.renew();
     const partialUnderIdentity = await inspectPartialLinearLink(deps.graph, subject);
     const chosenThread = partialUnderIdentity.threadId ?? options.thread ?? deps.mintThreadId(identity);
@@ -365,11 +527,18 @@ async function importIssue(
     // order lexical as well as explicit, which keeps every importer/sync caller
     // on the same deadlock-free path.
     threadLease = await deps.leases.acquire(threadLeaseResource(chosenThread));
-    const scope = endpointLeaseScope(identityLease, threadLease);
+    const scope = endpointLeaseScope(
+      identityLease,
+      threadLease,
+      bootstrapLease ? [bootstrapLease] : [],
+    );
     const freshIssue = normalizeLinearIssueDocument(await leaseBoundary(
       scope, () => gateway.readIssue({ id: key }),
     ));
-    const freshIdentity = identityForIssue(freshIssue, gateway.server);
+    const freshIdentity = (await leaseBoundary(
+      scope,
+      () => resolveImportIdentity(freshIssue, gateway.server, deps.graph),
+    )).identity;
     if (linearIdentityKey(freshIdentity) !== linearIdentityKey(identity))
       throw new Error("Linear issue identity changed during import");
 
@@ -379,23 +548,17 @@ async function importIssue(
     const threadId = partialNow.threadId ?? options.thread ?? deps.mintThreadId(identity);
     if (threadId !== chosenThread)
       throw new Error("canonical Linear identity/thread endpoint changed while its leases were being acquired");
-    if (options.thread && threadId !== options.thread)
-      throw new Error(`Linear issue is already prepared for @${threadId}, not @${options.thread}`);
     if (partialNow.manifest)
       verifyPreparedManifest(partialNow.manifest, identity, threadId, freshIssue, gateway.server);
 
     const currentThread = await leaseBoundary(scope, () => deps.graph.show(threadId));
-    const otherLinks = [...new Set(currentThread.filter((fact) => fact.predicate === "linear_link")
-      .map((fact) => fact.value.replace(/^@/, "")))];
-    if (otherLinks.length && (otherLinks.length !== 1 || otherLinks[0] !== subject))
-      throw new Error(`requested North thread @${threadId} already has a different canonical Linear link`);
+    assertImportThreadPreconditions(
+      options, threadId, subject, currentThread, partialNow.manifest, freshIssue,
+    );
 
     let manifest = partialNow.manifest;
     let createdThread = manifest?.evidence.createdThread ?? !options.thread;
     if (!manifest) {
-      assertImportableDescription(freshIssue.description);
-      if (options.thread && !currentThread.some((fact) => fact.predicate === "title"))
-        throw new Error(`requested North thread @${threadId} does not exist`);
       createdThread = !options.thread;
       const baseline = createdThread
         ? createLinearSyncBaseline(identity, threadId, {
@@ -416,17 +579,39 @@ async function importIssue(
       };
     }
     verifyPreparedManifest(manifest, identity, threadId, freshIssue, gateway.server);
+
+    if (identity.identityKind === "mcp-bootstrap-v2") {
+      if (!bootstrapLease)
+        throw new Error("Linear bootstrap-v2 import lacks its evidence lease");
+      const initialKey = partialNow.bootstrapInitialKey;
+      const markerProven = managedLinearThreadId(freshIssue.description) === threadId;
+      if (initialKey && initialKey !== manifest.evidence.initialKey)
+        throw new Error("Linear bootstrap initial-key evidence conflicts with its manifest");
+      if (initialKey && initialKey !== freshIssue.key && !markerProven)
+        throw new Error("Linear bootstrap evidence collides with another key; an exact managed marker is required");
+    }
+
     const schema = await leaseBoundary(scope, () => inspectLinearSchema(deps.graph));
     if (schema.conflicting.length && !isKnownLinearSchemaMigration(schema))
       throw new Error(`Linear graph schema conflicts: ${schema.conflicting.join("; ")}`);
 
-    // This is the first mutation. The helper validates every reverse
+    // For native UUIDs and legacy v1 links this is the first mutation. A fresh
+    // bootstrap-v2 link first records immutable initial-key collision evidence
+    // under its connector+createdAt lease. The helper then validates every reverse
     // linked_thread claimant and the thread's canonical pointer, then commits
     // this durable identity -> thread reservation against one global graph
     // version and the exact identity fence. A crash from here is a healable
     // prepared association, never an unowned thread.
     await scope.renew();
-    await deps.graph.reserveLinearBinding(scope.identity, subject, threadId, gateway.server);
+    await deps.graph.reserveLinearBinding(
+      scope.identity,
+      subject,
+      threadId,
+      gateway.server,
+      identity.identityKind === "mcp-bootstrap-v2"
+        ? manifest.evidence.initialKey
+        : undefined,
+    );
     await scope.renew();
     await leaseBoundary(scope, () => ensureLinearSchema(deps.graph, schema));
 
@@ -474,7 +659,11 @@ async function importIssue(
     return result;
   } finally {
     await releaseLeasesWithoutMaskingFailure(
-      [identityLease, ...(threadLease ? [threadLease] : [])],
+      [
+        ...(bootstrapLease ? [bootstrapLease] : []),
+        ...(identityLease ? [identityLease] : []),
+        ...(threadLease ? [threadLease] : []),
+      ],
       operationCompleted,
     );
   }
@@ -609,16 +798,22 @@ async function confirmOrRefusePending(
   const pending = link.manifest.pending;
   if (!pending) return link.manifest;
   await lease.renew();
-  const { issue, comments } = await readRemote(gateway, link, lease);
-  const indexedComments = indexManagedLinearComments(comments);
-  const issueSatisfied = pending.kind === "issue"
-    && (issueOperationSatisfied(pending, issue)
-      || await legacyNormalizedIssueOperationSatisfied(pending, issue, graph, lease, link));
-  const remoteId = pending.kind === "issue"
-    ? issueSatisfied ? issue.key : undefined
-    : commentOperationSatisfied(pending, indexedComments);
+  let remoteId: string | undefined;
+  if (pending.kind === "issue") {
+    const issue = await readRemoteIssue(gateway, link, lease);
+    const issueSatisfied = issueOperationSatisfied(pending, issue)
+      || await legacyNormalizedIssueOperationSatisfied(pending, issue, graph, lease, link);
+    remoteId = issueSatisfied ? issue.key : undefined;
+  } else {
+    const { comments } = await readRemote(gateway, link, lease);
+    remoteId = commentOperationSatisfied(pending, indexManagedLinearComments(comments));
+  }
   if (!remoteId) throw new Error(`prior ${pending.kind} write has unknown outcome and is not observable; refusing to retry`);
-  const receipts = { ...(link.manifest.receipts ?? {}), [pending.key]: { confirmedAt: now.toISOString(), remoteId } };
+  const receipts = recordLinearReceipt(
+    link.manifest.receipts,
+    pending.key,
+    { confirmedAt: now.toISOString(), remoteId },
+  );
   const markerAdopted = pending.kind === "issue" && pending.descriptionHash !== undefined;
   const confirmed: LinearSyncManifest = {
     ...link.manifest, pending: undefined, receipts,
@@ -633,39 +828,93 @@ async function confirmOrRefusePending(
 async function applyOperation(
   gateway: LinearGateway, graph: GraphStore, lease: SyncLease, link: LinearLinkState,
   manifest: LinearSyncManifest,
-  kind: "issue" | "comment", key: string, payload: Record<string, unknown>, marker: string | undefined,
+  kind: "issue" | "comment", key: string, payload: Record<string, unknown>,
+  commentBinding: Pick<ProjectedLinearComment, "kind" | "sourceId" | "marker"> | undefined,
   now: Date,
   onConfirmed?: (manifest: LinearSyncManifest) => LinearSyncManifest,
   baselineAfter?: LinearApplyPlan["expectedBaseline"],
 ): Promise<{ remoteId: string; manifest: LinearSyncManifest }> {
-  const pending = {
-    key, kind, payloadHash: sha256Canonical(payload),
-    ...(typeof payload.title === "string" ? { titleHash: sha256Canonical(payload.title) } : {}),
-    ...(typeof payload.description === "string" ? { descriptionHash: sha256Canonical(payload.description) } : {}),
-    ...(typeof payload.description === "string"
-      ? { descriptionReceiptHash: managedLinearDescriptionReceiptHash(payload.description, link.threadId) } : {}),
-    ...(typeof payload.body === "string" ? { bodyHash: sha256Canonical(normalizeBody(payload.body)) } : {}),
-    ...(baselineAfter ? { baselineAfter } : {}),
-    ...(marker ? { marker } : {}), startedAt: now.toISOString(),
+  const common = {
+    key, kind, payloadHash: sha256Canonical(payload), startedAt: now.toISOString(),
   } as const;
+  let pending: PendingLinearOperation;
+  if (kind === "issue") {
+    if (!baselineAfter)
+      throw new Error("Linear issue intent requires its full recovery baseline");
+    const titleHash = typeof payload.title === "string" ? sha256Canonical(payload.title) : undefined;
+    const descriptionHash = typeof payload.description === "string"
+      ? sha256Canonical(payload.description) : undefined;
+    if (!titleHash && !descriptionHash)
+      throw new Error("Linear issue intent requires a title or description");
+    pending = {
+      ...common, kind: "issue", baselineAfter,
+      ...(titleHash ? { titleHash } : {}),
+      ...(descriptionHash ? {
+        descriptionHash,
+        descriptionReceiptHash: managedLinearDescriptionReceiptHash(
+          payload.description as string,
+          link.threadId,
+        ),
+      } : {}),
+    };
+  } else {
+    if (typeof payload.body !== "string" || !commentBinding)
+      throw new Error("Linear comment intent requires a body and managed identity");
+    pending = {
+      ...common, kind: "comment",
+      bodyHash: sha256Canonical(normalizeBody(payload.body)),
+      marker: commentBinding.marker,
+      commentKind: commentBinding.kind,
+      commentSourceId: commentBinding.sourceId,
+    };
+  }
   const prepared: LinearSyncManifest = { ...manifest, pending };
   await lease.renew();
   await writeManifest(graph, lease, link, prepared);
   await lease.renew();
+  let writeResult: unknown;
   try {
-    if (kind === "issue") await gateway.writeIssue({ id: link.remoteKey, ...payload });
-    else await gateway.writeComment(payload);
+    writeResult = kind === "issue"
+      ? await gateway.writeIssue({ id: link.remoteKey, ...payload })
+      : await gateway.writeComment(payload);
   } catch {
     // The call may have committed remotely before transport failure. Reconcile, never retry.
   }
   await lease.renew();
-  const { issue, comments } = await readRemote(gateway, link, lease);
-  const indexedComments = indexManagedLinearComments(comments);
-  const remoteId = kind === "issue"
-    ? issueOperationSatisfied(pending, issue) ? issue.key : undefined
-    : commentOperationSatisfied(pending, indexedComments);
+  let remoteId: string | undefined;
+  if (kind === "issue") {
+    const issue = await readRemoteIssue(gateway, link, lease);
+    remoteId = issueOperationSatisfied(pending, issue) ? issue.key : undefined;
+  } else if (writeResult !== undefined) {
+    try {
+      const written = record(
+        record(writeResult, "Linear save_comment result").comment ?? writeResult,
+        "Linear save_comment comment",
+      );
+      if (typeof written.id === "string"
+          && written.id.trim()
+          && written.id === written.id.trim()
+          && typeof written.body === "string") {
+        const indexed = indexManagedLinearComments([{
+          id: written.id,
+          body: written.body,
+        }]);
+        remoteId = commentOperationSatisfied(pending, indexed);
+      }
+    } catch {
+      // A malformed success envelope is not commit proof; recover by observation.
+    }
+  }
+  if (kind === "comment" && !remoteId) {
+    const { comments } = await readRemote(gateway, link, lease);
+    remoteId = commentOperationSatisfied(pending, indexManagedLinearComments(comments));
+  }
   if (!remoteId) throw new Error(`${kind} write outcome is unknown and not observable; intent retained, retry refused`);
-  const receipts = { ...(prepared.receipts ?? {}), [key]: { confirmedAt: now.toISOString(), remoteId } };
+  const receipts = recordLinearReceipt(
+    prepared.receipts,
+    key,
+    { confirmedAt: now.toISOString(), remoteId },
+  );
   const confirmed: LinearSyncManifest = { ...prepared, pending: undefined, receipts };
   const nextManifest = onConfirmed ? onConfirmed(confirmed) : confirmed;
   await lease.renew();
@@ -733,9 +982,12 @@ async function applySync(thread: string, gateway: LinearGateway, deps: LinearCli
       const payload = comment.action === "create"
         ? { issueId: link.remoteKey, body: comment.body }
         : { id: comment.commentId, body: comment.body };
+      const bindings = planned.local.comments.filter(({ marker }) => marker === comment.marker);
+      if (bindings.length !== 1)
+        throw new Error(`Linear comment plan marker ${comment.marker} lacks one exact local identity`);
       const applied = await applyOperation(
         gateway, deps.graph, scope.thread, link, manifest, "comment",
-        `${planned.plan!.hash}:comment:${index}`, payload, comment.marker, deps.now(),
+        `${planned.plan!.hash}:comment:${index}`, payload, bindings[0], deps.now(),
       );
       manifest = applied.manifest;
       writes++;
@@ -750,7 +1002,8 @@ async function applySync(thread: string, gateway: LinearGateway, deps: LinearCli
         markerBound: manifest.evidence.markerBound || planned.descriptionMarkerPresent || Boolean(planned.plan?.issue.description),
       },
     };
-    if (canonicalJson(finalized) !== canonicalJson(manifest)) {
+    if (canonicalJson(finalized) !== canonicalJson(manifest)
+        || linearManifestNeedsReceiptCompaction(manifest)) {
       await scope.renew();
       await writeManifest(deps.graph, scope.thread, link, finalized);
     }
@@ -798,7 +1051,9 @@ export async function runLinearCommand(argv: readonly string[], dependencies: Pa
   if (!server && (verb === "plan" || verb === "sync"))
     server = (await loadLinkForThread(deps.graph, options.positional[0]!)).remoteServer;
   const gateway = await deps.openGateway({ server });
+  normalizeLinearConnector(gateway.server);
   let result: unknown;
+  let operationCompleted = false;
   try {
     if (verb === "doctor") {
       const schemaBefore = await inspectLinearSchema(deps.graph);
@@ -813,7 +1068,8 @@ export async function runLinearCommand(argv: readonly string[], dependencies: Pa
         ? schemaBefore : await inspectLinearSchema(deps.graph);
       result = {
         command: "doctor", server: gateway.server, oauth: true, modelTurn: false,
-        identityMode: "mcp-bootstrap-v1", identityLimitation: "connector omits native workspace and issue UUIDs; managed backlink + createdAt fingerprint",
+        identityMode: "mcp-bootstrap-v2",
+        identityLimitation: "connector omits native workspace and issue UUIDs; connector + canonical createdAt collisions fail closed without an exact managed marker",
         graphSchemaBootstrap: {
           applied: !schemaBefore.ok && (!schemaBefore.conflicting.length || migratable),
           assertions: schemaBefore.conflicting.length && !migratable ? 0 : schemaBefore.missing.length,
@@ -831,7 +1087,13 @@ export async function runLinearCommand(argv: readonly string[], dependencies: Pa
         ? await applySync(thread, gateway, deps)
         : publicPlan(await computePlan(thread, gateway, deps.graph));
     } else throw new Error(`unknown north linear verb ${verb}`);
-  } finally { await gateway.close(); }
+    operationCompleted = true;
+  } finally {
+    try { await gateway.close(); }
+    catch (error) {
+      if (operationCompleted) throw error;
+    }
+  }
   return { ...record(result, "Linear command result"), transportReceipt: gateway.transportReceipt() };
 }
 

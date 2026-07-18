@@ -8,15 +8,29 @@ export interface LinearUuidIdentity {
   issueId: string;
 }
 
-export interface LinearMcpBootstrapIdentity {
+export interface LinearMcpBootstrapV1Identity {
   identityKind: "mcp-bootstrap-v1";
   /** Configured MCP server name: the connector namespace, not a Linear workspace UUID. */
   connector: string;
-  /** SHA-256 of connector + createdAt + initial key; never sent to Linear. */
+  /** Legacy SHA-256 of connector + createdAt + initial key; never sent to Linear. */
   fingerprint: string;
 }
 
-export type LinearIssueIdentity = LinearUuidIdentity | LinearMcpBootstrapIdentity;
+export interface LinearMcpBootstrapV2Identity {
+  identityKind: "mcp-bootstrap-v2";
+  /** Configured MCP server name: the connector namespace, not a Linear workspace UUID. */
+  connector: string;
+  /**
+   * SHA-256 of connector + canonical createdAt. Timestamp collisions fail
+   * closed unless an exact managed marker proves the existing thread.
+   */
+  fingerprint: string;
+}
+
+export type LinearIssueIdentity =
+  | LinearUuidIdentity
+  | LinearMcpBootstrapV1Identity
+  | LinearMcpBootstrapV2Identity;
 
 interface LinearMutableReferenceMetadata {
   /** Human-facing and mutable (for example, MSA-123). Never part of identity. */

@@ -27,6 +27,10 @@ north linear sync <north-id> --apply
 never writes Linear, but it deterministically seeds any missing adapter-owned
 schema facts in North. Repeating it is a no-op; conflicting pre-existing schema
 facts are reported and never overwritten. Only `sync --apply` writes Linear.
+Import dry-run performs the same read-only schema, identity, prepared-manifest,
+requested-thread, and reverse-link preconditions as a real import. It reports
+schema/link/thread healing and bounded-receipt compaction separately, and never
+calls a partial or compaction-needing binding `reuse-link`.
 `--server <name>` may select a server during get/import; an existing link
 remembers its server, so later plan/sync commands do not depend on ambiguous
 auto-discovery.
@@ -37,8 +41,9 @@ actions. Repeating `import` must return the same thread and integration-link
 identity. Import acquires the canonical identity endpoint and then the North
 thread endpoint; concurrent callers for either endpoint serialize, and the
 later caller either reuses the post-lease link or fails with the conflicting
-canonical binding before creating another link. A second
-`sync --apply` in that state performs zero Linear writes and zero graph writes.
+canonical binding before creating another link. With a canonical bounded
+manifest, a second `sync --apply` in that state performs zero Linear writes and
+zero graph writes.
 
 Every transport-backed command returns a `transportReceipt`. It records the
 selected Linear server, ephemeral app-server thread, exact outgoing method
@@ -55,13 +60,21 @@ notifications fail closed. Any terminal transport error invalidates the receipt,
 including one observed after a successful tool response. This protocol
 receipt—not a process-wide account usage sample—is the evidence that the command
 used no model turn or model tokens.
+Entering client cleanup is not itself shutdown evidence. A provider process
+that exits after a valid tool response still invalidates the receipt; only a
+signal delivered to a demonstrably live child makes termination
+client-initiated. Cleanup drains stdout and escalates from SIGTERM to SIGKILL
+within fixed bounds. A cleanup error is reported when the command otherwise
+succeeded, but never replaces the command's primary failure.
 
 The app-server transport parses newline-delimited JSON as raw bytes. UTF-8 is
 decoded fatally only after a complete frame is present; a split multibyte
 character is preserved, while invalid UTF-8, a line larger than 1 MiB, or any
 partial frame at EOF invalidates the session. The byte limit is per line, not
 per read buffer, so a large chunk containing many individually bounded frames
-is valid. MCP inventory traversal stops at 20 pages or 100 servers and rejects
+is valid. Outgoing JSONL requests have the same 1 MiB ceiling and fail before
+the provider call when serialization would exceed it. MCP inventory traversal
+stops at 20 pages or 100 servers and rejects
 missing, empty, or repeated cursors.
 
 Import creates one deterministic integration-link entity and either adopts the
@@ -78,13 +91,24 @@ The identity lease key is the URI-component-encoded canonical identity key used
 by `linkSubject`: native identity is exactly workspace UUID + issue UUID, with
 both UUIDs validated and normalized to lowercase and no MCP server alias; the
 bootstrap identity includes the connector because the connector is part of
-that fallback identity. The thread lease key is the
+that fallback identity. A fallback import first acquires the
+connector-plus-canonical-creation-time bootstrap-evidence lease, then the
+identity and thread leases. The thread lease key is the
 URI-component-encoded normalized North thread ID. Every writer acquires them in
-the fixed lexical order `identity` then `thread`.
+the fixed order `bootstrap evidence` (when needed), `identity`, then `thread`.
 
 The current Linear MCP response omits native workspace and issue UUIDs. North
-therefore records an honest `mcp-bootstrap-v1` connector fingerprint over the
-MCP server name, the issue creation timestamp, and its initial key. The key,
+therefore creates `mcp-bootstrap-v2` identities from the connector and
+canonical creation instant only. It records the initial key separately as
+immutable collision evidence before reserving the thread. A second issue with
+the same connector and creation instant fails closed; a changed key is accepted
+only when the issue carries the exact structurally valid managed marker for the
+already linked thread. Legacy `mcp-bootstrap-v1` subjects (whose fingerprint
+also included the initial key) remain canonical when the current key derives
+that exact subject or the exact marker proves the old thread-to-link handle.
+North never creates a parallel v2 subject to “migrate” a proven v1 link.
+Without the marker, a renamed v1 match on connector plus creation instant is an
+ambiguity and fails closed. The key,
 team, and workspace slug remain mutable metadata. The first applied sync plants
 a `north:thread` managed marker in the Linear description; that exact marker is
 the durable backlink after a key, team, or workspace rename. Relocation searches
@@ -93,6 +117,14 @@ requires exactly one exact hidden marker plus matching creation evidence. The
 binding write is mandatory even when an explicitly adopted North thread has no
 ordinary field delta. Existing unmanaged description text is retained
 byte-for-byte and the managed block is appended exactly once.
+Backlink search begins only after method-aware structural not-found evidence
+from `get_issue`: either the reviewed typed error envelope or the connector's
+exact four-field JSON error (`invalid_request`, status 400, bounded request ID,
+and exact missing-issue message), or after a successful stored-key read proves
+that identity/marker evidence
+moved. Provider error prose is never classified. A timeout, outage, generic MCP
+failure, or RPC failure therefore remains one failed stored-key read and cannot
+fan out into a backlink search.
 Linear issue/comment traversal is bounded independently: 20 pages, 5,000
 comments, and 25 fully inspected backlink candidates. Pagination requires a
 new non-empty cursor on every continued page.
@@ -176,14 +208,29 @@ reservation, a stale holder therefore cannot publish a
 pending intent, receipt, baseline, link fact, or synchronization timestamp
 after losing the authorizing endpoint. The bridge also renews both endpoints on both sides of each Linear
 write and before final graph publication.
+Fenced values travel to the local lease helper over private stdin, never argv,
+environment variables, or temporary files. Caller and helper both enforce one
+160 KiB UTF-8 byte ceiling—above Linux's per-argument ceiling, while a
+worst-case escaped EDN value plus bounded metadata remains under Fram's 1 MiB
+request-line limit. The shared coordinator client also measures the actual
+serialized request and rejects an oversized line before connecting. Helper stderr is drained
+but never retained or surfaced, and helper failures use fixed diagnostics so
+private thread or manifest content cannot escape through process errors.
 
 A local coordinator lease cannot be atomic with a call to an external Linear
 server. North closes that unavoidable boundary with a durable protocol. Before
-a non-idempotent call, it atomically writes a compact operation intent
-containing hashes and operation IDs, never copied issue or comment bodies. If
-the Linear call commits and the lease or transport is then lost, the intent
-remains. North does not blindly retry an unknown write. A successor reads
-Linear and reconciles the intent first:
+a non-idempotent call, it atomically writes an exact operation-specific intent.
+The intent contains operation IDs and content hashes, never copied issue or
+comment bodies. An issue intent also carries the complete expected baseline
+snapshot—identity, thread ID, all per-field hashes, and its aggregate hash.
+That full snapshot is recovery-critical because a successor must advance the
+same baseline after observing the remote write; it is more than one hash while
+still containing no raw North field content. A comment intent carries its body
+hash plus kind/source identity, allowing the managed marker to be recomputed
+against the linked thread rather than trusted from stored text. If the Linear
+call commits and the lease or transport is then lost, the intent remains. North
+does not blindly retry an unknown write. A successor reads Linear and reconciles
+the intent first:
 
 - if the intended title/description or marked comment is observable, North
   records the receipt and continues;
@@ -200,11 +247,29 @@ local baseline, a reconstruction of the original payload hash, and that same
 narrow scaffold receipt all agree; arbitrary whitespace, body, or unmanaged
 description drift still fails closed.
 
-Import is crash-healable too. The atomic `linked_thread` reservation lands
-first. The prepared manifest then records the deterministic thread ID, identity
-evidence, original hashes, and one stable import timestamp before the remaining
-link and thread facts. A repeated import fills any missing facts without
-creating a second thread. Conflicting or malformed partial state fails closed.
+Confirmed operation receipts are diagnostic history, not a replay dependency.
+The manifest retains the newest 32 by the deterministic
+`(confirmedAt, operation-key)` order. Every legacy entry is validated before
+compaction; malformed timestamps or shapes fail closed rather than disappearing.
+This makes cumulative manifest serialization linear instead of quadratic.
+`sync --apply` persists compaction under the dual-endpoint lease scope and
+thread fence even when the remote plan is already a no-op; pending-write
+recovery remains independent of evicted receipts.
+
+Import is crash-healable too. Native and legacy-v1 imports begin with the atomic
+`linked_thread` reservation. A fresh bootstrap-v2 import first atomically
+records its immutable `bootstrap_initial_key` after validating the same reverse
+thread claims, then reserves `linked_thread`. The prepared manifest records the deterministic
+thread ID, identity evidence, original hashes, and one stable import timestamp
+before the remaining link and thread facts. A repeated import fills any missing
+facts without creating a second thread. Conflicting or malformed partial state
+fails closed.
+
+Normal apply work reads the comment corpus once to plan. Issue intent
+confirmation reads only the issue, and a structurally validated successful
+`save_comment` response confirms that comment directly. A full comment scan is
+reserved for lost, malformed, or otherwise unknown comment-write responses, so
+multi-comment applies do not repeatedly download the growing corpus.
 
 Remote edits inside North-owned fields are reported as drift/divergence; they
 are never timestamp-resolved or overwritten partially. Inspect with `north

@@ -8,6 +8,7 @@ const reapedPath = process.env.FAKE_LINEAR_REAPED;
 const startupPath = process.env.FAKE_LINEAR_STARTUP_LOG;
 
 if (startupPath) writeFileSync(startupPath, JSON.stringify({
+  pid: process.pid,
   argv: process.argv.slice(2),
   env: {
     CODEX_HOME: process.env.CODEX_HOME,
@@ -53,6 +54,10 @@ function sendResult(request, result) {
       setImmediate(() => process.exit(0));
       return;
     }
+    if (config.afterResponse.type === "cleanExit") {
+      process.stdout.write(`${JSON.stringify(response)}\n`, () => process.exit(0));
+      return;
+    }
     if (["exitBeforeEndPartial", "exitBeforeEndPartialLong"].includes(config.afterResponse.type)) {
       process.stdout.write(`${JSON.stringify(response)}\n{"method":"thread/started"`);
       const delay = config.afterResponse.type === "exitBeforeEndPartialLong" ? 500 : 75;
@@ -76,6 +81,7 @@ function sendResult(request, result) {
 
 process.on("SIGTERM", () => {
   if (reapedPath) writeFileSync(reapedPath, "SIGTERM");
+  if (config.ignoreSigterm) return;
   process.exit(0);
 });
 

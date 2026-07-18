@@ -9,7 +9,7 @@
 ;;   bb lease-cli.clj <port> [--json] renew  <res> <holder> <epoch> <ttl-ms>
 ;;   bb lease-cli.clj <port> [--json] release <res> <holder> [<epoch>]
 ;;   bb lease-cli.clj <port> [--json] fence   <res> <holder> <epoch>
-;;   bb lease-cli.clj <port> [--json] put-fenced <res> <holder> <epoch> <subject> <predicate> <value>
+;;   printf %s <value> | bb lease-cli.clj <port> [--json] put-fenced-stdin <res> <holder> <epoch> <subject> <predicate>
 ;;   bb lease-cli.clj <port> [--json] status
 (require '[cheshire.core :as json]
          '[clojure.edn :as edn]
@@ -33,6 +33,24 @@
 (defn required-text [label value]
   (when (str/blank? value) (fail! (str label " must not be blank")))
   value)
+
+;; The Fram coordinator admits one 1 MiB EDN request line. 160 KiB remains
+;; above Linux's per-argument ceiling while leaving enough room for worst-case
+;; EDN string escaping plus the fenced metadata envelope.
+(def max-fenced-value-bytes (* 160 1024))
+
+(defn read-fenced-value []
+  (let [bytes (.readNBytes System/in (inc max-fenced-value-bytes))]
+    (when (> (alength bytes) max-fenced-value-bytes)
+      (fail! (str "fenced value exceeds " max-fenced-value-bytes " bytes")))
+    (try
+      (let [decoder
+            (doto (.newDecoder java.nio.charset.StandardCharsets/UTF_8)
+              (.onMalformedInput java.nio.charset.CodingErrorAction/REPORT)
+              (.onUnmappableCharacter java.nio.charset.CodingErrorAction/REPORT))]
+        (str (.decode decoder (java.nio.ByteBuffer/wrap bytes))))
+      (catch java.nio.charset.CharacterCodingException _
+        (fail! "fenced value must be valid UTF-8")))))
 
 (let [[port-token maybe-format & tail] *command-line-args*
       json? (= maybe-format "--json")
@@ -64,7 +82,7 @@
                     :res (required-text "resource" (nth args 0 nil))
                     :holder (required-text "holder" (nth args 1 nil))
                     :epoch (positive-long "epoch" (nth args 2 nil))})
-     "put-fenced"
+     "put-fenced-stdin"
      (north.coord/put-with-fence!
       port
       {:resource (required-text "resource" (nth args 0 nil))
@@ -72,7 +90,7 @@
        :epoch (positive-long "epoch" (nth args 2 nil))}
       (required-text "subject" (nth args 3 nil))
       (required-text "predicate" (nth args 4 nil))
-      (if (< 5 (count args)) (nth args 5) (fail! "value is required")))
+      (read-fenced-value))
      "status"
      (send-op port {:op :status})
      (fail! (str "unknown verb: " verb)))]

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { AppServerMcpBroker, StrictJsonlFrames } from "../src/integrations/linear/app-server-broker";
 import { runLinearCommand } from "../src/integrations/linear/cli";
-import { openLinearGateway } from "../src/integrations/linear/gateway";
+import { LinearGatewayError, openLinearGateway } from "../src/integrations/linear/gateway";
 
 const fixture = resolve(import.meta.dir, "fixtures/fake-linear-app-server.mjs");
 const temporary: string[] = [];
@@ -187,6 +187,17 @@ test("uses stable app-server MCP calls without starting a model turn", async () 
   expect(readFileSync(reaped, "utf8")).toBe("SIGTERM");
 });
 
+test("concurrent client closes share one orderly shutdown", async () => {
+  const { broker, reaped } = harness({ servers: [linearServer()] });
+  const gateway = await openLinearGateway(broker);
+  const first = gateway.close();
+  const second = gateway.close();
+  expect(first).toBe(second);
+  await Promise.all([first, second]);
+  await gateway.close();
+  expect(readFileSync(reaped, "utf8")).toBe("SIGTERM");
+});
+
 test("command results carry a deterministic zero-model transport receipt", async () => {
   const { broker } = harness({
     servers: [linearServer()],
@@ -276,6 +287,32 @@ test("a late duplicate app-server error response invalidates the command receipt
   await expect(runLinearCommand(["get", "MSA-123"], {
     openGateway: ({ server }) => openLinearGateway(broker, { server }),
   })).rejects.toThrow("response for an unknown request");
+});
+
+test("an app-server self-exit after a valid tool response never becomes a client-close receipt", async () => {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const { broker } = harness({
+      servers: [linearServer()],
+      afterResponse: { method: "mcpServer/tool/call", type: "cleanExit" },
+      results: {
+        get_issue: {
+          structuredContent: {
+            issue: {
+              id: "MSA-123",
+              title: "A clean provider exit is still unexpected",
+              description: "",
+              url: "https://linear.app/msa/issue/MSA-123/provider-exit",
+              createdAt: "2026-07-18T00:00:00.000Z",
+            },
+          },
+          content: [],
+        },
+      },
+    });
+    await expect(runLinearCommand(["get", "MSA-123"], {
+      openGateway: ({ server }) => openLinearGateway(broker, { server }),
+    })).rejects.toThrow("transport exited unexpectedly");
+  }
 });
 
 test("split UTF-8 app-server output survives transport framing", async () => {
@@ -471,6 +508,19 @@ test("rejects malformed output and bounded timeouts", async () => {
     .rejects.toThrow("timed out after 30ms");
 });
 
+test("terminal protocol failure reaps a SIGTERM-resistant app-server without laundering the error", async () => {
+  const { broker, startup, reaped } = harness({
+    action: { method: "initialize", type: "malformed" },
+    ignoreSigterm: true,
+  });
+  const startedAt = Date.now();
+  await expect(openLinearGateway(broker)).rejects.toThrow("malformed JSONL output");
+  expect(Date.now() - startedAt).toBeLessThan(1_500);
+  expect(readFileSync(reaped, "utf8")).toBe("SIGTERM");
+  const { pid } = JSON.parse(readFileSync(startup, "utf8")) as { pid: number };
+  expect(() => process.kill(pid, 0)).toThrow();
+});
+
 test("reports child death before handshake completes", async () => {
   const canary = "canary-secret raw app-server stderr";
   try {
@@ -512,6 +562,122 @@ test("does not retry MCP tool errors", async () => {
   expect(requests(second.log).filter(({ method }) => method === "mcpServer/tool/call")).toHaveLength(1);
 });
 
+test("outgoing app-server JSONL is bounded before a provider tool call", async () => {
+  const h = harness({ servers: [linearServer()] });
+  const gateway = await openLinearGateway(h.broker);
+  await expect(gateway.writeIssue({
+    id: "MSA-123",
+    description: "x".repeat(1024 * 1024),
+  })).rejects.toThrow("JSONL request exceeded 1 MiB");
+  expect(requests(h.log).filter(({ method }) => method === "mcpServer/tool/call"))
+    .toHaveLength(0);
+  await gateway.close();
+});
+
+test("only a structural NOT_FOUND code becomes typed relocation evidence", async () => {
+  const typed = harness({
+    servers: [linearServer()],
+    results: {
+      get_issue: {
+        isError: true,
+        structuredContent: { error: { code: "NOT_FOUND", message: "ignored provider prose" } },
+        content: [{ type: "text", text: "untrusted text" }],
+      },
+    },
+  });
+  const typedGateway = await openLinearGateway(typed.broker);
+  try {
+    await typedGateway.readIssue({ id: "MOVED-1" });
+    throw new Error("expected typed not-found");
+  } catch (error) {
+    expect(error).toBeInstanceOf(LinearGatewayError);
+    expect((error as LinearGatewayError).kind).toBe("not-found");
+    expect(String(error)).not.toContain("ignored provider prose");
+  }
+  await typedGateway.close();
+
+  const observed = harness({
+    servers: [linearServer()],
+    results: {
+      get_issue: {
+        isError: true,
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: "invalid_request",
+            message: "Could not find referenced Issue.",
+            status: 400,
+            requestId: "req_observed_123",
+          }),
+        }],
+      },
+    },
+  });
+  const observedGateway = await openLinearGateway(observed.broker);
+  await expect(observedGateway.readIssue({ id: "MOVED-1" }))
+    .rejects.toBeInstanceOf(LinearGatewayError);
+  await observedGateway.close();
+
+  for (const text of [
+    "NOT_FOUND issue moved elsewhere",
+    JSON.stringify({
+      error: "invalid_request",
+      message: "Temporary validation outage.",
+      status: 400,
+      requestId: "req_transient",
+    }),
+    JSON.stringify({
+      error: "invalid_request",
+      message: "Could not find referenced Issue.",
+      status: 503,
+      requestId: "req_wrong_status",
+    }),
+    JSON.stringify({
+      error: "invalid_request",
+      message: "Could not find referenced Issue.",
+      status: 400,
+      requestId: "req_surplus",
+      retryable: true,
+    }),
+  ]) {
+    const negative = harness({
+      servers: [linearServer()],
+      results: {
+        get_issue: {
+          isError: true,
+          content: [{ type: "text", text }],
+        },
+      },
+    });
+    const gateway = await openLinearGateway(negative.broker);
+    await expect(gateway.readIssue({ id: "MOVED-1" }))
+      .rejects.toThrow("Linear MCP tool failed");
+    await gateway.close();
+  }
+
+  const wrongMethod = harness({
+    servers: [linearServer()],
+    results: {
+      list_issues: {
+        isError: true,
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: "invalid_request",
+            message: "Could not find referenced Issue.",
+            status: 400,
+            requestId: "req_wrong_method",
+          }),
+        }],
+      },
+    },
+  });
+  const wrongMethodGateway = await openLinearGateway(wrongMethod.broker);
+  await expect(wrongMethodGateway.listIssues({ query: "MOVED-1" }))
+    .rejects.toThrow("Linear MCP tool failed");
+  await wrongMethodGateway.close();
+});
+
 test("rejects server requests and MCP elicitation instead of answering them", async () => {
   const { broker } = harness({
     servers: [linearServer()],
@@ -519,5 +685,5 @@ test("rejects server requests and MCP elicitation instead of answering them", as
   });
   const gateway = await openLinearGateway(broker);
   await expect(gateway.readIssue({ id: "MSA-123" })).rejects.toThrow("unsupported server request; request rejected");
-  await gateway.close();
+  await expect(gateway.close()).rejects.toThrow("unsupported server request; request rejected");
 });

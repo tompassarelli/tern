@@ -484,7 +484,8 @@ EOF
             # The Linear route is spread across these load-bearing runtime
             # modules. Catch untracked/omitted flake sources before producing a
             # package whose `north linear` verb points at a missing entrypoint.
-            for f in cli.ts north-state.ts app-server-broker.ts reserve-link.clj; do
+            for f in cli.ts north-state.ts app-server-broker.ts \
+              reserve-link.clj find-bootstrap-links.clj; do
               test -f "$out/sdk/src/integrations/linear/$f"
             done
 
@@ -617,7 +618,11 @@ EOF
             ${pkgs.coreutils}/bin/env -i \
               HOME="$smoke/home" PATH= \
               $out/bin/ensure-private-docs "$client_repo"
-            grep -qxF 'docs/private/' "$client_repo/.gitignore"
+            if ! grep -qxF 'docs/private/' "$client_repo/.gitignore"; then
+              echo "north package smoke: ensure-private-docs did not install its exact ignore rule" >&2
+              sed -n '1,120p' "$client_repo/.gitignore" >&2
+              exit 1
+            fi
             # Empty PATH proves the packaged wrapper supplies bb + git itself.
             if ${pkgs.coreutils}/bin/env -i \
               HOME="$smoke/home" PATH= \
@@ -625,7 +630,11 @@ EOF
               echo "north package smoke: uncovered commit unexpectedly passed clock audit" >&2
               exit 1
             fi
-            grep -q '1 uncovered' "$smoke/clock-audit.out"
+            if ! grep -q '1 uncovered' "$smoke/clock-audit.out"; then
+              echo "north package smoke: clock audit did not report the uncovered commit" >&2
+              sed -n '1,160p' "$smoke/clock-audit.out" >&2
+              exit 1
+            fi
 
             stream_src="$smoke/source with spaces/project"
             mkdir -p "$stream_src" "$smoke/xdg"
@@ -678,6 +687,91 @@ EOF
               $out/bin/north doctor > "$smoke/doctor.out"
             grep -Eq 'north  package rev [^? ]+' "$smoke/doctor.out"
             grep -Eq 'fram  package rev [^? ]+' "$smoke/doctor.out"
+            # Cross the packaged TypeScript graph-store seam with FRAM_BIN in
+            # its public form: a bin directory, never an executable path.
+            HOME="$smoke/home" PATH="${runtimePath}" \
+              NORTH_BIN="$out/bin/north" NORTH_PORT="$coord_port" \
+              FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" FRAM_BIN="${framPkg}/bin" \
+              ${pkgs.bun}/bin/bun -e \
+              'import {
+                 CoordinatorSyncLeaseManager, LINEAR_GRAPH_VALUE_MAX_BYTES, NorthGraphStore,
+               } from "'$out'/sdk/src/integrations/linear/north-state.ts";
+               import { canonicalJson } from "'$out'/sdk/src/integrations/linear/normalize.ts";
+               import { createLinearSyncBaseline } from "'$out'/sdk/src/integrations/linear/reconcile.ts";
+               const store = new NorthGraphStore();
+               const before = await store.show("package-linear-graph-store");
+               if (before.length !== 0)
+                 throw new Error("north package smoke: isolated graph store was not empty");
+               await store.put("package-linear-graph-store", "kind", "package_smoke");
+               const written = await store.show("package-linear-graph-store");
+               if (!written.some((fact) => fact.predicate === "kind" && fact.value === "package_smoke"))
+                 throw new Error("north package smoke: packaged graph store put was not visible");
+               const bootstrapSubject = "link:linear:mcp-bootstrap-v1:linear-package:" + "a".repeat(64);
+               await store.put(bootstrapSubject, "kind", "integration_link");
+               await store.put(
+                 bootstrapSubject,
+                 "sync_manifest",
+                 canonicalJson({
+                   version: 1,
+                   phase: "prepared",
+                   baseline: createLinearSyncBaseline(
+                     {
+                       identityKind: "mcp-bootstrap-v1",
+                       connector: "linear-package",
+                       fingerprint: "a".repeat(64),
+                     },
+                     "package-bootstrap-thread",
+                     {
+                       title: "Package bootstrap smoke",
+                       body: "",
+                       doneWhen: [],
+                       barEvidence: [],
+                       repos: [],
+                       lifecycle: "ready",
+                     },
+                   ),
+                   evidence: {
+                     connector: "linear-package",
+                     createdAt: "2026-07-19T00:00:00.000Z",
+                     initialKey: "PACKAGE-1",
+                     workspace: "package",
+                   },
+                 }),
+               );
+               const found = await store.findBootstrapLinkSubjects(
+                 "linear-package",
+                 "2026-07-19T00:00:00.000Z",
+               );
+               if (found.length !== 1 || found[0] !== bootstrapSubject)
+                 throw new Error("north package smoke: packaged bootstrap evidence lookup disagreed");
+               const leases = new CoordinatorSyncLeaseManager();
+               const lease = await leases.acquire("linear-sync:package-private-frame");
+               try {
+                 const unit = String.fromCharCode(34, 92, 10);
+                 const value = unit.repeat(Math.floor(LINEAR_GRAPH_VALUE_MAX_BYTES / unit.length))
+                   + "x".repeat(LINEAR_GRAPH_VALUE_MAX_BYTES % unit.length);
+                 if (Buffer.byteLength(value, "utf8") !== LINEAR_GRAPH_VALUE_MAX_BYTES)
+                   throw new Error("north package smoke: private-frame boundary fixture is the wrong size");
+                 await store.putFenced(lease, "package-linear-private-frame", "note", value);
+                 const privateFacts = await store.show("package-linear-private-frame");
+                 if (!privateFacts.some((fact) => fact.predicate === "note" && fact.value === value))
+                   throw new Error("north package smoke: maximum private frame did not round-trip");
+                 let rejected = false;
+                 try {
+                   await store.putFenced(
+                     lease,
+                     "package-linear-private-frame",
+                     "note",
+                     "x".repeat(LINEAR_GRAPH_VALUE_MAX_BYTES + 1),
+                   );
+                 } catch (error) {
+                   rejected = String(error).includes("exceeds " + LINEAR_GRAPH_VALUE_MAX_BYTES + " bytes");
+                 }
+                 if (!rejected)
+                   throw new Error("north package smoke: oversized private frame was not rejected");
+               } finally {
+                 await lease.release();
+               }'
             # The Linear identity↔thread invariant depends on the packaged
             # global-version CAS helper, not merely the TypeScript entrypoint.
             # Reserve one partial link, then prove a second identity cannot
@@ -690,14 +784,25 @@ EOF
               ${pkgs.babashka}/bin/bb "$out/cli/lease-cli.clj" "$coord_port" --json \
               acquire "$linear_resource_a" "$linear_holder_a" 300000 \
               > "$smoke/linear-lease-a.json"
-            linear_epoch_a="$(${pkgs.jq}/bin/jq -er '.epoch' "$smoke/linear-lease-a.json")"
+            if ! linear_epoch_a="$(${pkgs.jq}/bin/jq -er '.epoch' \
+              "$smoke/linear-lease-a.json" 2> "$smoke/linear-lease-a.err")"; then
+              echo "north package smoke: first Linear reservation lease was invalid" >&2
+              sed -n '1,80p' "$smoke/linear-lease-a.json" >&2
+              sed -n '1,80p' "$smoke/linear-lease-a.err" >&2
+              exit 1
+            fi
             HOME="$smoke/home" FRAM_LOG="$coord_log" \
               ${pkgs.babashka}/bin/bb \
               "$out/sdk/src/integrations/linear/reserve-link.clj" \
               "$coord_port" "$linear_resource_a" "$linear_holder_a" "$linear_epoch_a" \
-              "$linear_link_a" "$linear_thread" "linear-package" \
+              "$linear_link_a" "$linear_thread" "linear-package" "-" \
               > "$smoke/linear-reserve-a.json"
-            ${pkgs.jq}/bin/jq -e '.ok | numbers' "$smoke/linear-reserve-a.json" > /dev/null
+            if ! ${pkgs.jq}/bin/jq -e '.ok | numbers' \
+              "$smoke/linear-reserve-a.json" > /dev/null; then
+              echo "north package smoke: first Linear binding reservation failed" >&2
+              sed -n '1,80p' "$smoke/linear-reserve-a.json" >&2
+              exit 1
+            fi
 
             linear_link_b="link:linear:uuid:22222222-2222-8222-8222-222222222222:33333333-3333-8333-8333-333333333333"
             linear_resource_b="linear-sync:identity:linear%3Auuid%3A22222222-2222-8222-8222-222222222222%3A33333333-3333-8333-8333-333333333333"
@@ -706,16 +811,26 @@ EOF
               ${pkgs.babashka}/bin/bb "$out/cli/lease-cli.clj" "$coord_port" --json \
               acquire "$linear_resource_b" "$linear_holder_b" 300000 \
               > "$smoke/linear-lease-b.json"
-            linear_epoch_b="$(${pkgs.jq}/bin/jq -er '.epoch' "$smoke/linear-lease-b.json")"
+            if ! linear_epoch_b="$(${pkgs.jq}/bin/jq -er '.epoch' \
+              "$smoke/linear-lease-b.json" 2> "$smoke/linear-lease-b.err")"; then
+              echo "north package smoke: second Linear reservation lease was invalid" >&2
+              sed -n '1,80p' "$smoke/linear-lease-b.json" >&2
+              sed -n '1,80p' "$smoke/linear-lease-b.err" >&2
+              exit 1
+            fi
             HOME="$smoke/home" FRAM_LOG="$coord_log" \
               ${pkgs.babashka}/bin/bb \
               "$out/sdk/src/integrations/linear/reserve-link.clj" \
               "$coord_port" "$linear_resource_b" "$linear_holder_b" "$linear_epoch_b" \
-              "$linear_link_b" "$linear_thread" "linear-package" \
+              "$linear_link_b" "$linear_thread" "linear-package" "-" \
               > "$smoke/linear-reserve-b.json"
-            ${pkgs.jq}/bin/jq -e \
+            if ! ${pkgs.jq}/bin/jq -e \
               '.reject | strings | contains("already reserved by")' \
-              "$smoke/linear-reserve-b.json" > /dev/null
+              "$smoke/linear-reserve-b.json" > /dev/null; then
+              echo "north package smoke: competing Linear binding was not rejected exactly" >&2
+              sed -n '1,80p' "$smoke/linear-reserve-b.json" >&2
+              exit 1
+            fi
             # North-managed daemons require the log-fence protocol. Exercise
             # the shared CLI seam against strict mode, then prove a mismatched
             # corpus and a raw bypass are both rejected without changing either

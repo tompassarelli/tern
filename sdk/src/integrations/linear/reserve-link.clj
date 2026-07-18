@@ -100,9 +100,10 @@
   #"linear:uuid:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})")
 
 (def bootstrap-identity
-  #"linear:mcp-bootstrap-v1:([^:]+):([0-9a-f]{64})")
+  #"linear:(mcp-bootstrap-v[12]):([^:]+):([0-9a-f]{64})")
 
-(let [[port-token resource holder epoch-token bare-link bare-thread remote-server]
+(let [[port-token resource holder epoch-token bare-link bare-thread remote-server
+       bootstrap-initial-key-token]
       *command-line-args*]
   (try
     (let [port (positive-long "port" port-token)
@@ -113,6 +114,9 @@
           bare-link (str/replace (required-text "link subject" bare-link) #"^@" "")
           bare-thread (str/replace (required-text "thread" bare-thread) #"^@" "")
           remote-server (required-text "remote server" remote-server)
+          bootstrap-initial-key
+          (when-not (= "-" bootstrap-initial-key-token)
+            (required-text "bootstrap initial key" bootstrap-initial-key-token))
           _link-shape
           (when-not (re-matches #"link:linear:[A-Za-z0-9:._!~*'()%-]+" bare-link)
             (fail! "link subject is not a canonical Linear link id"))
@@ -123,13 +127,13 @@
           identity
           (if-let [[_ workspace issue] (re-matches uuid-identity identity-key)]
             {:kind "linear-uuid" :workspace workspace :issue issue}
-            (if-let [[_ encoded-connector fingerprint]
+            (if-let [[_ bootstrap-kind encoded-connector fingerprint]
                      (re-matches bootstrap-identity identity-key)]
               (do
                 (when-not
                  (= encoded-connector (encode-uri-component remote-server))
                   (fail! "bootstrap identity connector does not match the remote server"))
-                {:kind "mcp-bootstrap-v1" :fingerprint fingerprint})
+                {:kind bootstrap-kind :fingerprint fingerprint})
               (fail! "link subject does not contain a canonical Linear identity")))
           expected-resource
           (str "linear-sync:identity:" (encode-uri-component identity-key))
@@ -161,6 +165,11 @@
                    port link "remote_uuid" (:issue identity)))
                 (compatible-singleton!
                  port link "remote_fingerprint" (:fingerprint identity)))
+              (when (= "mcp-bootstrap-v2" (:kind identity))
+                (when-not bootstrap-initial-key
+                  (fail! "bootstrap-v2 reservation requires an initial key"))
+                (compatible-singleton!
+                 port link "bootstrap_initial_key" bootstrap-initial-key))
               (when (or (> (count linked) 1)
                         (and (seq linked) (not= linked #{thread})))
                 (fail! (str "canonical Linear identity is already reserved for "
@@ -171,14 +180,23 @@
               (when (or (> (count thread-links) 1)
                         (and (seq thread-links) (not= thread-links #{link})))
                 (fail! (str "requested North thread already has a different canonical Linear link")))))
+          bootstrap-result
+          (when (= "mcp-bootstrap-v2" (:kind identity))
+            (north.coord/assert-after-read-with-fence!
+             port {:resource resource :holder holder :epoch epoch}
+             link "bootstrap_initial_key" bootstrap-initial-key validate!))
+          bootstrap-ok?
+          (or (not= "mcp-bootstrap-v2" (:kind identity))
+              (and (:ok bootstrap-result) (not (:reject bootstrap-result))))
           result
+          (when bootstrap-ok?
           (north.coord/assert-after-read-with-fence!
            port {:resource resource :holder holder :epoch epoch}
-           link "linked_thread" thread validate!)]
-      (if (and (:ok result) (not (:reject result)))
+           link "linked_thread" thread validate!))]
+      (if (and bootstrap-ok? (:ok result) (not (:reject result)))
         (println (json/generate-string {"ok" (:ok result)}))
         (println (json/generate-string
-                  {"reject" (if (= :conflict (:reject result))
+                  {"reject" (if (= :conflict (:reject (or result bootstrap-result)))
                               "Linear binding reservation raced with another graph write"
                               "Linear binding reservation lost its identity fence")}))))
     (catch Exception error
