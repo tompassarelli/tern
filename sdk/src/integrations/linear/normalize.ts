@@ -141,7 +141,10 @@ export function canonicalLinearInstant(value: Nullable<string>, name: string): s
   const parsed = Date.parse(exact);
   if (!Number.isFinite(parsed))
     throw new Error(`Linear ${name} is not a supported canonical instant`);
-  return new Date(parsed).toISOString();
+  const canonical = new Date(parsed).toISOString();
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(canonical))
+    throw new Error(`Linear ${name} is not a supported canonical instant`);
+  return canonical;
 }
 
 export function normalizeLinearRemoteKey(value: Nullable<string>): string {

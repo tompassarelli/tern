@@ -23,7 +23,7 @@ import {
   type SyncLeaseManager,
 } from "../src/integrations/linear/north-state";
 import {
-  canonicalJson, MAX_LINEAR_CONNECTOR_BYTES, MAX_LINEAR_REMOTE_KEY_BYTES,
+  canonicalJson, canonicalLinearInstant, MAX_LINEAR_CONNECTOR_BYTES, MAX_LINEAR_REMOTE_KEY_BYTES,
   MAX_LINEAR_THREAD_ID_BYTES, normalizeBody, normalizeLinearConnector,
   sha256Canonical,
 } from "../src/integrations/linear/normalize";
@@ -1263,6 +1263,25 @@ test("authority text profile rejects U+0085 and U+FEFF in intake and stored elec
   }
 });
 
+test("provider timestamps canonicalize idempotently inside the four-digit UTC authority profile", () => {
+  for (const timestamp of [
+    "0000-01-01T14:00:00+14:00",
+    "2026-07-16T10:08:20.639-04:00",
+    "9999-12-31T09:59:59-14:00",
+  ]) {
+    const canonical = canonicalLinearInstant(timestamp, "createdAt");
+    expect(canonicalLinearInstant(canonical, "createdAt")).toBe(canonical);
+  }
+
+  for (const timestamp of [
+    "0000-01-01T00:00:00+14:00",
+    "9999-12-31T23:59:59-14:00",
+  ]) {
+    expect(() => canonicalLinearInstant(timestamp, "createdAt"))
+      .toThrow("not a supported canonical instant");
+  }
+});
+
 test("provider timestamps canonicalize equivalent instants and reject invalid evidence", async () => {
   const h = harness();
   const first = await runLinearCommand(["import", "MSA-236"], h.dependencies) as {
@@ -1298,6 +1317,8 @@ test("provider timestamps canonicalize equivalent instants and reject invalid ev
     "2026-07-19T12:00:00+15:00",
     "2026-07-19T12:00:00-00:00",
     "2026-07-19T12:00:00.1234Z",
+    "0000-01-01T00:00:00+14:00",
+    "9999-12-31T23:59:59-14:00",
   ]) {
     const invalid = harness();
     invalid.gateway.issue.createdAt = timestamp;
