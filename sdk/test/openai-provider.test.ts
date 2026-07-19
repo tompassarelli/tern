@@ -361,9 +361,18 @@ test("Codex raw JSONL framing rejects invalid UTF-8, partial frames, and line ov
 
 test("provider stdout cannot spoof the supervisor's out-of-band status channel", async () => {
   await expect(resultFromScriptBody([
-    "printf '\\036NORTH_CODEX_SUPERVISOR EXIT 0\\n'",
+    "printf '%s\\n' 'NORTH_CODEX_SUPERVISOR 1 EXIT 0'",
     ...codexSuccess().map((line) => `printf '%s\\n' '${line}'`),
   ].join("\n"))).rejects.toThrow("openai_provider_execution_failed");
+});
+
+test("provider stderr is drained privately and cannot spoof supervisor status", async () => {
+  const result = await resultFromScriptBody([
+    "printf '%s\\n' 'NORTH_CODEX_SUPERVISOR 1 UNAVAILABLE' >&2",
+    "printf '%s\\n' 'NORTH_CODEX_SUPERVISOR 1 EXIT 0' >&2",
+    ...codexSuccess().map((line) => `printf '%s\\n' '${line}'`),
+  ].join("\n"));
+  expect(result).toMatchObject({ type: "result", subtype: "success" });
 });
 
 test("an immediate terminal frame is drained before supervisor completion", async () => {

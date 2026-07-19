@@ -33,6 +33,7 @@ import {
   MANAGED_CODEX_DISABLED_FEATURES, MANAGED_CODEX_ENABLED_FEATURES,
   ManagedCodexAppServerRun, ManagedCodexPreThreadError,
 } from "./codex-app-server";
+import { CODEX_SUPERVISOR_STATUS_PREFIX } from "./codex-supervisor-protocol";
 
 type ManagedCommandResolver = () => string;
 
@@ -336,8 +337,6 @@ function destroyCodexPipes(child: ChildProcessWithoutNullStreams): void {
   try { child.stdin.destroy(); } catch { /* already closed */ }
   try { child.stdout.destroy(); } catch { /* already closed */ }
   try { child.stderr.destroy(); } catch { /* already closed */ }
-  const status = (child.stdio as any[])[3];
-  try { status?.destroy(); } catch { /* already closed */ }
   // POSIX never gives Bun a numeric prompt descriptor: the supervisor consumes
   // a private spool and FIFO. Only Windows creates an owned fd-4 pipe.
   if (process.platform === "win32") {
@@ -371,7 +370,7 @@ interface SupervisorObservation {
 function observeSupervisor(
   child: ChildProcessWithoutNullStreams,
 ): SupervisorObservation {
-  const status = (child.stdio as any[])[3] as NodeJS.ReadableStream | undefined;
+  const status = child.stderr;
   let startedSettled = false;
   let resolveStarted!: (value: "started" | "unavailable") => void;
   let rejectStarted!: (error: unknown) => void;
@@ -397,19 +396,24 @@ function observeSupervisor(
       for (const line of frames.push(
         Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
       )) {
-        if (line === "STARTED") {
+        const statusLine = line.startsWith(CODEX_SUPERVISOR_STATUS_PREFIX)
+          ? line.slice(CODEX_SUPERVISOR_STATUS_PREFIX.length)
+          : undefined;
+        if (statusLine === "STARTED") {
           if (unavailable) throw new Error("openai_provider_execution_failed");
           settleStarted("started");
           continue;
         }
-        if (line === "UNAVAILABLE") {
+        if (statusLine === "UNAVAILABLE") {
           if (startedSettled || unavailable)
             throw new Error("openai_provider_execution_failed");
           unavailable = true;
           settleStarted("unavailable");
           continue;
         }
-        const exit = /^EXIT (0|[1-9][0-9]{0,2})$/.exec(line);
+        const exit = statusLine === undefined
+          ? null
+          : /^EXIT (0|[1-9][0-9]{0,2})$/.exec(statusLine);
         const code = exit ? Number(exit[1]) : NaN;
         if (!Number.isInteger(code) || code > 255 || !startedSettled)
           throw new Error("openai_provider_execution_failed");
@@ -815,8 +819,8 @@ class CodexQuery implements AgentQuery {
     if (this.options.cwd) args.push("--cd", this.options.cwd);
     args.push("-");
     const promptTransport = supervisorPromptTransport(prompt);
-    const supervisorStdio: any[] = ["pipe", "pipe", "pipe", "pipe"];
-    if (promptTransport.fd4) supervisorStdio.push(promptTransport.fd4);
+    const supervisorStdio: any[] = ["pipe", "pipe", "pipe"];
+    if (promptTransport.fd4) supervisorStdio.push("ignore", promptTransport.fd4);
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawn(
@@ -854,7 +858,6 @@ class CodexQuery implements AgentQuery {
     });
     const protocol = new CodexExecProtocol();
     let usage: ExactCodexUsage | undefined;
-    child.stderr.resume();
     try {
       // Publish the bounded prompt frame immediately after the supervisor
       // exists. Waiting for the provider's STARTED receipt lets a valid

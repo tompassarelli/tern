@@ -15,6 +15,9 @@ import {
   closeSync, constants, createReadStream, fstatSync, lstatSync, openSync, readFileSync,
   realpathSync, rmSync, statSync, unlinkSync, watch, writeSync,
 } from "node:fs";
+import {
+  codexSupervisorStatusLine, type CodexSupervisorStatus,
+} from "./codex-supervisor-protocol";
 
 const PROMPT = "NORTH_CODEX_PROMPT ";
 const MAX_PROMPT_BYTES = 16 * 1024 * 1024;
@@ -40,20 +43,16 @@ const oneShotSpool = rawArgs[0] === "--oneshot-spool";
 const spooledInput = duplex || oneShotSpool;
 const controlPath = spooledInput ? rawArgs[1] : undefined;
 const [executable, ...args] = spooledInput ? rawArgs.slice(2) : rawArgs;
-const trace = (value: string) => {
-  if (process.env.NORTH_TEST_TRACE_SUPERVISOR === "1")
-    process.stderr.write(`TRACE ${Date.now()} ${value}\n`);
-};
-
-function receipt(value: string): void {
-  const bytes = Buffer.from(`${value}\n`, "utf8");
+function receipt(value: CodexSupervisorStatus): void {
+  const bytes = Buffer.from(`${codexSupervisorStatusLine(value)}\n`, "utf8");
   let offset = 0;
   try {
     while (offset < bytes.byteLength)
-      offset += writeSync(3, bytes, offset, bytes.byteLength - offset);
+      offset += writeSync(2, bytes, offset, bytes.byteLength - offset);
   } catch {
-    // The status reader is owned by the North host. EPIPE here means that host
-    // is gone; kernel EOF on supervisor stdin already drives provider cleanup.
+    // Stderr is a supervisor-only status channel; provider stderr is drained
+    // separately. EPIPE means the North host is gone, and stdin EOF still
+    // drives provider cleanup.
   }
 }
 
@@ -201,14 +200,12 @@ async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<b
 }
 
 async function terminateProvider(): Promise<void> {
-  trace("terminate:start");
   signalGroup("SIGTERM");
   const termMs = providerExit === undefined ? TERM_MS : ORPHAN_TERM_MS;
   const goneAfterTerm = POSIX_GROUP
     ? await waitUntil(() => !groupExists(), termMs)
     : await waitUntil(() => child.exitCode !== null || child.signalCode !== null, termMs);
-  if (goneAfterTerm) { trace("terminate:term-gone"); return; }
-  trace("terminate:kill");
+  if (goneAfterTerm) return;
   signalGroup("SIGKILL");
   if (POSIX_GROUP)
     await waitUntil(() => !groupExists(), KILL_MS);
@@ -218,11 +215,8 @@ async function terminateProvider(): Promise<void> {
 
 function shutdown(): Promise<void> {
   shutdownPromise ??= (async () => {
-    trace("shutdown:control");
     stopControl();
-    trace("shutdown:provider");
     await terminateProvider();
-    trace("shutdown:done");
   })();
   return shutdownPromise;
 }
@@ -252,11 +246,13 @@ function closeOutput(target: NodeJS.WritableStream): Promise<void> {
 }
 
 const stdoutPump = pump(child.stdout, process.stdout);
-const stderrPump = pump(child.stderr, process.stderr);
+const stderrDrain = (async () => {
+  for await (const _ of child.stderr) { /* provider diagnostics stay private */ }
+})();
 let closeResolved = false;
 let resolveClose!: () => void;
 const providerClosed = new Promise<void>((resolve) => { resolveClose = resolve; });
-const pipesClosed = Promise.allSettled([providerClosed, stdoutPump, stderrPump]);
+const pipesClosed = Promise.allSettled([providerClosed, stdoutPump, stderrDrain]);
 const noteClosed = () => {
   if (closeResolved) return;
   closeResolved = true;
@@ -286,7 +282,6 @@ setTimeout(() => {
   if (child.pid !== undefined) noteStarted();
 }, 0);
 child.once("exit", (code, signal) => {
-  trace(`provider:exit:${code ?? "null"}:${signal ?? "null"}`);
   providerExit = { code, signal };
   // Reap any inherited descendants left in the direct Codex process group.
   void shutdown();
@@ -389,7 +384,6 @@ if (spooledInput) {
         providerWriterFd = undefined;
       }
     } catch {
-      trace("flush:reject");
       void shutdown();
     } finally {
       flushing = false;
@@ -462,7 +456,6 @@ if (spooledInput) {
         }
       }
     } catch {
-      trace("scan:reject");
       void shutdown();
     } finally {
       scanning = false;
@@ -493,17 +486,16 @@ if (spooledInput) {
   providerInput.once("error", () => { void shutdown(); });
   providerInput.resume();
 }
-hostInput.once("end", () => { trace("host:end"); void shutdown(); });
-hostInput.once("close", () => { trace("host:close"); void shutdown(); });
-hostInput.once("error", () => { trace("host:error"); void shutdown(); });
+hostInput.once("end", () => { void shutdown(); });
+hostInput.once("close", () => { void shutdown(); });
+hostInput.once("error", () => { void shutdown(); });
 hostInput.resume();
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const)
-  process.on(signal, () => { trace(`host:signal:${signal}`); void shutdown(); });
+  process.on(signal, () => { void shutdown(); });
 
 await waitUntil(() => providerExit !== undefined || shutdownPromise !== undefined, 2 ** 31 - 1);
 await shutdown();
-trace("main:shutdown-done");
 const pipeDeadline = Date.now() + PIPE_CLOSE_MS;
 const pipeTimeRemaining = () => Math.max(0, pipeDeadline - Date.now());
 if (!await waitUntil(() => closeResolved, pipeTimeRemaining())) {
@@ -527,9 +519,12 @@ const exitCode = !providerExit
       : 1
     );
 await Promise.race([
-  Promise.all([closeOutput(process.stdout), closeOutput(process.stderr)]),
+  closeOutput(process.stdout),
   new Promise<void>((resolve) => setTimeout(resolve, pipeTimeRemaining())),
 ]);
 receipt(`EXIT ${exitCode}`);
-trace(`main:exit-${exitCode}`);
+await Promise.race([
+  closeOutput(process.stderr),
+  new Promise<void>((resolve) => setTimeout(resolve, pipeTimeRemaining())),
+]);
 process.exit(exitCode);

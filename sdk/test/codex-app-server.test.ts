@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -16,6 +16,7 @@ import {
   managedCodexAppServerLaunch,
 } from "../src/providers/codex-app-server";
 import { expectedManagedCodexHooks } from "../src/providers/codex-managed-hooks";
+import { codexSupervisorStatusLine } from "../src/providers/codex-supervisor-protocol";
 import type { OpenAIAuthoritySurface } from "../src/providers/authority";
 
 function firstLine(stream: NodeJS.ReadableStream, label: string): Promise<string> {
@@ -539,14 +540,14 @@ test("the production duplex supervisor carries RPC and bounds host-EOF cleanup",
       NORTH_MKFIFO_BIN: realpathSync(Bun.which("mkfifo")!),
       FAKE_CODEX_RESPONSES: JSON.stringify({ probe: { transport: "exact" } }),
     },
-    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   }) as ChildProcessWithoutNullStreams;
-  const status = (child.stdio as any[])[3] as NodeJS.ReadableStream;
-  child.stderr.resume();
+  const status = child.stderr;
   let output = "";
   child.stdout.on("data", (chunk) => { output += chunk.toString(); });
   try {
-    expect(await firstLine(status, "Codex supervisor start receipt")).toBe("STARTED");
+    expect(await firstLine(status, "Codex supervisor start receipt"))
+      .toBe(codexSupervisorStatusLine("STARTED"));
     const firstTemporary = join(controlRoot, ".000000000001.test.tmp");
     writeAtomicSupervisorFrame(
       firstTemporary, `${JSON.stringify({ id: 1, method: "probe", params: {} })}\n`,
@@ -598,14 +599,14 @@ process.stdout.write(Buffer.concat(chunks));
     supervisor, "--oneshot-spool", controlRoot, process.execPath, provider,
   ], {
     env: { ...process.env, NORTH_MKFIFO_BIN: realpathSync(Bun.which("mkfifo")!) },
-    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   }) as ChildProcessWithoutNullStreams;
-  const status = (child.stdio as any[])[3] as NodeJS.ReadableStream;
+  const status = child.stderr;
   const output: Buffer[] = [];
   child.stdout.on("data", (chunk) => output.push(Buffer.from(chunk)));
-  child.stderr.resume();
   try {
-    expect(await firstLine(status, "Codex one-shot start receipt")).toBe("STARTED");
+    expect(await firstLine(status, "Codex one-shot start receipt"))
+      .toBe(codexSupervisorStatusLine("STARTED"));
     const temporary = join(controlRoot, ".000000000001.test.tmp");
     writeAtomicSupervisorFrame(temporary, prompt);
     renameSync(temporary, join(controlRoot, "000000000001.req"));
@@ -637,14 +638,14 @@ test("the duplex supervisor rejects symlinked, oversized, corrupt, and over-perm
         NORTH_MKFIFO_BIN: realpathSync(Bun.which("mkfifo")!),
         FAKE_CODEX_RESPONSES: JSON.stringify({ probe: { transport: "must-not-run" } }),
       },
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
     child.stdout.resume();
-    child.stderr.resume();
     const closed = new Promise<boolean>((resolveClose) => child.once("close", () => resolveClose(true)));
     try {
-      const status = (child.stdio as any[])[3] as NodeJS.ReadableStream;
-      expect(await firstLine(status, `Codex ${mode} start receipt`)).toBe("STARTED");
+      const status = child.stderr;
+      expect(await firstLine(status, `Codex ${mode} start receipt`))
+        .toBe(codexSupervisorStatusLine("STARTED"));
       const request = join(controlRoot, "000000000001.req");
       if (mode === "symlink") {
         writeFileSync(join(controlRoot, "target"), "hostile\n", { mode: 0o600 });
@@ -695,7 +696,7 @@ import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 const supervisor = spawn(process.execPath, ${JSON.stringify([
     supervisor, "--duplex", controlRoot, process.execPath, provider,
-  ])}, { env: process.env, stdio: ["pipe", "ignore", "ignore", "ignore"] });
+  ])}, { env: process.env, stdio: ["pipe", "ignore", "ignore"] });
 writeFileSync(${JSON.stringify(supervisorPidPath)}, String(supervisor.pid));
 setInterval(() => {}, 1000);
 `);
@@ -736,27 +737,26 @@ setInterval(() => {}, 1000);
   }
 }, 8_000);
 
-test("spooled supervisors require the wrapper-sealed Nix mkfifo binary", async () => {
+test("spooled supervisors require the wrapper-sealed Nix mkfifo binary", () => {
   const supervisor = join(import.meta.dir, "../src/providers/codex-supervisor.ts");
   const fixture = join(import.meta.dir, "fixtures/fake-codex-app-server.mjs");
-  const inheritedStatusWrapper = join(
-    import.meta.dir, "fixtures/run-with-inherited-status-fd.mjs",
-  );
   for (const inputMode of ["--duplex", "--oneshot-spool"]) {
     for (const mkfifo of [undefined, fixture]) {
       const controlRoot = mkdtempSync(join(tmpdir(), "north-codex-control-mkfifo-"));
       roots.push(controlRoot);
       const env = { ...process.env, NORTH_MKFIFO_BIN: mkfifo };
       if (mkfifo === undefined) delete env.NORTH_MKFIFO_BIN;
-      const child = spawn(process.execPath, [
-        inheritedStatusWrapper,
+      const child = spawnSync(process.execPath, [
         supervisor, inputMode, controlRoot, process.execPath, fixture,
-      ], { env, stdio: ["pipe", "pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
-      child.stdout.resume();
-      child.stderr.resume();
-      const status = (child.stdio as any[])[3] as NodeJS.ReadableStream;
-      expect(await firstLine(status, "Codex sealed mkfifo rejection")).toBe("UNAVAILABLE");
-      await new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+      ], {
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "ignore", "pipe"],
+        timeout: 2_000,
+      });
+      expect(child.error).toBeUndefined();
+      expect(child.signal).toBeNull();
+      expect(child.stderr.trim()).toBe(codexSupervisorStatusLine("UNAVAILABLE"));
       expect(existsSync(controlRoot)).toBe(false);
     }
   }
