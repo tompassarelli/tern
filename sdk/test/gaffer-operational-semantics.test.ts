@@ -106,7 +106,7 @@ test("domain requirements install a before-side-effect context gate, not an expe
 test("topology controls prompt and tools with positive-only orchestration authority", async () => {
   process.env.AGENT_LAWS = "off";
   const worker = harnessOptions({
-    self: "worker-topology", provider: "openai",
+    self: "worker-topology", provider: "openai", model: "gpt-5.6-sol",
     presenceRegistrar: false, routingMetadata: preset("integrator"),
   }) as any;
   expect(worker.systemPrompt).toContain("TOPOLOGY: WORKER (two-tier law)");
@@ -251,8 +251,9 @@ test("model calibration uses exact catalog keys and never applies stale alias de
   });
 
   const fallback = applyHarnessRoute(opus, "openai", "gpt-5.6-sol");
-  expect(fallback.options.systemPrompt).not.toContain("Fluency alarm");
-  expect(fallback.evidence?.modelDelta).toEqual({
+  expect(fallback.options.systemPrompt).toContain("Gaffer exact-model delta — openai:gpt-5.6-sol");
+  expect(fallback.options.systemPrompt).toContain("ANCHOR LINE");
+  expect(fallback.evidence?.modelDelta).toMatchObject({
     provider: "openai", model: "gpt-5.6-sol", kind: "calibrated",
     path: "docs/deltas/gpt-5.6-sol.md",
   });

@@ -133,6 +133,41 @@ test("persistent experimental-envelope drift remains a fixed bounded failure", a
   expect(calls).toBe(2);
 });
 
+test("cancellation prevents startup and suppresses the schema retry", async () => {
+  const target = { id: "claude", provider: "anthropic" as const, authMode: "ambient" as const };
+  const before = new AbortController();
+  before.abort(new Error("PRIVATE PRE-ABORT"));
+  let startups = 0;
+  await expect(readAnthropicSubscriptionUsage({
+    target,
+    signal: before.signal,
+    start: async () => {
+      startups++;
+      return await new Promise<never>(() => {});
+    },
+  })).rejects.toThrow("anthropic_usage_probe_aborted");
+  expect(startups).toBe(0);
+
+  const during = new AbortController();
+  let calls = 0;
+  await expect(readAnthropicSubscriptionUsage({
+    target,
+    signal: during.signal,
+    start: async () => ({
+      query: () => ({
+        async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+          calls++;
+          during.abort(new Error("PRIVATE MID-PROBE ABORT"));
+          return { schema: "would normally retry" };
+        },
+        close() {},
+      }),
+      close() {},
+    }),
+  })).rejects.toThrow("anthropic_usage_probe_aborted");
+  expect(calls).toBe(1);
+});
+
 test("an unavailable plan endpoint and unusable windows never infer headroom", () => {
   expect(() => normalizeAnthropicUsage({
     subscription_type: "max", rate_limits_available: false, rate_limits: null,

@@ -26,6 +26,7 @@ import {
   STRUGGLE_THRESHOLD_MAX,
   type StruggleObservation,
 } from "./struggle";
+import type { ProviderModelAdmissionReceipt } from "./provider-model-observation-store";
 
 const REPO = resolve(import.meta.dir, "../..");
 const internalWriter = resolve(REPO, "cli/run-fact-internal.clj");
@@ -50,6 +51,8 @@ export interface RunRecord {
   provider?: string; // anthropic | openai
   providerTarget?: string; // exact account/target that executed the final route
   providerReason?: string; // explainable auto/explicit routing decision
+  /** Exact target/model supportedModels evidence admitted for the final route. */
+  modelAvailability?: ProviderModelAdmissionReceipt;
   requestedProvider?: string;
   requestedTarget?: string;
   requestedTier?: string;
@@ -142,6 +145,19 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (rec.provider) facts.push(["provider", rec.provider]);
   if (rec.providerTarget) facts.push(["provider_target", rec.providerTarget]);
   if (rec.providerReason) facts.push(["provider_reason", rec.providerReason]);
+  if (rec.modelAvailability) {
+    const evidence = rec.modelAvailability;
+    if (rec.provider !== evidence.provider
+        || rec.providerTarget !== evidence.targetId
+        || rec.model !== evidence.model) {
+      throw new Error("model availability evidence does not match the final provider route");
+    }
+    facts.push(["model_availability_target", evidence.targetId]);
+    facts.push(["model_availability_source", evidence.source]);
+    facts.push(["model_availability_observed_at", evidence.observedAt]);
+    facts.push(["model_availability_model", evidence.model]);
+    facts.push(["model_availability_digest", evidence.observationDigest]);
+  }
   const authority = rec.effectiveAuthority;
   if (authority) {
     if (rec.provider && authority.provider !== rec.provider) {

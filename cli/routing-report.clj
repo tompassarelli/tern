@@ -477,6 +477,13 @@
                          (attributed? (get' "requested_tier" nil)) "requested-route-fallback"
                          :else "unattributed")
        :model (get' "model" "unattributed") :effort (get' "effort" "unattributed")
+       :modelAvailability
+       (when-let [source (normalized-token (one facts entity "model_availability_source"))]
+         {:target (normalized-token (one facts entity "model_availability_target"))
+          :source source
+          :observedAt (normalized-token (one facts entity "model_availability_observed_at"))
+          :model (normalized-token (one facts entity "model_availability_model"))
+          :digest (normalized-token (one facts entity "model_availability_digest"))})
        :role (or role "unattributed")
        :taskGrade (or (:taskGrade effective-axes)
                       (when-let [value (:taskGrade requested-axes)]

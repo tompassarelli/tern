@@ -26,9 +26,16 @@ interface ProviderTier {
   defaultReasoning?: Effort;
 }
 
+interface ProviderModel {
+  efforts?: Effort[];
+  reasoning?: Effort[];
+  routes?: Partial<Record<SemanticTier, Effort[]>>;
+}
+
 interface ProviderCatalog {
   provider: ProviderId;
   modelAliases: Record<string, string>;
+  models: Record<string, ProviderModel>;
   modelDeltas: Record<string, ModelDeltaDescriptor>;
   tiers: Record<SemanticTier, ProviderTier>;
 }
@@ -40,7 +47,8 @@ function gafferHome(): string {
 function providerCatalog(provider: ProviderId): ProviderCatalog {
   const path = resolve(gafferHome(), "providers", `${provider}.json`);
   const catalog = JSON.parse(readFileSync(path, "utf8")) as ProviderCatalog;
-  if (catalog.provider !== provider || !catalog.tiers || !catalog.modelAliases || !catalog.modelDeltas)
+  if (catalog.provider !== provider || !catalog.tiers || !catalog.modelAliases
+      || !catalog.models || !catalog.modelDeltas)
     throw new Error(`invalid Gaffer provider catalog for ${provider} at ${path}`);
   return catalog;
 }
@@ -48,7 +56,8 @@ function providerCatalog(provider: ProviderId): ProviderCatalog {
 /** Resolve a provider-local family alias to the exact catalog model ID. */
 export function resolveModelAlias(provider: ProviderId, model?: string): string | undefined {
   if (!model) return undefined;
-  return providerCatalog(provider).modelAliases[model] ?? model;
+  const aliases = providerCatalog(provider).modelAliases;
+  return Object.hasOwn(aliases, model) ? aliases[model] : model;
 }
 
 /**
@@ -58,7 +67,7 @@ export function resolveModelAlias(provider: ProviderId, model?: string): string 
 export function modelFamily(provider: ProviderId, model?: string): string | undefined {
   if (!model) return undefined;
   const catalog = providerCatalog(provider);
-  const concrete = catalog.modelAliases[model] ?? model;
+  const concrete = Object.hasOwn(catalog.modelAliases, model) ? catalog.modelAliases[model] : model;
   return Object.entries(catalog.modelAliases)
     .find(([, exact]) => exact === concrete)?.[0];
 }
@@ -70,8 +79,8 @@ export function modelFamilies(provider: ProviderId): string[] {
 export function providerSupportsModel(provider: ProviderId, model?: string): boolean {
   if (!model) return true;
   const catalog = providerCatalog(provider);
-  const concrete = catalog.modelAliases[model] ?? model;
-  return Object.hasOwn(catalog.modelDeltas, concrete);
+  const concrete = Object.hasOwn(catalog.modelAliases, model) ? catalog.modelAliases[model] : model;
+  return Object.hasOwn(catalog.models, concrete);
 }
 
 function tierEntry(provider: ProviderId, tier: SemanticTier): ProviderTier {
@@ -117,16 +126,8 @@ function supportedReasoningForModel(
   model: string,
 ): readonly Effort[] {
   const catalog = providerCatalog(provider);
-  const levels = new Set<Effort>();
-  for (const tier of SEMANTIC_TIER_ORDER) {
-    const entry = catalog.tiers[tier];
-    if (!entry) continue;
-    const concrete = catalog.modelAliases[entry.model] ?? entry.model;
-    if (concrete !== model) continue;
-    for (const effort of entry.efforts ?? entry.reasoning ?? [])
-      levels.add(effort);
-  }
-  return [...levels];
+  const declaration = Object.hasOwn(catalog.models, model) ? catalog.models[model] : undefined;
+  return declaration?.efforts ?? declaration?.reasoning ?? [];
 }
 
 function assertModelEffortPair(
@@ -136,7 +137,11 @@ function assertModelEffortPair(
   tier?: SemanticTier,
 ): void {
   if (!model || !effort) return;
-  const supported = supportedReasoningForModel(provider, model).includes(effort);
+  const catalog = providerCatalog(provider);
+  const declaration = Object.hasOwn(catalog.models, model) ? catalog.models[model] : undefined;
+  const rawSupported = supportedReasoningForModel(provider, model).includes(effort);
+  const routeSupported = !tier || declaration?.routes?.[tier]?.includes(effort) === true;
+  const supported = rawSupported && routeSupported;
   if (!supported) {
     throw new Error(
       `provider ${provider} model ${model} does not support reasoning ${effort}`
@@ -145,17 +150,39 @@ function assertModelEffortPair(
   }
 }
 
-export function providerSupportsRoute(provider: ProviderId, tier?: SemanticTier, reasoning?: Effort): boolean {
+export function providerSupportsRoute(
+  provider: ProviderId,
+  tier?: SemanticTier,
+  reasoning?: Effort,
+  model?: string,
+): boolean {
+  if (model) {
+    const concrete = resolveModelAlias(provider, model);
+    if (!concrete || !providerSupportsModel(provider, concrete)) return false;
+    if (!reasoning) return tier === undefined;
+    const catalog = providerCatalog(provider);
+    const declaration = catalog.models[concrete];
+    return supportedReasoningForModel(provider, concrete).includes(reasoning)
+      && (!tier || declaration?.routes?.[tier]?.includes(reasoning) === true);
+  }
   return !tier || !reasoning || supportedReasoning(provider, tier).includes(reasoning);
 }
 
 export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: string, effort?: Effort): ResolvedTier {
   if (model && !providerSupportsModel(provider, model))
     throw new Error(`provider ${provider} does not declare model ${model}`);
+  if (model) {
+    const resolvedModel = resolveModelAlias(provider, model)!;
+    if (tier && !effort) {
+      throw new Error(
+        `provider ${provider} exact model ${resolvedModel} requires explicit reasoning at semantic tier ${tier}`,
+      );
+    }
+    assertModelEffortPair(provider, resolvedModel, effort, tier);
+    return { ...(tier ? { tier } : {}), model: resolvedModel, effort };
+  }
   if (!tier) {
-    const resolvedModel = resolveModelAlias(provider, model);
-    assertModelEffortPair(provider, resolvedModel, effort);
-    return { model: resolvedModel, effort };
+    return { effort };
   }
   const entry = tierEntry(provider, tier);
   const levels = entry.efforts ?? entry.reasoning ?? [];
@@ -166,10 +193,9 @@ export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: s
     );
   }
 
-  // Resolve only the route declared by Gaffer. North never performs a hidden
-  // time-gated model substitution. An explicit model wins; unspecified effort
-  // defaults to the route's declared value.
-  const resolvedModel = resolveModelAlias(provider, model ?? (entry.model === "auto" ? undefined : entry.model));
+  // Unpinned composition preserves the canonical tier row. Exact pins return
+  // above and never consult this default model or infer a tier/model cross-product.
+  const resolvedModel = resolveModelAlias(provider, entry.model === "auto" ? undefined : entry.model);
   const resolvedEffort = effort ?? entry.defaultEffort ?? entry.defaultReasoning;
   assertModelEffortPair(
     provider,

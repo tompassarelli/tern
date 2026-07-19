@@ -82,6 +82,10 @@ export function routedQueryWithRegistry(
       : resolveTier(provider, tier, undefined, requestedReasoning);
     const rebuilt = applyHarnessRoute(
       args.options, provider, resolved.model, resolved.effort,
+      {
+        targetId: decision.target,
+        receipt: decision.modelAvailabilityReceipts?.[decision.target],
+      },
     );
     const options = (rebuilt.options === args.options
       ? { ...rebuilt.options }

@@ -27,11 +27,11 @@ import {
   type BillableClockAdmission,
 } from "./clock";
 import {
-  formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider, ProviderRetrySafeError,
+  formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider,
+  selectProviderForExecution, ProviderRetrySafeError,
   type ProviderAuthoritySurface, type ProviderPreference,
 } from "./providers";
 import type { AgentQuery } from "./providers/types";
-import { refreshCodexEntitlementsIfStale } from "./codex-entitlement";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
 import type { RoutingRequest } from "./routing-metadata";
 import { admitRoutingRequest, routingRequestFromEnv } from "./routing-admission";
@@ -111,7 +111,6 @@ interface DispatchRuntime {
   feedSubscriber?: typeof subscribeFeed;
   registerTermination?: HostTerminationRegistrar;
   refreshAccountUsages?: typeof refreshAccountUsages;
-  refreshCodexEntitlements?: typeof refreshCodexEntitlementsIfStale;
   admitResourceEnvelope?: typeof admitResourceEnvelope;
   completeResourceEnvelope?: typeof completeResourceEnvelope;
   admitBillableClock?: typeof admitBillableClock;
@@ -182,7 +181,7 @@ async function runDispatch(
   termination: ManagedQueryTermination = new ManagedQueryTermination(),
   preflightRuntime: Pick<
     DispatchRuntime,
-    "refreshAccountUsages" | "refreshCodexEntitlements" | "clockFinalize"
+    "refreshAccountUsages" | "clockFinalize"
   > = {},
 ): Promise<DispatchResult> {
   const runStartedAt = process.hrtime.bigint();
@@ -248,29 +247,36 @@ async function runDispatch(
   const requestedReasoning = (routingMetadata.reasoning ?? process.env.AGENT_EFFORT) as Effort | undefined;
   const providerPreference = process.env.AGENT_PROVIDER as ProviderPreference | undefined ?? "auto";
   const targetPreference = process.env.AGENT_TARGET;
+  const requestedModel = process.env.AGENT_MODEL;
   const routingRequest = { provider: providerPreference, target: targetPreference };
   if (!queryFn) {
     admitPinnedProvider(providerPreference, capabilities);
-    try {
-      await (preflightRuntime.refreshAccountUsages ?? refreshAccountUsages)({
-        requested: routingRequest,
-        signal: termination.signal,
-      });
-    } catch { /* telemetry is advisory */ }
-    termination.throwIfTerminated();
-    try {
-      await (preflightRuntime.refreshCodexEntitlements ?? refreshCodexEntitlementsIfStale)({
-        requested: routingRequest,
-        signal: termination.signal,
-      });
-    } catch { /* telemetry is advisory */ }
-    termination.throwIfTerminated();
   }
-  const routing = selectProvider(routingRequest, undefined,
-    { tier: requestedTier, reasoning: requestedReasoning,
-      model: process.env.AGENT_MODEL, stableKey: agentId, capabilities });
+  const routingContext = { tier: requestedTier, reasoning: requestedReasoning,
+    model: requestedModel, stableKey: agentId, capabilities, signal: termination.signal };
+  let routing;
+  if (queryFn) {
+    routing = selectProvider(routingRequest, undefined, routingContext);
+  } else {
+    try {
+      routing = await selectProviderForExecution(
+        routingRequest,
+        undefined,
+        routingContext,
+        preflightRuntime.refreshAccountUsages
+          ? { refreshAccountUsages: preflightRuntime.refreshAccountUsages }
+          : {},
+      );
+    } catch (error) {
+      // Provider refresh cancellation is an internal control edge. If the host
+      // caused it, retain the host signal as the public lifecycle terminal.
+      termination.throwIfTerminated();
+      throw error;
+    }
+  }
+  termination.throwIfTerminated();
   const resolved = resolveTier(routing.provider, requestedTier,
-    process.env.AGENT_MODEL, requestedReasoning);
+    requestedModel, requestedReasoning);
   const composition = routingMetadata.composition!;
   const identityBase = {
     kind: "lane",
@@ -386,6 +392,11 @@ async function runDispatch(
       model: resolved.model,
       effort: resolved.effort,
       provider: routing.provider,
+      modelAvailability: {
+        exactModelPinned: requestedModel !== undefined,
+        targetId: routing.target,
+        receipt: routing.modelAvailabilityReceipts?.[routing.target],
+      },
       routingMetadata,
       role,
       posture: routingMetadata.posture,
@@ -737,10 +748,11 @@ async function runDispatch(
               model: routing.resolvedModel ?? resolved.model, effort: routing.resolvedEffort ?? resolved.effort,
               role,
               provider: routing.provider, providerTarget: routing.target, providerReason: routing.selectionReason,
+              modelAvailability: routing.modelAvailabilityReceipts?.[routing.target],
               requestedProvider: routing.requestedProvider,
               requestedTarget: targetPreference,
               requestedTier,
-              requestedModel: process.env.AGENT_MODEL,
+              requestedModel,
               requestedEffort: routingMetadata.reasoning ?? process.env.AGENT_EFFORT,
               allocationMode: routing.allocationMode,
               entitlementPressure: routing.entitlementPressure,

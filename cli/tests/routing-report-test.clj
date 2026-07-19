@@ -261,6 +261,11 @@
 ;; Same applied contract + effective axes, deliberately different improvised IDs.
 (applied-bespoke! "@run-a" "migration-forensics" hash-a [" NIX " "Beagle"])
 (applied-bespoke! "@run-b" "schema-archaeologist" hash-a ["beagle " "nix"])
+(fact telem "@run-b" "model_availability_target" "claude-personal")
+(fact telem "@run-b" "model_availability_source" "claude-agent-sdk:Query.supportedModels")
+(fact telem "@run-b" "model_availability_observed_at" "2026-07-20T10:00:00.000Z")
+(fact telem "@run-b" "model_availability_model" "test-model")
+(fact telem "@run-b" "model_availability_digest" hash-b)
 (verified-lane! "@run-a" "thread-a")
 (verified-lane! "@run-b" "thread-b")
 (fact telem "@run-c" "composition_kind" "none")
@@ -324,6 +329,13 @@
                  (:taskGradeProvenance historical-zero-duration))))
   (check "legacy zero-turn success is absence, not exact turn evidence"
          (nil? (:turns historical-zero-turn-success)))
+  (check "routing report projects structured exact-model availability evidence"
+         (= {:target "claude-personal"
+             :source "claude-agent-sdk:Query.supportedModels"
+             :observedAt "2026-07-20T10:00:00.000Z"
+             :model "test-model"
+             :digest hash-b}
+            (:modelAvailability historical-zero-turn-success)))
   (check "an explicit preflight zero remains exact zero-turn evidence"
          (= 0 (observed-turns "0" "blocked_preflight"))))
 

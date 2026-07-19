@@ -156,6 +156,38 @@ test("run telemetry preserves requested, active, and fallback account targets", 
   })]]);
 });
 
+test("run telemetry persists structured exact-model availability evidence", () => {
+  const facts = runFacts({
+    thread: "thread-model", agent: "lane-model", durationMs: 2,
+    posture: "spawn", outcome: "ran", provider: "anthropic",
+    providerTarget: "claude-personal", model: "claude-fable-5",
+    modelAvailability: {
+      provider: "anthropic", targetId: "claude-personal", authMode: "ambient",
+      model: "claude-fable-5", observedAt: "2026-07-20T10:00:00.000Z",
+      source: "claude-agent-sdk:Query.supportedModels",
+      observationDigest: "a".repeat(64),
+    },
+  });
+  expect(facts).toContainEqual(["provider_target", "claude-personal"]);
+  expect(facts).toContainEqual(["model", "claude-fable-5"]);
+  expect(facts).toContainEqual(["model_availability_target", "claude-personal"]);
+  expect(facts).toContainEqual(["model_availability_source", "claude-agent-sdk:Query.supportedModels"]);
+  expect(facts).toContainEqual(["model_availability_observed_at", "2026-07-20T10:00:00.000Z"]);
+  expect(facts).toContainEqual(["model_availability_model", "claude-fable-5"]);
+  expect(facts).toContainEqual(["model_availability_digest", "a".repeat(64)]);
+  expect(() => runFacts({
+    thread: "thread-model", agent: "lane-model", durationMs: 2,
+    posture: "spawn", outcome: "ran", provider: "anthropic",
+    providerTarget: "claude-personal", model: "claude-opus-4-8",
+    modelAvailability: {
+      provider: "anthropic", targetId: "claude-personal", authMode: "ambient",
+      model: "claude-fable-5", observedAt: "2026-07-20T10:00:00.000Z",
+      source: "claude-agent-sdk:Query.supportedModels",
+      observationDigest: "a".repeat(64),
+    },
+  })).toThrow("does not match the final provider route");
+});
+
 test("run telemetry separates wall time, provider time, process terminal, and delivery truth", () => {
   const facts = runFacts({
     thread: "thread-terminal", agent: "lane-terminal",

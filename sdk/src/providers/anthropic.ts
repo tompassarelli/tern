@@ -16,9 +16,11 @@ import {
   READONLY_SHELL_SERVER, READONLY_SHELL_TOOL,
 } from "../readonly-shell";
 import {
+  canonicalHarnessModelAvailability,
   COORDINATION_TOOLS, hasCanonicalAuthoringHooks, hasCanonicalHarnessAuthority, managedToolPolicy,
   NATIVE_AGENT_TOOLS, ORCHESTRATION_TOOLS,
 } from "../harness";
+import { validateModelAdmissionReceipt } from "../provider-model-observation-store";
 import {
   createAnthropicProcessLifecycle, settleAnthropicProcessOwner,
   type AnthropicProcessLifecycle,
@@ -209,6 +211,22 @@ function validateAnthropicHarness(options: any): ReturnType<typeof requireGaffer
 export async function admitAnthropic(options: any, target?: RoutingTarget): Promise<void> {
   const capabilities = validateAnthropicHarness(options);
   if (!capabilities) return;
+  const modelAvailability = canonicalHarnessModelAvailability(options, "anthropic");
+  if (!modelAvailability)
+    throw new ProviderRetrySafeError("anthropic_model_availability_authority_missing");
+  if (modelAvailability.required) {
+    if (!target || modelAvailability.targetId !== target.id
+        || modelAvailability.model !== options.model
+        || typeof options.model !== "string"
+        || !await validateModelAdmissionReceipt(
+          modelAvailability.receipt,
+          target,
+          options.model,
+          modelAvailability.observationPath,
+        )) {
+      throw new ProviderRetrySafeError("anthropic_model_availability_unproven");
+    }
+  }
   await admitExecution("anthropic", capabilities, resolve(options.cwd ?? process.cwd()), options, target);
 }
 

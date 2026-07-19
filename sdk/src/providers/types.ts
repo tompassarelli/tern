@@ -1,5 +1,6 @@
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Effort } from "../harness";
+import type { ProviderModelAdmissionReceipt } from "../provider-model-observation-store";
 
 export type ProviderId = "anthropic" | "openai";
 export type ProviderPreference = ProviderId | "auto";
@@ -230,7 +231,10 @@ export interface AgentProvider {
   liveInput: LiveInputCapability;
   probe(target?: RoutingTarget): ProviderAvailability;
   /** Fail before a provider can accept the turn when the compiled harness is unenforceable. */
-  admit?(args: { options: Options; target?: RoutingTarget }): Promise<void> | void;
+  admit?(args: {
+    options: Options;
+    target?: RoutingTarget;
+  }): Promise<void> | void;
   query(args: { prompt: string | AsyncIterable<any>; options: Options; target?: RoutingTarget }): AgentQuery;
 }
 
@@ -265,6 +269,10 @@ export interface RoutingDecision {
   entitlementPressures: Partial<Record<ProviderId, EntitlementPressure>>;
   /** Immutable allocator inputs captured at decision time for later replay/audit. */
   allocationEvidenceByTarget?: Record<string, AllocationEvidence>;
+  /** Fresh target/model observations admitted before provider execution. */
+  readonly modelAvailabilityReceipts?: Readonly<Record<string, ProviderModelAdmissionReceipt>>;
+  /** Targets whose concrete route is forbidden without such a receipt. */
+  readonly modelAvailabilityRequiredTargets?: readonly string[];
   /** Actual model/effort used by the currently active provider route. */
   resolvedModel?: string;
   resolvedEffort?: string;

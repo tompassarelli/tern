@@ -9,8 +9,10 @@ import type { HarnessCompositionEvidence } from "../harness";
 import type { ProviderAuthoritySurface } from "./authority";
 import { routedQueryWithRegistry } from "./internal-router";
 export {
-  ProviderSelectionError, resourcePolicyFromEnv, selectProvider, selectProviderFromAvailability,
+  ProviderSelectionError, resourcePolicyFromEnv, selectProvider, selectProviderForExecution,
+  selectProviderFromAvailability,
 } from "../provider-routing";
+export { ProviderRefreshCancelledError } from "../provider-cancellation";
 export {
   applyProviderUsageObservations, automatedPressure, effectivePressure, loadProviderUsageObservations,
   loadResourcePolicy, parseProviderUsageObservations, parseResourcePolicy,

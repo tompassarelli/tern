@@ -20,6 +20,7 @@ export const ANTHROPIC_USAGE_SOURCE = "claude-agent-sdk:usage-control-experiment
 
 export type AnthropicUsageUnavailableReason =
   | "anthropic_usage_capability_unavailable"
+  | "anthropic_usage_probe_aborted"
   | "anthropic_usage_probe_failed"
   | "anthropic_usage_probe_timed_out"
   | "anthropic_usage_rate_limits_unavailable"
@@ -173,13 +174,28 @@ function idlePrompt(signal: AbortSignal): AsyncIterable<SDKUserMessage> {
   };
 }
 
-function timed<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function timed<T>(promise: Promise<T>, timeoutMs: number, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new AnthropicUsageUnavailableError("anthropic_usage_probe_timed_out")), timeoutMs);
+    let settled = false;
+    const finish = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", aborted);
+      action();
+    };
+    const aborted = () => finish(() => reject(
+      new AnthropicUsageUnavailableError("anthropic_usage_probe_aborted"),
+    ));
+    const timer = setTimeout(() => finish(() => reject(
+      new AnthropicUsageUnavailableError("anthropic_usage_probe_timed_out"),
+    )), timeoutMs);
     timer.unref?.();
+    if (signal.aborted) aborted();
+    else signal.addEventListener("abort", aborted, { once: true });
     promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      () => { clearTimeout(timer); reject(new AnthropicUsageUnavailableError("anthropic_usage_probe_failed")); },
+      (value) => finish(() => resolve(value)),
+      () => finish(() => reject(new AnthropicUsageUnavailableError("anthropic_usage_probe_failed"))),
     );
   });
 }
@@ -192,13 +208,14 @@ export async function readAnthropicSubscriptionUsage(
   const deadline = Date.now() + timeoutMs;
   const remaining = () => Math.max(1, deadline - Date.now());
   const controller = new AbortController();
-  const abort = () => controller.abort(options.signal?.reason);
-  if (options.signal?.aborted) abort();
-  else options.signal?.addEventListener("abort", abort, { once: true });
+  const forwardAbort = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) forwardAbort();
+  else options.signal?.addEventListener("abort", forwardAbort, { once: true });
   let warm: UsageWarmQuery | undefined;
   let usageQuery: UsageQuery | undefined;
   try {
-    options.signal?.throwIfAborted();
+    if (controller.signal.aborted)
+      throw new AnthropicUsageUnavailableError("anthropic_usage_probe_aborted");
     const env = providerEnvironmentForTarget("anthropic", options.target, { env: options.env });
     warm = await timed((options.start ?? (startup as StartUsageQuery))({
       initializeTimeoutMs: timeoutMs,
@@ -213,14 +230,14 @@ export async function readAnthropicSubscriptionUsage(
         systemPrompt: "",
         tools: [],
       },
-    }), remaining());
+    }), remaining(), controller.signal);
     usageQuery = warm.query(idlePrompt(controller.signal));
     const query = usageQuery;
     const method = query[USAGE_METHOD];
     if (typeof method !== "function")
       throw new AnthropicUsageUnavailableError("anthropic_usage_capability_unavailable");
     const normalizeResponse = async () => normalizeAnthropicUsage(
-      await timed(method.call(query), remaining()),
+      await timed(method.call(query), remaining(), controller.signal),
       options.target.id,
       options.now,
     );
@@ -228,6 +245,8 @@ export async function readAnthropicSubscriptionUsage(
       return await normalizeResponse();
     } catch (error) {
       if (!responseSchemaChanged(error)) throw error;
+      if (controller.signal.aborted)
+        throw new AnthropicUsageUnavailableError("anthropic_usage_probe_aborted");
       // The control surface is read-only and emits no model turn. One retry
       // absorbs a transient experimental-envelope mismatch while the shared
       // deadline keeps permanent schema drift bounded and explicit.
@@ -237,7 +256,7 @@ export async function readAnthropicSubscriptionUsage(
     if (error instanceof AnthropicUsageUnavailableError) throw error;
     throw new AnthropicUsageUnavailableError("anthropic_usage_probe_failed");
   } finally {
-    options.signal?.removeEventListener("abort", abort);
+    options.signal?.removeEventListener("abort", forwardAbort);
     controller.abort();
     usageQuery?.close();
     if (!usageQuery) warm?.close();

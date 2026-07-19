@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import {
   CODEX_OBSERVATION_TTL_MS, CODEX_USAGE_PROBE_TIMEOUT_MS,
   normalizeCodexRateLimits, observeCodexEntitlement,
@@ -116,6 +118,40 @@ test("fails within the configured timeout", async () => {
   const payload = responses();
   payload.initialize = "never" as any;
   await expect(observe(payload, 40)).rejects.toThrow("codex_usage_probe_timed_out");
+});
+
+test("cancellation prevents process spawn and any second app-server request", async () => {
+  const before = new AbortController();
+  before.abort(new Error("PRIVATE PRE-ABORT"));
+  let spawns = 0;
+  await expect(readCodexEntitlementObservation({
+    signal: before.signal,
+    spawnProcess: (() => { spawns++; throw new Error("must not spawn"); }) as any,
+  })).rejects.toThrow("codex_usage_probe_failed");
+  expect(spawns).toBe(0);
+
+  const during = new AbortController();
+  let requests = 0;
+  const child = new EventEmitter() as any;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  child.stdin.on("data", (chunk: Buffer) => {
+    requests++;
+    const request = JSON.parse(chunk.toString("utf8"));
+    if (requests !== 1) return;
+    setImmediate(() => {
+      child.stdout.write(`${JSON.stringify({ id: request.id, result: { initialized: true } })}\n`);
+      during.abort(new Error("PRIVATE MID-PROBE ABORT"));
+    });
+  });
+  await expect(readCodexEntitlementObservation({
+    signal: during.signal,
+    spawnProcess: (() => child) as any,
+    timeoutMs: 1_000,
+  })).rejects.toThrow("codex_usage_probe_failed");
+  expect(requests).toBe(1);
 });
 
 test("the default deadline tolerates a slow authenticated app-server startup", async () => {

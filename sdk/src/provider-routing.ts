@@ -54,6 +54,23 @@ import {
   type AuthVerdictReason,
   type CachedAuthState,
 } from "./provider-auth-cache";
+import {
+  modelAdmissionReceipt,
+  modelObservationForTarget,
+  providerModelObservationPath,
+  readProviderModelObservations,
+  type ProviderModelAdmissionReceipt,
+  type ProviderModelObservation,
+  type ProviderModelObservationStore,
+} from "./provider-model-observation-store";
+import {
+  refreshAccountUsages,
+  type AccountModelAvailabilityAttempt,
+} from "./account-usage";
+import {
+  ProviderRefreshCancelledError,
+  throwIfProviderRefreshCancelled,
+} from "./provider-cancellation";
 
 const PROVIDERS: ProviderId[] = ["anthropic", "openai"];
 
@@ -363,7 +380,7 @@ function routeLimitApplies(
   model?: string,
 ) : boolean {
   if (target.provider !== "anthropic") return true;
-  if (!providerSupportsRoute(target.provider, tier, reasoning)) return false;
+  if (!providerSupportsRoute(target.provider, tier, reasoning, model)) return false;
   const family = modelFamily(target.provider,
     model ? resolveTier(target.provider, tier, model, reasoning).model
       : tier ? resolveTier(target.provider, tier, undefined, reasoning).model
@@ -691,7 +708,7 @@ export function balancedAllocationEstimates(
     const targetPressure = routePressure(target, policy, tier, reasoning, model);
     const numeric = numericHeadroomEvidence(target, policy, tier, reasoning, model);
     const categorical = categoricalAllocationEvidence(target, policy, tier, reasoning, model);
-    const eligible = providerSupportsRoute(target.provider, tier, reasoning)
+    const eligible = providerSupportsRoute(target.provider, tier, reasoning, model)
       && providerSupportsModel(target.provider, model)
       && providerSupportsCapabilities(target.provider, capabilities)
       && stateOfTarget(availability, target).available
@@ -744,6 +761,43 @@ function stateOfTarget(availability: ProviderAvailability[], target: RoutingTarg
   };
 }
 
+export interface ProviderModelSelectionEvidence {
+  /** Last persisted observations; used only when this execution made no newer attempt. */
+  store?: ProviderModelObservationStore;
+  /** In-memory results from this execution's refresh dominate every persisted predecessor. */
+  currentAttempts?: readonly AccountModelAvailabilityAttempt[];
+  now?: Date;
+}
+
+function routeRequiresModelObservation(
+  target: RoutingTarget,
+  tier: SemanticTier | undefined,
+  reasoning: Effort | undefined,
+  model: string | undefined,
+): boolean {
+  if (target.provider !== "anthropic") return false;
+  if (model !== undefined) return true;
+  // Today every automatic route is the canonical Gaffer tier row. When a
+  // provider adapter gains an automatic non-default alternate, its selected
+  // exact model must be threaded here and compared before admission.
+  return false;
+}
+
+function currentModelObservation(
+  target: RoutingTarget,
+  evidence: ProviderModelSelectionEvidence,
+): ProviderModelObservation | undefined {
+  const attempt = evidence.currentAttempts?.find((entry) =>
+    entry.status === "persisted"
+      ? entry.observation.targetId === target.id
+        && entry.observation.provider === target.provider
+        && entry.observation.authMode === (target.authMode ?? "ambient")
+        && entry.observation.profile === target.profile
+      : entry.targetId === target.id);
+  if (attempt) return attempt.status === "persisted" ? attempt.observation : undefined;
+  return modelObservationForTarget(evidence.store, target);
+}
+
 export function selectProviderFromAvailability(
   requested: RoutingPreference,
   availability: ProviderAvailability[],
@@ -753,6 +807,7 @@ export function selectProviderFromAvailability(
   reasoning?: Effort,
   model?: string,
   capabilities?: readonly GafferCapability[],
+  modelEvidence: ProviderModelSelectionEvidence = {},
 ): RoutingDecision {
   const request = typeof requested === "string" ? { provider: requested } : requested;
   const requestedProvider = request.provider ?? "auto";
@@ -760,9 +815,29 @@ export function selectProviderFromAvailability(
   const targets = orderedTargets(policy);
   const capabilityCompatible = (target: RoutingTarget) =>
     providerSupportsCapabilities(target.provider, capabilities);
-  const routeCompatible = (target: RoutingTarget) => providerSupportsRoute(target.provider, tier, reasoning)
+  const staticRouteCompatible = (target: RoutingTarget) => providerSupportsRoute(target.provider, tier, reasoning, model)
     && providerSupportsModel(target.provider, model)
     && capabilityCompatible(target);
+  const requiredModelTargets = new Set(targets
+    .filter((target) => staticRouteCompatible(target)
+      && routeRequiresModelObservation(target, tier, reasoning, model))
+    .map(({ id }) => id));
+  const modelReceipts: Record<string, ProviderModelAdmissionReceipt> = {};
+  for (const target of targets) {
+    if (!requiredModelTargets.has(target.id)) continue;
+    const exactModel = resolveTier(target.provider, tier, model, reasoning).model;
+    if (!exactModel) continue;
+    const observation = currentModelObservation(target, modelEvidence);
+    if (!observation) continue;
+    const receipt = modelAdmissionReceipt(
+      observation, target, exactModel, modelEvidence.now ?? new Date(),
+    );
+    if (receipt) modelReceipts[target.id] = receipt;
+  }
+  const modelCompatible = (target: RoutingTarget) =>
+    !requiredModelTargets.has(target.id) || modelReceipts[target.id] !== undefined;
+  const routeCompatible = (target: RoutingTarget) => staticRouteCompatible(target)
+    && modelCompatible(target);
   const targetPressures = Object.fromEntries(targets.map((target) => [
     target.id, routePressure(target, policy, tier, reasoning, model),
   ])) as Record<string, EntitlementPressure>;
@@ -793,7 +868,12 @@ export function selectProviderFromAvailability(
         "blocked_preflight",
         `routing target ${target.id} cannot enforce the requested Gaffer capabilities`,
       );
-    if (!routeCompatible(target)) throw routeFailure([target.provider]);
+    if (!staticRouteCompatible(target)) throw routeFailure([target.provider]);
+    if (!modelCompatible(target))
+      throw new ProviderSelectionError(
+        "blocked_preflight",
+        `routing target ${target.id} lacks fresh positive exact-model availability evidence`,
+      );
     const state = stateOfTarget(availability, target);
     if (!state.available)
       throw new ProviderSelectionError("provider_unavailable",
@@ -810,8 +890,14 @@ export function selectProviderFromAvailability(
         "blocked_preflight",
         `provider ${requestedProvider} cannot enforce the requested Gaffer capabilities`,
       );
-    const compatibleTargets = providerTargets.filter(routeCompatible);
-    if (!compatibleTargets.length) throw routeFailure([requestedProvider]);
+    const staticCompatibleTargets = providerTargets.filter(staticRouteCompatible);
+    if (!staticCompatibleTargets.length) throw routeFailure([requestedProvider]);
+    const compatibleTargets = staticCompatibleTargets.filter(modelCompatible);
+    if (!compatibleTargets.length)
+      throw new ProviderSelectionError(
+        "blocked_preflight",
+        `provider ${requestedProvider} lacks fresh positive exact-model availability evidence`,
+      );
     candidates = compatibleTargets.filter(eligible);
     if (!candidates.length && compatibleTargets.every((target) => !targetAvailable(target))) {
       if (compatibleTargets.length === 1) {
@@ -827,13 +913,24 @@ export function selectProviderFromAvailability(
       throw new ProviderSelectionError("entitlement_exhausted",
         `provider ${requestedProvider} entitlement exhausted (all routing targets)`);
   } else {
-    if (!targets.some(routeCompatible)) throw routeFailure(targets.map(({ provider }) => provider));
+    if (!targets.some(staticRouteCompatible)) throw routeFailure(targets.map(({ provider }) => provider));
     candidates = targets.filter(eligible);
   }
 
-  if (!candidates.length)
+  if (!candidates.length) {
+    const evidenceBlocked = targets.some((target) => staticRouteCompatible(target)
+      && targetAvailable(target)
+      && targetPressures[target.id] !== "exhausted"
+      && spendGuardEligible(target.provider, target.id)
+      && !modelCompatible(target));
+    if (evidenceBlocked)
+      throw new ProviderSelectionError(
+        "blocked_preflight",
+        "no agent target has fresh positive exact-model availability evidence",
+      );
     throw new ProviderSelectionError("no_provider_available",
       `no agent target available: ${targets.map((target) => `${target.id}=${stateOfTarget(availability, target).reason}/${targetPressures[target.id]}`).join(", ")}`);
+  }
 
   let chosen: RoutingTarget;
   let detail: string;
@@ -878,20 +975,28 @@ export function selectProviderFromAvailability(
 
   const fallbacks = requestedTarget === undefined ? candidates.filter(({ id }) => id !== chosen.id) : [];
   const routeReason = tier && reasoning ? `route=${tier}/${reasoning}; ` : "";
-  const selectionReason = `${requestedProvider === "auto" ? "" : `explicit provider=${requestedProvider}; `}${routeReason}mode=${policy.mode}; target=${chosen.id}; pressure=${targetPressures[chosen.id]}; ${detail}`;
+  const modelReceipt = modelReceipts[chosen.id];
+  const modelEvidenceReason = modelReceipt
+    ? `model-evidence=${modelReceipt.source}@${modelReceipt.observedAt}; ` : "";
+  const selectionReason = `${requestedProvider === "auto" ? "" : `explicit provider=${requestedProvider}; `}${routeReason}${modelEvidenceReason}mode=${policy.mode}; target=${chosen.id}; pressure=${targetPressures[chosen.id]}; ${detail}`;
   const allocationEvidenceByTarget = policy.mode === "balanced"
     ? Object.fromEntries(balancedAllocationEstimates(
       availability, policy, tier, reasoning, model,
       capabilities,
     ).map((estimate) => [estimate.target, estimate.allocationEvidence]))
     : undefined;
+  const routingTargets = Object.freeze(Object.fromEntries(
+    targets.map((target) => [target.id, Object.freeze({ ...target })]),
+  ));
+  const frozenModelReceipts = Object.freeze({ ...modelReceipts });
+  const frozenRequiredModelTargets = Object.freeze([...requiredModelTargets]);
   const decision: RoutingDecision = {
     requested: requestedProvider,
     requestedProvider,
     ...(requestedTarget === undefined ? {} : { requestedTarget }),
     target: chosen.id,
     provider: chosen.provider,
-    routingTargets: Object.fromEntries(targets.map((target) => [target.id, target])),
+    routingTargets,
     selectionReason,
     reason: selectionReason,
     availability,
@@ -906,6 +1011,12 @@ export function selectProviderFromAvailability(
     targetEntitlementPressures: targetPressures,
     entitlementPressures: policy.pressures,
     ...(allocationEvidenceByTarget ? { allocationEvidenceByTarget } : {}),
+    ...(Object.keys(modelReceipts).length
+      ? { modelAvailabilityReceipts: frozenModelReceipts }
+      : {}),
+    ...(requiredModelTargets.size
+      ? { modelAvailabilityRequiredTargets: frozenRequiredModelTargets }
+      : {}),
   };
   // RoutingDecision remains live for final provider/model/pressure attribution,
   // but the explanation of the original allocator choice is provenance. Make
@@ -913,6 +1024,17 @@ export function selectProviderFromAvailability(
   Object.defineProperties(decision, {
     selectionReason: { value: selectionReason, enumerable: true, writable: false, configurable: false },
     reason: { value: selectionReason, enumerable: true, writable: false, configurable: false },
+    routingTargets: { value: routingTargets, enumerable: true, writable: false, configurable: false },
+    ...(Object.keys(modelReceipts).length ? {
+      modelAvailabilityReceipts: {
+        value: frozenModelReceipts, enumerable: true, writable: false, configurable: false,
+      },
+    } : {}),
+    ...(requiredModelTargets.size ? {
+      modelAvailabilityRequiredTargets: {
+        value: frozenRequiredModelTargets, enumerable: true, writable: false, configurable: false,
+      },
+    } : {}),
   });
   return decision;
 }
@@ -955,4 +1077,104 @@ export function selectProvider(
     ?? (process.env.AGENT_REASONING ?? process.env.AGENT_EFFORT) as Effort | undefined;
   return selectProviderFromAvailability(preference, availability, policy,
     context.tier, context.stableKey, reasoning, context.model, context.capabilities);
+}
+
+/** @internal Source-tree seam; the package export exposes only the production selector. */
+export async function collectExecutionModelRefreshAttempts(
+  probeTargets: RoutingTarget[],
+  requiredTargets: RoutingTarget[],
+  preference: RoutingPreference,
+  refresh: typeof refreshAccountUsages = refreshAccountUsages,
+  signal?: AbortSignal,
+): Promise<AccountModelAvailabilityAttempt[]> {
+  throwIfProviderRefreshCancelled(signal);
+  try {
+    const reports = await refresh({
+      accounts: probeTargets,
+      requested: preference,
+      observeAnthropicModels: requiredTargets.length > 0,
+      signal,
+    });
+    throwIfProviderRefreshCancelled(signal);
+    return reports.flatMap(({ modelAvailabilityAttempt }) =>
+      modelAvailabilityAttempt ? [modelAvailabilityAttempt] : []);
+  } catch (error) {
+    if (error instanceof ProviderRefreshCancelledError || signal?.aborted)
+      throw new ProviderRefreshCancelledError();
+    const attemptedAt = new Date().toISOString();
+    return requiredTargets.map((target) => ({
+      status: "unavailable" as const,
+      targetId: target.id,
+      attemptedAt,
+      reason: "anthropic_models_refresh_unavailable",
+    }));
+  }
+}
+
+/**
+ * Execution selector: refresh subscription telemetry and target-scoped model
+ * evidence before returning a route. Dry/status callers retain selectProvider.
+ */
+export async function selectProviderForExecution(
+  requested?: RoutingPreference,
+  policy: ResourcePolicy = resourcePolicyFromEnv(),
+  context: {
+    tier?: SemanticTier; reasoning?: Effort; model?: string; stableKey?: string;
+    capabilities?: readonly GafferCapability[];
+    signal?: AbortSignal;
+  } = {},
+  dependencies: {
+    probeAnthropic?: typeof probeAnthropic;
+    probeOpenAI?: typeof probeOpenAI;
+    refreshAccountUsages?: typeof refreshAccountUsages;
+  } = {},
+): Promise<RoutingDecision> {
+  throwIfProviderRefreshCancelled(context.signal);
+  const preference = requested
+    ?? (process.env.AGENT_PROVIDER as ProviderPreference | undefined)
+    ?? "auto";
+  const request = typeof preference === "string" ? { provider: preference } : preference;
+  const requestedProvider = request.provider ?? "auto";
+  const probeTargets = orderedTargets(policy).filter((target) =>
+    request.target !== undefined ? target.id === request.target
+      : requestedProvider !== "auto" ? target.provider === requestedProvider
+        : true);
+  const availability = probeTargets.map((target) => {
+    try {
+      return {
+        ...(target.provider === "anthropic"
+          ? (dependencies.probeAnthropic ?? probeAnthropic)(target)
+          : (dependencies.probeOpenAI ?? probeOpenAI)(target)),
+        targetId: target.id,
+      };
+    } catch {
+      return {
+        targetId: target.id, provider: target.provider, installed: false,
+        authenticated: false, available: false, reason: "unknown" as const,
+      };
+    }
+  });
+  throwIfProviderRefreshCancelled(context.signal);
+  const reasoning = context.reasoning
+    ?? (process.env.AGENT_REASONING ?? process.env.AGENT_EFFORT) as Effort | undefined;
+  const requiredRefreshTargets = probeTargets.filter((target) =>
+    stateOfTarget(availability, target).available
+      && providerSupportsRoute(target.provider, context.tier, reasoning, context.model)
+      && providerSupportsModel(target.provider, context.model)
+      && routeRequiresModelObservation(target, context.tier, reasoning, context.model));
+  const attempts = await collectExecutionModelRefreshAttempts(
+    probeTargets, requiredRefreshTargets, preference,
+    dependencies.refreshAccountUsages ?? refreshAccountUsages,
+    context.signal,
+  );
+  throwIfProviderRefreshCancelled(context.signal);
+  let store: ProviderModelObservationStore | undefined;
+  try { store = await readProviderModelObservations(providerModelObservationPath()); }
+  catch { /* malformed/unreadable evidence is unavailable */ }
+  throwIfProviderRefreshCancelled(context.signal);
+  return selectProviderFromAvailability(
+    preference, availability, policy, context.tier, context.stableKey,
+    reasoning, context.model, context.capabilities,
+    { store, currentAttempts: attempts },
+  );
 }

@@ -148,6 +148,8 @@ export function normalizeCodexRateLimits(value: unknown): ProviderUsageWindow[] 
 
 /** Read ChatGPT/Codex subscription headroom without sending a model turn. */
 export async function readCodexEntitlementObservation(options: AppServerOptions = {}): Promise<ProviderUsageObservation> {
+  if (options.signal?.aborted)
+    throw new CodexUsageUnavailableError("codex_usage_probe_failed");
   if (options.target && options.targetId && options.target.id !== options.targetId)
     throw new Error(`Codex entitlement target mismatch: ${options.target.id} != ${options.targetId}`);
   const env = providerEnvironmentForTarget("openai", options.target, { env: options.env });
@@ -223,12 +225,19 @@ export async function readCodexEntitlementObservation(options: AppServerOptions 
   }, timeoutMs);
   timeout.unref?.();
   try {
-    options.signal?.throwIfAborted();
+    if (options.signal?.aborted)
+      throw new CodexUsageUnavailableError("codex_usage_probe_failed");
     await request(child, pending, 1, "initialize", { clientInfo: { name: "north", version: "1" } });
+    if (options.signal?.aborted)
+      throw new CodexUsageUnavailableError("codex_usage_probe_failed");
     const account = await request(child, pending, 2, "account/read", {});
+    if (options.signal?.aborted)
+      throw new CodexUsageUnavailableError("codex_usage_probe_failed");
     if (!record(account) || !record(account.account) || account.account.type !== "chatgpt")
       throw new CodexUsageUnavailableError("codex_usage_subscription_auth_required");
     const limits = await request(child, pending, 3, "account/rateLimits/read", null);
+    if (options.signal?.aborted)
+      throw new CodexUsageUnavailableError("codex_usage_probe_failed");
     const windows = normalizeCodexRateLimits(limits);
     if (!windows.length) throw new CodexUsageUnavailableError("codex_usage_windows_unavailable");
     return {

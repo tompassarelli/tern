@@ -37,6 +37,10 @@ import {
 } from "./readonly-shell";
 import { managedNorthMcpEnvironment } from "./execution-admission";
 import { requireJudgmentGrade } from "./judgment-grade";
+import {
+  providerModelObservationPath,
+  type ProviderModelAdmissionReceipt,
+} from "./provider-model-observation-store";
 
 // sdk/src/harness.ts -> its relocatable runtime root.
 const REPO = resolve(import.meta.dir, "../..");
@@ -306,6 +310,12 @@ export interface HarnessOpts {
   routingMetadata?: RoutingRequest;
   /** A live run may change models in-place, so no exact-model delta can remain valid. */
   omitModelDeltaReason?: string;
+  /** Original route intent plus target evidence, sealed into provider authority. */
+  modelAvailability?: {
+    exactModelPinned: boolean;
+    targetId: string;
+    receipt?: ProviderModelAdmissionReceipt;
+  };
   caveman?: string; // resolved terse-output mode (off|lite|full); fallback env-or-full when omitted
   cwd?: string; // provider working directory; dispatch resolves this from thread repo facts, spawn from opt-in worktree provisioning
   /** Capability-bound delivery context reserved before provider execution. */
@@ -889,6 +899,7 @@ interface HarnessCompositionState {
   initialModel?: string;
   initialEffort?: Effort;
   omitModelDeltaReason?: string;
+  exactModelPinned: boolean;
 }
 
 // The single 4-tier assembler. CORE (byte-identical for every lane) then
@@ -942,8 +953,16 @@ interface HarnessAuthoritySeal {
   effort?: Effort;
   model?: string;
   maxTurns?: number;
+  modelAvailability: HarnessModelAvailabilityBinding;
 }
 const harnessAuthoritySeals = new WeakMap<object, HarnessAuthoritySeal>();
+export interface HarnessModelAvailabilityBinding {
+  readonly required: boolean;
+  readonly targetId: string;
+  readonly model?: string;
+  readonly receipt?: ProviderModelAdmissionReceipt;
+  readonly observationPath: string;
+}
 interface AuthoringHookSealEntry {
   matcher?: string;
   hooks: unknown[];
@@ -997,6 +1016,7 @@ function sealHarnessAuthority(options: Options, provider: ProviderId): void {
     effort: raw.effort,
     model: raw.model,
     maxTurns: raw.maxTurns,
+    modelAvailability: raw.northModelAvailability,
   });
 }
 
@@ -1036,8 +1056,18 @@ export function hasCanonicalHarnessAuthority(options: Options, provider: Provide
     && raw.cwd === seal.cwd
     && raw.effort === seal.effort
     && raw.model === seal.model
-    && raw.maxTurns === seal.maxTurns,
+    && raw.maxTurns === seal.maxTurns
+    && raw.northModelAvailability === seal.modelAvailability,
   );
+}
+
+/** Availability authority is readable only from an otherwise canonical seal. */
+export function canonicalHarnessModelAvailability(
+  options: Options,
+  provider: ProviderId,
+): HarnessModelAvailabilityBinding | undefined {
+  if (!hasCanonicalHarnessAuthority(options, provider)) return undefined;
+  return harnessAuthoritySeals.get(options as object)?.modelAvailability;
 }
 
 function sealAuthoringHooks(options: Options): void {
@@ -1209,6 +1239,10 @@ export function applyHarnessRoute(
   provider: ProviderId,
   model?: string,
   effort?: Effort,
+  availability?: {
+    targetId: string;
+    receipt?: ProviderModelAdmissionReceipt;
+  },
 ): {
   options: Options;
   evidence?: HarnessCompositionEvidence;
@@ -1227,11 +1261,41 @@ export function applyHarnessRoute(
   const concreteModel = resolveModelAlias(provider, model);
   const composed = composeSystemPrompt(state, provider, concreteModel);
   if (provider === "anthropic") assertCanonicalGlobalAgentsExactlyOnce(composed.prompt);
+  let modelAvailabilityRequired = false;
+  if (provider === "anthropic") {
+    if (state.exactModelPinned) modelAvailabilityRequired = true;
+    else if (state.routingRequest?.tier && concreteModel) {
+      try {
+        const canonical = resolveTier(
+          provider, state.routingRequest.tier, undefined, effort,
+        ).model;
+        modelAvailabilityRequired = concreteModel !== canonical;
+      } catch {
+        // A route that cannot be compared with its canonical row is never
+        // silently treated as the canonical default.
+        modelAvailabilityRequired = true;
+      }
+    }
+  }
+  const targetId = availability?.targetId
+    ?? (options as any).northModelAvailability?.targetId
+    ?? provider;
+  const modelAvailability = deepFreeze({
+    required: modelAvailabilityRequired,
+    targetId,
+    ...(concreteModel ? { model: concreteModel } : {}),
+    ...(modelAvailabilityRequired && availability?.receipt
+      ? { receipt: availability.receipt }
+      : {}),
+    observationPath: (options as any).northModelAvailability?.observationPath
+      ?? providerModelObservationPath((options as any).env ?? process.env),
+  } satisfies HarnessModelAvailabilityBinding);
   const next = {
     ...(state.routeBase ?? options),
     model: concreteModel ?? state.initialModel,
     effort: effort ?? state.initialEffort,
     systemPrompt: composed.prompt,
+    northModelAvailability: modelAvailability,
   } as Options;
   harnessComposition.set(next as object, state);
   const renewActivity = harnessActivityRenewers.get(options as object);
@@ -1469,6 +1533,9 @@ export function harnessOptions(o: HarnessOpts): Options {
     initialModel: effectiveModel,
     initialEffort: effectiveEffort,
     omitModelDeltaReason: o.omitModelDeltaReason,
+    // A direct managed caller that supplies a model is conservatively an exact
+    // pin. Production explicitly supplies false for a canonical tier default.
+    exactModelPinned: o.modelAvailability?.exactModelPinned ?? o.model !== undefined,
   };
   const initialRouteModel = o.provider
     ? resolveModelAlias(o.provider, effectiveModel)
@@ -1497,6 +1564,12 @@ export function harnessOptions(o: HarnessOpts): Options {
     systemPrompt: initialSystemPrompt,
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
     ...(o.abortController ? { abortController: o.abortController } : {}),
+    northModelAvailability: deepFreeze({
+      required: false,
+      targetId: o.modelAvailability?.targetId ?? o.provider ?? "unresolved",
+      ...(initialRouteModel ? { model: initialRouteModel } : {}),
+      observationPath: providerModelObservationPath(childEnv),
+    } satisfies HarnessModelAvailabilityBinding),
     // Pin auto-compaction explicitly (audit fix 4). Managed lanes run with
     // settingSources: [], so the SDK's compaction behavior would otherwise ride a
     // silent library default that a future bump could flip. This pins the ENABLED
@@ -1540,7 +1613,13 @@ export function harnessOptions(o: HarnessOpts): Options {
   // prompt/bootstrap contract for the initial route must succeed first, or a
   // malformed AGENTS/Gaffer/model source would leave a ghost roster entry.
   const routedOptions = o.provider
-    ? applyHarnessRoute(options, o.provider, effectiveModel, effectiveEffort).options
+    ? applyHarnessRoute(
+        options, o.provider, effectiveModel, effectiveEffort,
+        {
+          targetId: o.modelAvailability?.targetId ?? o.provider,
+          ...(o.modelAvailability?.receipt ? { receipt: o.modelAvailability.receipt } : {}),
+        },
+      ).options
     : options;
   if (o.presenceRegistrar !== false) (o.presenceRegistrar ?? registerPresence)(o.self, cwd);
   return routedOptions;

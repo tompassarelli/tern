@@ -34,10 +34,10 @@ import {
 } from "./clock";
 import {
   formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider,
+  selectProviderForExecution,
   ProviderRetrySafeError,
   type ProviderAuthoritySurface, type ProviderPreference,
 } from "./providers";
-import { refreshCodexEntitlementsIfStale } from "./codex-entitlement";
 import type { AgentQuery } from "./providers/types";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
 import type { RoutingRequest } from "./routing-metadata";
@@ -109,7 +109,6 @@ interface SpawnRuntime {
   feedSubscriber?: typeof subscribeFeed;
   registerTermination?: HostTerminationRegistrar;
   refreshAccountUsages?: typeof refreshAccountUsages;
-  refreshCodexEntitlements?: typeof refreshCodexEntitlementsIfStale;
   admitResourceEnvelope?: typeof admitResourceEnvelope;
   completeResourceEnvelope?: typeof completeResourceEnvelope;
   admitBillableClock?: typeof admitBillableClock;
@@ -212,27 +211,31 @@ async function runSpawn(
   if (!injected.queryFn) admitPinnedProvider(opts.provider, capabilities);
   // Injected query functions own their entire provider boundary; keeping the
   // refresh out of that path makes tests and alternative adapters hermetic.
-  if (!injected.queryFn) {
+  const routingContext = {
+    tier: requestedTier, reasoning: requestedReasoning, model: opts.model,
+    stableKey: agentId, capabilities, signal: termination.signal,
+  };
+  let routing;
+  if (injected.queryFn) {
+    routing = selectProvider(routingRequest, undefined, routingContext);
+  } else {
     try {
-      await (injected.refreshAccountUsages ?? refreshAccountUsages)({
-        requested: routingRequest,
-        signal: termination.signal,
-      });
-    } catch { /* telemetry is advisory */ }
-    termination.throwIfTerminated();
-    try {
-      await (injected.refreshCodexEntitlements ?? refreshCodexEntitlementsIfStale)({
-        requested: routingRequest,
-        signal: termination.signal,
-      });
-    } catch { /* telemetry is advisory */ }
-    termination.throwIfTerminated();
+      routing = await selectProviderForExecution(
+        routingRequest,
+        undefined,
+        routingContext,
+        injected.refreshAccountUsages
+          ? { refreshAccountUsages: injected.refreshAccountUsages }
+          : {},
+      );
+    } catch (error) {
+      // Provider refresh cancellation is an internal control edge. If the host
+      // caused it, retain the host signal as the public lifecycle terminal.
+      termination.throwIfTerminated();
+      throw error;
+    }
   }
-  const routing = selectProvider(routingRequest, undefined,
-    {
-      tier: requestedTier, reasoning: requestedReasoning, model: opts.model,
-      stableKey: agentId, capabilities,
-    });
+  termination.throwIfTerminated();
   const resolved = resolveTier(routing.provider, requestedTier, opts.model, opts.effort);
   opts.model = resolved.model;
   opts.effort = resolved.effort;
@@ -397,6 +400,11 @@ async function runSpawn(
     extraTools: opts.tools ?? ["Read", "Edit", "Write", "Bash", "Grep", "Glob"],
     model: opts.model, effort: opts.effort,
     provider: routing.provider,
+    modelAvailability: {
+      exactModelPinned: requested.model !== undefined,
+      targetId: routing.target,
+      receipt: routing.modelAvailabilityReceipts?.[routing.target],
+    },
     routingMetadata,
     // Worktree lane: run tools IN the worktree (cwd) and append the
     // isolation+landing+verify protocol to the prompt. Composed HERE so
@@ -743,6 +751,7 @@ async function runSpawn(
     effort: finalRoute.effort,
     role: routingMetadata.role,
     provider: routing.provider, providerTarget: routing.target, providerReason: routing.selectionReason,
+    modelAvailability: routing.modelAvailabilityReceipts?.[routing.target],
     requestedProvider: routing.requestedProvider, requestedTarget: requested.target, requestedTier: requested.tier,
     requestedModel: requested.model, requestedEffort: requested.effort,
     allocationMode: routing.allocationMode, entitlementPressure: routing.entitlementPressure,
