@@ -739,6 +739,9 @@ setInterval(() => {}, 1000);
 test("spooled supervisors require the wrapper-sealed Nix mkfifo binary", async () => {
   const supervisor = join(import.meta.dir, "../src/providers/codex-supervisor.ts");
   const fixture = join(import.meta.dir, "fixtures/fake-codex-app-server.mjs");
+  const inheritedStatusWrapper = join(
+    import.meta.dir, "fixtures/run-with-inherited-status-fd.mjs",
+  );
   for (const inputMode of ["--duplex", "--oneshot-spool"]) {
     for (const mkfifo of [undefined, fixture]) {
       const controlRoot = mkdtempSync(join(tmpdir(), "north-codex-control-mkfifo-"));
@@ -746,6 +749,7 @@ test("spooled supervisors require the wrapper-sealed Nix mkfifo binary", async (
       const env = { ...process.env, NORTH_MKFIFO_BIN: mkfifo };
       if (mkfifo === undefined) delete env.NORTH_MKFIFO_BIN;
       const child = spawn(process.execPath, [
+        inheritedStatusWrapper,
         supervisor, inputMode, controlRoot, process.execPath, fixture,
       ], { env, stdio: ["pipe", "pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
       child.stdout.resume();

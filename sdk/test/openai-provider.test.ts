@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn as spawnChild } from "node:child_process";
 import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync,
@@ -6,14 +6,31 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { codexHarnessArguments, openaiProvider } from "../src/providers/openai";
+import { createServer } from "node:net";
+import type { AddressInfo } from "node:net";
+import {
+  codexHarnessArguments, internalOpenAIProviderWithManagedHooksProbeForTest, openaiProvider,
+} from "../src/providers/openai";
 import {
   MANAGED_CODEX_DISABLED_FEATURES, MANAGED_CODEX_ENABLED_FEATURES,
 } from "../src/providers/codex-app-server";
 import { ProviderRetrySafeError } from "../src/providers";
+import { anthropicProvider } from "../src/providers/anthropic";
+import { routedQueryWithRegistry } from "../src/providers/internal-router";
 import { harnessOptions } from "../src/harness";
 import { applyGafferStaffing } from "../src/gaffer-staffing";
+import { markExecutionAdmission } from "../src/execution-admission";
+import { selectProviderFromAvailability } from "../src/provider-routing";
 import { providerEnvironmentForTarget } from "../src/accounts";
+import { scrubAmbientGraphEnv } from "./support/managed-env";
+import { gatedTest } from "./support/capabilities";
+
+// When this suite runs inside a managed north lane, the ambient graph identity
+// (AGENT_COORDINATOR, FRAM_*, NORTH_AUTHOR/DRIVER/LEAD/…) is on the harness MCP
+// env whitelist and leaks into the compiled Codex MCP args, breaking the exact
+// hermetic env assertion below. Scrub the inherited pollution around every test;
+// each test that needs specific graph state sets it explicitly afterward.
+let restoreGraphEnv: (() => void) | undefined;
 
 const savedBin = process.env.NORTH_CODEX_BIN;
 const savedHome = process.env.HOME;
@@ -23,6 +40,9 @@ const savedLaws = process.env.AGENT_LAWS;
 const savedGaffer = process.env.GAFFER_HOME;
 const northRoot = realpathSync(join(import.meta.dir, "../.."));
 const temporary: string[] = [];
+beforeEach(() => {
+  restoreGraphEnv = scrubAmbientGraphEnv();
+});
 const liveProcessPidFiles = new Set<string>();
 function leakedPromptDescriptors(): string[] {
   if (process.platform !== "linux") return [];
@@ -54,6 +74,8 @@ const codexSuccess = (
   codexTerminal(usage),
 ];
 afterEach(() => {
+  restoreGraphEnv?.();
+  restoreGraphEnv = undefined;
   if (savedBin === undefined) delete process.env.NORTH_CODEX_BIN;
   else process.env.NORTH_CODEX_BIN = savedBin;
   if (savedHome === undefined) delete process.env.HOME;
@@ -872,8 +894,188 @@ test("the executable Codex adapter rejects orchestrator authority before startin
   expect(existsSync(marker)).toBe(false);
 });
 
-test("selected Codex account bootstrap refuses to replace an existing account path", () => {
+test("managed executable resolution fails retry-safe before onRoute or query construction", async () => {
+  const home = mkdtempSync(join(tmpdir(), "north-openai-command-preflight-"));
+  temporary.push(home);
+  process.env.HOME = home;
+  process.env.AGENT_LAWS = "on";
+  process.env.GAFFER_HOME = realpathSync(savedGaffer ?? join(northRoot, "../gaffer"));
+  process.env.NORTH_PORT = "65534";
+  const coordinatorLogPath = join(home, "must-not-reach-coordinator.log");
+  process.env.FRAM_LOG = coordinatorLogPath;
+  const codexHome = join(home, ".codex");
+  mkdirSync(codexHome);
+  writeFileSync(join(codexHome, "AGENTS.md"), "COMMAND_PREFLIGHT_CANONICAL\n");
+
+  const target = {
+    id: "codex-command-preflight",
+    provider: "openai" as const,
+    authMode: "isolated" as const,
+    profile: "command-preflight",
+  };
+  const options = harnessOptions({
+    self: "openai-command-preflight-proof",
+    provider: "openai",
+    cwd: northRoot,
+    routingMetadata: applyGafferStaffing({ role: "executor" }),
+    presenceRegistrar: false,
+  });
+  const decision = selectProviderFromAvailability(
+    { provider: "openai", target: target.id },
+    [{ targetId: target.id, provider: "openai", available: true, reason: "ready" }],
+    {
+      mode: "balanced",
+      targets: [target],
+      targetOrder: [target.id],
+      providerOrder: ["openai"],
+      pressures: { openai: "normal" },
+    },
+    "economy",
+    "command-preflight-proof",
+    "low",
+  );
+  let resolverCalls = 0;
+  let queryConstructed = false;
+  let routePublished = false;
+  const provider = internalOpenAIProviderWithManagedHooksProbeForTest(
+    () => {},
+    {
+      resolveManagedCommand: () => {
+        resolverCalls++;
+        throw new Error("trusted resolver unavailable");
+      },
+      onQueryConstruction: () => { queryConstructed = true; },
+    },
+  );
+  const query = routedQueryWithRegistry(
+    decision,
+    { prompt: "must not run", options },
+    "economy",
+    Object.freeze({ anthropic: anthropicProvider, openai: Object.freeze(provider) }),
+    undefined,
+    () => { routePublished = true; },
+  );
+
+  let caught: unknown;
+  try {
+    for await (const _ of query as AsyncIterable<any>) {}
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(ProviderRetrySafeError);
+  expect((caught as Error).message)
+    .toBe("openai_provider_executable_unavailable_before_acceptance");
+  expect(resolverCalls).toBe(1);
+  expect(queryConstructed).toBe(false);
+  expect(routePublished).toBe(false);
+  expect(existsSync(coordinatorLogPath)).toBe(false);
+});
+
+gatedTest("loopback-bind", "selected Codex account bootstrap fails during admission before onRoute or provider spawn", async () => {
+  let coordinatorLog = "";
+  const server = createServer((socket) => {
+    socket.once("data", (chunk) => {
+      if (chunk.toString("utf8").includes(":for-log")) {
+        socket.end("{:version 23}\n");
+      } else {
+        socket.end(
+          `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(coordinatorLog)}}\n`,
+        );
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
   const home = mkdtempSync(join(tmpdir(), "north-openai-target-admission-"));
+  temporary.push(home);
+  process.env.HOME = home;
+  process.env.AGENT_LAWS = "on";
+  process.env.GAFFER_HOME = realpathSync(savedGaffer ?? join(northRoot, "../gaffer"));
+  process.env.NORTH_PORT = String((server.address() as AddressInfo).port);
+  process.env.FRAM_LOG = join(home, "north target admission.log");
+  coordinatorLog = process.env.FRAM_LOG;
+  const codexHome = join(home, ".codex");
+  mkdirSync(codexHome);
+  writeFileSync(join(codexHome, "AGENTS.md"), "TARGET_ADMISSION_CANONICAL\n");
+
+  const target = {
+    id: "codex-broken-target",
+    provider: "openai" as const,
+    authMode: "isolated" as const,
+    profile: "broken-target",
+  };
+  const targetRoot = join(home, ".local/state/north/accounts/openai/broken-target");
+  mkdirSync(targetRoot, { recursive: true });
+  writeFileSync(join(targetRoot, "AGENTS.md"), "TARGET_REPLACEMENT_MUST_FAIL\n");
+
+  const marker = join(home, "provider-spawned");
+  const command = join(home, "fake-codex");
+  writeFileSync(command, `#!/usr/bin/env bash\nprintf spawned > "${marker}"\n`);
+  chmodSync(command, 0o700);
+  process.env.NORTH_CODEX_BIN = command;
+
+  const options = harnessOptions({
+    self: "openai-target-admission-proof",
+    provider: "openai",
+    cwd: northRoot,
+    routingMetadata: applyGafferStaffing({ role: "executor" }),
+    presenceRegistrar: false,
+  });
+  await expect(openaiProvider.admit!({
+    options: {
+      ...options,
+      env: { ...options.env, AGENT_LAWS: "off" },
+    },
+    target: { ...target, authMode: "ambient" },
+  })).rejects.toThrow("openai_harness_authority_seal_missing");
+  expect(existsSync(marker)).toBe(false);
+
+  const decision = selectProviderFromAvailability(
+    { provider: "openai", target: target.id },
+    [{ targetId: target.id, provider: "openai", available: true, reason: "ready" }],
+    {
+      mode: "balanced",
+      targets: [target],
+      targetOrder: [target.id],
+      providerOrder: ["openai"],
+      pressures: { openai: "normal" },
+    },
+    "economy",
+    "target-admission-proof",
+    "low",
+  );
+  let routePublished = false;
+  const query = routedQueryWithRegistry(
+    decision,
+    { prompt: "must not run", options },
+    "economy",
+    Object.freeze({
+      anthropic: anthropicProvider,
+      openai: Object.freeze(
+        internalOpenAIProviderWithManagedHooksProbeForTest(
+          () => {},
+          { resolveManagedCommand: () => "/nix/store/codex-test/bin/codex" },
+        ),
+      ),
+    }),
+    undefined,
+    () => { routePublished = true; },
+  );
+  try {
+    await expect(async () => {
+      for await (const _ of query as AsyncIterable<any>) {}
+    }).toThrow("openai_target_environment_invalid");
+    expect(routePublished).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("selected Codex account bootstrap refuses to replace an existing account path", () => {
+  const home = mkdtempSync(join(tmpdir(), "north-openai-target-replacement-"));
   temporary.push(home);
   process.env.HOME = home;
   const codexHome = join(home, ".codex");

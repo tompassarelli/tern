@@ -135,7 +135,7 @@ test("route application rejects request laundering and authoring hooks are an ex
   expect(hasCanonicalAuthoringHooks(hookLaundered)).toBe(false);
   expect(() => applyHarnessRoute(
     hookLaundered, "anthropic", "claude-opus-4-6", "xhigh",
-  )).toThrow("harness composition root mutated before route application");
+  )).toThrow("harness authority source mutated before route application");
 });
 
 test("provider authority surfaces are deeply frozen at every array boundary", () => {
@@ -187,6 +187,11 @@ test("managed authority rejects every unowned SDK option on initial and fallback
   const spend = designer("anthropic", "anthropic-max-turns-tamper") as any;
   spend.maxTurns = 1_000_000_000;
   expect(hasCanonicalHarnessAuthority(spend, "anthropic")).toBe(false);
+
+  const settings = designer("anthropic", "anthropic-settings-tamper") as any;
+  expect(Object.isFrozen(settings.settings)).toBe(true);
+  expect(() => { settings.settings.autoCompactEnabled = false; }).toThrow();
+  expect(hasCanonicalHarnessAuthority(settings, "anthropic")).toBe(true);
 });
 
 test("managed-lane marker is explicit, sealed, and never inherited or sent to North MCP", () => {

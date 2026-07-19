@@ -11,7 +11,7 @@
   "scripts": {
     "dispatch": "bun run src/dispatch.ts",
     "check": "bun x tsc --noEmit && bun build src/dispatch.ts --no-bundle > /dev/null && bun build src/spawn.ts --no-bundle > /dev/null && bun build src/integrations/linear/cli.ts --no-bundle > /dev/null",
-    "test": "bun test --preload ./test/support/hermetic-preload.ts ./test"
+    "test": "bun test --isolate --preload ./test/support/hermetic-preload.ts ./test"
   },
   "devDependencies": {
     "@types/bun": "latest"

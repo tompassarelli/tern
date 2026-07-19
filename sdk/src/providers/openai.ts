@@ -34,10 +34,36 @@ import {
   ManagedCodexAppServerRun, ManagedCodexPreThreadError,
 } from "./codex-app-server";
 
-function command(env: NodeJS.ProcessEnv, managed: boolean): string {
-  return managed
-    ? trustedManagedCodexExecutable()
-    : env.NORTH_CODEX_BIN ?? "codex";
+type ManagedCommandResolver = () => string;
+
+const managedCommandReceipts = new WeakMap<object, string>();
+
+function resolveManagedCommand(resolver: ManagedCommandResolver): string {
+  try {
+    const resolved = resolver();
+    if (typeof resolved !== "string" || !resolved.trim())
+      throw new Error("empty managed Codex executable");
+    return resolved;
+  } catch (cause) {
+    throw new ProviderRetrySafeError(
+      "openai_provider_executable_unavailable_before_acceptance", { cause },
+    );
+  }
+}
+
+function recordManagedCommand(options: unknown, resolved: string): void {
+  if ((typeof options !== "object" && typeof options !== "function") || options === null)
+    throw new ProviderRetrySafeError("openai_managed_command_receipt_unavailable");
+  managedCommandReceipts.set(options as object, resolved);
+}
+
+function takeManagedCommand(options: unknown): string | undefined {
+  if ((typeof options !== "object" && typeof options !== "function") || options === null)
+    return undefined;
+  const key = options as object;
+  const resolved = managedCommandReceipts.get(key);
+  managedCommandReceipts.delete(key);
+  return resolved;
 }
 const CODEX_SUPERVISOR = resolve(import.meta.dir, "codex-supervisor.ts");
 
@@ -215,15 +241,19 @@ async function admitOpenAIWithManagedHooksProbe(
   options: any,
   target: RoutingTarget | undefined,
   assertManagedHooks: ManagedHooksProbe,
+  resolveCommand: ManagedCommandResolver = trustedManagedCodexExecutable,
 ): Promise<void> {
   const capabilities = validateOpenAIHarness(options);
   if (!capabilities) return;
   assertManagedHooks();
-  await admitExecution("openai", capabilities, options?.cwd ?? process.cwd(), options);
-  // AgentProvider.admit runs before routed onRoute/query construction. Resolve
-  // the exact selected account here so a bad CODEX_HOME cannot publish a route
-  // as active or trigger provider work. Query repeats this proof at spawn time.
+  // Resolve every fallible target-local prerequisite before admission can
+  // publish a route or construct a provider query. The one-use executable
+  // receipt closes the async admit -> synchronous query seam without repeating
+  // trusted-path resolution after onRoute.
+  const resolvedCommand = resolveManagedCommand(resolveCommand);
   managedCodexTargetEnvironment(options, target);
+  await admitExecution("openai", capabilities, options?.cwd ?? process.cwd(), options, target);
+  recordManagedCommand(options, resolvedCommand);
 }
 
 export async function admitOpenAI(options: any, target?: RoutingTarget): Promise<void> {
@@ -263,26 +293,35 @@ const CODEX_PROMPT_MAX_BYTES = 16 * 1024 * 1024;
 const CODEX_SUPERVISOR_STATUS_MAX_BYTES = 4 * 1024;
 const CODEX_SUPERVISOR_STATUS_MAX_FRAMES = 4;
 
-function processExists(child: ChildProcessWithoutNullStreams): boolean {
-  if (child.pid === undefined) return false;
-  try {
-    process.kill(child.pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
+function supervisorExited(child: ChildProcessWithoutNullStreams): boolean {
+  // An async spawn failure has no pid and emits `error`, not `exit`.
+  return child.pid === undefined || child.exitCode !== null || child.signalCode !== null;
 }
 
 function waitForExitBounded(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number,
 ): Promise<boolean> {
-  return (async () => {
-    const deadline = Date.now() + timeoutMs;
-    while (processExists(child) && Date.now() < deadline)
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    return !processExists(child);
-  })();
+  if (supervisorExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (exited: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = (): void => finish(true);
+    // Listen first, then re-check state to close the exit-before-listener race.
+    child.once("exit", onExit);
+    if (supervisorExited(child)) {
+      finish(true);
+      return;
+    }
+    timer = setTimeout(() => finish(supervisorExited(child)), timeoutMs);
+  });
 }
 
 function closeSupervisorControl(child: ChildProcessWithoutNullStreams): void {
@@ -658,6 +697,8 @@ class CodexQuery implements AgentQuery {
     private target?: RoutingTarget,
     private admitted = false,
     private assertManagedHooks: ManagedHooksProbe = assertInstalledManagedCodexHooks,
+    private resolveManagedCommand: ManagedCommandResolver = trustedManagedCodexExecutable,
+    private admittedManagedCommand?: string,
   ) {}
 
   supportsInFlightEscalation(): boolean { return false; }
@@ -692,7 +733,7 @@ class CodexQuery implements AgentQuery {
     this.admitted = false;
     if (admitted) validateOpenAIHarness(this.options);
     else await admitOpenAIWithManagedHooksProbe(
-      this.options, this.target, this.assertManagedHooks,
+      this.options, this.target, this.assertManagedHooks, this.resolveManagedCommand,
     );
     const managed = this.options?.northCapabilities !== undefined;
     // Repeat the root-managed hook proof at the final pre-spawn seam. This
@@ -701,6 +742,12 @@ class CodexQuery implements AgentQuery {
     const env = managed
       ? managedCodexTargetEnvironment(this.options, this.target)
       : providerEnvironmentForTarget("openai", this.target, { env: this.options.env });
+    const managedCommand = managed
+      ? this.admittedManagedCommand ?? takeManagedCommand(this.options)
+      : undefined;
+    this.admittedManagedCommand = undefined;
+    if (managed && !managedCommand)
+      throw new ProviderRetrySafeError("openai_managed_command_receipt_unavailable");
     const task = await initialPrompt(this.prompt);
     const prompt = managed
       ? task
@@ -716,7 +763,7 @@ class CodexQuery implements AgentQuery {
         throw new ProviderRetrySafeError("openai_exact_model_resolution_missing");
       const north = this.options.mcpServers.north;
       const run = new ManagedCodexAppServerRun({
-        command: command(env, true),
+        command: managedCommand!,
         env,
         cwd: this.options.cwd ?? process.cwd(),
         prompt,
@@ -777,7 +824,7 @@ class CodexQuery implements AgentQuery {
         [
           CODEX_SUPERVISOR,
           ...promptTransport.supervisorArguments,
-          command(env, managed),
+          env.NORTH_CODEX_BIN ?? "codex",
           ...args,
         ],
         {
@@ -872,25 +919,42 @@ class CodexQuery implements AgentQuery {
   }
 }
 
-function providerWithManagedHooksProbe(
+/**
+ * @internal Hermetic test seam. Deliberately not exported by providers/index;
+ * production remains closed over assertInstalledManagedCodexHooks below.
+ */
+export interface InternalOpenAIProviderTestRuntime {
+  resolveManagedCommand?: () => string;
+  onQueryConstruction?: () => void;
+}
+
+export function internalOpenAIProviderWithManagedHooksProbeForTest(
   assertManagedHooks: ManagedHooksProbe,
+  runtime: InternalOpenAIProviderTestRuntime = {},
 ): AgentProvider {
+  const resolveCommand = runtime.resolveManagedCommand ?? trustedManagedCodexExecutable;
   return {
     id: "openai",
     liveInput: "unsupported",
     probe: probeCodex,
     admit: ({ options, target }) =>
-      admitOpenAIWithManagedHooksProbe(options, target, assertManagedHooks),
-    query: ({ prompt, options, target }) => new CodexQuery(
-      prompt,
-      options,
-      target,
-      consumeExecutionAdmission("openai", options),
-      assertManagedHooks,
-    ),
+      admitOpenAIWithManagedHooksProbe(options, target, assertManagedHooks, resolveCommand),
+    query: ({ prompt, options, target }) => {
+      runtime.onQueryConstruction?.();
+      const admitted = consumeExecutionAdmission("openai", options);
+      return new CodexQuery(
+        prompt,
+        options,
+        target,
+        admitted,
+        assertManagedHooks,
+        resolveCommand,
+        admitted ? takeManagedCommand(options) : undefined,
+      );
+    },
   };
 }
 
 export const openaiProvider: AgentProvider = Object.freeze(
-  providerWithManagedHooksProbe(assertInstalledManagedCodexHooks),
+  internalOpenAIProviderWithManagedHooksProbeForTest(assertInstalledManagedCodexHooks),
 );
