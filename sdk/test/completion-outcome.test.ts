@@ -501,7 +501,7 @@ test("a blocked auxiliary terminal writer cannot stack beyond the shared publica
 
 
 test("dispatch warns a committed thread that lacks BOTH done_when and judgment_grade", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
   const captured: string[] = [];
   const originalLog = console.log;
@@ -509,7 +509,7 @@ test("dispatch warns a committed thread that lacks BOTH done_when and judgment_g
   try {
     await dispatch("@test-warn-thread", {
       agentId: "test-warn-thread-agent",
-      routingMetadata: { role: "integrator" },
+      routingMetadata: presetRequest("integrator"),
       claimDriver: (() => ({ release() { return true; } })) as any,
       queryFn: () => (async function* () {})() as any,
       loadThreadFacts: () => [
@@ -1636,7 +1636,7 @@ test("a struggle sensor firing records a struggle run fact without any in-flight
   // EVERY spawn as harness-observed execution-axis evidence: a fired sensor writes a
   // `struggle <reason>` run fact at terminal and never changes model/effort. Three
   // consecutive tool errors trip the consecutive_errors sensor (STRUGGLE_ERROR_STREAK=3).
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   let modelChanged = false;
   const queryFn: any = () => ({
@@ -1653,7 +1653,7 @@ test("a struggle sensor firing records a struggle run fact without any in-flight
   });
 
   await spawn({ prompt: "hit repeated errors", agentId: "test-struggle-lane",
-    role: "integrator", provider: "anthropic", queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn });
 
   const logged = await waitForLog("struggle consecutive_errors");
   expect(logged).toContain("struggle consecutive_errors");
