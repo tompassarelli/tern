@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import type { ProviderId } from "./types";
-import type { Effort } from "../harness";
+import type { ReasoningLevel, RoutingTier } from "../routing-metadata";
 import { fableWindowOpen } from "../fable-window";
 
-export type SemanticTier = "economy" | "standard" | "senior" | "frontier";
+export type SemanticTier = RoutingTier;
+type Effort = ReasoningLevel;
 export const SEMANTIC_TIER_ORDER: readonly SemanticTier[] = [
   "economy", "standard", "senior", "frontier",
 ];
@@ -118,6 +119,44 @@ export function supportedReasoning(provider: ProviderId, tier: SemanticTier): re
   return entry.efforts ?? entry.reasoning ?? [];
 }
 
+function supportedReasoningForModel(
+  provider: ProviderId,
+  model: string,
+): readonly Effort[] {
+  const catalog = providerCatalog(provider);
+  const levels = new Set<Effort>();
+  for (const tier of SEMANTIC_TIER_ORDER) {
+    const entry = catalog.tiers[tier];
+    if (!entry) continue;
+    const concrete = catalog.modelAliases[entry.model] ?? entry.model;
+    if (concrete !== model) continue;
+    for (const effort of entry.efforts ?? entry.reasoning ?? [])
+      levels.add(effort);
+  }
+  return [...levels];
+}
+
+function assertModelEffortPair(
+  provider: ProviderId,
+  model: string | undefined,
+  effort: Effort | undefined,
+  tier?: SemanticTier,
+): void {
+  if (!model || !effort) return;
+  const fable = provider === "anthropic" && model === resolveModelAlias(
+    "anthropic", "fable",
+  );
+  const supported = fable
+    ? tier === "frontier" && effort === "xhigh" && fableWindowOpen()
+    : supportedReasoningForModel(provider, model).includes(effort);
+  if (!supported) {
+    throw new Error(
+      `provider ${provider} model ${model} does not support reasoning ${effort}`
+      + (tier ? ` at semantic tier ${tier}` : ""),
+    );
+  }
+}
+
 /**
  * Project Gaffer's provider-local semantic tiers into a concrete escalation
  * order. Duplicate model/effort pairs (for example a senior ceiling repeated
@@ -160,7 +199,11 @@ export function providerSupportsRoute(provider: ProviderId, tier?: SemanticTier,
 export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: string, effort?: Effort): ResolvedTier {
   if (model && !providerSupportsModel(provider, model))
     throw new Error(`provider ${provider} does not declare model ${model}`);
-  if (!tier) return { model: resolveModelAlias(provider, model), effort };
+  if (!tier) {
+    const resolvedModel = resolveModelAlias(provider, model);
+    assertModelEffortPair(provider, resolvedModel, effort);
+    return { model: resolvedModel, effort };
+  }
   const entry = tierEntry(provider, tier);
   const levels = entry.efforts ?? entry.reasoning ?? [];
   if (effort && !levels.includes(effort)) {
@@ -181,5 +224,11 @@ export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: s
   const resolvedEffort = temporaryFable
     ? effort ?? "xhigh"
     : effort ?? entry.defaultEffort ?? entry.defaultReasoning;
+  assertModelEffortPair(
+    provider,
+    resolvedModel,
+    resolvedEffort,
+    tier,
+  );
   return { tier, model: resolvedModel, effort: resolvedEffort };
 }

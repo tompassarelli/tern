@@ -3,8 +3,7 @@ import { getThreadFacts, getChildren, normalizeNorthEntityId } from "./north-cli
 import { derivePosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
 import {
-  effectiveCapabilitySurface, formatEffectiveCapabilitySurface,
-  harnessCompositionEvidence, harnessOptions, DEFAULT_SYSTEM_PROMPT,
+  harnessCompositionEvidence, harnessOptions, renewHarnessPresence, DEFAULT_SYSTEM_PROMPT,
   type Effort, type HarnessCompositionEvidence,
 } from "./harness";
 import { inputChannel, subscribeFeed } from "./coordination";
@@ -23,16 +22,21 @@ import {
   userAnchoredPath,
 } from "./identity";
 import { BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION } from "./bespoke-contract";
-import { clockStart, clockFinalize } from "./clock";
 import {
-  routedQuery, selectProvider, ProviderRetrySafeError, type ProviderPreference,
+  admitBillableClock, clockFinalize, clockStop,
+  type BillableClockAdmission,
+} from "./clock";
+import {
+  formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider, ProviderRetrySafeError,
+  type ProviderAuthoritySurface, type ProviderPreference,
 } from "./providers";
 import type { AgentQuery } from "./providers/types";
 import { refreshCodexEntitlementsIfStale } from "./codex-entitlement";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
-import { routingMetadataFromEnv, validateRoutingMetadata, type RoutingMetadata } from "./routing-metadata";
+import type { RoutingRequest } from "./routing-metadata";
+import { admitRoutingRequest, routingRequestFromEnv } from "./routing-admission";
 import {
-  applyGafferStaffing, gafferCapabilities, requireManagedGafferSelection,
+  gafferCapabilities,
 } from "./gaffer-staffing";
 import { refreshAccountUsages } from "./account-usage";
 import { resolveDispatchWorkingDirectory } from "./dispatch-context";
@@ -56,6 +60,8 @@ import {
   loadDeliveryRunState, newDeliveryRunContext, reserveDeliveryRun,
   type DeliveryReservation, type DeliveryRunContext, type DeliveryRunState,
 } from "./delivery-evidence";
+import { takeDispatchTestRuntime } from "./internal/test-runtime";
+import { ManagedLiveInputRoute } from "./live-input-route";
 
 const PLAN_TOOLS = ["Read", "Grep", "Glob", "Bash"];
 const EXEC_TOOLS = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
@@ -67,25 +73,55 @@ interface DispatchResult {
   result: string;
 }
 
+interface ManagedClockLease {
+  admission: BillableClockAdmission;
+  finalized: boolean;
+}
+
 export interface DispatchDependencies {
-  claimDriver?: typeof claimDispatchDriver;
-  driverOptions?: DispatchDriverOptions;
-  /** Explicit staffing request for programmatic callers; CLI/MCP adapters use env. */
-  routingMetadata?: RoutingMetadata;
+  /** Complete per-subtask request; programmatic callers never inherit ambient routing. */
+  routingMetadata: RoutingRequest;
   /** Explicit child identity for a programmatic handoff; never inferred from a parent. */
   agentId?: string;
-  /** Hermetic provider boundary for tests and alternate programmatic adapters. */
+}
+
+interface DispatchRuntime {
+  claimDriver?: typeof claimDispatchDriver;
+  driverOptions?: DispatchDriverOptions;
   queryFn?: (args: any) => AgentQuery;
-  /** Read seams keep programmatic dispatch tests off the live coordination graph. */
   loadThreadFacts?: typeof getThreadFacts;
   loadChildren?: typeof getChildren;
-  /** Hermetic seam for the capability-bound delivery reservation/evidence store. */
   deliveryRuntime?: {
     reserve: (context: DeliveryRunContext) => DeliveryReservation;
     load: (runId: string) => DeliveryRunState;
   };
-  /** Hermetic graph seam for orchestrator child settlement observation. */
   childSettlementReader?: (agentId: string) => ChildSettlement;
+  feedSubscriber?: typeof subscribeFeed;
+}
+
+const DISPATCH_DEPENDENCY_FIELDS = new Set(["routingMetadata", "agentId"]);
+
+function allowlistedDispatchDependencies(
+  value: DispatchDependencies,
+): DispatchDependencies {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("managed North dispatch request must be an object");
+  const admitted: Record<string, unknown> = {};
+  for (const [field, descriptor] of Object.entries(
+    Object.getOwnPropertyDescriptors(value),
+  )) {
+    if (!DISPATCH_DEPENDENCY_FIELDS.has(field))
+      throw new Error(`managed North dispatch request has unknown field ${field}`);
+    if (descriptor.get || descriptor.set)
+      throw new Error(`managed North dispatch request field ${field} must be a data property`);
+    admitted[field] = descriptor.value;
+  }
+  return admitted as unknown as DispatchDependencies;
+}
+
+interface DispatchAgentIdOptions {
+  agentId?: string;
+  driverOptions?: DispatchDriverOptions;
 }
 
 export function createDispatchAgentId(threadId: string, now = Date.now(), uuid = randomUUID()): string {
@@ -95,7 +131,7 @@ export function createDispatchAgentId(threadId: string, now = Date.now(), uuid =
 
 export function selectDispatchAgentId(
   threadId: string,
-  dependencies: DispatchDependencies = {},
+  dependencies: DispatchAgentIdOptions = {},
 ): string {
   if (dependencies.agentId) return dependencies.agentId;
   const preclaimed = dependencies.driverOptions?.preclaimed
@@ -107,18 +143,21 @@ export function selectDispatchAgentId(
 async function runDispatch(
   threadId: string,
   envelopeAdmission?: EnvelopeAdmission,
-  hydratedMetadata?: ReturnType<typeof routingMetadataFromEnv>,
+  hydratedMetadata?: RoutingRequest,
   hydratedWorkingDirectory?: string,
   hydratedAgentId?: string,
   queryFn?: (args: any) => AgentQuery,
   hydratedFacts?: ReturnType<typeof getThreadFacts>,
   hydratedChildren?: ReturnType<typeof getChildren>,
   loadTerminalFacts: typeof getThreadFacts = getThreadFacts,
-  deliveryRuntime?: DispatchDependencies["deliveryRuntime"],
+  deliveryRuntime?: DispatchRuntime["deliveryRuntime"],
   childSettlementReader: (agentId: string) => ChildSettlement = settleChildren,
+  feedSubscriber: typeof subscribeFeed = subscribeFeed,
+  clockLease?: ManagedClockLease,
 ): Promise<DispatchResult> {
   const runStartedAt = process.hrtime.bigint();
-  const routingMetadata = hydratedMetadata ?? validateRoutingMetadata(applyGafferStaffing(routingMetadataFromEnv()));
+  const routingMetadata = hydratedMetadata;
+  if (!routingMetadata) throw new Error("managed North dispatch execution requires explicit routingMetadata");
   const role = routingMetadata.role!;
   const capabilities = gafferCapabilities(routingMetadata);
   const facts = hydratedFacts ?? getThreadFacts(threadId);
@@ -201,30 +240,37 @@ async function runDispatch(
     goal: posture.title,
     coordinator: process.env.AGENT_COORDINATOR,
   } as const;
-  writeAgentFacts(agentId, { ...identityBase, model: resolved.model,
-    provider: routing.provider, providerTarget: routing.target, effort: resolved.effort });
-  let identityRoute = `${routing.provider}|${routing.target}|${resolved.model ?? ""}|${resolved.effort ?? ""}`;
-  const refreshIdentityRoute = (required = false) => {
-    const route = { provider: routing.provider,
+  const initialLiveInput = providerLiveInput(routing.provider);
+  const ch = inputChannel(prompt);
+  const liveInputRoute = new ManagedLiveInputRoute(
+    agentId,
+    identityBase,
+    {
+      provider: routing.provider,
       providerTarget: routing.target,
-      model: routing.resolvedModel ?? resolved.model,
-      effort: routing.resolvedEffort ?? resolved.effort };
-    const next = `${route.provider}|${route.providerTarget}|${route.model ?? ""}|${route.effort ?? ""}`;
-    if (next === identityRoute) return;
-    try {
-      updateAgentRoute(agentId, { ...identityBase, ...route });
-      identityRoute = next;
-    } catch (error) {
-      if (required) throw error;
-    }
+      liveInput: initialLiveInput,
+      model: resolved.model,
+      effort: resolved.effort,
+    },
+    (message) => ch.push(message),
+    feedSubscriber,
+  );
+  writeAgentFacts(agentId, { ...identityBase, model: resolved.model,
+    provider: routing.provider, providerTarget: routing.target,
+    liveInput: initialLiveInput, ...liveInputRoute.initialProjection(),
+    effort: resolved.effort });
+  const activeRoute = () => ({
+    provider: routing.provider,
+    providerTarget: routing.target,
+    liveInput: providerLiveInput(routing.provider),
+    model: routing.resolvedModel ?? resolved.model,
+    effort: routing.resolvedEffort ?? resolved.effort,
+  });
+  const refreshIdentityRoute = (required = false) => {
+    liveInputRoute.refresh(activeRoute(), required);
   };
 
   console.log(`[dispatch] @${threadId} — ${posture.title}`);
-
-  // Auto-clock (per-agent): open a session on this thread as THIS worker, so its
-  // billable time attributes to the thread it actually worked — not one global
-  // clock. Closed on exit below (clean stop / orphan-close on crash).
-  clockStart(agentId, threadId);
 
   let result = "";
   let resultMsg: any = null;
@@ -232,10 +278,7 @@ async function runDispatch(
   let outcome = "ran";
 
   // Real-time coordination: run the prompt in streaming-input mode so peers can inject
-  // pings into THIS run (no re-arm — subscribeFeed re-spawns host-side, invisibly).
-  const ch = inputChannel(prompt);
-  const stopFeed = subscribeFeed(agentId, (m) => ch.push(m));
-
+  // pings only when the admitted provider can consume turns after its initial prompt.
   // Stream watchdog (thread 019f4d54): wrap the SDK iterator so a stall (no message for
   // N min while the query is open) is caught — the iterator neither yields nor throws on
   // a hang, so the catch below would never fire. N min silence -> stalled fact + ping;
@@ -246,6 +289,7 @@ async function runDispatch(
   let stallAborted = false;
   let terminalSignal: Pick<TerminalNotification, "detail" | "subject"> = {};
   const terminalAuxiliaryWrites: Array<(timeoutMs: number) => void> = [];
+  let liveInputFreezeError: unknown;
   // Background-task refusal (thread 019f4ed2, half a): don't finalize on the first
   // `result` while a harness-tracked background task is live — see bgtasks.ts.
   const bgTracker = makeBgTracker();
@@ -253,7 +297,12 @@ async function runDispatch(
   const orchestrator = routingMetadata.topology === "orchestrator";
   let childContinuation = initialChildContinuationState();
   let q: AgentQuery | undefined;
-  let compositionEvidence: HarnessCompositionEvidence | undefined;
+  let injectedCompositionEvidence: HarnessCompositionEvidence | undefined;
+  let admittedRoute: {
+    provider: ProviderAuthoritySurface["provider"];
+    evidence: HarnessCompositionEvidence | undefined;
+    authority: ProviderAuthoritySurface;
+  } | undefined;
   let queryInterrupted = false;
   const interruptQuery = async () => {
     if (queryInterrupted || !q) return;
@@ -295,24 +344,36 @@ async function runDispatch(
       deliveryRun: deliveryReservationReady ? runContext : undefined,
       systemPrompt: `You are a north agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
     });
-    const effectiveSurface = effectiveCapabilitySurface(agentOptions);
     console.log(
       `[dispatch] posture: ${postureLabel}, provider: ${routing.provider}, `
-      + `target: ${routing.target} (${routing.reason}), effective `
-      + formatEffectiveCapabilitySurface(effectiveSurface),
+      + `target: ${routing.target} (${routing.reason})`,
     );
-    compositionEvidence = harnessCompositionEvidence(agentOptions);
+    if (queryFn) injectedCompositionEvidence = harnessCompositionEvidence(agentOptions);
     const queryArgs = {
       prompt: ch.stream(),
       options: agentOptions,
     };
+    if (queryFn && feedSubscriber !== subscribeFeed)
+      await liveInputRoute.activate(activeRoute());
     q = queryFn
       ? queryFn(queryArgs)
-      : routedQuery(routing, queryArgs, requestedTier, undefined,
-        () => reserveResourceEnvelopeRetry(envelopeAdmission),
-        (_decision, evidence) => {
-          refreshIdentityRoute(true);
-          if (evidence) compositionEvidence = evidence;
+      : routedQuery(routing, queryArgs, requestedTier,
+        async (transition) => {
+          await liveInputRoute.beforeFallback(
+            transition,
+            () => reserveResourceEnvelopeRetry(envelopeAdmission),
+          );
+        },
+        async (_decision, evidence, authority) => {
+          if (!authority) return;
+          await liveInputRoute.activate({
+            ...activeRoute(),
+            liveInput: authority.liveInput,
+          });
+          admittedRoute = { provider: authority.provider, evidence, authority };
+          console.log(
+            `[dispatch] effective authority: ${formatProviderAuthoritySurface(authority)}`,
+          );
         });
     const watched = withStallWatchdog((q as AsyncIterable<any>)[Symbol.asyncIterator](), {
       stallMs: window,
@@ -321,6 +382,7 @@ async function runDispatch(
     });
     for await (const message of watched) {
       const msg = message as any;
+      renewHarnessPresence(agentOptions);
       refreshIdentityRoute();
       stream.writeSDKMessage(msg);
       if (bgTracker.observe(msg) === "settled") bgContinuations = 0; // forward progress refreshes the cap
@@ -447,12 +509,32 @@ async function runDispatch(
       );
     }
   } finally {
-    stopFeed();
+    try {
+      await liveInputRoute.freezeAndUnbind();
+    } catch (error) {
+      liveInputFreezeError = error;
+    }
     try { ch.end(); } catch { /* already closed */ }
     // Streaming input can keep the provider subprocess alive even after it has
     // emitted a terminal result. Close the active query exactly once so Bun and
     // the provider CLI cannot survive a completed dispatch.
     await interruptQuery();
+  }
+
+  if (liveInputFreezeError) {
+    try {
+      await liveInputRoute.freezeAndUnbind();
+      liveInputFreezeError = undefined;
+    } catch {
+      outcome = "died";
+      const error = liveInputFreezeError instanceof Error
+        ? liveInputFreezeError
+        : new Error("managed live-input route could not be frozen");
+      terminalSignal = { subject: "AGENT DEATH", detail: deathReason(error) };
+      terminalAuxiliaryWrites.push((timeoutMs) =>
+        notifyDeath(agentId, error, { thread: threadId }, timeoutMs)
+      );
+    }
   }
 
   // Final child gate is deliberately adjacent to terminal publication. It
@@ -493,9 +575,11 @@ async function runDispatch(
     );
   }
 
-  // Close the auto-clock: a crash (died/stalled) orphan-closes (end_time + flag);
-  // any other terminal (clean or provider-capped) stops the session normally.
-  clockFinalize(agentId, outcome);
+  // Close only the exact clock positively opened by this dispatch preflight.
+  if (clockLease?.admission.kind === "opened") {
+    clockFinalize(agentId, outcome);
+    clockLease.finalized = true;
+  }
 
   // Commit the lane's process/delivery terminal (SYNC, digest marker last)
   // before exit. Mirrors spawn.ts at the same reap-avoidance seam.
@@ -587,7 +671,8 @@ async function runDispatch(
               envelopeRetries: envelopeAdmission?.retries,
               envelopeAdvisories: envelopeAdmission?.advisories,
               routingMetadata,
-              promptComposition: compositionEvidence,
+              promptComposition: admittedRoute?.evidence ?? injectedCompositionEvidence,
+              effectiveAuthority: admittedRoute?.authority,
               durationMs: Number(process.hrtime.bigint() - runStartedAt) / 1_000_000,
               providerDurationMs: typeof resultMsg?.duration_ms === "number" ? resultMsg.duration_ms : undefined,
               posture: postureLabel, outcome,
@@ -616,46 +701,66 @@ let bootstrapAuthorityGranted = false;
 
 export async function dispatch(
   threadIdInput: string,
-  dependencies: DispatchDependencies = {},
+  dependencies: DispatchDependencies,
 ): Promise<DispatchResult> {
+  const injected = takeDispatchTestRuntime<DispatchRuntime>(dependencies) ?? {};
+  const admitted = allowlistedDispatchDependencies(dependencies);
   const callerTopology = process.env.AGENT_TOPOLOGY;
   if (!bootstrapAuthorityGranted) {
     assertCoordinationAuthority("dispatch", callerTopology);
   }
   const threadId = normalizeNorthEntityId(threadIdInput);
-  // Avoid charging an admission for an unknown or already-completed thread.
-  const facts = (dependencies.loadThreadFacts ?? getThreadFacts)(threadId);
-  if (!facts.length) throw new Error(`Thread @${threadId} not found or has no facts`);
-  const children = (dependencies.loadChildren ?? getChildren)(threadId);
-  const preflight = derivePosture(facts, children.length > 0);
-  if (preflight.hasOutcome) {
-    const preclaimed = dependencies.driverOptions?.preclaimed
-      ?? process.env.NORTH_DISPATCH_DRIVER_PRECLAIMED === "1";
-    if (preclaimed) {
-      const agentId = selectDispatchAgentId(threadId, dependencies);
-      const driver = (dependencies.claimDriver ?? claimDispatchDriver)(
-        threadId, agentId, dependencies.driverOptions,
-      );
-      if (driver.release() === false) throw new DispatchDriverReleaseError(threadId);
-    }
-    return { threadId, posture: "atomic", result: "already done" };
-  }
-  const workingDirectory = resolveDispatchWorkingDirectory(facts);
-  const agentId = selectDispatchAgentId(threadId, dependencies);
-  const routingMetadata = requireManagedGafferSelection(
-    validateRoutingMetadata(applyGafferStaffing(
-      dependencies.routingMetadata ?? routingMetadataFromEnv(),
-    )),
-    "managed North dispatch",
+  // Routing admission is the first request-dependent boundary. Even a
+  // completed thread must not make an incomplete/hostile managed envelope look
+  // accepted, and a preclaimed fast path must not touch driver state first.
+  const routingMetadata = admitRoutingRequest(
+    admitted.routingMetadata ?? {}, "managed North dispatch",
   );
   if (!bootstrapAuthorityGranted) {
     assertManagedChildTopology(
       "dispatch", routingMetadata.topology, callerTopology,
     );
   }
-  const driver = (dependencies.claimDriver ?? claimDispatchDriver)(threadId, agentId, dependencies.driverOptions);
+  // Avoid charging an admission for an unknown or already-completed thread.
+  const facts = (injected.loadThreadFacts ?? getThreadFacts)(threadId);
+  if (!facts.length) throw new Error(`Thread @${threadId} not found or has no facts`);
+  const children = (injected.loadChildren ?? getChildren)(threadId);
+  const preflight = derivePosture(facts, children.length > 0);
+  if (preflight.hasOutcome) {
+    const preclaimed = injected.driverOptions?.preclaimed
+      ?? process.env.NORTH_DISPATCH_DRIVER_PRECLAIMED === "1";
+    if (preclaimed) {
+      const agentId = selectDispatchAgentId(threadId, {
+        agentId: admitted.agentId,
+        driverOptions: injected.driverOptions,
+      });
+      const driver = (injected.claimDriver ?? claimDispatchDriver)(
+        threadId, agentId, injected.driverOptions,
+      );
+      if (driver.release() === false) throw new DispatchDriverReleaseError(threadId);
+    }
+    return { threadId, posture: "atomic", result: "already done" };
+  }
+  const workingDirectory = resolveDispatchWorkingDirectory(facts);
+  const agentId = selectDispatchAgentId(threadId, {
+    agentId: admitted.agentId,
+    driverOptions: injected.driverOptions,
+  });
+  const clockLease: ManagedClockLease = {
+    admission: admitBillableClock({
+      agentId,
+      capabilities: gafferCapabilities(routingMetadata),
+      cwd: workingDirectory,
+      threadId,
+    }),
+    finalized: false,
+  };
+  let driver: ReturnType<typeof claimDispatchDriver> | undefined;
   let admission: EnvelopeAdmission | undefined;
   try {
+    driver = (injected.claimDriver ?? claimDispatchDriver)(
+      threadId, agentId, injected.driverOptions,
+    );
     const context = envelopeContextFromEnv(workingDirectory);
     admission = await admitResourceEnvelope({
       agentId, tier: routingMetadata.tier ?? process.env.AGENT_TIER as SemanticTier | undefined,
@@ -663,15 +768,19 @@ export async function dispatch(
     });
     for (const advisory of admission?.advisories ?? []) console.warn(`[envelope] advisory: ${advisory}`);
     return await runDispatch(
-      threadId, admission, routingMetadata, workingDirectory, agentId, dependencies.queryFn,
-      facts, children, dependencies.loadThreadFacts ?? getThreadFacts,
-      dependencies.deliveryRuntime,
-      dependencies.childSettlementReader,
+      threadId, admission, routingMetadata, workingDirectory, agentId, injected.queryFn,
+      facts, children, injected.loadThreadFacts ?? getThreadFacts,
+      injected.deliveryRuntime,
+      injected.childSettlementReader,
+      injected.feedSubscriber ?? subscribeFeed,
+      clockLease,
     );
   } finally {
     try { await completeResourceEnvelope(admission); }
     finally {
-      if (driver.release() === false) {
+      if (clockLease.admission.kind === "opened" && !clockLease.finalized)
+        clockStop(agentId);
+      if (driver && driver.release() === false) {
         console.error(`[dispatch] safe driver release unavailable for @${threadId}; liveness reaper remains armed`);
       }
     }
@@ -680,7 +789,7 @@ export async function dispatch(
 
 export async function dispatchParallel(
   threadIds: string[],
-  dependencies: DispatchDependencies = {},
+  dependencies: DispatchDependencies,
 ): Promise<DispatchResult[]> {
   assertCoordinationAuthority("dispatchParallel");
   if (dependencies.agentId && threadIds.length > 1)
@@ -697,16 +806,9 @@ if (import.meta.main) {
     console.error("usage: bun run src/dispatch.ts <thread-id>");
     process.exit(1);
   }
-  if (!process.env.AGENT_ROLE) {
-    console.error(
-      "managed North dispatch requires AGENT_ROLE selecting a canonical Gaffer preset or complete bespoke composition",
-    );
-    process.exit(1);
-  }
-
   dispatch(threadId, {
     agentId: process.env.AGENT_ID,
-    routingMetadata: routingMetadataFromEnv(),
+    routingMetadata: routingRequestFromEnv("managed North dispatch bootstrap"),
   })
     .then((result) => {
       console.log(JSON.stringify(result, null, 2));

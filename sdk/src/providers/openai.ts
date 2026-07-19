@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { ProviderRetrySafeError, type AgentProvider, type AgentQuery, type ProviderAvailability } from "./types";
@@ -6,49 +6,55 @@ import type { RoutingTarget } from "./types";
 import { probeOpenAI } from "../provider-routing";
 import type { AdapterUsageMetadata, TerminalTokenUsage } from "../usage";
 import { codexConfigArguments, providerEnvironmentForTarget } from "../accounts";
-import {
-  requireGafferCapabilities, type GafferCapability,
-} from "../gaffer-capabilities";
+import type { GafferCapability } from "../gaffer-capabilities";
 import {
   admitExecution, admitPinnedProvider, consumeExecutionAdmission,
   managedNorthMcpEnvironment, validateManagedExecutionEnvelope,
 } from "../execution-admission";
 import {
-  canonicalGlobalAgents, GLOBAL_AGENTS_MAX_BYTES,
+  canonicalGlobalAgents, GLOBAL_AGENTS_MAX_BYTES, hasCanonicalHarnessAuthority,
+  renewHarnessPresence,
 } from "../harness";
+import {
+  CODEX_WORKER_NORTH_ENABLED_TOOLS, compileProviderAuthoritySurface,
+  type OpenAIAuthoritySurface,
+} from "./authority";
 import { parseStrictJson, StrictJsonlFrames } from "../strict-json";
+import { assertInstalledManagedCodexHooks } from "./codex-managed-hooks";
+import {
+  trustedGitProjectRoot, trustedManagedCodexExecutable,
+} from "../trusted-runtime";
 
-function command(env: NodeJS.ProcessEnv): string { return env.NORTH_CODEX_BIN ?? "codex"; }
-
-const WORKER_NORTH_TOOLS = [
-  "capture", "tell", "evidence_record", "show", "ready", "next", "board", "plate",
-];
-const ORCHESTRATOR_NORTH_TOOLS = [...WORKER_NORTH_TOOLS, "dispatch", "spawn"];
+function command(env: NodeJS.ProcessEnv, managed: boolean): string {
+  return managed
+    ? trustedManagedCodexExecutable()
+    : env.NORTH_CODEX_BIN ?? "codex";
+}
+const CODEX_SUPERVISOR = resolve(import.meta.dir, "codex-supervisor.ts");
 
 /** Per-invocation Codex restrictions derived from the provider-neutral harness contract. */
 export function codexHarnessArguments(options: any): string[] {
   const denied = new Set(Array.isArray(options?.disallowedTools) ? options.disallowedTools : []);
-  const capabilities = codexCapabilities(options);
-  const args = capabilities ? managedCodexAuthorityArguments(options, capabilities) : [];
-  if (capabilities || ["Agent", "Task", "Workflow"].some((tool) => denied.has(tool))) {
+  const surface = options?.northCapabilities === undefined
+    ? undefined
+    : compileProviderAuthoritySurface("openai", options) as OpenAIAuthoritySurface;
+  const args = surface ? managedCodexAuthorityArguments(options, surface) : [];
+  if (surface?.nativeMultiAgent === "disabled"
+      || (!surface && ["Agent", "Task", "Workflow"].some((tool) => denied.has(tool)))) {
     // North is the canonical two-tier spawn surface; native Codex subagents would
     // create an unobserved third authority path even for orchestrators.
     args.push("--disable", "multi_agent");
   }
-  if (!capabilities
+  if (!surface
       && (denied.has("mcp__north__spawn") || denied.has("mcp__north__dispatch"))) {
-    args.push("--config", `mcp_servers.north.enabled_tools=${JSON.stringify(WORKER_NORTH_TOOLS)}`);
+    args.push("--config", `mcp_servers.north.enabled_tools=${JSON.stringify(CODEX_WORKER_NORTH_ENABLED_TOOLS)}`);
   }
-  if (capabilities) {
-    args.push("--sandbox", capabilities.includes("shell.readonly") ? "read-only" : "workspace-write");
-    if (!capabilities.includes("web")) args.push("--config", 'web_search="disabled"');
+  if (surface) {
+    args.push("--sandbox", surface.sandbox);
+    if (surface.web === "disabled")
+      args.push("--config", 'web_search="disabled"');
   }
   return args;
-}
-
-function codexCapabilities(options: any): GafferCapability[] | undefined {
-  if (options?.northCapabilities === undefined) return undefined;
-  return requireGafferCapabilities(options.northCapabilities, "northCapabilities");
 }
 
 function tomlStringMap(values: Record<string, string>): string {
@@ -58,13 +64,7 @@ function tomlStringMap(values: Record<string, string>): string {
 }
 
 function defaultCodexProjectRoot(cwd: string): string {
-  const git = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: 2_000,
-  });
-  const root = git.status === 0 ? git.stdout.trim() : "";
-  return realpathSync(root || cwd);
+  return trustedGitProjectRoot(cwd);
 }
 
 function managedDeveloperInstructions(options: any): string {
@@ -155,12 +155,14 @@ function managedCodexTargetEnvironment(
 
 function managedCodexAuthorityArguments(
   options: any,
-  capabilities: GafferCapability[],
+  surface: OpenAIAuthoritySurface,
 ): string[] {
   // This helper is also exported indirectly through codexHarnessArguments, so
   // retain the same fail-closed envelope check as the executable adapter.
-  validateManagedExecutionEnvelope("openai", capabilities, options);
-  admitPinnedProvider("openai", capabilities);
+  if (!hasCanonicalHarnessAuthority(options, "openai"))
+    throw new ProviderRetrySafeError("openai_harness_authority_seal_missing");
+  validateManagedExecutionEnvelope("openai", [...surface.capabilities], options);
+  admitPinnedProvider("openai", surface.capabilities);
   const north = options.mcpServers.north;
   const cwd = realpathSync(options.cwd ?? process.cwd());
   const projectRoot = defaultCodexProjectRoot(cwd);
@@ -174,10 +176,11 @@ function managedCodexAuthorityArguments(
     "--ignore-user-config",
     "--ignore-rules",
     "--disable", "plugins",
-    // Managed North owns its lifecycle and authority hooks outside Codex.
-    // Disable native hooks entirely: account/project hooks are ambient
-    // authority, and Codex 0.144 has no "managed hooks only" config key.
-    "--disable", "hooks",
+    // The root requirements layer enforces allow_managed_hooks_only=true and
+    // pins the exact North Pre/Post surface. User/session config cannot enable
+    // that policy in Codex 0.144, so admission parses /etc requirements itself;
+    // this flag only keeps the pinned stable feature explicitly on.
+    "--enable", "hooks",
     // Preserve North/Gaffer/project authority at developer precedence. Managed
     // task stdin contains only the task and can never override this contract.
     "--config", `developer_instructions=${JSON.stringify(developerInstructions)}`,
@@ -199,9 +202,7 @@ function managedCodexAuthorityArguments(
   ];
   args.push(
     "--config",
-    `mcp_servers.north.enabled_tools=${JSON.stringify(
-      capabilities.includes("coordination") ? ORCHESTRATOR_NORTH_TOOLS : WORKER_NORTH_TOOLS,
-    )}`,
+    `mcp_servers.north.enabled_tools=${JSON.stringify(surface.northEnabledTools)}`,
   );
   return args;
 }
@@ -216,17 +217,44 @@ export function probeCodex(target?: RoutingTarget): ProviderAvailability {
 }
 
 function validateOpenAIHarness(options: any): GafferCapability[] | undefined {
-  const capabilities = codexCapabilities(options);
-  if (!capabilities) return undefined;
+  if (options?.northCapabilities === undefined) return undefined;
+  if (!hasCanonicalHarnessAuthority(options, "openai"))
+    throw new ProviderRetrySafeError("openai_harness_authority_seal_missing");
+  const surface = compileProviderAuthoritySurface("openai", options) as OpenAIAuthoritySurface;
+  const capabilities = [...surface.capabilities];
   validateManagedExecutionEnvelope("openai", capabilities, options);
   admitPinnedProvider("openai", capabilities);
   managedDeveloperInstructions(options);
+  if (surface.sandbox === "workspace-write") {
+    let cwd: string;
+    let projectRoot: string;
+    try {
+      cwd = realpathSync(options?.cwd ?? process.cwd());
+      projectRoot = defaultCodexProjectRoot(cwd);
+    } catch (cause) {
+      throw new ProviderRetrySafeError("openai_write_workspace_identity_unavailable", { cause });
+    }
+    // Codex's unified-exec hook intentionally omits a per-call workdir. The
+    // clock invariant therefore relies on the other half of the executable
+    // boundary too: workspace-write has no --add-dir, and the admitted cwd is
+    // the canonical project root. A client project root appears in common hook
+    // cwd; a non-client root cannot sandbox-write a client checkout.
+    if (cwd !== projectRoot)
+      throw new ProviderRetrySafeError("openai_write_workspace_must_be_project_root");
+  }
   return capabilities;
 }
 
-export async function admitOpenAI(options: any, target?: RoutingTarget): Promise<void> {
+type ManagedHooksProbe = () => void;
+
+async function admitOpenAIWithManagedHooksProbe(
+  options: any,
+  target: RoutingTarget | undefined,
+  assertManagedHooks: ManagedHooksProbe,
+): Promise<void> {
   const capabilities = validateOpenAIHarness(options);
   if (!capabilities) return;
+  assertManagedHooks();
   await admitExecution("openai", capabilities, options?.cwd ?? process.cwd(), options);
   // AgentProvider.admit runs before routed onRoute/query construction. Resolve
   // the exact selected account here so a bad CODEX_HOME cannot publish a route
@@ -234,17 +262,27 @@ export async function admitOpenAI(options: any, target?: RoutingTarget): Promise
   managedCodexTargetEnvironment(options, target);
 }
 
+export async function admitOpenAI(options: any, target?: RoutingTarget): Promise<void> {
+  await admitOpenAIWithManagedHooksProbe(
+    options, target, assertInstalledManagedCodexHooks,
+  );
+}
+
 async function initialPrompt(value: string | AsyncIterable<any>): Promise<string> {
   if (typeof value === "string") return value;
   const it = value[Symbol.asyncIterator]();
-  const first = await it.next();
-  if (first.done) return "";
-  const v = first.value;
-  if (typeof v === "string") return v;
-  if (v?.type === "user" && typeof v.message?.content === "string") return v.message.content;
-  if (v?.type === "user" && Array.isArray(v.message?.content))
-    return v.message.content.map((x: any) => x.text ?? "").join("\n");
-  return String(v?.text ?? v?.content ?? v ?? "");
+  try {
+    const first = await it.next();
+    if (first.done) return "";
+    const v = first.value;
+    if (typeof v === "string") return v;
+    if (v?.type === "user" && typeof v.message?.content === "string") return v.message.content;
+    if (v?.type === "user" && Array.isArray(v.message?.content))
+      return v.message.content.map((x: any) => x.text ?? "").join("\n");
+    return String(v?.text ?? v?.content ?? v ?? "");
+  } finally {
+    try { await it.return?.(); } catch { /* provider teardown owns the terminal error */ }
+  }
 }
 
 function modelForCodex(model?: string): string | undefined {
@@ -254,110 +292,146 @@ function modelForCodex(model?: string): string | undefined {
   return model;
 }
 
-const CODEX_INTERRUPT_TERM_MS = 750;
-const CODEX_INTERRUPT_KILL_MS = 750;
-const CODEX_POSIX_PROCESS_GROUP = process.platform !== "win32";
+const CODEX_SUPERVISOR_GRACE_MS = 1_750;
+const CODEX_SUPERVISOR_KILL_MS = 750;
+const CODEX_PROMPT_HEADER = "NORTH_CODEX_PROMPT ";
+const CODEX_PROMPT_MAX_BYTES = 16 * 1024 * 1024;
+const CODEX_SUPERVISOR_STATUS_MAX_BYTES = 4 * 1024;
+const CODEX_SUPERVISOR_STATUS_MAX_FRAMES = 4;
 
-function signalCodexProcessGroup(
-  child: ChildProcessWithoutNullStreams,
-  signal: NodeJS.Signals,
-): boolean {
-  if (CODEX_POSIX_PROCESS_GROUP && child.pid !== undefined) {
-    try { return process.kill(-child.pid, signal); }
-    catch { return false; }
-  }
-  try { return child.kill(signal); }
-  catch { return false; }
-}
-
-function waitForExit(child: ChildProcessWithoutNullStreams): Promise<number | null> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(child.exitCode);
-  return new Promise((resolve) => child.once("exit", resolve));
-}
-
-function waitForExitBounded(
-  child: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (exited: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.off("exit", onExit);
-      resolve(exited);
-    };
-    const onExit = (): void => finish(true);
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    child.once("exit", onExit);
-  });
-}
-
-function codexProcessGroupExists(child: ChildProcessWithoutNullStreams): boolean {
-  if (!CODEX_POSIX_PROCESS_GROUP || child.pid === undefined) return false;
+function processExists(child: ChildProcessWithoutNullStreams): boolean {
+  if (child.pid === undefined) return false;
   try {
-    process.kill(-child.pid, 0);
+    process.kill(child.pid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
-async function waitForCodexProcessGroupGone(
+function waitForExitBounded(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (codexProcessGroupExists(child) && Date.now() < deadline) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-  }
-  return !codexProcessGroupExists(child);
+  return (async () => {
+    const deadline = Date.now() + timeoutMs;
+    while (processExists(child) && Date.now() < deadline)
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    return !processExists(child);
+  })();
+}
+
+function closeSupervisorControl(child: ChildProcessWithoutNullStreams): void {
+  try { child.stdin.end(); } catch { /* already closed */ }
+}
+
+function destroySupervisorControl(child: ChildProcessWithoutNullStreams): void {
+  try { child.stdin.destroy(); } catch { /* already closed */ }
 }
 
 function destroyCodexPipes(child: ChildProcessWithoutNullStreams): void {
-  child.stdin.destroy();
-  child.stdout.destroy();
-  child.stderr.destroy();
+  try { child.stdin.destroy(); } catch { /* already closed */ }
+  try { child.stdout.destroy(); } catch { /* already closed */ }
+  try { child.stderr.destroy(); } catch { /* already closed */ }
+  const status = (child.stdio as any[])[3];
+  try { status?.destroy(); } catch { /* already closed */ }
+  destroySupervisorControl(child);
 }
 
 async function terminateCodexProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
-  signalCodexProcessGroup(child, "SIGTERM");
-  if (CODEX_POSIX_PROCESS_GROUP) {
-    // The direct CLI can already be gone while an inherited-pipe descendant
-    // remains. Bound the process group itself, not just the leader's exit.
-    if (!await waitForCodexProcessGroupGone(child, CODEX_INTERRUPT_TERM_MS)) {
-      signalCodexProcessGroup(child, "SIGKILL");
-      await waitForCodexProcessGroupGone(child, CODEX_INTERRUPT_KILL_MS);
-    }
-  } else {
-    // Node cannot address a process group on Windows. Bound the direct child
-    // and local pipe wait; descendant ownership remains platform-limited.
-    if (!await waitForExitBounded(child, CODEX_INTERRUPT_TERM_MS)) {
-      signalCodexProcessGroup(child, "SIGKILL");
-      await waitForExitBounded(child, CODEX_INTERRUPT_KILL_MS);
+  // Closing supervisor stdin asks it to terminate and reap the complete Codex
+  // process group. The prompt is length-framed and stdin deliberately remains
+  // open afterwards, so the kernel generates this same EOF if North is
+  // SIGKILLed; cleanup does not depend on a live Bun callback.
+  closeSupervisorControl(child);
+  if (!await waitForExitBounded(child, CODEX_SUPERVISOR_GRACE_MS)) {
+    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    if (!await waitForExitBounded(child, CODEX_SUPERVISOR_KILL_MS)) {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      await waitForExitBounded(child, CODEX_SUPERVISOR_KILL_MS);
     }
   }
   destroyCodexPipes(child);
 }
 
-function armCodexDescendantReaper(
+interface SupervisorObservation {
+  started: Promise<"started" | "unavailable">;
+  completed: Promise<number>;
+}
+
+function observeSupervisor(
   child: ChildProcessWithoutNullStreams,
+): SupervisorObservation {
+  const status = (child.stdio as any[])[3] as NodeJS.ReadableStream | undefined;
+  let startedSettled = false;
+  let resolveStarted!: (value: "started" | "unavailable") => void;
+  let rejectStarted!: (error: unknown) => void;
+  const started = new Promise<"started" | "unavailable">((resolve, reject) => {
+    resolveStarted = resolve;
+    rejectStarted = reject;
+  });
+  const settleStarted = (value: "started" | "unavailable") => {
+    if (startedSettled) throw new Error("openai_provider_execution_failed");
+    startedSettled = true;
+    resolveStarted(value);
+  };
+  const completed = (async (): Promise<number> => {
+    if (!status) throw new Error("openai_provider_execution_failed");
+    const frames = new StrictJsonlFrames({
+      label: "Codex supervisor status",
+      maxLineBytes: CODEX_SUPERVISOR_STATUS_MAX_BYTES,
+      maxTotalBytes: CODEX_SUPERVISOR_STATUS_MAX_BYTES,
+      maxFrames: CODEX_SUPERVISOR_STATUS_MAX_FRAMES,
+    });
+    let unavailable = false;
+    for await (const chunk of status) {
+      for (const line of frames.push(
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+      )) {
+        if (line === "STARTED") {
+          if (unavailable) throw new Error("openai_provider_execution_failed");
+          settleStarted("started");
+          continue;
+        }
+        if (line === "UNAVAILABLE") {
+          if (startedSettled || unavailable)
+            throw new Error("openai_provider_execution_failed");
+          unavailable = true;
+          settleStarted("unavailable");
+          continue;
+        }
+        const exit = /^EXIT (0|[1-9][0-9]{0,2})$/.exec(line);
+        const code = exit ? Number(exit[1]) : NaN;
+        if (!Number.isInteger(code) || code > 255 || !startedSettled)
+          throw new Error("openai_provider_execution_failed");
+        return code;
+      }
+    }
+    frames.finish();
+    throw new Error("openai_provider_execution_failed");
+  })();
+  void completed.catch((error) => {
+    if (!startedSettled) {
+      startedSettled = true;
+      rejectStarted(error);
+    }
+  });
+  return { started, completed };
+}
+
+async function writeSupervisorPrompt(
+  child: ChildProcessWithoutNullStreams,
+  prompt: string,
 ): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    child.once("error", () => {
-      if (child.pid === undefined) finish();
-    });
-    child.once("exit", () => {
-      void terminateCodexProcessTree(child).finally(finish);
-    });
+  const bytes = Buffer.from(prompt, "utf8");
+  if (bytes.byteLength > CODEX_PROMPT_MAX_BYTES)
+    throw new Error("openai_provider_execution_failed");
+  const frame = Buffer.concat([
+    Buffer.from(`${CODEX_PROMPT_HEADER}${bytes.byteLength}\n`, "utf8"),
+    bytes,
+  ]);
+  await new Promise<void>((resolve, reject) => {
+    child.stdin.write(frame, (error) => error ? reject(error) : resolve());
   });
 }
 
@@ -545,6 +619,7 @@ class CodexQuery implements AgentQuery {
     private options: any,
     private target?: RoutingTarget,
     private admitted = false,
+    private assertManagedHooks: ManagedHooksProbe = assertInstalledManagedCodexHooks,
   ) {}
 
   supportsInFlightEscalation(): boolean { return false; }
@@ -568,13 +643,18 @@ class CodexQuery implements AgentQuery {
     const admitted = this.admitted;
     this.admitted = false;
     if (admitted) validateOpenAIHarness(this.options);
-    else await admitOpenAI(this.options, this.target);
-    const capabilities = codexCapabilities(this.options);
-    const env = capabilities
+    else await admitOpenAIWithManagedHooksProbe(
+      this.options, this.target, this.assertManagedHooks,
+    );
+    const managed = this.options?.northCapabilities !== undefined;
+    // Repeat the root-managed hook proof at the final pre-spawn seam. This
+    // closes the filesystem race between routed admission and Codex startup.
+    if (managed) this.assertManagedHooks();
+    const env = managed
       ? managedCodexTargetEnvironment(this.options, this.target)
       : providerEnvironmentForTarget("openai", this.target, { env: this.options.env });
     const task = await initialPrompt(this.prompt);
-    const prompt = capabilities
+    const prompt = managed
       ? task
       : this.options.systemPrompt
       ? `${this.options.systemPrompt}\n\n## Task\n${task}`
@@ -589,28 +669,20 @@ class CodexQuery implements AgentQuery {
     if (this.options.effort) args.push("--config", `model_reasoning_effort=${JSON.stringify(this.options.effort)}`);
     if (this.options.cwd) args.push("--cd", this.options.cwd);
     args.push("-");
-    const child = spawn(command(env), args, {
-      cwd: this.options.cwd ?? process.cwd(),
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: CODEX_POSIX_PROCESS_GROUP,
-    });
+    const child = spawn(
+      process.execPath,
+      [CODEX_SUPERVISOR, command(env, managed), ...args],
+      {
+        cwd: this.options.cwd ?? process.cwd(),
+        env,
+        stdio: ["pipe", "pipe", "pipe", "pipe"],
+        detached: false,
+      },
+    ) as unknown as ChildProcessWithoutNullStreams;
     this.child = child;
-    const descendantsReaped = armCodexDescendantReaper(child);
-    const launched = new Promise<void>((resolve, reject) => {
-      child.once("spawn", resolve);
-      child.once("error", reject);
-    });
     child.stdin.on("error", () => { /* child process error is classified below */ });
-    try { await launched; }
-    catch {
-      this.child = undefined;
-      throw new ProviderRetrySafeError("openai_provider_executable_unavailable_before_acceptance");
-    }
-    child.stdin.end(prompt);
-    // Once the process has spawned, silence is not proof of non-acceptance: the
-    // provider may have accepted work before the CLI emitted a recognized event.
-    // Every subsequent failure therefore remains the original provider error.
+    const supervision = observeSupervisor(child);
+    let providerStarted = false;
     let result = "";
     const frames = new StrictJsonlFrames({
       label: "Codex exec",
@@ -622,9 +694,21 @@ class CodexQuery implements AgentQuery {
     let usage: ExactCodexUsage | undefined;
     child.stderr.resume();
     try {
+      const startStatus = await supervision.started;
+      if (startStatus === "unavailable") {
+        throw new ProviderRetrySafeError(
+          "openai_provider_executable_unavailable_before_acceptance",
+        );
+      }
+      providerStarted = true;
+      await writeSupervisorPrompt(child, prompt);
       for await (const chunk of child.stdout) {
         for (const line of frames.push(chunk)) {
           const accepted = protocol.accept(line);
+          // Every accepted native frame is activity, including command/MCP
+          // item frames that yield no assistant text. The production renewer is
+          // throttled, so a noisy provider cannot create unbounded graph writes.
+          renewHarnessPresence(this.options);
           if (accepted.text !== undefined) {
             result = accepted.text || result;
             if (accepted.text) {
@@ -641,14 +725,18 @@ class CodexQuery implements AgentQuery {
         }
       }
       frames.finish();
-      const code = await waitForExit(child);
-      if (code !== 0) throw new Error("openai_provider_execution_failed");
+      const supervisorExit = await supervision.completed;
+      if (supervisorExit !== 0)
+        throw new Error("openai_provider_execution_failed");
       usage = protocol.finish();
-    } catch {
+    } catch (error) {
       try { await this.interrupt(); } catch { /* cleanup must not replace the provider error */ }
+      try { await supervision.completed; } catch { /* preserve the provider error */ }
+      if (error instanceof ProviderRetrySafeError && !providerStarted)
+        throw error;
       throw new Error("openai_provider_execution_failed");
     } finally {
-      await descendantsReaped;
+      destroyCodexPipes(child);
       this.child = undefined;
     }
     if (!usage) throw new Error("openai_provider_execution_failed");
@@ -662,11 +750,25 @@ class CodexQuery implements AgentQuery {
   }
 }
 
-export const openaiProvider: AgentProvider = {
-  id: "openai",
-  probe: probeCodex,
-  admit: ({ options, target }) => admitOpenAI(options, target),
-  query: ({ prompt, options, target }) => new CodexQuery(
-    prompt, options, target, consumeExecutionAdmission("openai", options),
-  ),
-};
+function providerWithManagedHooksProbe(
+  assertManagedHooks: ManagedHooksProbe,
+): AgentProvider {
+  return {
+    id: "openai",
+    liveInput: "unsupported",
+    probe: probeCodex,
+    admit: ({ options, target }) =>
+      admitOpenAIWithManagedHooksProbe(options, target, assertManagedHooks),
+    query: ({ prompt, options, target }) => new CodexQuery(
+      prompt,
+      options,
+      target,
+      consumeExecutionAdmission("openai", options),
+      assertManagedHooks,
+    ),
+  };
+}
+
+export const openaiProvider: AgentProvider = Object.freeze(
+  providerWithManagedHooksProbe(assertInstalledManagedCodexHooks),
+);

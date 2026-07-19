@@ -1,9 +1,9 @@
-import { canonicalStaffingRole } from "./gaffer-staffing";
 import {
   validateTopologyCapabilities, type GafferCapability,
 } from "./gaffer-capabilities";
 import { requireGafferRoleId } from "./gaffer-role-id";
 import { canonicalBespokeContract } from "./bespoke-contract";
+import { requireProviderNeutralRoute } from "./provider-neutral-route";
 
 export const TASK_GRADES = ["novice", "junior", "mid", "senior", "staff", "principal", "research-grade"] as const;
 export type TaskGrade = typeof TASK_GRADES[number];
@@ -21,7 +21,7 @@ export const POSTURES = ["explore", "evaluate", "deliver", "preserve"] as const;
 export type RoutingPosture = typeof POSTURES[number];
 
 export const ROUTING_OVERRIDE_FIELDS = [
-  "taskGrade", "domainRequirements", "topology", "tier", "reasoning", "posture",
+  "taskGrade", "domainRequirements", "tier", "reasoning", "posture",
 ] as const;
 export type RoutingOverrideField = typeof ROUTING_OVERRIDE_FIELDS[number];
 
@@ -52,16 +52,26 @@ export interface BespokeComposition {
 }
 export type AgentComposition = PresetComposition | BespokeComposition;
 
-export interface RoutingMetadata {
-  role?: string;
-  taskGrade?: TaskGrade;
-  domainRequirements?: string[];
-  topology?: Topology;
-  tier?: RoutingTier;
-  reasoning?: ReasoningLevel;
-  posture?: RoutingPosture;
-  composition?: AgentComposition;
+/** The executable routing contract carried by every managed North boundary. */
+export interface RoutingRequest {
+  role: string;
+  taskGrade: TaskGrade;
+  domainRequirements: string[];
+  topology: Topology;
+  tier: RoutingTier;
+  reasoning: ReasoningLevel;
+  posture: RoutingPosture;
+  composition: AgentComposition;
 }
+
+/** Partial input exists only while a trusted composer is constructing a request. */
+export type RoutingDraft = Partial<RoutingRequest>;
+
+/**
+ * Compatibility name for parsing and composer utilities. Managed execution
+ * surfaces must accept RoutingRequest, never this partial draft type.
+ */
+export type RoutingMetadata = RoutingDraft;
 
 const ROUTING_FIELDS = new Set([
   "role", "taskGrade", "domainRequirements", "topology", "tier", "reasoning", "posture", "composition",
@@ -101,10 +111,10 @@ function nonEmptyStrings(value: unknown, field: string, requireItems = false): s
 }
 
 export function canonicalRole(role?: string): string | undefined {
-  return role === undefined ? undefined : canonicalStaffingRole(requireGafferRoleId(role));
+  return role === undefined ? undefined : requireGafferRoleId(role);
 }
 
-export function validateRoutingMetadata(value: RoutingMetadata): RoutingMetadata {
+export function validateRoutingMetadata(value: RoutingDraft): RoutingDraft {
   if (value == null || typeof value !== "object" || Array.isArray(value))
     throw new Error("routing metadata must be an object");
   rejectUnknownFields(value, ROUTING_FIELDS, "routing metadata");
@@ -117,6 +127,7 @@ export function validateRoutingMetadata(value: RoutingMetadata): RoutingMetadata
   const domainRequirements = value.domainRequirements == null
     ? undefined
     : nonEmptyStrings(value.domainRequirements, "domainRequirements");
+  if (tier && reasoning) requireProviderNeutralRoute(tier, reasoning);
   const composition: unknown = value.composition;
   let normalizedComposition: AgentComposition | undefined;
   if (composition != null) {
@@ -186,6 +197,26 @@ export function validateRoutingMetadata(value: RoutingMetadata): RoutingMetadata
   };
 }
 
+export const ROUTING_REQUEST_FIELDS = [
+  "role", "taskGrade", "domainRequirements", "topology",
+  "tier", "reasoning", "posture", "composition",
+] as const satisfies readonly (keyof RoutingRequest)[];
+
+/** Structural/full parser only. Executable surfaces must call admitRoutingRequest. */
+export function parseCompleteRoutingRequest(
+  value: RoutingDraft,
+  surface = "managed North agent",
+): RoutingRequest {
+  const normalized = validateRoutingMetadata(value);
+  const missing = ROUTING_REQUEST_FIELDS.filter((field) => normalized[field] === undefined);
+  if (missing.length) {
+    throw new Error(
+      `${surface} requires the complete eight-field Gaffer request; missing: ${missing.join(", ")}`,
+    );
+  }
+  return normalized as RoutingRequest;
+}
+
 function jsonEnv<T>(name: string): T | undefined {
   const raw = process.env[name];
   if (!raw) return undefined;
@@ -200,7 +231,7 @@ export function routingMetadataFromEnv(): RoutingMetadata {
     domainRequirements: jsonEnv<string[]>("AGENT_DOMAIN_REQUIREMENTS"),
     topology: process.env.AGENT_TOPOLOGY as Topology | undefined,
     tier: process.env.AGENT_TIER as RoutingTier | undefined,
-    reasoning: (process.env.AGENT_REASONING ?? process.env.AGENT_EFFORT) as ReasoningLevel | undefined,
+    reasoning: process.env.AGENT_REASONING as ReasoningLevel | undefined,
     posture: process.env.AGENT_POSTURE as RoutingPosture | undefined,
     composition: jsonEnv<AgentComposition>("AGENT_COMPOSITION"),
   });

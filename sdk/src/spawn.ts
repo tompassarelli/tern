@@ -3,13 +3,13 @@ import { randomUUID } from "node:crypto";
 const REPO_ROOT = pathResolve(import.meta.dir, "..", "..");
 import { StreamWriter } from "./stream-writer";
 import {
-  harnessCompositionEvidence, harnessOptions,
+  harnessCompositionEvidence, harnessOptions, renewHarnessPresence,
   type Effort, type HarnessCompositionEvidence,
 } from "./harness";
 import { normalizeUsage } from "./usage";
 import { newRunId, recordRun } from "./telemetry";
 import { deathReason, notifyDeath } from "./death";
-import { inputChannel } from "./coordination";
+import { inputChannel, subscribeFeed } from "./coordination";
 import {
   bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute, goalFromPrompt,
   userAnchoredPath,
@@ -27,17 +27,22 @@ import {
   decideChildTurnEnd, initialChildContinuationState, notifyEarlyExitChildren,
   settleChildren, type ChildSettlement,
 } from "./children";
-import { clockStart, clockFinalize } from "./clock";
 import {
-  routedQuery, selectProvider, ProviderEscalationUnsupportedError, ProviderRetrySafeError,
-  type ProviderPreference,
+  admitBillableClock, clockFinalize, clockStop,
+  type BillableClockAdmission,
+} from "./clock";
+import {
+  formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider,
+  ProviderEscalationUnsupportedError, ProviderRetrySafeError,
+  type ProviderAuthoritySurface, type ProviderPreference,
 } from "./providers";
 import { refreshCodexEntitlementsIfStale } from "./codex-entitlement";
 import type { AgentQuery } from "./providers/types";
 import { resolveTier, type SemanticTier } from "./providers/catalog";
-import { canonicalRole, routingMetadataFromEnv, validateRoutingMetadata, type RoutingMetadata } from "./routing-metadata";
+import type { RoutingRequest } from "./routing-metadata";
+import { admitRoutingRequest, routingRequestFromEnv } from "./routing-admission";
 import {
-  applyGafferStaffing, gafferCapabilities, requireManagedGafferSelection,
+  gafferCapabilities,
 } from "./gaffer-staffing";
 import { refreshAccountUsages } from "./account-usage";
 import {
@@ -49,6 +54,7 @@ import {
 } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal } from "./execution-outcome";
+import { ManagedLiveInputRoute } from "./live-input-route";
 import {
   notifyTerminalSettlement, TerminalPublicationBudget, type TerminalNotification,
 } from "./terminal-notification";
@@ -58,6 +64,7 @@ import {
   loadDeliveryRunState, newDeliveryRunContext, reserveDeliveryRun,
   type DeliveryReservation, type DeliveryRunContext, type DeliveryRunState,
 } from "./delivery-evidence";
+import { takeSpawnTestRuntime } from "./internal/test-runtime";
 
 export interface SpawnOptions {
   prompt: string;
@@ -68,7 +75,8 @@ export interface SpawnOptions {
   systemPrompt?: string;
   maxTurns?: number;
   escalate?: boolean; // escalate-not-kill: climb the ladder on struggle instead of stopping
-  role: string;
+  /** Equality-only compatibility alias; routingMetadata remains authoritative. */
+  role?: string;
   posture?: string;
   thread?: string; // exact work/evidence thread; also auto-clock like dispatch. Raw ad-hoc spawns omit it.
   caveman?: "off" | "lite" | "full"; // per-spawn terse-output dial; overrides ambient AGENT_CAVEMAN
@@ -76,54 +84,87 @@ export interface SpawnOptions {
   provider?: ProviderPreference;
   target?: string;
   tier?: SemanticTier;
-  routingMetadata?: RoutingMetadata;
+  routingMetadata: RoutingRequest;
   project?: string;
   sessionId?: string;
-  queryFn?: (args: any) => AgentQuery; // injection seam for tests; bypasses provider selection
-  /** Hermetic seam for the capability-bound delivery reservation/evidence store. */
+}
+
+interface SpawnRuntime {
+  queryFn?: (args: any) => AgentQuery;
   deliveryRuntime?: {
     reserve: (context: DeliveryRunContext) => DeliveryReservation;
     load: (runId: string) => DeliveryRunState;
   };
-  /** Hermetic terminal thread read for delivery assessment. */
   loadThreadFacts?: typeof getThreadFacts;
-  /** Hermetic graph seam for orchestrator child settlement observation. */
   childSettlementReader?: (agentId: string) => ChildSettlement;
+  feedSubscriber?: typeof subscribeFeed;
+}
+
+const SPAWN_OPTION_FIELDS = new Set([
+  "prompt", "agentId", "model", "effort", "tools", "systemPrompt", "maxTurns",
+  "escalate", "role", "posture", "thread", "caveman", "coordinator", "provider",
+  "target", "tier", "routingMetadata", "project", "sessionId",
+]);
+
+function allowlistedSpawnOptions(value: SpawnOptions): SpawnOptions {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("managed North spawn request must be an object");
+  const admitted: Record<string, unknown> = {};
+  for (const [field, descriptor] of Object.entries(
+    Object.getOwnPropertyDescriptors(value),
+  )) {
+    if (!SPAWN_OPTION_FIELDS.has(field))
+      throw new Error(`managed North spawn request has unknown field ${field}`);
+    if (descriptor.get || descriptor.set)
+      throw new Error(`managed North spawn request field ${field} must be a data property`);
+    admitted[field] = descriptor.value;
+  }
+  return admitted as unknown as SpawnOptions;
 }
 
 export function createSpawnAgentId(now = Date.now(), uuid = randomUUID()): string {
   return `lane-${now.toString(36)}-${uuid}`;
 }
 
-function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetadata: RoutingMetadata } {
-  // Library calls are request-owned. Only the CLI adapter below explicitly
-  // imports its already-scrubbed child environment into RoutingMetadata.
-  const requestedMetadata = opts.routingMetadata ? validateRoutingMetadata(opts.routingMetadata) : {};
-  // The public spawn dials are part of the composition request, not a second
-  // overlay after staffing. Merge them first so a role-only request can hydrate
-  // from Gaffer while every explicitly supplied axis wins independently.
-  const explicitMetadata = validateRoutingMetadata({
-    ...requestedMetadata,
-    ...(opts.role != null ? { role: opts.role } : {}),
-    ...(opts.tier != null ? { tier: opts.tier } : {}),
-    ...(opts.effort != null ? { reasoning: opts.effort } : {}),
-    ...(opts.posture != null ? { posture: opts.posture as RoutingMetadata["posture"] } : {}),
-  });
-  const routingMetadata = requireManagedGafferSelection(
-    validateRoutingMetadata(applyGafferStaffing(explicitMetadata)),
-    "managed North spawn",
+interface ManagedClockLease {
+  admission: BillableClockAdmission;
+  finalized: boolean;
+}
+
+function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetadata: RoutingRequest } {
+  const routingMetadata = admitRoutingRequest(
+    opts.routingMetadata ?? {}, "managed North spawn",
   );
+  const aliases = [
+    ["role", opts.role, routingMetadata.role],
+    ["tier", opts.tier, routingMetadata.tier],
+    ["effort", opts.effort, routingMetadata.reasoning],
+    ["posture", opts.posture, routingMetadata.posture],
+  ] as const;
+  for (const [field, supplied, canonical] of aliases) {
+    if (supplied !== undefined && supplied !== canonical) {
+      throw new Error(
+        `managed North spawn ${field} compatibility alias must equal routingMetadata `
+        + `(${JSON.stringify(supplied)} != ${JSON.stringify(canonical)})`,
+      );
+    }
+  }
   return {
     ...opts,
     routingMetadata,
-    role: canonicalRole(routingMetadata.role)!,
+    role: routingMetadata.role,
     tier: routingMetadata.tier,
     effort: routingMetadata.reasoning as Effort | undefined,
     posture: routingMetadata.posture,
   };
 }
 
-async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata }, envelopeAdmission?: EnvelopeAdmission): Promise<string> {
+async function runSpawn(
+  opts: SpawnOptions & { routingMetadata: RoutingRequest },
+  envelopeAdmission?: EnvelopeAdmission,
+  clockLease?: ManagedClockLease,
+  injected: SpawnRuntime = {},
+): Promise<string> {
   const runStartedAt = process.hrtime.bigint();
   // Composition is deliberately complete before admission and stays immutable
   // through routing, identity, provider execution, and terminal telemetry.
@@ -136,7 +177,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   const runContext = opts.thread
     ? newDeliveryRunContext(runId, opts.thread, agentId)
     : undefined;
-  const runtime = opts.deliveryRuntime ?? (opts.queryFn ? undefined : {
+  const deliveryRuntime = injected.deliveryRuntime ?? (injected.queryFn ? undefined : {
     reserve: reserveDeliveryRun,
     load: loadDeliveryRunState,
   });
@@ -148,10 +189,10 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   const providerPreference = opts.provider ?? "auto";
   const targetPreference = opts.target;
   const routingRequest = { provider: providerPreference, target: targetPreference };
-  if (!opts.queryFn) admitPinnedProvider(opts.provider, capabilities);
+  if (!injected.queryFn) admitPinnedProvider(opts.provider, capabilities);
   // Injected query functions own their entire provider boundary; keeping the
   // refresh out of that path makes tests and alternative adapters hermetic.
-  if (!opts.queryFn) {
+  if (!injected.queryFn) {
     try { await refreshAccountUsages({ requested: routingRequest }); } catch { /* telemetry is advisory */ }
     try { await refreshCodexEntitlementsIfStale({ requested: routingRequest }); } catch { /* telemetry is advisory */ }
   }
@@ -187,11 +228,28 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     goal: goalFromPrompt(opts.prompt),
     coordinator: opts.coordinator,
   };
+  const initialLiveInput = providerLiveInput(routing.provider);
+  const ch = inputChannel(opts.prompt); // streaming-input mode -> unlocks q.setModel()
+  const liveInputRoute = new ManagedLiveInputRoute(
+    agentId,
+    identityBase,
+    {
+      provider: routing.provider,
+      providerTarget: routing.target,
+      liveInput: initialLiveInput,
+      model: opts.model,
+      effort: opts.effort,
+    },
+    (message) => ch.push(message),
+    injected.feedSubscriber ?? subscribeFeed,
+  );
   writeAgentFacts(agentId, {
     ...identityBase,
     model: opts.model,
     provider: routing.provider,
     providerTarget: routing.target,
+    liveInput: initialLiveInput,
+    ...liveInputRoute.initialProjection(),
     effort: opts.effort,
   });
   const escalate = opts.escalate ?? process.env.AGENT_ESCALATE === "1";
@@ -200,7 +258,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   // a turn cap. Opt-in via opts.escalate / AGENT_ESCALATE; off => behaves as before.
   // Snapshot the active ladder once per run (includes the Fable rung iff the window is
   // open); tier indices below resolve against THIS array, matching decideEscalation.
-  const ladder = activeLadder(routing.provider);
+  let ladder = activeLadder(routing.provider);
   let tier = escalate ? tierIndexOf(routing.provider, opts.model, opts.effort, ladder) : -1; // -1 = fixed model (legacy)
   const rung = () => (tier >= 0 ? ladder[tier] : { model: opts.model, effort: opts.effort });
   let acceptedModel = opts.model;
@@ -208,41 +266,52 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   const activeRoute = () => ({
     provider: routing.provider,
     providerTarget: routing.target,
+    liveInput: providerLiveInput(routing.provider),
     model: routing.resolvedModel ?? acceptedModel,
     effort: routing.resolvedEffort ?? acceptedEffort,
   });
-  let identityRoute = `${routing.provider}|${routing.target}|${opts.model ?? ""}|${opts.effort ?? ""}`;
   const refreshIdentityRoute = (required = false) => {
-    const route = activeRoute();
-    const next = `${route.provider}|${route.providerTarget}|${route.model ?? ""}|${route.effort ?? ""}`;
-    if (next === identityRoute) return;
-    try {
-      updateAgentRoute(agentId, { ...identityBase, ...route });
-      identityRoute = next;
-    } catch (error) {
-      if (required) throw error;
-    }
+    liveInputRoute.refresh(activeRoute(), required);
   };
   const st = makeStruggleState();
-  const ch = inputChannel(opts.prompt); // streaming-input mode -> unlocks q.setModel()
 
   console.log(`[spawn] @agent:${agentId} starting provider=${routing.provider} target=${routing.target}${resolved.tier ? ` tier=${resolved.tier}` : ""} (${routing.reason})${escalate ? ` (escalate from ${acceptedModel}/${acceptedEffort})` : ""}`);
-
-  // Auto-clock only when this spawn carries a billable thread — ad-hoc spawns
-  // aren't billable by default. Same per-agent treatment as dispatch.
-  if (opts.thread) clockStart(agentId, opts.thread);
 
   let result = "", resultMsg: any = null, outcome = "ran";
   const terminalMessages: any[] = [];
   const escalations: Array<{ from: string; to: string; reason: string }> = [];
   const end = (oc: string) => { outcome = oc; try { ch.end(); } catch { /* already closed */ } };
 
-  let compositionEvidence: HarnessCompositionEvidence | undefined;
-  const queryFn = opts.queryFn ?? ((args: any) => routedQuery(
-    routing, args, requestedTier, undefined, () => reserveResourceEnvelopeRetry(envelopeAdmission),
-    (_decision, evidence) => {
-      refreshIdentityRoute(true);
-      if (evidence) compositionEvidence = evidence;
+  let injectedCompositionEvidence: HarnessCompositionEvidence | undefined;
+  let admittedRoute: {
+    provider: ProviderAuthoritySurface["provider"];
+    evidence: HarnessCompositionEvidence | undefined;
+    authority: ProviderAuthoritySurface;
+  } | undefined;
+  const queryFn = injected.queryFn ?? ((args: any) => routedQuery(
+    routing, args, requestedTier, async (transition) => {
+      await liveInputRoute.beforeFallback(
+        transition,
+        () => reserveResourceEnvelopeRetry(envelopeAdmission),
+      );
+    },
+    async (_decision, evidence, authority) => {
+      if (!authority) return;
+      await liveInputRoute.activate({
+        ...activeRoute(),
+        liveInput: authority.liveInput,
+      });
+      admittedRoute = { provider: authority.provider, evidence, authority };
+      acceptedModel = routing.resolvedModel ?? acceptedModel;
+      const admittedEffort = routing.resolvedEffort as Effort | undefined;
+      acceptedEffort = admittedEffort ?? acceptedEffort;
+      if (escalate) {
+        ladder = activeLadder(routing.provider);
+        tier = tierIndexOf(
+          routing.provider, routing.resolvedModel, admittedEffort, ladder,
+        );
+      }
+      console.log(`[spawn] effective authority: ${formatProviderAuthoritySurface(authority)}`);
     },
   ));
   const noteAppliedEscalation = (route: AppliedEscalationRoute) => {
@@ -273,6 +342,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   let stallAborted = false;
   let terminalSignal: Pick<TerminalNotification, "detail" | "subject"> = {};
   const terminalAuxiliaryWrites: Array<(timeoutMs: number) => void> = [];
+  let liveInputFreezeError: unknown;
   // Background-task refusal (thread 019f4ed2): a lane that ends its turn while a
   // harness-tracked background Bash task is live must NOT finalize — the SDK
   // auto-continues the model on task settlement, but only if we keep the loop alive
@@ -281,15 +351,15 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   const bgTracker = makeBgTracker();
   let bgContinuations = 0;
   const orchestrator = routingMetadata.topology === "orchestrator";
-  const readChildSettlement = opts.childSettlementReader ?? settleChildren;
+  const readChildSettlement = injected.childSettlementReader ?? settleChildren;
   let childContinuation = initialChildContinuationState();
   try {
   // Reserve only at the last pre-provider seam. Earlier routing/admission
   // failures must not strand undiscoverable reservation-only subjects.
   if (runContext) {
     try {
-      if (runtime) {
-        deliveryReservation = runtime.reserve(runContext);
+      if (deliveryRuntime) {
+        deliveryReservation = deliveryRuntime.reserve(runContext);
         if (!deliveryReservation) throw new Error("reservation acknowledgement unavailable");
         deliveryReservationReady = true;
       }
@@ -315,7 +385,9 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     // per-spawn dial wins over ambient env; env-or-full is the harness fallback
     caveman: opts.caveman ?? process.env.AGENT_CAVEMAN ?? "full",
   });
-  compositionEvidence = harnessCompositionEvidence(agentOptions);
+  if (injected.queryFn) injectedCompositionEvidence = harnessCompositionEvidence(agentOptions);
+  if (injected.queryFn && injected.feedSubscriber)
+    await liveInputRoute.activate(activeRoute());
   const activeQuery = queryFn({
     prompt: ch.stream(),
     options: agentOptions,
@@ -328,6 +400,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   });
   for await (const message of watched) {
     const msg = message as any;
+    renewHarnessPresence(agentOptions);
     // routedQuery mutates the decision before the first fallback-provider event.
     // Refresh from that structured decision before the event is exposed.
     refreshIdentityRoute();
@@ -509,11 +582,32 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       );
     }
   } finally {
+    try {
+      await liveInputRoute.freezeAndUnbind();
+    } catch (error) {
+      liveInputFreezeError = error;
+    }
     end(outcome); // idempotent: close the channel so the query + any leak unwinds
     // A terminal SDK result does not guarantee the provider subprocess has
     // exited while streaming input remains open. Interrupt exactly once after
     // closing input so a completed lane cannot retain its Bun/CLI process tree.
     await interruptQuery();
+  }
+
+  if (liveInputFreezeError) {
+    try {
+      await liveInputRoute.freezeAndUnbind();
+      liveInputFreezeError = undefined;
+    } catch {
+      outcome = "died";
+      const error = liveInputFreezeError instanceof Error
+        ? liveInputFreezeError
+        : new Error("managed live-input route could not be frozen");
+      terminalSignal = { subject: "AGENT DEATH", detail: deathReason(error) };
+      terminalAuxiliaryWrites.push((timeoutMs) =>
+        notifyDeath(agentId, error, { thread: undefined }, timeoutMs)
+      );
+    }
   }
 
   // Belt-and-suspenders terminal gate. A child may appear after the last
@@ -555,15 +649,18 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     );
   }
 
-  // Close the auto-clock (only if this spawn opened one): crash -> orphan-close, else stop.
-  if (opts.thread) clockFinalize(agentId, outcome);
+  // Close only the exact clock positively opened by this run's preflight.
+  if (clockLease?.admission.kind === "opened") {
+    clockFinalize(agentId, outcome);
+    clockLease.finalized = true;
+  }
 
   // Commit the lane's process/delivery terminal (SYNC, digest marker last)
   // before exit so the reactor cannot mistake a completed lane for silence.
   refreshIdentityRoute();
   let delivery: DeliveryAssessment | undefined;
   if (outcome === "ran" && opts.thread) {
-    if (!deliveryReservationReady || !deliveryReservation || !runtime) {
+    if (!deliveryReservationReady || !deliveryReservation || !deliveryRuntime) {
       delivery = {
         deliveryOutcome: "unverified",
         deliveryReason: "delivery_reservation_unavailable_at_finalize",
@@ -572,7 +669,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       const reservedRunId = runId;
       let runState: DeliveryRunState | undefined;
       try {
-        runState = runtime.load(runId);
+        runState = deliveryRuntime.load(runId);
       } catch {
         runState = undefined;
       }
@@ -591,7 +688,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
           delivery = assessThreadDelivery(
             opts.thread,
             agentId,
-            (opts.loadThreadFacts ?? getThreadFacts)(opts.thread),
+            (injected.loadThreadFacts ?? getThreadFacts)(opts.thread),
             deliveryReservation.baselineDoneWhen.map(
               (value) => ({ predicate: "done_when", value }),
             ),
@@ -635,7 +732,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     // mirrors the identity write so a bare AGENT_MODEL spawn is still attributed.
     model: finalRoute.model,
     effort: finalRoute.effort,
-    role: opts.role,
+    role: routingMetadata.role,
     provider: routing.provider, providerTarget: routing.target, providerReason: routing.selectionReason,
     requestedProvider: routing.requestedProvider, requestedTarget: requested.target, requestedTier: requested.tier,
     requestedModel: requested.model, requestedEffort: requested.effort,
@@ -648,7 +745,8 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     envelopeRetries: envelopeAdmission?.retries,
     envelopeAdvisories: envelopeAdmission?.advisories,
     routingMetadata,
-    promptComposition: compositionEvidence,
+    promptComposition: admittedRoute?.evidence ?? injectedCompositionEvidence,
+    effectiveAuthority: admittedRoute?.authority,
     tokenUsage,
     durationMs: Number(process.hrtime.bigint() - runStartedAt) / 1_000_000,
     providerDurationMs: typeof resultMsg?.duration_ms === "number" ? resultMsg.duration_ms : undefined,
@@ -684,9 +782,11 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
 let bootstrapAuthorityGranted = false;
 
 export async function spawn(opts: SpawnOptions): Promise<string> {
+  const injected = takeSpawnTestRuntime<SpawnRuntime>(opts);
+  const admitted = allowlistedSpawnOptions(opts);
   const callerTopology = process.env.AGENT_TOPOLOGY;
   if (!bootstrapAuthorityGranted) assertCoordinationAuthority("spawn", callerTopology);
-  const composed = composeSpawnOptions(opts);
+  const composed = composeSpawnOptions(admitted);
   if (!bootstrapAuthorityGranted) {
     assertManagedChildTopology(
       "spawn", composed.routingMetadata.topology, callerTopology,
@@ -698,13 +798,31 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   // Pin the generated id so admission, telemetry, and the provider run name the
   // same lane. Admission completes before entitlement refresh or provider query.
   composed.agentId = agentId;
-  const admission = await admitResourceEnvelope({
-    agentId, tier: requestedTier, project: composed.project ?? context.project,
-    sessionId: composed.sessionId ?? context.sessionId,
-  });
-  for (const advisory of admission?.advisories ?? []) console.warn(`[envelope] advisory: ${advisory}`);
-  try { return await runSpawn(composed, admission); }
-  finally { await completeResourceEnvelope(admission); }
+  const clockLease: ManagedClockLease = {
+    admission: admitBillableClock({
+      agentId,
+      capabilities: gafferCapabilities(composed.routingMetadata),
+      cwd: process.cwd(),
+      threadId: composed.thread,
+    }),
+    finalized: false,
+  };
+  let admission: EnvelopeAdmission | undefined;
+  try {
+    admission = await admitResourceEnvelope({
+      agentId, tier: requestedTier, project: composed.project ?? context.project,
+      sessionId: composed.sessionId ?? context.sessionId,
+    });
+    for (const advisory of admission?.advisories ?? [])
+      console.warn(`[envelope] advisory: ${advisory}`);
+    return await runSpawn(composed, admission, clockLease, injected);
+  } finally {
+    try { await completeResourceEnvelope(admission); }
+    finally {
+      if (clockLease.admission.kind === "opened" && !clockLease.finalized)
+        clockStop(agentId);
+    }
+  }
 }
 
 // Spawn multiple agents in parallel — the core win over the bash swarm.
@@ -722,13 +840,6 @@ if (import.meta.main) {
   const prompt = process.argv.slice(2).join(" ");
   if (!prompt) {
     console.error("usage: bun run src/spawn.ts <prompt>");
-    process.exit(1);
-  }
-  const role = process.env.AGENT_ROLE;
-  if (!role) {
-    console.error(
-      "managed North spawn requires AGENT_ROLE selecting a canonical Gaffer preset or complete bespoke composition",
-    );
     process.exit(1);
   }
   const rawDelegateThread = process.env.NORTH_DELEGATE_THREAD_ID;
@@ -751,10 +862,9 @@ if (import.meta.main) {
     provider: process.env.AGENT_PROVIDER as ProviderPreference | undefined,
     target: process.env.AGENT_TARGET,
     tier: process.env.AGENT_TIER as SemanticTier | undefined,
-    role,
     thread: delegateThread,
     coordinator: process.env.AGENT_COORDINATOR,
-    routingMetadata: routingMetadataFromEnv(),
+    routingMetadata: routingRequestFromEnv("managed North spawn bootstrap"),
   })
     .then((result) => console.log(result))
     .catch((err) => {

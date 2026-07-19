@@ -15,13 +15,17 @@ import { z } from "zod";
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
-import { resolveGuard, evaluateGuards } from "./authoring-guards";
+import {
+  authoringGuardsOff, evaluateGuards, HOOKS_DIR, resolveManagedGuardChain,
+} from "./authoring-guards";
 import { recordDenial } from "./guard-log";
-import { resolveModelAlias, resolveModelDelta } from "./providers/catalog";
+import { resolveModelAlias, resolveModelDelta, resolveTier } from "./providers/catalog";
 import type { ProviderId } from "./providers/types";
-import type { RoutingMetadata, RoutingOverrideField, Topology } from "./routing-metadata";
-import { applyGafferStaffing, gafferCapabilities } from "./gaffer-staffing";
-import { validateRoutingMetadata } from "./routing-metadata";
+import {
+  type RoutingDraft, type RoutingOverrideField, type RoutingRequest, type Topology,
+} from "./routing-metadata";
+import { admitRoutingRequest } from "./routing-admission";
+import { gafferCapabilities } from "./gaffer-staffing";
 import type { GafferCapability } from "./gaffer-capabilities";
 import {
   BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION,
@@ -86,16 +90,16 @@ export function validatePeerCommandArgs(op: PeerOperation, args: Record<string, 
   if (!nonEmpty(workField) || !nonEmpty("role"))
     throw new Error(`${op} requires ${workField} and an explicit Gaffer role`);
   const presentRouting = PEER_ROUTING_FIELDS.filter((field) => Object.hasOwn(args, field));
-  if (presentRouting.length !== 1 && presentRouting.length !== PEER_ROUTING_FIELDS.length) {
+  if (presentRouting.length !== PEER_ROUTING_FIELDS.length) {
+    const missing = PEER_ROUTING_FIELDS.filter((field) => !Object.hasOwn(args, field));
     throw new Error(
-      `${op} routing must be role-only (canonical preset hydration) or the complete `
-      + `${PEER_ROUTING_FIELDS.join(", ")} envelope`,
+      `${op} requires the complete eight-field Gaffer request; missing: ${missing.join(", ")}`,
     );
   }
   const metadata = Object.fromEntries(
     PEER_ROUTING_FIELDS.filter((field) => Object.hasOwn(args, field)).map((field) => [field, args[field]]),
-  ) as RoutingMetadata;
-  applyGafferStaffing(validateRoutingMetadata(metadata));
+  ) as RoutingDraft;
+  admitRoutingRequest(metadata, `managed peer ${op}`);
 }
 
 export function sendPeerCommand(
@@ -244,39 +248,6 @@ export function managedToolPolicy(
   };
 }
 
-export interface EffectiveCapabilitySurface {
-  capabilities: string[];
-  builtins: string[];
-  managedTools: string[];
-}
-
-/**
- * The authority surface actually compiled into provider options. In particular,
- * this is not the dispatch posture's requested tool hint: a Gaffer contract can
- * and often does narrow that hint before the provider process is constructed.
- */
-export function effectiveCapabilitySurface(options: {
-  northCapabilities?: unknown;
-  tools?: unknown;
-  allowedTools?: unknown;
-}): EffectiveCapabilitySurface {
-  const strings = (value: unknown): string[] =>
-    Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-  return {
-    capabilities: strings(options.northCapabilities),
-    builtins: strings(options.tools),
-    managedTools: strings(options.allowedTools).filter((toolName) => toolName.startsWith("mcp__")),
-  };
-}
-
-export function formatEffectiveCapabilitySurface(
-  surface: EffectiveCapabilitySurface,
-): string {
-  const list = (values: readonly string[]) => values.length ? values.join(", ") : "(none)";
-  return `capabilities: ${list(surface.capabilities)}; `
-    + `builtins: ${list(surface.builtins)}; managed: ${list(surface.managedTools)}`;
-}
-
 function readonlyShellServer(cwd: string) {
   return createSdkMcpServer({
     name: READONLY_SHELL_SERVER,
@@ -328,7 +299,7 @@ export interface HarnessOpts {
   role?: string;
   posture?: string;
   provider?: ProviderId;
-  routingMetadata?: RoutingMetadata;
+  routingMetadata?: RoutingRequest;
   /** A live run may change models in-place, so no exact-model delta can remain valid. */
   omitModelDeltaReason?: string;
   caveman?: string; // resolved terse-output mode (off|lite|full); fallback env-or-full when omitted
@@ -671,7 +642,7 @@ function listLines(values: string[]): string {
   return values.map((value) => `- ${value}`).join("\n");
 }
 
-function bespokeRoleBlock(metadata: RoutingMetadata): string {
+function bespokeRoleBlock(metadata: RoutingRequest): string {
   if (metadata.composition?.kind !== "bespoke") throw new Error("bespoke role block requires bespoke composition");
   const c = metadata.composition.contract;
   return [
@@ -759,13 +730,44 @@ interface HarnessCompositionState {
   baseSystemPrompt: string;
   cwd: string;
   evidence: HarnessCompositionEvidence;
+  routingRequest?: RoutingRequest;
+  capabilities?: readonly GafferCapability[];
+  routeBase: Options;
   initialProvider?: ProviderId;
   initialModel?: string;
+  initialEffort?: Effort;
   omitModelDeltaReason?: string;
 }
 
 const harnessComposition = new WeakMap<object, HarnessCompositionState>();
 const appliedEvidence = new WeakMap<object, HarnessCompositionEvidence>();
+const harnessActivityRenewers = new WeakMap<object, () => void>();
+interface HarnessAuthoritySeal {
+  provider: ProviderId;
+  optionKeys: readonly string[];
+  systemPrompt: string;
+  routingRequest: RoutingRequest;
+  capabilities: readonly GafferCapability[];
+  evidence: HarnessCompositionEvidence;
+  env: object;
+  mcpServers: object;
+  mcpServerEntries: Array<[string, unknown]>;
+  northServer: object;
+  tools?: unknown;
+  allowedTools: unknown;
+  disallowedTools?: unknown;
+  settingSources?: unknown;
+  strictMcpConfig?: unknown;
+  permissionMode?: unknown;
+  agentId: string;
+  managedLane: "1";
+  topology: Topology;
+  cwd: string;
+  effort?: Effort;
+  model?: string;
+  maxTurns?: number;
+}
+const harnessAuthoritySeals = new WeakMap<object, HarnessAuthoritySeal>();
 interface AuthoringHookSealEntry {
   matcher?: string;
   hooks: unknown[];
@@ -773,19 +775,104 @@ interface AuthoringHookSealEntry {
 interface AuthoringHookSeal {
   topology?: string;
   entries: AuthoringHookSealEntry[];
+  postEntries: AuthoringHookSealEntry[];
   mcpServers: Array<[string, unknown]>;
 }
 const authoringHookSeals = new WeakMap<object, AuthoringHookSeal>();
 
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function sealHarnessAuthority(options: Options, provider: ProviderId): void {
+  const raw = options as any;
+  if (!raw.northRoutingRequest || !raw.northCapabilities) return;
+  const evidence = appliedEvidence.get(options as object);
+  const northServer = raw.mcpServers?.north;
+  if (!evidence || typeof raw.systemPrompt !== "string"
+      || !raw.env || !northServer || typeof raw.cwd !== "string") return;
+  harnessAuthoritySeals.set(options as object, {
+    provider,
+    optionKeys: Object.freeze(Object.keys(raw).sort()),
+    systemPrompt: raw.systemPrompt,
+    routingRequest: raw.northRoutingRequest,
+    capabilities: raw.northCapabilities,
+    evidence,
+    env: raw.env,
+    mcpServers: raw.mcpServers,
+    mcpServerEntries: Object.entries(raw.mcpServers),
+    northServer,
+    tools: raw.tools,
+    allowedTools: raw.allowedTools,
+    disallowedTools: raw.disallowedTools,
+    settingSources: raw.settingSources,
+    strictMcpConfig: raw.strictMcpConfig,
+    permissionMode: raw.permissionMode,
+    agentId: raw.env.AGENT_ID,
+    managedLane: raw.env.NORTH_MANAGED_LANE,
+    topology: raw.env.AGENT_TOPOLOGY,
+    cwd: raw.cwd,
+    effort: raw.effort,
+    model: raw.model,
+    maxTurns: raw.maxTurns,
+  });
+}
+
+/** Exact harness-owned authority receipt consumed by both provider adapters. */
+export function hasCanonicalHarnessAuthority(options: Options, provider: ProviderId): boolean {
+  const raw = options as any;
+  const seal = harnessAuthoritySeals.get(options as object);
+  const mcpServerEntries = Object.entries(raw.mcpServers ?? {});
+  const optionKeys = Object.keys(raw).sort();
+  return Boolean(
+    seal
+    && seal.provider === provider
+    && optionKeys.length === seal.optionKeys.length
+    && optionKeys.every((key, index) => key === seal.optionKeys[index])
+    && raw.systemPrompt === seal.systemPrompt
+    && raw.northRoutingRequest === seal.routingRequest
+    && raw.northCapabilities === seal.capabilities
+    && appliedEvidence.get(options as object) === seal.evidence
+    && raw.env === seal.env
+    && raw.mcpServers === seal.mcpServers
+    && mcpServerEntries.length === seal.mcpServerEntries.length
+    && mcpServerEntries.every(([name, server], index) =>
+      name === seal.mcpServerEntries[index]?.[0]
+      && server === seal.mcpServerEntries[index]?.[1])
+    && raw.mcpServers?.north === seal.northServer
+    && raw.tools === seal.tools
+    && raw.allowedTools === seal.allowedTools
+    && raw.disallowedTools === seal.disallowedTools
+    && raw.settingSources === seal.settingSources
+    && raw.strictMcpConfig === seal.strictMcpConfig
+    && raw.permissionMode === seal.permissionMode
+    && raw.env.AGENT_ID === seal.agentId
+    && raw.env.NORTH_MANAGED_LANE === seal.managedLane
+    && raw.env.AGENT_TOPOLOGY === seal.topology
+    && raw.cwd === seal.cwd
+    && raw.effort === seal.effort
+    && raw.model === seal.model
+    && raw.maxTurns === seal.maxTurns,
+  );
+}
+
 function sealAuthoringHooks(options: Options): void {
   const entries = (options.hooks as any)?.PreToolUse;
-  if (!Array.isArray(entries)) return;
-  authoringHookSeals.set(options as object, {
-    topology: (options.env as any)?.AGENT_TOPOLOGY,
-    entries: entries.map((entry: any) => ({
+  const postEntries = (options.hooks as any)?.PostToolUse;
+  if (!Array.isArray(entries) || !Array.isArray(postEntries)) return;
+  const snapshot = (values: any[]): AuthoringHookSealEntry[] =>
+    values.map((entry: any) => ({
       matcher: entry?.matcher,
       hooks: Array.isArray(entry?.hooks) ? [...entry.hooks] : [],
-    })),
+    }));
+  authoringHookSeals.set(options as object, {
+    topology: (options.env as any)?.AGENT_TOPOLOGY,
+    entries: snapshot(entries),
+    postEntries: snapshot(postEntries),
     mcpServers: Object.entries((options.mcpServers as any) ?? {}),
   });
 }
@@ -801,41 +888,59 @@ function inheritAuthoringHookSeal(source: Options, target: Options): void {
  */
 export function hasCanonicalAuthoringHooks(options: Options): boolean {
   const seal = authoringHookSeals.get(options as object);
+  const hookSurface = options.hooks as any;
   const entries = (options.hooks as any)?.PreToolUse;
+  const postEntries = (options.hooks as any)?.PostToolUse;
   const mcpServers = Object.entries((options.mcpServers as any) ?? {});
   if (!seal
+      || !hookSurface
+      || Object.keys(hookSurface).sort().join(",") !== "PostToolUse,PreToolUse"
       || (options.env as any)?.AGENT_TOPOLOGY !== seal.topology
       || !Array.isArray(entries)
+      || !Array.isArray(postEntries)
       || entries.length !== seal.entries.length
+      || postEntries.length !== seal.postEntries.length
       || mcpServers.length !== seal.mcpServers.length
       || mcpServers.some(([name, server], index) =>
         name !== seal.mcpServers[index][0] || server !== seal.mcpServers[index][1])) return false;
-  return seal.entries.every((expected, index) => {
-    const actual = entries[index];
-    return actual?.matcher === expected.matcher
-      && Array.isArray(actual?.hooks)
-      && actual.hooks.length === expected.hooks.length
-      && actual.hooks.every((hook: unknown, hookIndex: number) =>
-        hook === expected.hooks[hookIndex]);
-  });
+  const exactEntries = (actualEntries: any[], expectedEntries: AuthoringHookSealEntry[]) =>
+    expectedEntries.every((expected, index) => {
+      const actual = actualEntries[index];
+      const expectedKeys = expected.matcher === undefined ? ["hooks"] : ["hooks", "matcher"];
+      return actual && typeof actual === "object" && !Array.isArray(actual)
+        && Object.keys(actual).sort().join(",") === expectedKeys.join(",")
+        && actual.matcher === expected.matcher
+        && Array.isArray(actual?.hooks)
+        && actual.hooks.length === expected.hooks.length
+        && actual.hooks.every((hook: unknown, hookIndex: number) =>
+          hook === expected.hooks[hookIndex]);
+    });
+  return exactEntries(entries, seal.entries)
+    && exactEntries(postEntries, seal.postEntries);
 }
 
 /** Compose Gaffer's authority contracts. Missing canonical artifacts are fatal. */
-export function gafferAppendix(metadata: RoutingMetadata | undefined, cwd = process.cwd()): {
+export function gafferAppendix(metadata: RoutingDraft | undefined, cwd = process.cwd()): {
   appendix: string;
   evidence: HarnessCompositionEvidence;
 } {
   if (!metadata || Object.keys(metadata).length === 0) return { appendix: "", evidence: {} };
+  // Axis-only appendix composition remains useful for native/prompt tests, but
+  // selecting a managed role is an execution-grade act and therefore admits
+  // only the complete request before any authority prompt is constructed.
+  const admitted = metadata.role || metadata.composition
+    ? admitRoutingRequest(metadata, "Gaffer appendix")
+    : undefined;
+  const routing: RoutingDraft = admitted ?? metadata;
   const blocks: string[] = [];
   const evidence: HarnessCompositionEvidence = {};
-  if (metadata.role) {
-    const composition = metadata.composition;
-    if (!composition) throw new Error(`Gaffer role ${metadata.role} has no composition provenance`);
-    if (composition.id !== metadata.role)
-      throw new Error(`Gaffer composition ${composition.id} does not match role ${metadata.role}`);
+  if (admitted) {
+    const composition = admitted.composition;
+    if (composition.id !== admitted.role)
+      throw new Error(`Gaffer composition ${composition.id} does not match role ${admitted.role}`);
     if (composition.kind === "preset") {
-      const role = exactSectionFence(resolve(gafferDocs(), "roles.md"), metadata.role, `role:${metadata.role}`);
-      blocks.push(`## Gaffer role contract — preset:${metadata.role}\n${role}`);
+      const role = exactSectionFence(resolve(gafferDocs(), "roles.md"), admitted.role, `role:${admitted.role}`);
+      blocks.push(`## Gaffer role contract — preset:${admitted.role}\n${role}`);
       if (composition.overrides.length) {
         blocks.push([
           "## Gaffer preset override",
@@ -847,7 +952,7 @@ export function gafferAppendix(metadata: RoutingMetadata | undefined, cwd = proc
           .update(composition.overrideReason!).digest("hex");
       }
     } else {
-      blocks.push(`## Gaffer role contract — bespoke:${composition.id}\n${bespokeRoleBlock(metadata)}`);
+      blocks.push(`## Gaffer role contract — bespoke:${composition.id}\n${bespokeRoleBlock(admitted)}`);
       evidence.bespokeContractHash = bespokeContractFingerprint(composition.contract);
       evidence.bespokeContractFingerprintVersion = BESPOKE_FINGERPRINT_VERSION;
       evidence.bespokeContractFingerprintDomain = BESPOKE_FINGERPRINT_DOMAIN;
@@ -856,47 +961,45 @@ export function gafferAppendix(metadata: RoutingMetadata | undefined, cwd = proc
     evidence.roleId = composition.id;
     evidence.capabilities = composition.kind === "bespoke"
       ? canonicalGafferCapabilities(composition.contract.capabilities)
-      : gafferCapabilities(metadata);
+      : gafferCapabilities(admitted);
     const comms = exactSectionFence(resolve(gafferDocs(), "comms.md"), "universal", "comms:universal");
     blocks.push(`## Gaffer communication contract — universal\n${comms}`);
     evidence.commsContractHash = createHash("sha256").update(comms).digest("hex");
-  } else if (metadata.composition) {
-    throw new Error("Gaffer composition requires a role");
   }
-  if (metadata.taskGrade) {
+  if (routing.taskGrade) {
     const block = exactSectionFence(
-      resolve(gafferDocs(), "task-grades.md"), metadata.taskGrade, `task-grade:${metadata.taskGrade}`,
+      resolve(gafferDocs(), "task-grades.md"), routing.taskGrade, `task-grade:${routing.taskGrade}`,
     );
-    blocks.push(`## Gaffer task grade — ${metadata.taskGrade}\n${block}`);
-    evidence.taskGrade = metadata.taskGrade;
+    blocks.push(`## Gaffer task grade — ${routing.taskGrade}\n${block}`);
+    evidence.taskGrade = routing.taskGrade;
   }
-  if (metadata.domainRequirements?.length) {
-    blocks.push(domainContextGate(metadata.domainRequirements, cwd));
-    evidence.domainRequirements = [...metadata.domainRequirements];
+  if (routing.domainRequirements?.length) {
+    blocks.push(domainContextGate(routing.domainRequirements, cwd));
+    evidence.domainRequirements = [...routing.domainRequirements];
   }
-  if (metadata.topology) {
+  if (routing.topology) {
     const block = exactSectionFence(
-      resolve(gafferDocs(), "topologies.md"), metadata.topology, `topology:${metadata.topology}`,
+      resolve(gafferDocs(), "topologies.md"), routing.topology, `topology:${routing.topology}`,
     );
-    blocks.push(`## Gaffer topology — ${metadata.topology}\n${block}`);
-    evidence.topology = metadata.topology;
+    blocks.push(`## Gaffer topology — ${routing.topology}\n${block}`);
+    evidence.topology = routing.topology;
   }
-  if (metadata.tier || metadata.reasoning) {
+  if (routing.tier || routing.reasoning) {
     blocks.push([
       "## Gaffer capacity route",
-      `Semantic tier: ${metadata.tier ?? "unselected"}.`,
-      `Reasoning: ${metadata.reasoning ?? "unselected"}.`,
+      `Semantic tier: ${routing.tier ?? "unselected"}.`,
+      `Reasoning: ${routing.reasoning ?? "unselected"}.`,
       "Capacity does not widen the role, grade, topology, or domain authority above.",
     ].join("\n"));
-    evidence.tier = metadata.tier;
-    evidence.reasoning = metadata.reasoning;
+    evidence.tier = routing.tier;
+    evidence.reasoning = routing.reasoning;
   }
-  if (metadata.posture) {
+  if (routing.posture) {
     const block = exactSectionFence(
-      resolve(gafferDocs(), "postures.md"), metadata.posture, `posture:${metadata.posture}`,
+      resolve(gafferDocs(), "postures.md"), routing.posture, `posture:${routing.posture}`,
     );
-    blocks.push(`## Gaffer posture — ${metadata.posture}\n${block}`);
-    evidence.posture = metadata.posture;
+    blocks.push(`## Gaffer posture — ${routing.posture}\n${block}`);
+    evidence.posture = routing.posture;
   }
   return { appendix: blocks.length ? `\n\n${blocks.join("\n\n")}` : "", evidence };
 }
@@ -921,12 +1024,26 @@ function modelDeltaAppendix(provider?: ProviderId, model?: string, omitReason?: 
 }
 
 /** Rebuild a harness prompt for an exact provider/model route; never inherit a stale delta. */
-export function applyHarnessRoute(options: Options, provider: ProviderId, model?: string): {
+export function applyHarnessRoute(
+  options: Options,
+  provider: ProviderId,
+  model?: string,
+  effort?: Effort,
+): {
   options: Options;
   evidence?: HarnessCompositionEvidence;
 } {
   const state = harnessComposition.get(options as object);
   if (!state) return { options };
+  const sourceSeal = harnessAuthoritySeals.get(options as object);
+  if (sourceSeal && !hasCanonicalHarnessAuthority(options, sourceSeal.provider))
+    throw new Error("harness authority source mutated before route application");
+  if (state.routingRequest
+      && ((options as any).northRoutingRequest !== state.routingRequest
+        || (options as any).northCapabilities !== state.capabilities
+        || !hasCanonicalAuthoringHooks(options))) {
+    throw new Error("harness composition root mutated before route application");
+  }
   const concreteModel = resolveModelAlias(provider, model);
   const delta = modelDeltaAppendix(provider, concreteModel, state.omitModelDeltaReason);
   const systemPrompt = state.baseSystemPrompt
@@ -934,14 +1051,18 @@ export function applyHarnessRoute(options: Options, provider: ProviderId, model?
     + delta.appendix;
   if (provider === "anthropic") assertCanonicalGlobalAgentsExactlyOnce(systemPrompt);
   const next = {
-    ...options,
-    model: concreteModel ?? options.model,
+    ...state.routeBase,
+    model: concreteModel ?? state.initialModel,
+    effort: effort ?? state.initialEffort,
     systemPrompt,
   } as Options;
   harnessComposition.set(next as object, state);
+  const renewActivity = harnessActivityRenewers.get(options as object);
+  if (renewActivity) harnessActivityRenewers.set(next as object, renewActivity);
   inheritAuthoringHookSeal(options, next);
   const evidence = { ...state.evidence, modelDelta: delta.evidence };
-  appliedEvidence.set(next as object, evidence);
+  appliedEvidence.set(next as object, deepFreeze(evidence));
+  sealHarnessAuthority(next, provider);
   return { options: next, evidence };
 }
 
@@ -952,6 +1073,11 @@ export function harnessRouteSeed(options: Options): { provider?: ProviderId; mod
 
 export function harnessCompositionEvidence(options: Options): HarnessCompositionEvidence | undefined {
   return appliedEvidence.get(options as object) ?? harnessComposition.get(options as object)?.evidence;
+}
+
+/** Provider-neutral activity heartbeat used by both SDK and CLI adapters. */
+export function renewHarnessPresence(options: Options): void {
+  harnessActivityRenewers.get(options as object)?.();
 }
 
 /** Compatibility name for callers that only need role/posture blocks. */
@@ -990,53 +1116,73 @@ export function cavemanAppendix(mode?: string): string {
 // the interactive Bash matcher; keep both in lockstep with settings.json.
 //   Edit|Write|MultiEdit -> code-upstream, firn, north-clock
 //   Bash                 -> tripwire, firn, north-clock
-// Resolved (existence-checked) ONCE at module load — a missing script is dropped
-// silently so the SDK stays portable on a machine without the nixos-config checkout.
-const EDIT_GUARDS = ["code-upstream-guard.sh", "firn-guard.sh", "north-clock-guard.sh"]
-  .map(resolveGuard)
-  .filter((p): p is string => p !== null);
-const BASH_GUARDS = ["tripwire-guard.sh", "firn-guard.sh", "north-clock-guard.sh"]
-  .map(resolveGuard)
-  .filter((p): p is string => p !== null);
-const WORKER_BASH_GUARDS = [
+// Optional advisory guards are existence-checked once. The clock path is
+// retained unconditionally: missing/unexecutable is unavailable and denies.
+const EDIT_GUARDS = resolveManagedGuardChain([
+  "code-upstream-guard.sh", "firn-guard.sh", "north-clock-guard.sh",
+]);
+const BASH_GUARDS = resolveManagedGuardChain([
+  "tripwire-guard.sh", "firn-guard.sh", "north-clock-guard.sh",
+]);
+const WORKER_BASH_GUARDS = resolveManagedGuardChain([
   "agent-spawn-guard.sh", "tripwire-guard.sh", "firn-guard.sh", "north-clock-guard.sh",
-]
-  .map(resolveGuard)
-  .filter((p): p is string => p !== null);
+]);
+const REQUIRED_CLOCK_GUARD = resolve(HOOKS_DIR, "north-clock-guard.sh");
 
 // One matcher's callback: run its guard chain (first deny wins) over the hook input,
 // translate to HookJSONOutput. A deny blocks THIS tool call (permissionDecision:deny)
 // but does NOT halt the agent (`continue` stays default-true) — the worker sees the
-// reason and can clock in + retry, exactly like the interactive deny. Fail-open on any
-// internal error so a broken guard never bricks a worker.
+// reason and can clock in + retry, exactly like the interactive deny. The canonical
+// clock guard must positively classify every matched tool envelope: a live clock
+// yields "allow", a proven nonbillable envelope yields "not-applicable", and every
+// missing/empty/error/timeout/unknown result denies unavailable. This keeps shell
+// semantics in one guard instead of duplicating an inevitably incomplete classifier.
 async function guardHook(self: string, scripts: string[], input: unknown, topology?: Topology) {
+  const env = topology ? { ...process.env, AGENT_TOPOLOGY: topology } : process.env;
+  if (authoringGuardsOff(env)) return { continue: true };
+  const deny = (reason: string) => {
+    recordDenial(self, reason, input);
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse" as const,
+        permissionDecision: "deny" as const,
+        permissionDecisionReason: reason,
+      },
+    };
+  };
   try {
-    const env = topology ? { ...process.env, AGENT_TOPOLOGY: topology } : undefined;
-    const d = await evaluateGuards(scripts, input, 10000, env);
+    const d = await evaluateGuards(
+      scripts,
+      input,
+      10000,
+      env,
+      new Set([REQUIRED_CLOCK_GUARD]),
+    );
     if (d.decision === "deny") {
       // Durable trail: record the denial as a `kind guard_denial` fact so a worker
       // block is learnable after the fact (which agent, which guard, what target).
       // Fire-and-forget — never delay or break the tool call the guard decided.
-      recordDenial(self, d.reason, input);
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse" as const,
-          permissionDecision: "deny" as const,
-          permissionDecisionReason: d.reason,
-        },
-      };
+      return deny(d.reason);
     }
-  } catch {
-    /* fail-open */
-  }
+  } catch { return deny("billable_clock_guard_unavailable"); }
   return { continue: true };
 }
 
 export function harnessOptions(o: HarnessOpts): Options {
   const cwd = o.cwd ?? process.cwd();
-  const metadata = o.routingMetadata ?? (
-    o.role || o.posture ? { role: o.role, posture: o.posture as RoutingMetadata["posture"] } : undefined
-  );
+  const metadata = o.routingMetadata
+    ? admitRoutingRequest(o.routingMetadata, "managed North harness")
+    : undefined;
+  if (o.role !== undefined && (!metadata || o.role !== metadata.role))
+    throw new Error("harness role compatibility alias requires an equal complete routingMetadata request");
+  if (o.posture !== undefined && (!metadata || o.posture !== metadata.posture))
+    throw new Error("harness posture compatibility alias requires an equal complete routingMetadata request");
+  if (metadata && o.effort !== undefined && o.effort !== metadata.reasoning)
+    throw new Error("harness effort compatibility alias must equal routingMetadata.reasoning");
+  const effectiveEffort = metadata?.reasoning ?? o.effort;
+  const effectiveModel = o.provider && metadata
+    ? resolveTier(o.provider, metadata.tier, o.model, effectiveEffort).model
+    : o.model;
   const topology = metadata?.topology;
   const gaffer = gafferAppendix(metadata, cwd);
   const capabilities = gaffer.evidence.capabilities;
@@ -1062,12 +1208,17 @@ export function harnessOptions(o: HarnessOpts): Options {
     NORTH_RUN_ID: _inheritedRun,
     NORTH_THREAD_ID: _inheritedThread,
     NORTH_RUN_CAPABILITY: _inheritedCapability,
+    NORTH_MANAGED_LANE: _inheritedManagedLane,
+    NORTH_CODEX_BIN: _inheritedCodexOverride,
     ...ambientEnv
   } = process.env;
-  const childEnv = {
+  const childEnv = Object.freeze({
     ...ambientEnv,
     AGENT_ID: o.self,
     AGENT_TOPOLOGY: enforcementTopology,
+    // Sealed authority marker consumed by the system-managed Codex lifecycle
+    // wrappers. Ambient callers cannot inherit or forge managed-lane behavior.
+    NORTH_MANAGED_LANE: "1",
     ...(o.deliveryRun ? {
       NORTH_RUN_ID: o.deliveryRun.runId,
       NORTH_THREAD_ID: o.deliveryRun.threadId,
@@ -1076,7 +1227,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     // One explicit value feeds lane presence, provider CLI, North MCP, and
     // admission. Never let a later process ambient choose a different graph.
     NORTH_PORT: northPort(),
-  };
+  });
   // An injected registrar denotes a hermetic boundary: never pair it with a
   // real graph renewer implicitly. Tests/adapters that want both injected
   // phases supply presenceRenewer explicitly. Production (both omitted) keeps
@@ -1085,34 +1236,59 @@ export function harnessOptions(o: HarnessOpts): Options {
     ? undefined
     : o.presenceRenewer ?? (o.presenceRegistrar === undefined ? renewPresence : undefined);
   const readonlyShell = capabilities?.includes("shell.readonly") === true;
-  const northMcpEnv = managedNorthMcpEnvironment({ ...childEnv, NORTH_BIN: ENGINE });
+  const northMcpEnv = Object.freeze(
+    managedNorthMcpEnvironment({ ...childEnv, NORTH_BIN: ENGINE }),
+  );
+  const northMcpServer = Object.freeze({
+    type: "stdio", command: MCP,
+    args: Object.freeze([]) as unknown as string[],
+    env: northMcpEnv,
+  });
+  const mcpServers = Object.freeze({
+    north: northMcpServer,
+    ...(orchestrationAllowed
+      ? { "north-peer": Object.freeze(peerCommandServer(o.self)) }
+      : {}),
+    // Compile the minimum authority surface for every retry-safe route up
+    // front. Codex ignores Claude SDK tool allowlists and independently
+    // enforces --sandbox read-only; an Anthropic fallback must still inherit
+    // denied native Bash plus North's isolated read-only shell.
+    ...(readonlyShell
+      ? { [READONLY_SHELL_SERVER]: Object.freeze(readonlyShellServer(cwd)) }
+      : {}),
+  });
+  const sealedTools = policy
+    ? Object.freeze([...policy.tools]) as unknown as string[]
+    : undefined;
+  const sealedAllowedTools = Object.freeze([...allowedTools]) as unknown as string[];
+  const sealedDisallowedTools = disallowedTools.length
+    ? Object.freeze([...disallowedTools]) as unknown as string[]
+    : undefined;
+  const sealedSettingSources = policy
+    ? Object.freeze([]) as unknown as NonNullable<Options["settingSources"]>
+    : undefined;
   const initialInstructionAppendix = o.provider
     ? ""
     : globalLawsAppendix() + projectAgentsAppendix(cwd);
   const initialSystemPrompt = baseSystemPrompt + initialInstructionAppendix;
   if (!o.provider) assertCanonicalGlobalAgentsExactlyOnce(initialSystemPrompt);
   const options = {
-    mcpServers: {
-      north: { type: "stdio", command: MCP, args: [], env: northMcpEnv },
-      ...(orchestrationAllowed ? { "north-peer": peerCommandServer(o.self) } : {}),
-      // Compile the minimum authority surface for every retry-safe route up
-      // front. Codex ignores Claude SDK tool allowlists and independently
-      // enforces --sandbox read-only; an Anthropic fallback must still inherit
-      // denied native Bash plus North's isolated read-only shell.
-      ...(readonlyShell ? { [READONLY_SHELL_SERVER]: readonlyShellServer(cwd) } : {}),
-    },
+    mcpServers,
     ...(policy ? {
-      tools: policy.tools,
-      settingSources: [],
+      tools: sealedTools,
+      settingSources: sealedSettingSources,
       strictMcpConfig: true,
     } : {}),
-    allowedTools,
-    ...(disallowedTools.length ? { disallowedTools } : {}),
-    model: o.provider ? resolveModelAlias(o.provider, o.model) : o.model,
-    effort: o.effort, // the reasoning knob spawn.ts used to drop on the floor
+    allowedTools: sealedAllowedTools,
+    ...(sealedDisallowedTools ? { disallowedTools: sealedDisallowedTools } : {}),
+    model: o.provider ? resolveModelAlias(o.provider, effectiveModel) : effectiveModel,
+    effort: effectiveEffort,
     env: childEnv,
     permissionMode: capabilities && !capabilities.includes("filesystem.write") ? "default" : "acceptEdits",
-    ...(capabilities ? { northCapabilities: [...capabilities] } : {}),
+    ...(capabilities ? {
+      northCapabilities: Object.freeze([...capabilities]) as unknown as GafferCapability[],
+    } : {}),
+    ...(metadata ? { northRoutingRequest: metadata } : {}),
     cwd,
     systemPrompt: initialSystemPrompt,
     maxTurns: o.maxTurns ?? (Number(process.env.AGENT_MAX_TURNS) || 200),
@@ -1134,22 +1310,32 @@ export function harnessOptions(o: HarnessOpts): Options {
       }] }],
     },
   } as Options & { northCapabilities?: GafferCapability[] };
+  // Hooks are executable authority, not an advisory bag. Freeze the exact
+  // harness-owned surface and make every routed provider rebuild from this
+  // canonical root rather than spreading a caller-mutated retry object.
+  deepFreeze((options as any).hooks);
   const state: HarnessCompositionState = {
     baseSystemPrompt,
     cwd,
     evidence: gaffer.evidence,
+    routingRequest: metadata,
+    capabilities: (options as any).northCapabilities,
+    routeBase: Object.freeze({ ...options }) as Options,
     initialProvider: o.provider,
-    initialModel: o.model,
+    initialModel: effectiveModel,
+    initialEffort: effectiveEffort,
     omitModelDeltaReason: o.omitModelDeltaReason,
   };
   harnessComposition.set(options as object, state);
-  appliedEvidence.set(options as object, gaffer.evidence);
+  if (presenceRenewer)
+    harnessActivityRenewers.set(options as object, () => presenceRenewer(o.self));
+  appliedEvidence.set(options as object, deepFreeze(gaffer.evidence));
   sealAuthoringHooks(options);
   // Presence is an assertion that a runnable lane exists. Every synchronous
   // prompt/bootstrap contract for the initial route must succeed first, or a
   // malformed AGENTS/Gaffer/model source would leave a ghost roster entry.
   const routedOptions = o.provider
-    ? applyHarnessRoute(options, o.provider, o.model).options
+    ? applyHarnessRoute(options, o.provider, effectiveModel, effectiveEffort).options
     : options;
   if (o.presenceRegistrar !== false) (o.presenceRegistrar ?? registerPresence)(o.self, cwd);
   return routedOptions;

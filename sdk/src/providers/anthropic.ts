@@ -15,7 +15,7 @@ import {
   READONLY_SHELL_SERVER, READONLY_SHELL_TOOL,
 } from "../readonly-shell";
 import {
-  COORDINATION_TOOLS, hasCanonicalAuthoringHooks, managedToolPolicy,
+  COORDINATION_TOOLS, hasCanonicalAuthoringHooks, hasCanonicalHarnessAuthority, managedToolPolicy,
   NATIVE_AGENT_TOOLS, ORCHESTRATION_TOOLS,
 } from "../harness";
 
@@ -92,6 +92,8 @@ function validateAnthropicHarness(options: any): ReturnType<typeof requireGaffer
   const capabilities = requireGafferCapabilities(
     options.northCapabilities, "northCapabilities",
   );
+  if (!hasCanonicalHarnessAuthority(options, "anthropic"))
+    throw new ProviderRetrySafeError("anthropic_harness_authority_seal_missing");
   validateManagedExecutionEnvelope("anthropic", capabilities, options);
   admitPinnedProvider("anthropic", capabilities);
   const policy = managedToolPolicy(capabilities);
@@ -226,8 +228,9 @@ function createAnthropicQuery(
   };
 }
 
-export const anthropicProvider: AgentProvider = {
+const canonicalAnthropicProvider: AgentProvider = {
   id: "anthropic",
+  liveInput: "streaming",
   probe(target): ProviderAvailability {
     return probeAnthropic(target);
   },
@@ -239,3 +242,7 @@ export const anthropicProvider: AgentProvider = {
     return createAnthropicQuery(args, admitted);
   },
 };
+
+export const anthropicProvider: AgentProvider = Object.freeze(
+  canonicalAnthropicProvider,
+);

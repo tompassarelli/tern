@@ -3,6 +3,7 @@ import type { Effort } from "../harness";
 
 export type ProviderId = "anthropic" | "openai";
 export type ProviderPreference = ProviderId | "auto";
+export type LiveInputCapability = "streaming" | "unsupported";
 export interface RoutingRequest {
   provider?: ProviderPreference;
   /** Exact target pin. Exact pins never fall back to another target. */
@@ -210,8 +211,19 @@ export interface RoutingFallbackReason {
   toProvider: ProviderId;
 }
 
+export interface ProviderFallbackTransition {
+  fromTarget: string;
+  fromProvider: ProviderId;
+  fromLiveInput: LiveInputCapability;
+  toTarget: string;
+  toProvider: ProviderId;
+  toLiveInput: LiveInputCapability;
+}
+
 export interface AgentProvider {
   id: ProviderId;
+  /** Whether this adapter can consume user turns after its initial prompt. */
+  liveInput: LiveInputCapability;
   probe(target?: RoutingTarget): ProviderAvailability;
   /** Fail before a provider can accept the turn when the compiled harness is unenforceable. */
   admit?(args: { options: Options; target?: RoutingTarget }): Promise<void> | void;

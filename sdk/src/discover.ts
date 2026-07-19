@@ -12,6 +12,8 @@ import { execSync } from "node:child_process";
 import { dispatch } from "./dispatch";
 import { ProviderSelectionError } from "./provider-routing";
 import { DispatchAlreadyActiveError } from "./dispatch-driver";
+import type { RoutingRequest } from "./routing-metadata";
+import { admitRoutingRequest, routingRequestFromEnv } from "./routing-admission";
 
 export interface ReadyThread {
   id: string;
@@ -32,21 +34,21 @@ function readyThreads(): ReadyThread[] {
 }
 
 export interface DiscoverOpts {
-  role: string; // explicit Gaffer preset/bespoke role for every discovered dispatch
+  routingRequest: RoutingRequest;
   maxTasks?: number; // stop after N completed (default: unbounded)
   maxEmptyRounds?: number; // stop after N consecutive unsuccessful rounds (default 5)
 }
 
 export interface DiscoverDependencies {
   readyThreads: () => ReadyThread[];
-  dispatch: (thread: string, role: string) => Promise<unknown>;
+  dispatch: (thread: string, routingRequest: RoutingRequest) => Promise<unknown>;
   sleep: (ms: number) => Promise<void>;
   random: () => number;
 }
 
 const defaultDependencies: DiscoverDependencies = {
   readyThreads,
-  dispatch: (thread, role) => dispatch(thread, { routingMetadata: { role } }),
+  dispatch: (thread, routingRequest) => dispatch(thread, { routingMetadata: routingRequest }),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   random: Math.random,
 };
@@ -70,8 +72,9 @@ export async function discover(
   opts: DiscoverOpts,
   overrides: Partial<DiscoverDependencies> = {},
 ): Promise<string[]> {
-  const role = opts.role?.trim();
-  if (!role) throw new Error("managed discovery requires an explicit Gaffer role");
+  const routingRequest = admitRoutingRequest(
+    opts.routingRequest ?? {}, "managed North discovery",
+  );
   const dependencies = { ...defaultDependencies, ...overrides };
   const maxTasks = opts.maxTasks ?? Infinity;
   const maxEmpty = opts.maxEmptyRounds ?? 5;
@@ -93,7 +96,7 @@ export async function discover(
       let failure: unknown;
       let failed = false;
       try {
-        await dependencies.dispatch(t.id, role);
+        await dependencies.dispatch(t.id, routingRequest);
         attempted = true;
         done.push(t.id);
         unsuccessfulRounds = 0;
@@ -120,12 +123,10 @@ export async function discover(
 if (import.meta.main) {
   const self = process.env.AGENT_ID ?? `sdk-disc-${Date.now().toString(36).slice(-6)}`;
   const maxTasks = process.env.DISCOVER_MAX ? Number(process.env.DISCOVER_MAX) : undefined;
-  const role = process.env.AGENT_ROLE;
-  if (!role) {
-    console.error("managed discovery requires AGENT_ROLE selecting a Gaffer staffing role");
-    process.exit(1);
-  }
-  discover(self, { role, maxTasks }).catch((e) => {
+  discover(self, {
+    routingRequest: routingRequestFromEnv("managed North discovery bootstrap"),
+    maxTasks,
+  }).catch((e) => {
     console.error(e);
     process.exit(1);
   });

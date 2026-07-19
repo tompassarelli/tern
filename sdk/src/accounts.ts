@@ -68,7 +68,7 @@ export const ACCOUNT_CONFIG_ALLOWLIST: Record<AccountProvider, readonly string[]
     "keybindings",
     "themes",
   ],
-  openai: ["AGENTS.md", "config.toml", "hooks.json", "rules", "skills"],
+  openai: ["AGENTS.md", "config.toml", "rules", "skills"],
 };
 
 function homeOf(context: AccountContext): string {
@@ -182,6 +182,25 @@ export function bootstrapAccountConfig(account: ProviderAccount, context: Accoun
   ensurePrivateDirectory(join(accountsRoot(context), account.provider));
   ensurePrivateDirectory(account.root);
   if (account.provider === "openai") ensurePrivateDirectory(join(account.root, "sqlite"));
+
+  // Codex hooks are now enforced exclusively by root-managed requirements.
+  // Retire only the exact legacy ambient symlink North itself created; a user
+  // file or differently targeted link is outside this migration's authority
+  // and remains untouched (and ignored by allow_managed_hooks_only policy).
+  if (account.provider === "openai") {
+    const legacySource = join(sourceRoot, "hooks.json");
+    const legacyDestination = join(account.root, "hooks.json");
+    try {
+      if (matchesConfigLink(legacyDestination, legacySource))
+        unlinkSync(legacyDestination);
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) {
+        const info = lstatSync(legacyDestination);
+        if (info.isSymbolicLink() && readlinkSync(legacyDestination) === legacySource)
+          throw error;
+      }
+    }
+  }
 
   const linked: string[] = [];
   for (const name of ACCOUNT_CONFIG_ALLOWLIST[account.provider]) {

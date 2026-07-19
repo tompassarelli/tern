@@ -9,12 +9,13 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import type { RoutingMetadata } from "./routing-metadata";
+import type { RoutingRequest } from "./routing-metadata";
 import type { NormalizedTokenUsage } from "./usage";
 import type { AllocationEvidence, RoutingFallbackReason } from "./providers/types";
 import type { HarnessCompositionEvidence } from "./harness";
 import { GAFFER_CAPABILITIES } from "./gaffer-capabilities";
 import type { DeliveryProof } from "./delivery-verification";
+import type { ProviderAuthoritySurface } from "./providers";
 
 const REPO = resolve(import.meta.dir, "../..");
 const internalWriter = resolve(REPO, "cli/run-fact-internal.clj");
@@ -43,9 +44,11 @@ export interface RunRecord {
   requestedTier?: string;
   requestedModel?: string;
   requestedEffort?: string;
-  routingMetadata?: RoutingMetadata;
+  routingMetadata?: RoutingRequest;
   /** Redacted identifiers proving which operational prompt/tool contracts were applied. */
   promptComposition?: HarnessCompositionEvidence;
+  /** Exact provider-executable authority from the final admitted route. */
+  effectiveAuthority?: ProviderAuthoritySurface;
   allocationMode?: string;
   entitlementPressure?: string;
   allocationEvidence?: Record<string, AllocationEvidence>;
@@ -112,6 +115,30 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (rec.provider) facts.push(["provider", rec.provider]);
   if (rec.providerTarget) facts.push(["provider_target", rec.providerTarget]);
   if (rec.providerReason) facts.push(["provider_reason", rec.providerReason]);
+  const authority = rec.effectiveAuthority;
+  if (authority) {
+    if (rec.provider && authority.provider !== rec.provider) {
+      throw new Error(
+        `effective authority provider ${authority.provider} does not match final provider ${rec.provider}`,
+      );
+    }
+    facts.push(["effective_authority_provider", authority.provider]);
+    facts.push(["effective_native_multi_agent", authority.nativeMultiAgent]);
+    facts.push(["effective_live_input", authority.liveInput]);
+    facts.push(["effective_authoring_hooks", authority.authoringHooks]);
+    for (const capability of authority.capabilities)
+      facts.push(["effective_authority_capability", capability]);
+    for (const tool of authority.northEnabledTools)
+      facts.push(["effective_north_enabled_tool", tool]);
+    if (authority.provider === "openai") {
+      facts.push(["effective_sandbox", authority.sandbox]);
+      facts.push(["effective_web", authority.web]);
+    } else {
+      facts.push(["effective_web", authority.web]);
+      for (const tool of authority.builtins) facts.push(["effective_builtin", tool]);
+      for (const tool of authority.managedTools) facts.push(["effective_mcp_tool", tool]);
+    }
+  }
   if (rec.requestedProvider) facts.push(["requested_provider", rec.requestedProvider]);
   if (rec.requestedTarget) facts.push(["requested_target", rec.requestedTarget]);
   if (rec.requestedTier) facts.push(["requested_tier", rec.requestedTier]);
@@ -222,7 +249,17 @@ export function recordRun(
   id = newRunId(rec.agent),
   timeoutMs = 10_000,
 ): Promise<RunPublicationStatus> {
-  const facts = runFacts(rec);
+  let facts: Array<[string, string]>;
+  try {
+    facts = runFacts(rec);
+  } catch (error) {
+    console.error(
+      `[telemetry] @${id} unavailable: ${
+        error instanceof Error ? error.message : "run fact serialization failed"
+      }`,
+    );
+    return Promise.resolve("unavailable");
+  }
   return new Promise((resolvePublication) => {
     let resolved = false;
     const settle = (status: RunPublicationStatus) => {

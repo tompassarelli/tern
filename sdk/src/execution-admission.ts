@@ -5,6 +5,8 @@ import type { GafferCapability } from "./gaffer-capabilities";
 import { providerCapabilityRejectionCode } from "./gaffer-capabilities";
 import { preflightReadonlyShell, ReadonlyShellUnavailableError } from "./readonly-shell";
 import { ProviderRetrySafeError, type ProviderId } from "./providers/types";
+import { admitRoutingRequest } from "./routing-admission";
+import { gafferCapabilities } from "./gaffer-staffing";
 
 const REPO = resolve(import.meta.dir, "../..");
 const ENGINE = `${REPO}/bin/north`;
@@ -89,6 +91,13 @@ function sameStringMap(actual: unknown, expected: Record<string, string>): boole
     && Object.keys(expected).every((key) => Object.hasOwn(actual, key));
 }
 
+function deeplyFrozen(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (!Object.isFrozen(value)) return false;
+  return Object.values(value as Record<string, unknown>)
+    .every((child) => !child || typeof child !== "object" || deeplyFrozen(child));
+}
+
 /**
  * Carry one successful async admission across the synchronous provider.query
  * construction seam. The receipt is scoped to the exact options object and
@@ -133,6 +142,22 @@ export function validateManagedExecutionEnvelope(
   options: any,
 ): void {
   const topology = capabilities.includes("coordination") ? "orchestrator" : "worker";
+  try {
+    if (!deeplyFrozen(options?.northRoutingRequest))
+      throw new Error("managed routing request is not immutable");
+    const request = admitRoutingRequest(
+      options.northRoutingRequest, `${provider} managed execution`,
+    );
+    const expectedCapabilities = gafferCapabilities(request);
+    if (request.topology !== topology
+        || JSON.stringify(expectedCapabilities) !== JSON.stringify(capabilities)) {
+      throw new Error("managed routing request disagrees with compiled capability authority");
+    }
+  } catch (cause) {
+    throw new ExecutionAdmissionError(
+      `${provider}_managed_gaffer_request_contract_missing`, { cause },
+    );
+  }
   const agentId = typeof options?.env?.AGENT_ID === "string"
     ? options.env.AGENT_ID.trim()
     : "";

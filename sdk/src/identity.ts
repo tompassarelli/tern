@@ -16,7 +16,10 @@ import {
 } from "./bespoke-contract";
 import type { ExecutionTerminal } from "./execution-outcome";
 import { classifyExecutionTerminal } from "./execution-outcome";
+import type { LiveInputCapability } from "./providers/types";
 export { bespokeContractFingerprint } from "./bespoke-contract";
+
+export type LiveInputState = "pending" | "armed" | "frozen";
 
 // NORTH_BIN override mirrors death.ts/clock.ts/children.ts/watchdog.ts, so the whole
 // coordinator-writing surface resolves the SAME engine — and a hermetic test that points
@@ -36,6 +39,10 @@ export interface ObservedAgentIdentity {
   model?: string; // tier name as spawned (opus|sonnet|haiku); SDK resolves the full id
   provider?: string;
   providerTarget?: string;
+  liveInput?: LiveInputCapability;
+  liveInputState?: LiveInputState;
+  /** Opaque UUIDv4 route generation; changes on every live-input/route publication. */
+  liveInputEpoch?: string;
   effort?: string;
   compositionKind?: "preset" | "bespoke" | "none";
   compositionId?: string;
@@ -60,6 +67,9 @@ export interface ObservedAgentIdentity {
 export interface ManagedLaneIdentity extends ObservedAgentIdentity {
   kind: "lane";
   role: string;
+  liveInput: LiveInputCapability;
+  liveInputState: LiveInputState;
+  liveInputEpoch: string;
   compositionKind: "preset" | "bespoke";
   compositionId: string;
 }
@@ -79,7 +89,7 @@ const shortModel = (m?: string) => {
 };
 const idSuffix = (id: string) => component(id.split("-").at(-1));
 const ROUTING_OVERRIDE_FIELDS = new Set([
-  "taskGrade", "domainRequirements", "topology", "tier", "reasoning", "posture",
+  "taskGrade", "domainRequirements", "tier", "reasoning", "posture",
 ]);
 const SAFE_ROLE_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -150,6 +160,9 @@ export function agentRouteFacts(agentId: string, f: AgentIdentity): Array<[strin
   return [
     ["provider", f.provider],
     ["provider_target", f.providerTarget],
+    ["live_input", f.liveInput],
+    ["live_input_state", f.liveInputState],
+    ["live_input_epoch", f.liveInputEpoch],
     ["model", f.model],
     ["effort", f.effort],
     ["display_handle", semanticHandle(agentId, f)],
@@ -237,6 +250,9 @@ export function agentIdentityFacts(
     ["model", f.model],
     ["provider", f.provider],
     ["provider_target", f.providerTarget],
+    ["live_input", f.liveInput],
+    ["live_input_state", f.liveInputState],
+    ["live_input_epoch", f.liveInputEpoch],
     ["effort", f.effort],
     ["composition_kind", f.compositionKind],
     ["composition_id", f.compositionId],

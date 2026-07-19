@@ -36,13 +36,18 @@ function canonicalTextSet(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.length === 0)
     throw new Error(`bespoke contract ${field} must be a non-empty string array`);
   const normalized = value.map((entry) => canonicalText(entry, field));
+  if (new Set(normalized).size !== normalized.length)
+    throw new Error(`bespoke contract ${field} must not contain duplicates`);
   return [...new Set(normalized)].sort();
 }
 
 export function canonicalGafferCapabilities(value: unknown): GafferCapability[] {
   if (!Array.isArray(value) || value.length === 0)
     throw new Error("bespoke contract capabilities must be a non-empty array");
-  const requested = new Set(value.map((entry) => canonicalText(entry, "capabilities")));
+  const normalized = value.map((entry) => canonicalText(entry, "capabilities"));
+  if (new Set(normalized).size !== normalized.length)
+    throw new Error("bespoke contract capabilities must not contain duplicates");
+  const requested = new Set(normalized);
   const unknown = [...requested].filter((entry) => !GAFFER_CAPABILITIES.includes(entry as GafferCapability));
   if (unknown.length)
     throw new Error(`bespoke contract capabilities contain unknown values: ${unknown.join(", ")}`);
