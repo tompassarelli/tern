@@ -8,7 +8,12 @@
 const ERROR_STREAK = Number(process.env.STRUGGLE_ERROR_STREAK) || 3;
 const LOOP_REPEAT = Number(process.env.STRUGGLE_LOOP_REPEAT) || 3;
 const LOOP_WINDOW = Number(process.env.STRUGGLE_LOOP_WINDOW) || 20;
-const STALL_TURNS = Number(process.env.STRUGGLE_STALL_TURNS) || 6;
+// no_progress stall threshold is topology-bound: an orchestrator/director legitimately
+// spends more turns coordinating fan-out before its own tool calls show progress, so it
+// gets a wider window. Worker (and unknown/unset topology, the conservative default)
+// keeps the original tighter bound.
+const WORKER_STALL_TURNS = Number(process.env.STRUGGLE_STALL_TURNS) || 6;
+const ORCHESTRATOR_STALL_TURNS = Number(process.env.STRUGGLE_STALL_TURNS_ORCHESTRATOR) || 12;
 
 // Tools whose SUCCESSFUL result counts as forward progress (work recorded / files
 // changed). A run that keeps producing these isn't stuck, however many turns it takes.
@@ -19,6 +24,10 @@ const PROGRESS_TOOLS = new Set([
 
 export type StruggleTrigger = "consecutive_errors" | "tool_loop" | "no_progress";
 
+// Only "orchestrator" widens the no_progress window; every other value (including
+// "worker" and unknown/unset topology) gets the conservative worker default.
+export type StruggleTopology = "worker" | "orchestrator" | undefined;
+
 export interface StruggleState {
   turn: number; // assistant-turn counter
   consecutiveErrors: number;
@@ -26,10 +35,12 @@ export interface StruggleState {
   lastProgressTurn: number;
   fingerprints: string[]; // ring of recent tool-call fingerprints (<= LOOP_WINDOW)
   pending: Map<string, string>; // tool_use_id -> tool name, to classify the matching result
+  stallTurns: number; // resolved no_progress threshold for this lane's topology
 }
 
-export function makeStruggleState(): StruggleState {
-  return { turn: 0, consecutiveErrors: 0, totalErrors: 0, lastProgressTurn: 0, fingerprints: [], pending: new Map() };
+export function makeStruggleState(topology?: StruggleTopology): StruggleState {
+  const stallTurns = topology === "orchestrator" ? ORCHESTRATOR_STALL_TURNS : WORKER_STALL_TURNS;
+  return { turn: 0, consecutiveErrors: 0, totalErrors: 0, lastProgressTurn: 0, fingerprints: [], pending: new Map(), stallTurns };
 }
 
 function fingerprint(name: string, input: unknown): string {
@@ -75,6 +86,6 @@ export function checkStruggle(st: StruggleState): StruggleTrigger | null {
     counts.set(f, n);
     if (n >= LOOP_REPEAT) return "tool_loop";
   }
-  if (st.turn - st.lastProgressTurn >= STALL_TURNS) return "no_progress";
+  if (st.turn - st.lastProgressTurn >= st.stallTurns) return "no_progress";
   return null;
 }

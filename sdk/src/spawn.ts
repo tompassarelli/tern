@@ -196,7 +196,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       if (required) throw error;
     }
   };
-  const st = makeStruggleState();
+  const st = makeStruggleState(routingMetadata.topology);
   // Harness-observed struggle sensors run on EVERY spawn now (in-flight escalation
   // retired). A fired sensor leaves a stderr breadcrumb once per reason and a terminal
   // `struggle <reason>` run fact — execution-axis evidence for D2 diagnosis, not a model swap.

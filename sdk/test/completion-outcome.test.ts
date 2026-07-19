@@ -892,3 +892,47 @@ test("a struggle sensor firing records a struggle run fact without any in-flight
   expect(logged).toContain("tell agent:test-struggle-lane model claude-opus-4-8");
   expect(logged).not.toContain("outcome provider_escalation_unsupported");
 });
+
+test("no_progress threshold is topology-bound: worker fires at 6, orchestrator waits until 12", async () => {
+  // Bounded topology-aware no_progress threshold fix (thread 019f7b9d-8bad): a director/
+  // orchestrator lane legitimately spends more turns coordinating fan-out before its own
+  // tool calls look like progress, so it gets a wider no_progress window than a worker.
+  // Unknown/unset topology must fall back to the conservative worker default — never
+  // silently inherit the wider orchestrator bound.
+  const { makeStruggleState, updateStruggle, checkStruggle } = await import("../src/struggle");
+
+  // Advance one assistant turn with a successful, non-progress, non-error, distinct
+  // tool call so neither consecutive_errors nor tool_loop trips — isolates no_progress.
+  const advance = (st: ReturnType<typeof makeStruggleState>, i: number) => {
+    updateStruggle({ type: "assistant", message: { content: [
+      { type: "tool_use", id: `t${i}`, name: "Bash", input: { i } },
+    ] } }, st);
+    updateStruggle({ type: "user", message: { content: [
+      { type: "tool_result", tool_use_id: `t${i}`, is_error: false },
+    ] } }, st);
+  };
+
+  // Worker (explicit) stalls at the original threshold: null through turn 5, fires at 6.
+  const worker = makeStruggleState("worker");
+  for (let i = 1; i <= 5; i++) { advance(worker, i); expect(checkStruggle(worker)).toBeNull(); }
+  advance(worker, 6);
+  expect(checkStruggle(worker)).toBe("no_progress");
+
+  // Orchestrator gets the wider bound: still null at 8 and 11, fires at 12.
+  const orchestrator = makeStruggleState("orchestrator");
+  for (let i = 1; i <= 8; i++) advance(orchestrator, i);
+  expect(checkStruggle(orchestrator)).toBeNull();
+  for (let i = 9; i <= 11; i++) advance(orchestrator, i);
+  expect(checkStruggle(orchestrator)).toBeNull();
+  advance(orchestrator, 12);
+  expect(checkStruggle(orchestrator)).toBe("no_progress");
+
+  // Unknown/unset topology is NOT the wider bound — it stays the worker default.
+  const unknown = makeStruggleState(undefined);
+  for (let i = 1; i <= 5; i++) { advance(unknown, i); expect(checkStruggle(unknown)).toBeNull(); }
+  advance(unknown, 6);
+  expect(checkStruggle(unknown)).toBe("no_progress");
+
+  // Trigger vocabulary is unchanged by this fix.
+  expect(checkStruggle(worker)).toBe("no_progress");
+});
