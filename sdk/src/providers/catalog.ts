@@ -166,10 +166,9 @@ export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: s
     );
   }
 
-  // Anthropic frontier resolves per Gaffer provider config with NO hidden model
-  // swap (the temporary Fable promotion window expired 2026-07-20T04:00Z and its
-  // machinery is retired). An explicit model always wins; unspecified effort
-  // defaults to the tier's declared default.
+  // Resolve only the route declared by Gaffer. North never performs a hidden
+  // time-gated model substitution. An explicit model wins; unspecified effort
+  // defaults to the route's declared value.
   const resolvedModel = resolveModelAlias(provider, model ?? (entry.model === "auto" ? undefined : entry.model));
   const resolvedEffort = effort ?? entry.defaultEffort ?? entry.defaultReasoning;
   assertModelEffortPair(

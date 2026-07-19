@@ -24,7 +24,7 @@ const MANAGED_ENV = [
   "AGENT_ID", "NORTH_AGENT_ID", "AGENT_COORDINATOR", "AGENT_MODEL", "AGENT_ROLE", "AGENT_EFFORT",
   "AGENT_IDENTITY_ROLE", "AGENT_TARGET",
   "AGENT_TIER", "AGENT_REASONING", "AGENT_POSTURE", "AGENT_TOPOLOGY", "AGENT_TASK_GRADE",
-  "AGENT_DOMAIN_REQUIREMENTS", "AGENT_COMPOSITION", "NORTH_FABLE_NOW",
+  "AGENT_DOMAIN_REQUIREMENTS", "AGENT_COMPOSITION",
   "NORTH_ROUTING_POLICY", "NORTH_ENVELOPE_ACCOUNTING",
   "NORTH_BG_MAX_CONTINUATIONS", "NORTH_STALL_MS", "NORTH_TERMINAL_PUBLICATION_BUDGET_MS",
   "NORTH_PROVIDER_OBSERVATIONS", "NORTH_ALLOCATION_MODE", "NORTH_PROVIDER_ORDER",
@@ -1527,7 +1527,6 @@ async function settledRunLines(agent: string, requiredSuffix = "error_count 0"):
 test("public spawn composes justified explicit axes before Gaffer hydration", async () => {
   const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
-  process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   let queryOptions: any;
   const queryFn: any = (args: any) => {
     queryOptions = args.options;
@@ -1559,7 +1558,6 @@ test("public spawn composes justified explicit axes before Gaffer hydration", as
 test("public role-only integrator spawn hydrates the complete Gaffer preset", async () => {
   const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
-  process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   let queryOptions: any;
   const queryFn: any = (args: any) => {
     queryOptions = args.options;
@@ -1679,7 +1677,7 @@ test("a struggle sensor firing records a struggle run fact without any in-flight
   expect(logged).toContain("struggle_detector_policy_version north:struggle-observer:v1");
   expect(logged).toContain("struggle_error_streak_threshold 3");
   console.log(`[bar-evidence] ${logged.split("\n").find((l) => l.includes("struggle consecutive_errors"))}`);
-  // The run still finished normally at its original route — no ladder climb.
+  // The run still finished normally at its immutable admitted route.
   expect(modelChanged).toBe(false);
   expect(logged).toContain("tell agent:test-struggle-lane model claude-opus-4-8");
   expect(logged).not.toContain("outcome provider_escalation_unsupported");

@@ -286,8 +286,8 @@ export function writeAgentFacts(agentId: string, f: ManagedLaneIdentity): void {
 }
 
 // Refresh the route projection without resetting generation identity. This is
-// used when a pre-side-effect provider fallback activates or an in-flight
-// escalation changes model/effort. The control key and spawned_at stay stable.
+// used when a pre-side-effect provider fallback activates. The control key and
+// spawned_at stay stable; the route is immutable once side effects begin.
 export function updateAgentRoute(agentId: string, f: AgentIdentity): void {
   const route = Object.fromEntries(agentRouteFacts(agentId, f)
     .filter((fact): fact is [string, string] => fact[1] !== undefined && fact[1] !== ""));

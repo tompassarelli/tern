@@ -327,10 +327,12 @@ already contain an exact aggregate remain readable.
 ## Adapter boundary
 
 Provider imports remain confined to `~/code/north/sdk/src/providers`. Anthropic
-uses the Claude Agent SDK; OpenAI uses the authenticated Codex CLI and its ChatGPT
-subscription. Both receive the target-specific environment and shared North
-supervision. Live mid-run steering and model escalation remain capability-checked:
-unsupported escalation fails visibly rather than pretending it succeeded.
+uses the Claude Agent SDK; managed OpenAI lanes use one authenticated Codex
+app-server process and unmanaged compatibility calls use the Codex CLI. Both
+receive the target-specific environment and shared North supervision. Live
+mid-run steering remains capability-checked. Provider, target, model, and
+reasoning are immutable once side effects begin; a higher route is a new,
+explicitly dispatched lane rather than a hidden in-flight mutation.
 
 Every managed provider turn preflights the canonical North MCP executable and a
 live coordinator, including terminal workers: missing North is a blocked
@@ -343,14 +345,14 @@ the Claude query. Codex independently disables its native multi-agent surface
 and restricts worker-visible North tools from the canonical capability contract,
 not from optional Claude-shaped deny metadata.
 
-The escalation ladder is provider-local and projected from Gaffer's tier
-catalog at run admission. It contains concrete model IDs and declared
-reasoning levels only; repeated tier boundaries are deduplicated. North then
-applies the active transport's live-control ceiling (the current Claude Agent
-SDK cannot set `max` in flight). An unknown or pinned route is treated as a
-ceiling, never silently mapped down to a cheaper default. The temporary Fable
-promotion is a bounded Anthropic runtime rung and disappears at its clock gate.
-An in-flight escalation can never change providers or accounts.
+Gaffer supplies static model/tier/reasoning compatibility. North intersects
+that contract with fresh authenticated, target-scoped model availability before
+admitting a concrete route. Missing, stale, malformed, or cross-account model
+evidence never proves availability, and usage pressure never substitutes for
+model entitlement. AUTO may choose another eligible target before side effects;
+an exact provider/target/model pin fails closed instead of silently mapping to a
+different model. After acceptance, any change requires a new dispatch with the
+desired semantic tier or exact model.
 
 ## Coordination authority boundary
 

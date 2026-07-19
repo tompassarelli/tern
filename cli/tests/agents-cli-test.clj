@@ -522,13 +522,10 @@
               (not (str/includes? (:out dry) "agent-id would be")))))
 
 (let [closed (proc/shell {:out :string :err :string :continue true
-                          :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"
-                                      ;; even forcing the OLD in-window instant, the retired
-                                      ;; Fable promotion must never resolve to fable.
-                                      "NORTH_FABLE_NOW" "2026-07-19T00:00:00Z"}}
+                          :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
                          "bb" (str root "/cli/agents-cli.clj") "spawn" "designer" "probe"
                          "--provider" "anthropic" "--dry-run")]
-  (check "CLI dry route resolves anthropic frontier to opus/xhigh with no retired Fable window swap"
+  (check "CLI dry route resolves anthropic frontier to the static Gaffer opus/xhigh route"
          (and (zero? (:exit closed))
               (re-find #"anthropic-ambient-opus-xhigh-gaffer-designer-[a-z0-9]+" (:out closed))
               (not (str/includes? (:out closed) "anthropic-fable")))))

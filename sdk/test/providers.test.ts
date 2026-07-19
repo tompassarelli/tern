@@ -27,7 +27,6 @@ const MANAGED_ENV = [
   "NORTH_DISABLE_ANTHROPIC", "NORTH_DISABLE_OPENAI", "NORTH_PROVIDER_ORDER",
   "NORTH_ROUTING_POLICY", "NORTH_PROVIDER_OBSERVATIONS", "NORTH_ALLOCATION_MODE",
   "NORTH_PROVIDER_WEIGHTS", "NORTH_RESERVED_FRONTIER_PROVIDER",
-  "NORTH_FABLE_NOW",
   "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
 ] as const;
 const saved = Object.fromEntries(MANAGED_ENV.map((key) => [key, process.env[key]])) as Record<typeof MANAGED_ENV[number], string | undefined>;
@@ -377,8 +376,7 @@ test("warning floors expire and do not absorb unlike provider windows", () => {
   expect(unlikeEvidence.measuredUsedPercent).toBeUndefined();
 });
 
-test("model-scoped exhaustion constrains only the matching Anthropic route", () => {
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
+test("model-scoped exhaustion constrains only the matching Anthropic model", () => {
   const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
   const scoped = accountPolicy({
     targetPressures: { "claude-personal": "exhausted", "claude-work": "unknown", "codex-personal": "unknown" },
@@ -387,17 +385,17 @@ test("model-scoped exhaustion constrains only the matching Anthropic route", () 
         targetId: "claude-personal", provider: "anthropic", observedAt: new Date().toISOString(),
         windows: [
           { limitId: "claude:seven_day", usedPercent: 20, resetsAt: "2099-01-01T00:00:00Z" },
-          { limitId: "claude:model:fable", usedPercent: 100, resetsAt: "2099-01-01T00:00:00Z" },
+          { limitId: "claude:model:opus", usedPercent: 100, resetsAt: "2099-01-01T00:00:00Z" },
         ],
       },
     },
   });
-  const senior = selectProviderFromAvailability(
-    { target: "claude-personal" }, target, scoped, "senior", "senior", "high",
+  const standard = selectProviderFromAvailability(
+    { target: "claude-personal" }, target, scoped, "standard", "standard", "medium",
   );
-  expect(senior.entitlementPressure).toBe("plenty");
+  expect(standard.entitlementPressure).toBe("plenty");
   expect(() => selectProviderFromAvailability(
-    { target: "claude-personal" }, target, scoped, "frontier", "frontier", "xhigh",
+    { target: "claude-personal" }, target, scoped, "frontier", "frontier", "xhigh", "opus",
   )).toThrow("routing target claude-personal entitlement exhausted");
 });
 
@@ -413,7 +411,7 @@ test("route pressure combines every source after explicit-model family filtering
           source: "claude-agent-sdk:usage-control-experimental", observedAt,
           windows: [
             { limitId: "claude:seven_day", usedPercent: 20, resetsAt: "2099-01-01T00:00:00Z" },
-            { limitId: "claude:model:fable", usedPercent: 100, resetsAt: "2099-01-01T00:00:00Z" },
+            { limitId: "claude:model:opus", usedPercent: 100, resetsAt: "2099-01-01T00:00:00Z" },
           ],
         },
         {
@@ -431,10 +429,10 @@ test("route pressure combines every source after explicit-model family filtering
   expect(sonnet.allocationEvidence).toMatchObject({
     source: "claude-code:statusline", limitId: "seven_day", usedPercent: 90,
   });
-  const fable = balancedAllocationEstimates(
-    target, combined, "frontier", "xhigh", "claude-fable-5",
+  const opus = balancedAllocationEstimates(
+    target, combined, "frontier", "xhigh", "claude-opus-4-8",
   )[0];
-  expect(fable).toMatchObject({ pressure: "exhausted", eligible: false });
+  expect(opus).toMatchObject({ pressure: "exhausted", eligible: false });
 });
 
 test("explicit models constrain provider compatibility before observed-window pressure", () => {
@@ -454,7 +452,6 @@ test("explicit models constrain provider compatibility before observed-window pr
 });
 
 test("fresh telemetry failure neither rewards stale headroom nor revives model-scoped exhaustion", () => {
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
   const observedAt = new Date().toISOString();
   const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
   const failed = accountPolicy({
@@ -463,7 +460,7 @@ test("fresh telemetry failure neither rewards stale headroom nor revives model-s
     automatedPressureObservations: {
       "claude-personal": {
         targetId: "claude-personal", provider: "anthropic", observedAt,
-        windows: [{ limitId: "claude:model:fable", usedPercent: 100, resetsAt: "2099-01-01T00:00:00Z" }],
+        windows: [{ limitId: "claude:model:opus", usedPercent: 100, resetsAt: "2099-01-01T00:00:00Z" }],
         collectionFailure: { observedAt, reason: "anthropic_usage_probe_timed_out" },
       },
     },
@@ -471,7 +468,7 @@ test("fresh telemetry failure neither rewards stale headroom nor revives model-s
 
   const standard = balancedAllocationEstimates(target, failed, "standard", "medium")[0];
   expect(standard).toMatchObject({ eligible: true, pressure: "unknown", effectiveWeight: 0.5 });
-  const frontier = balancedAllocationEstimates(target, failed, "frontier", "xhigh")[0];
+  const frontier = balancedAllocationEstimates(target, failed, "frontier", "xhigh", "opus")[0];
   expect(frontier).toMatchObject({ eligible: false, pressure: "exhausted", effectiveWeight: 0 });
   expect(() => selectProviderFromAvailability(
     { target: "claude-personal" }, target, failed, "frontier", "failed-frontier", "xhigh",
@@ -612,15 +609,11 @@ test("provider selection filters unenforceable capability shapes before side eff
   }
 });
 
-test("temporary Fable promotion is Anthropic-only at the semantic frontier", () => {
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
-  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
+test("Anthropic frontier follows Gaffer's static route without a hidden time swap", () => {
+  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", undefined, "high"))
     .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
-  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
-  expect(resolveTier("anthropic", "frontier", "fable", "xhigh")).toEqual({
-    tier: "frontier", model: "claude-fable-5", effort: "xhigh",
-  });
+  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", "sonnet", "xhigh"))
     .toThrow("model claude-sonnet-5 does not support reasoning xhigh");
   expect(() => resolveTier("openai", "frontier", "luna", "xhigh"))
@@ -630,10 +623,6 @@ test("temporary Fable promotion is Anthropic-only at the semantic frontier", () 
   });
   expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: "gpt-5.6-sol", effort: "xhigh" });
-  process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
-  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
-  expect(() => resolveTier("anthropic", "frontier", "fable", "xhigh"))
-    .toThrow("model claude-fable-5 does not support reasoning xhigh");
 });
 
 function fakeProvider(id: ProviderId, query: AgentProvider["query"]): AgentProvider {

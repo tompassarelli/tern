@@ -41,11 +41,9 @@ export interface RunRecord {
   durationMs: number; // North-observed wall-clock duration
   providerDurationMs?: number; // provider-reported duration when available
   posture: string; // unplanned | atomic | composite | spawn
-  // Routing dials — the EFFECTIVE final dial the run finished at (escalation-aware:
-  // spawn passes rung() after any ladder climb, so this is the tier that actually did
-  // the work, not necessarily the spawn tier on @agent:<id>). Denormalized onto @run so
-  // dial analytics need no @run.agent -> @agent:<id> join, and so escalation cases
-  // (started opus/high, finished opus/xhigh) report the tier that carried the outcome.
+  // Effective admitted route, denormalized onto @run so dial analytics need no
+  // @run.agent -> @agent:<id> join. Pre-side-effect fallback may change these
+  // values before execution; the route is immutable once side effects begin.
   model?: string; // opus | sonnet | haiku
   effort?: string; // low | medium | high | xhigh | max
   role?: string; // executor | implementer | integrator | designer | researcher | ...
@@ -77,9 +75,6 @@ export interface RunRecord {
   deliveryOutcome?: string;
   deliveryReason?: string;
   deliveryProof?: DeliveryProof;
-  // escalate-not-kill (thread 019f1194-ca57) — present only on escalation-enabled runs.
-  // Option A yields ONE @run row per spawn with an internal escalation chain, NOT one
-  // row per tier (north-reconcile.clj queries adapt in lockstep — follow-up).
   numTurns?: number; // SDKResultMessage.num_turns (was dropped before)
   compactions?: number; // count of SDK compact_boundary events observed this run (audit fix 4)
   /** Immutable admission-time dispatcher judgment; required by recordRun. */
@@ -89,7 +84,7 @@ export interface RunRecord {
   // Legacy in-flight escalation fields — the machinery is retired; these stay so
   // historical @run rows (escalation_* facts, routing-report escalated column) keep
   // reading. No current producer sets them.
-  escalationTier?: number; // final ladder tier (omit / <0 = escalation off)
+  escalationTier?: number; // legacy final ladder tier
   escalations?: Array<{ from: string; to: string; reason: string }>;
   // Spend guard (build-order step 2). Present only on an API-billed run that
   // carried a reservation from admission. No producer sets these until the first

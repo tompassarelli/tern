@@ -124,9 +124,8 @@
           (println (dim (str "  capabilities " (str/join " " capabilities))))
           (when verbose? (println (str "  " description))))))))
 
-;; Dry-run route preview. Anthropic frontier resolves per Gaffer provider config
-;; with NO hidden model swap — the temporary Fable promotion window expired
-;; 2026-07-20T04:00Z and its machinery is retired (twin of sdk/src/providers/catalog.ts).
+;; Dry-run route preview. Resolve the provider route declared by Gaffer with no
+;; hidden time-gated model substitution (twin of sdk/src/providers/catalog.ts).
 (defn dry-resolved-route [provider tier explicit-model reasoning]
   (when (and provider (not= provider "auto"))
     (try

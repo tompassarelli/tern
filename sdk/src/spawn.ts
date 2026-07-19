@@ -255,7 +255,7 @@ async function runSpawn(
     branch: wt?.branch,
   };
   const initialLiveInput = providerLiveInput(routing.provider);
-  const ch = inputChannel(opts.prompt); // streaming-input mode -> unlocks q.setModel()
+  const ch = inputChannel(opts.prompt); // streaming input keeps the managed live-steering route open
   const liveInputRoute = new ManagedLiveInputRoute(
     agentId,
     identityBase,
