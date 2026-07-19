@@ -155,6 +155,31 @@ test("provider RPC diagnostics are normalized before crossing the adapter bounda
   }
 });
 
+test("an invalidated ChatGPT token maps to the subscription-auth-required reason", async () => {
+  const payload = responses();
+  payload["account/rateLimits/read"] = {
+    $error: {
+      code: -32_603,
+      message:
+        'failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; content-type=text/plain; body={ "error": { "message": "Your authentication token has been invalidated. Please try signing in again.", "type": "invalid_request_error", "code": "token_invalidated", "param": null }, "status": 401 }',
+    },
+  } as any;
+  try {
+    await observe(payload);
+    throw new Error("expected the probe to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("codex_usage_subscription_auth_required");
+    expect(String(error)).not.toContain("token_invalidated");
+  }
+});
+
+test("a non-authentication RPC error stays the generic transport-failed reason", async () => {
+  const payload = responses();
+  payload["account/rateLimits/read"] = { $error: { code: -32_603, message: "internal error" } } as any;
+  await expect(observe(payload)).rejects.toThrow("codex_usage_transport_failed");
+});
+
 test("fresh cached observation skips the app-server probe", async () => {
   const directory = mkdtempSync(join(tmpdir(), "north-codex-refresh-"));
   temporary.push(directory);

@@ -15,7 +15,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { codexConfigArguments, providerEnvironmentForTarget } from "../src/accounts";
+import {
+  codexConfigArguments,
+  liveCodexAuthState,
+  providerEnvironmentForTarget,
+  type AccountAuthState,
+} from "../src/accounts";
+import { runAccountStatus } from "../src/account-cli";
 
 const root = join(import.meta.dir, "..");
 const cli = join(root, "src/account-cli.ts");
@@ -58,9 +64,9 @@ const login = isClaude ? process.argv[2] === "auth" && process.argv[3] === "logi
   : process.argv[2] === "login" && process.argv[3] !== "status";
 if (login) { fs.writeFileSync(path.join(root, "logged-in"), "yes"); process.exit(0); }
 const loggedIn = fs.existsSync(path.join(root, "logged-in"));
-if (isClaude) console.log(JSON.stringify({ loggedIn, authMethod: loggedIn ? "claude.ai" : "none" }));
-else if (loggedIn) console.log("Logged in using ChatGPT");
-else console.error("Not logged in");
+if (isClaude) fs.writeSync(1, JSON.stringify({ loggedIn, authMethod: loggedIn ? "claude.ai" : "none" }) + "\\n");
+else if (loggedIn) fs.writeSync(1, "Logged in using ChatGPT\\n");
+else fs.writeSync(2, "Not logged in\\n");
 process.exit(loggedIn ? 0 : 1);
 `);
   chmodSync(fake, 0o755);
@@ -90,7 +96,7 @@ process.exit(loggedIn ? 0 : 1);
     CODEX_PRIVATE_CREDENTIAL: "must-not-propagate",
   };
   const run = (...args: string[]) => spawnSync("bun", ["run", cli, ...args], { env, encoding: "utf8" });
-  return { home, policy, run };
+  return { home, policy, env, run };
 }
 
 test("add preserves routing fields, isolates roots, and links only allowlisted config", () => {
@@ -236,8 +242,8 @@ test("login and status use disjoint provider homes and normalized account identi
 
   writeFileSync(join(home, ".claude/logged-in"), "ambient login must not count\n");
   writeFileSync(join(home, ".codex/logged-in"), "ambient login must not count\n");
-  const empty = run("status");
-  expect(empty.status).toBe(1);
+  const empty = run("list");
+  expect(empty.status).toBe(0);
   expect(empty.stdout).toBe([
     "Claude / Anthropic",
     "  claude-work  not logged in",
@@ -248,8 +254,8 @@ test("login and status use disjoint provider homes and normalized account identi
   ].join("\n"));
 
   expect(run("login", "claude-work").status).toBe(0);
-  const split = run("status");
-  expect(split.status).toBe(1);
+  const split = run("list");
+  expect(split.status).toBe(0);
   expect(split.stdout).toBe([
     "Claude / Anthropic",
     "  claude-work  logged in",
@@ -277,7 +283,7 @@ test("login and status use disjoint provider homes and normalized account identi
   expect(listed.stdout).not.toContain("\u001b[");
 
   expect(run("login", "codex-personal").status).toBe(0);
-  const ready = run("status");
+  const ready = run("list");
   expect(ready.status).toBe(0);
   expect(ready.stdout).toContain("  claude-work  logged in");
   expect(ready.stdout).toContain("  codex-personal  logged in");
@@ -305,6 +311,93 @@ test("login and status use disjoint provider homes and normalized account identi
   expect(codexCalls.every((call) => call.argv.includes('cli_auth_credentials_store="file"'))).toBe(true);
   expect(codexCalls.every((call) => call.argv.includes('forced_login_method="chatgpt"'))).toBe(true);
   expect(codexCalls.every((call) => call.argv.includes('model_provider="openai"'))).toBe(true);
+});
+
+async function captureStatusOutput(
+  account: { id: string; provider: "openai"; profile: string; authMode: "isolated"; root: string },
+  state: AccountAuthState,
+): Promise<{ exit: number; stdout: string }> {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...values: unknown[]) => { lines.push(values.map(String).join(" ")); };
+  try {
+    const exit = await runAccountStatus([account], async () => new Map([[account.id, state]]));
+    return { exit, stdout: `${lines.join("\n")}\n` };
+  } finally {
+    console.log = original;
+  }
+}
+
+test("status rejects a locally cached Codex login after live token invalidation", async () => {
+  const { home, run } = fixture();
+  expect(run("add", "codex-personal", "openai").status).toBe(0);
+  expect(run("login", "codex-personal").status).toBe(0);
+  const root = join(home, ".local/state/north/accounts/openai/codex-personal");
+
+  const local = run("list");
+  expect(local.status).toBe(0);
+  expect(local.stdout).toContain("codex-personal  logged in");
+
+  const account = { id: "codex-personal", provider: "openai", profile: "codex-personal", authMode: "isolated", root } as const;
+  const state = await liveCodexAuthState(account, { home }, async () => {
+    throw Object.assign(new Error("normalized"), { reason: "codex_usage_subscription_auth_required" });
+  });
+  expect(await captureStatusOutput(account, state)).toEqual({
+    exit: 1,
+    stdout: "Codex / OpenAI\n  codex-personal  auth required\n",
+  });
+});
+
+test("status keeps Codex transport failure distinct from revoked authentication", async () => {
+  const { home, run } = fixture();
+  expect(run("add", "codex-personal", "openai").status).toBe(0);
+  expect(run("login", "codex-personal").status).toBe(0);
+  const root = join(home, ".local/state/north/accounts/openai/codex-personal");
+  const account = { id: "codex-personal", provider: "openai", profile: "codex-personal", authMode: "isolated", root } as const;
+  const state = await liveCodexAuthState(account, { home }, async () => {
+    throw Object.assign(new Error("normalized"), { reason: "codex_usage_transport_failed" });
+  });
+  expect(await captureStatusOutput(account, state)).toEqual({
+    exit: 1,
+    stdout: "Codex / OpenAI\n  codex-personal  auth unverifiable\n",
+  });
+});
+
+test("healthy isolated Codex status uses the isolated target root", async () => {
+  const { home } = fixture();
+  const root = join(home, ".local/state/north/accounts/openai/codex-personal");
+  const account = { id: "codex-personal", provider: "openai", profile: "codex-personal", authMode: "isolated", root } as const;
+  let probedRoot: string | undefined;
+  const state = await liveCodexAuthState(account, { home }, async ({ target, env, timeoutMs }) => {
+    expect(timeoutMs).toBe(10_000);
+    probedRoot = providerEnvironmentForTarget("openai", target, { env }).CODEX_HOME;
+  });
+  expect(probedRoot).toBe(root);
+  expect(await captureStatusOutput(account, state)).toEqual({
+    exit: 0,
+    stdout: "Codex / OpenAI\n  codex-personal  logged in\n",
+  });
+});
+
+test("a live rate-limit response remains an auth signal when usage windows are unavailable", async () => {
+  const { home } = fixture();
+  const target = { id: "openai", provider: "openai", authMode: "ambient" } as const;
+  expect(await liveCodexAuthState(target, { home }, async () => {
+    throw Object.assign(new Error("normalized"), { reason: "codex_usage_windows_unavailable" });
+  })).toBe("logged-in");
+});
+
+test("live Codex authentication probe supports an ambient target", async () => {
+  const { home, env } = fixture();
+  let probedRoot: string | undefined;
+  expect(await liveCodexAuthState({
+    id: "openai",
+    provider: "openai",
+    authMode: "ambient",
+  }, { home, env }, async ({ target, env: probeEnv }) => {
+    probedRoot = providerEnvironmentForTarget("openai", target, { env: probeEnv }).CODEX_HOME;
+  })).toBe("logged-in");
+  expect(probedRoot).toBe(join(home, ".codex"));
 });
 
 test("account help advertises the grouped list and verbose diagnostics", () => {

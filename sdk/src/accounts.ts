@@ -21,7 +21,13 @@ import type { RoutingTarget } from "./providers/types";
 import { providerBilling, checkSpendBudget, spendBudgetEntityId } from "./spend-guard";
 
 export type AccountProvider = "anthropic" | "openai";
-export type AccountAuthState = "logged-in" | "not-logged-in" | "unavailable" | "error";
+export type AccountAuthState =
+  | "logged-in"
+  | "not-logged-in"
+  | "auth-required"
+  | "unverifiable"
+  | "unavailable"
+  | "error";
 
 export interface ProviderAccount {
   id: string;
@@ -434,4 +440,60 @@ export function statusProviderAccount(account: ProviderAccount, context: Account
   if (result.status === 0 && statusLines.includes("Logged in using ChatGPT")) return "logged-in";
   if (statusLines.includes("Not logged in")) return "not-logged-in";
   return "error";
+}
+
+/**
+ * Verify Codex authentication against ChatGPT without sending a model turn.
+ * A successful rate-limit RPC is sufficient even when its usage schema is not.
+ */
+export async function liveCodexAuthState(
+  target: RoutingTarget | undefined,
+  context: AccountContext = {},
+  readEntitlement?: (options: {
+    target?: RoutingTarget;
+    targetId?: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+  }) => Promise<unknown>,
+): Promise<AccountAuthState> {
+  try {
+    const entitlement = await import("./codex-entitlement");
+    const read = readEntitlement ?? entitlement.readCodexEntitlementObservation;
+    await read({
+      target,
+      targetId: target?.id,
+      env: { ...(context.env ?? process.env), HOME: homeOf(context) },
+      timeoutMs: entitlement.CODEX_USAGE_PROBE_TIMEOUT_MS,
+    });
+    return "logged-in";
+  } catch (error) {
+    const reason = error instanceof Error && "reason" in error
+      ? (error as Error & { reason?: unknown }).reason
+      : undefined;
+    switch (reason) {
+      case "codex_usage_subscription_auth_required": return "auth-required";
+      case "codex_usage_command_unavailable": return "unavailable";
+      case "codex_usage_probe_failed":
+      case "codex_usage_probe_timed_out":
+      case "codex_usage_transport_failed": return "unverifiable";
+      // These failures occur only after account/rateLimits/read returned a
+      // successful live response, which is the authentication signal here.
+      case "codex_usage_response_schema_changed":
+      case "codex_usage_windows_unavailable": return "logged-in";
+      default: return "error";
+    }
+  }
+}
+
+export async function liveStatusProviderAccount(
+  account: ProviderAccount,
+  context: AccountContext = {},
+): Promise<AccountAuthState> {
+  if (account.provider === "anthropic") return statusProviderAccount(account, context);
+  return liveCodexAuthState({
+    id: account.id,
+    provider: account.provider,
+    authMode: account.authMode,
+    profile: account.profile,
+  }, context);
 }

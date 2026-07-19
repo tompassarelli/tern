@@ -1,6 +1,7 @@
 import {
   addProviderAccount,
   listProviderAccounts,
+  liveStatusProviderAccount,
   loginProviderAccount,
   requireProviderAccount,
   statusProviderAccount,
@@ -31,6 +32,8 @@ function authLabel(state: AccountAuthState): string {
   switch (state) {
     case "logged-in": return "logged in";
     case "not-logged-in": return "not logged in";
+    case "auth-required": return "auth required";
+    case "unverifiable": return "auth unverifiable";
     case "unavailable": return "CLI unavailable";
     case "error": return "auth check failed";
   }
@@ -38,6 +41,23 @@ function authLabel(state: AccountAuthState): string {
 
 function accountStates(accounts: ProviderAccount[]): Map<string, AccountAuthState> {
   return new Map(accounts.map((account) => [account.id, statusProviderAccount(account)]));
+}
+
+async function liveAccountStates(accounts: ProviderAccount[]): Promise<Map<string, AccountAuthState>> {
+  const states = await Promise.all(accounts.map(async (account) => [
+    account.id,
+    await liveStatusProviderAccount(account),
+  ] as const));
+  return new Map(states);
+}
+
+export async function runAccountStatus(
+  accounts: ProviderAccount[],
+  statesFor = liveAccountStates,
+): Promise<number> {
+  const states = await statesFor(accounts);
+  printAccountList(accounts, false, states);
+  return accounts.every((account) => states.get(account.id) === "logged-in") ? 0 : 1;
 }
 
 function printAccountList(
@@ -142,9 +162,7 @@ export async function runAccountCli(args: string[]): Promise<number> {
           console.log("no isolated accounts configured");
           return 0;
         }
-        const states = accountStates(accounts);
-        printAccountList(accounts, false, states);
-        return accounts.every((account) => states.get(account.id) === "logged-in") ? 0 : 1;
+        return runAccountStatus(accounts);
       }
       case "usage": {
         const refresh = rest.includes("--refresh");

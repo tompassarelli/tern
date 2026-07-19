@@ -80,8 +80,20 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function responseError(_response: RpcResponse, _method: string): Error {
-  return new CodexUsageUnavailableError("codex_usage_transport_failed");
+function isAuthFailure(message: string | undefined): boolean {
+  if (!message) return false;
+  const normalized = message.toLowerCase();
+  return normalized.includes("401") || normalized.includes("unauthorized") || normalized.includes("token_invalidated");
+}
+
+// The provider error message may carry account-identifying or otherwise
+// sensitive diagnostics; only its fixed reason enum ever crosses this
+// boundary, never the raw text (mirrors the stderr drain above).
+function responseError(response: RpcResponse, _method: string): Error {
+  const reason = isAuthFailure(response.error?.message)
+    ? "codex_usage_subscription_auth_required"
+    : "codex_usage_transport_failed";
+  return new CodexUsageUnavailableError(reason);
 }
 
 function request(
