@@ -9,7 +9,7 @@ import {
 import { inputChannel, subscribeFeed } from "./coordination";
 import { normalizeUsage } from "./usage";
 import { newRunId, recordRun } from "./telemetry";
-import { notifyDeath } from "./death";
+import { deathReason, notifyDeath } from "./death";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import {
@@ -47,6 +47,9 @@ import {
 } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal } from "./execution-outcome";
+import {
+  notifyTerminalSettlement, TerminalPublicationBudget, type TerminalNotification,
+} from "./terminal-notification";
 import { assessThreadDelivery, type DeliveryAssessment } from "./delivery-verification";
 import {
   loadDeliveryRunState, newDeliveryRunContext, reserveDeliveryRun,
@@ -236,10 +239,12 @@ async function runDispatch(
   // Stream watchdog (thread 019f4d54): wrap the SDK iterator so a stall (no message for
   // N min while the query is open) is caught — the iterator neither yields nor throws on
   // a hang, so the catch below would never fire. N min silence -> stalled fact + ping;
-  // 2N -> abort + outcome=stalled + notifyDeath.
+  // 2N -> abort + outcome=stalled + a durable death fact. Terminal peer wakes
+  // are deferred until the terminal and run publications settle.
   const coordHandle = process.env.AGENT_COORDINATOR;
   const window = stallMs();
   let stallAborted = false;
+  let terminalSignal: Pick<TerminalNotification, "detail" | "subject"> = {};
   // Background-task refusal (thread 019f4ed2, half a): don't finalize on the first
   // `result` while a harness-tracked background task is live — see bgtasks.ts.
   const bgTracker = makeBgTracker();
@@ -257,9 +262,9 @@ async function runDispatch(
 
   // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
   // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) the generator THROWS exitError
-  // here. catch -> outcome "died" + notifyDeath (agent_death fact on this thread + @swarm,
-  // peer ping to the coordinator); finally -> ALWAYS stop the feed, close the channel, and
-  // record the run so the coordinator learns of the death instead of noticing silence.
+  // here. catch -> outcome "died" + durable agent_death facts on this thread and @swarm;
+  // finally -> ALWAYS stop the feed and close the channel. The peer wake is emitted only
+  // after the committed terminal and run publication attempts have settled.
   try {
     // Reserve only at the last pre-provider seam. Earlier routing/admission
     // failures must not strand undiscoverable reservation-only subjects.
@@ -325,7 +330,9 @@ async function runDispatch(
           const partial = result.trim()
             ? `partial: ${result.trim().slice(0, 200)}`
             : "no partial result";
-          notifyTurnCap(agentId, `${cap} — ${partial}`, { coordinator: coordHandle });
+          const detail = `${cap} — ${partial}`;
+          terminalSignal = { subject: "TURN CAP", detail };
+          notifyTurnCap(agentId, detail);
           break;
         }
         const providerError = msg.subtype !== "success"
@@ -405,11 +412,14 @@ async function runDispatch(
     }
     if (stallAborted) {
       // 2N of silence: interrupt the hung query, mark outcome=stalled, and fire the death
-      // path so a stall is terminal + visible instead of a silent hang.
+      // path durably. Its terminal peer wake follows publication settlement.
       outcome = "stalled";
       await interruptQuery();
-      notifyDeath(agentId, new Error(`stalled — no SDK output for ${Math.max(2, 2 * Math.round(window / 60_000))}min`),
-        { thread: threadId, coordinator: coordHandle });
+      const err = new Error(
+        `stalled — no SDK output for ${Math.max(2, 2 * Math.round(window / 60_000))}min`,
+      );
+      terminalSignal = { subject: "AGENT DEATH", detail: deathReason(err) };
+      notifyDeath(agentId, err, { thread: threadId });
     }
   } catch (err) {
     if (err instanceof ResourceEnvelopeExceededError) {
@@ -420,7 +430,8 @@ async function runDispatch(
       console.error(`[preflight] @agent:${agentId} ${err.message}`);
     } else {
       outcome = "died";
-      notifyDeath(agentId, err, { thread: threadId, coordinator: process.env.AGENT_COORDINATOR });
+      terminalSignal = { subject: "AGENT DEATH", detail: deathReason(err) };
+      notifyDeath(agentId, err, { thread: threadId });
     }
   } finally {
     stopFeed();
@@ -447,7 +458,15 @@ async function runDispatch(
     }
   }
   if (finalChildren.kind === "live") {
-    notifyEarlyExitChildren(agentId, finalChildren.live, { coordinator: coordHandle });
+    notifyEarlyExitChildren(agentId, finalChildren.live);
+    const childDetail =
+      `${finalChildren.live.length} live child(ren): ${finalChildren.live.join(",")}`;
+    terminalSignal = terminalSignal.subject
+      ? {
+          ...terminalSignal,
+          detail: [terminalSignal.detail, childDetail].filter(Boolean).join("; "),
+        }
+      : { subject: "EARLY EXIT WITH LIVE CHILDREN", detail: childDetail };
   } else if (orchestrator && finalChildren.kind === "unavailable") {
     console.error(
       `[harness] @agent:${agentId} CHILD SETTLEMENT UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
@@ -513,7 +532,12 @@ async function runDispatch(
     }
   }
   const terminal = classifyExecutionTerminal(outcome, delivery);
-  writeAgentTerminal(agentId, terminal);
+  const publicationBudget = new TerminalPublicationBudget();
+  const terminalPublication = writeAgentTerminal(
+    agentId,
+    terminal,
+    publicationBudget.publicationTimeout(2),
+  );
 
   const tokenUsage = normalizeUsage(terminalMessages, routing.provider);
   const numTurns = typeof resultMsg?.num_turns === "number"
@@ -521,7 +545,7 @@ async function runDispatch(
     // A retry-safe preflight block proves the provider accepted no turn. This
     // zero is North-observed; every other missing provider value stays absent.
     : terminal.processOutcome === "blocked_preflight" ? 0 : undefined;
-  recordRun({ thread: threadId, agent: agentId, tokenUsage,
+  const runPublication = await recordRun({ thread: threadId, agent: agentId, tokenUsage,
               model: routing.resolvedModel ?? resolved.model, effort: routing.resolvedEffort ?? resolved.effort,
               role,
               provider: routing.provider, providerTarget: routing.target, providerReason: routing.selectionReason,
@@ -549,7 +573,19 @@ async function runDispatch(
               deliveryOutcome: terminal.deliveryOutcome,
               deliveryReason: terminal.deliveryReason,
               deliveryProof: terminal.deliveryProof,
-              numTurns }, runId);
+              numTurns }, runId, publicationBudget.publicationTimeout(1));
+  notifyTerminalSettlement(
+    agentId,
+    coordHandle,
+    {
+      outcome,
+      terminal,
+      terminalPublication,
+      runPublication,
+      ...terminalSignal,
+    },
+    publicationBudget.notificationTimeout(),
+  );
   console.log(`\n[dispatch] @${threadId} process=${outcome} delivery=${terminal.deliveryOutcome}`);
   return { threadId, posture: postureLabel, result };
 }

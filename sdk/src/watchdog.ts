@@ -27,6 +27,7 @@ const REPO = resolve(import.meta.dir, "..", "..");
 const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
 const northBin = () => process.env.NORTH_BIN ?? `${REPO}/bin/north`;
 const port = () => process.env.NORTH_PORT ?? "7977";
+const peerBb = () => process.env.NORTH_PEER_BB ?? "bb";
 
 // Default stall window: 10 minutes. NORTH_STALL_MS overrides (ms) — the test seam.
 export const DEFAULT_STALL_MS = 10 * 60_000;
@@ -100,7 +101,7 @@ export function stallCommands(
     { cmd: northBin(), args: ["tell", `agent:${agentId}`, "stalled", line] },
   ];
   if (ctx.coordinator) {
-    cmds.push({ cmd: "bb", args: [MSG_CLI, port(), "send", agentId, ctx.coordinator, "AGENT STALLED", `${mins}min — no output (${ts})`] });
+    cmds.push({ cmd: peerBb(), args: [MSG_CLI, port(), "send", agentId, ctx.coordinator, "AGENT STALLED", `${mins}min — no output (${ts})`] });
   }
   return cmds;
 }
@@ -118,7 +119,7 @@ export function turnCapCommands(
     { cmd: northBin(), args: ["tell", `agent:${agentId}`, "turn_capped", `${agentId} | ${ts}`] },
   ];
   if (ctx.coordinator) {
-    cmds.push({ cmd: "bb", args: [MSG_CLI, port(), "send", agentId, ctx.coordinator, "TURN CAP", `${note} (${ts})`] });
+    cmds.push({ cmd: peerBb(), args: [MSG_CLI, port(), "send", agentId, ctx.coordinator, "TURN CAP", `${note} (${ts})`] });
   }
   return cmds;
 }

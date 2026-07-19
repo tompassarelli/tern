@@ -18,13 +18,13 @@ let dir: string;
 let log: string;
 
 const MANAGED_ENV = [
-  "PATH", "NORTH_BIN", "NORTH_IDENTITY_TEST_REDIRECT", "NORTH_PORT", "NORTH_STREAM_DIR", "AGENT_LAWS", "AGENT_PRAXIS",
+  "PATH", "NORTH_BIN", "NORTH_PEER_BB", "NORTH_IDENTITY_TEST_REDIRECT", "NORTH_PORT", "NORTH_STREAM_DIR", "AGENT_LAWS", "AGENT_PRAXIS",
   "AGENT_ID", "NORTH_AGENT_ID", "AGENT_COORDINATOR", "AGENT_MODEL", "AGENT_ROLE", "AGENT_EFFORT",
   "AGENT_IDENTITY_ROLE", "AGENT_TARGET",
   "AGENT_TIER", "AGENT_REASONING", "AGENT_POSTURE", "AGENT_TOPOLOGY", "AGENT_TASK_GRADE",
   "AGENT_DOMAIN_REQUIREMENTS", "AGENT_COMPOSITION", "NORTH_FABLE_NOW",
   "NORTH_ROUTING_POLICY", "NORTH_ENVELOPE_ACCOUNTING",
-  "NORTH_BG_MAX_CONTINUATIONS",
+  "NORTH_BG_MAX_CONTINUATIONS", "NORTH_STALL_MS", "NORTH_TERMINAL_PUBLICATION_BUDGET_MS",
   "NORTH_PROVIDER_OBSERVATIONS", "NORTH_ALLOCATION_MODE", "NORTH_PROVIDER_ORDER",
   "NORTH_PROVIDER_WEIGHTS", "NORTH_RESERVED_FRONTIER_PROVIDER",
   "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
@@ -40,9 +40,19 @@ beforeAll(() => {
   const fake = join(dir, "north");
   writeFileSync(fake, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${log}"\nexit 0\n`);
   chmodSync(fake, 0o755);
+  const fakeBb = join(dir, "bb");
+  writeFileSync(fakeBb, `#!/usr/bin/env bash
+printf 'bb %s\\n' "$*" >> "${log}"
+case "$*" in
+  *test-dispatch-notify-failure*) exit 1 ;;
+esac
+exit 0
+`);
+  chmodSync(fakeBb, 0o755);
 
   process.env.PATH = `${dir}:${process.env.PATH}`;
   process.env.NORTH_BIN = fake;
+  process.env.NORTH_PEER_BB = fakeBb;
   process.env.NORTH_IDENTITY_TEST_REDIRECT = "1";
   process.env.NORTH_PORT = "59999"; // unused -> any stray bb write silently no-ops
   process.env.NORTH_STREAM_DIR = dir;
@@ -257,6 +267,178 @@ test("an empty dispatch provider stream is a blocked provider error, never ran",
   expect(lines.some((line) => line.endsWith(" process_outcome provider_error"))).toBe(true);
   expect(lines.some((line) => line.endsWith(" delivery_outcome blocked"))).toBe(true);
   expect(lines.some((line) => line.includes("@@test-empty-dispatch"))).toBe(false);
+});
+
+test("dispatch wakes its coordinator once, after every terminal publication settles", async () => {
+  const { dispatch } = await import("../src/dispatch");
+  const scenarios = [
+    {
+      label: "ran",
+      queryFn: () => (async function* () {
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "done",
+          duration_ms: 1,
+          num_turns: 1,
+        };
+      })(),
+      processOutcome: "ran",
+      deliveryOutcome: "unverified",
+      runTail: "num_turns 1",
+      subject: "AGENT COMPLETE",
+    },
+    {
+      label: "blocked-preflight",
+      queryFn: () => {
+        throw new ProviderRetrySafeError("north_coordination_log_missing");
+      },
+      processOutcome: "blocked_preflight",
+      deliveryOutcome: "blocked",
+      runTail: "num_turns 0",
+      subject: "AGENT BLOCKED",
+    },
+    {
+      label: "died",
+      queryFn: () => (async function* () {
+        throw new Error("provider subprocess died for ordering probe");
+      })(),
+      processOutcome: "died",
+      deliveryOutcome: "blocked",
+      runTail: "process_outcome died",
+      subject: "AGENT DEATH",
+    },
+    {
+      label: "turn-cap",
+      queryFn: () => (async function* () {
+        yield {
+          type: "result",
+          subtype: "error_max_turns",
+          result: "partial",
+          duration_ms: 1,
+          num_turns: 2,
+        };
+      })(),
+      processOutcome: "max_turns",
+      deliveryOutcome: "blocked",
+      runTail: "num_turns 2",
+      subject: "TURN CAP",
+    },
+    {
+      label: "stalled",
+      queryFn: () => ({
+        interrupt: async () => {},
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise(() => {}),
+          };
+        },
+      }),
+      processOutcome: "stalled",
+      deliveryOutcome: "blocked",
+      runTail: "process_outcome stalled",
+      subject: "AGENT DEATH",
+      stallMs: "10",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    writeFileSync(log, "");
+    const agentId = `test-dispatch-notify-${scenario.label}`;
+    if ("stallMs" in scenario) process.env.NORTH_STALL_MS = scenario.stallMs;
+    try {
+      await dispatch(`thread-${agentId}`, {
+        agentId,
+        routingMetadata: { role: "integrator" },
+        claimDriver: (() => ({ release() {} })) as any,
+        queryFn: scenario.queryFn as any,
+        loadThreadFacts: () => [
+          { predicate: "title", value: "Prove coordinator terminal notification" },
+          { predicate: "planned", value: "true" },
+          { predicate: "atomic", value: "true" },
+        ],
+        loadChildren: () => [],
+      });
+    } finally {
+      delete process.env.NORTH_STALL_MS;
+    }
+
+    const output = await waitForLog(
+      `${scenario.subject} ${scenario.processOutcome === "died"
+        ? "provider subprocess died for ordering probe — "
+        : scenario.processOutcome === "max_turns"
+          ? "error_max_turns — partial: partial — "
+          : scenario.processOutcome === "stalled"
+            ? "stalled — no SDK output for 2min — "
+          : ""}process=${scenario.processOutcome}`,
+    );
+    const lines = output.split("\n").filter(Boolean);
+    const pings = lines.filter((line) =>
+      line.includes(`send ${agentId} ${TEST_COORDINATOR} ${scenario.subject}`)
+    );
+    expect(pings).toHaveLength(1);
+    expect(pings[0]).toEndWith(
+      `process=${scenario.processOutcome} — delivery=${scenario.deliveryOutcome} — terminal=recorded — run=recorded`,
+    );
+    expect(lines.some((line) =>
+      line.includes(`send ${agentId} ${TEST_COORDINATOR} AGENT COMPLETE`)
+      && scenario.subject !== "AGENT COMPLETE"
+    )).toBe(false);
+    const terminalIndex = lines.findIndex((line) =>
+      line === `tell agent:${agentId} process_outcome ${scenario.processOutcome}`
+    );
+    const runIndex = lines.findIndex((line) =>
+      line.includes(`tell run-${agentId}-`) && line.endsWith(` ${scenario.runTail}`)
+    );
+    const pingIndex = lines.indexOf(pings[0]!);
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(runIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeLessThan(pingIndex);
+    expect(runIndex).toBeLessThan(pingIndex);
+    if (scenario.processOutcome === "stalled") {
+      const diagnosticPings = lines.filter((line) =>
+        line.includes(`send ${agentId} ${TEST_COORDINATOR} AGENT STALLED`)
+      );
+      expect(diagnosticPings).toHaveLength(1);
+      expect(lines.indexOf(diagnosticPings[0]!)).toBeLessThan(terminalIndex);
+    }
+  }
+}, 15_000);
+
+test("a failed dispatch completion wake-up never replaces the execution outcome", async () => {
+  const { dispatch } = await import("../src/dispatch");
+  writeFileSync(log, "");
+  const agentId = "test-dispatch-notify-failure";
+  const result = await dispatch(`thread-${agentId}`, {
+    agentId,
+    routingMetadata: { role: "integrator" },
+    claimDriver: (() => ({ release() {} })) as any,
+    queryFn: () => (async function* () {
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done despite notification failure",
+        duration_ms: 1,
+        num_turns: 1,
+      };
+    })(),
+    loadThreadFacts: () => [
+      { predicate: "title", value: "Keep notification failure non-fatal" },
+      { predicate: "planned", value: "true" },
+      { predicate: "atomic", value: "true" },
+    ],
+    loadChildren: () => [],
+  });
+  expect(result.result).toBe("done despite notification failure");
+  const output = await waitForLog(
+    `send ${agentId} ${TEST_COORDINATOR} AGENT COMPLETE`,
+  );
+  expect(output.match(new RegExp(
+    `send ${agentId} ${TEST_COORDINATOR} AGENT COMPLETE`,
+    "g",
+  ))).toHaveLength(1);
+  const lines = await settledRunLines(agentId, "num_turns 1");
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(true);
 });
 
 test("an MCP-preclaimed terminal thread verifies and safely releases before returning", async () => {
@@ -575,6 +757,7 @@ test("a spawn orchestrator hits a bounded no-progress cap as incomplete, never r
       prompt: "coordinate a stuck child",
       agentId: "test-spawn-child-cap",
       role: "director",
+      coordinator: TEST_COORDINATOR,
       queryFn,
       childSettlementReader: () => ({
         kind: "live", children: ["@agent:stuck-child"], live: ["@agent:stuck-child"],
@@ -585,6 +768,26 @@ test("a spawn orchestrator hits a bounded no-progress cap as incomplete, never r
       line.endsWith(" process_outcome orchestrator_children_incomplete"),
     )).toBe(true);
     expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+    const logged = readFileSync(log, "utf8").split("\n").filter(Boolean);
+    const pings = logged.filter((line) =>
+      line.includes(
+        `send test-spawn-child-cap ${TEST_COORDINATOR} EARLY EXIT WITH LIVE CHILDREN`,
+      )
+    );
+    expect(pings).toHaveLength(1);
+    expect(logged.some((line) =>
+      line.includes(`send test-spawn-child-cap ${TEST_COORDINATOR} AGENT COMPLETE`)
+    )).toBe(false);
+    const terminalIndex = logged.indexOf(
+      "tell agent:test-spawn-child-cap process_outcome orchestrator_children_incomplete",
+    );
+    const runIndex = logged.findIndex((line) =>
+      line.includes("tell run-test-spawn-child-cap-")
+      && line.endsWith(" process_outcome orchestrator_children_incomplete")
+    );
+    const pingIndex = logged.indexOf(pings[0]!);
+    expect(terminalIndex).toBeLessThan(pingIndex);
+    expect(runIndex).toBeLessThan(pingIndex);
   } finally {
     if (previousCap === undefined) delete process.env.NORTH_BG_MAX_CONTINUATIONS;
     else process.env.NORTH_BG_MAX_CONTINUATIONS = previousCap;
@@ -680,7 +883,7 @@ test("spawn and dispatch require reduction for first-seen and changed settled ch
       expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(true);
     }
   }
-});
+}, 15_000);
 
 test("spawn and dispatch block a previously live child disappearing from the graph", async () => {
   const { spawn } = await import("../src/spawn");

@@ -3,8 +3,9 @@
 // what and with how many observed tokens). Records to a dedicated
 // `run-<agent>-<ts>` subject that has
 // NO title, so runs never show up as threads on the board — they're queryable via
-// fram, invisible to the work views. Fire-and-forget: telemetry must NEVER block
-// or fail an agent run, so writes are async and all errors are swallowed.
+// fram, invisible to the work views. Terminal publication is bounded and
+// non-throwing: callers wait for its settlement before waking a coordinator,
+// but an unavailable telemetry sink never replaces the provider outcome.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
@@ -68,6 +69,8 @@ export interface RunRecord {
   escalationTier?: number; // final ladder tier (omit / <0 = escalation off)
   escalations?: Array<{ from: string; to: string; reason: string }>;
 }
+
+export type RunPublicationStatus = "recorded" | "unavailable";
 
 export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[string, string]> {
   // base36 ms suffix keeps the id unique per agent without a clock dependency the
@@ -214,27 +217,59 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   return facts;
 }
 
-export function recordRun(rec: RunRecord, id = newRunId(rec.agent)): void {
+export function recordRun(
+  rec: RunRecord,
+  id = newRunId(rec.agent),
+  timeoutMs = 10_000,
+): Promise<RunPublicationStatus> {
   const facts = runFacts(rec);
-  // Hermetic capture engines intentionally retain the ordinary fact-verb shape.
-  if (process.env.NORTH_IDENTITY_TEST_REDIRECT === "1") {
-    for (const [predicate, value] of facts) {
-      try {
-        execFile(process.env.NORTH_BIN ?? "north", ["tell", id, predicate, value], () => {});
-      } catch { /* swallow */ }
+  return new Promise((resolvePublication) => {
+    let resolved = false;
+    const settle = (status: RunPublicationStatus) => {
+      if (resolved) return;
+      resolved = true;
+      resolvePublication(status);
+    };
+    // Hermetic capture engines intentionally retain the ordinary fact-verb shape.
+    if (process.env.NORTH_IDENTITY_TEST_REDIRECT === "1") {
+      let remaining = facts.length;
+      let committed = true;
+      if (remaining === 0) {
+        settle("recorded");
+        return;
+      }
+      const factSettled = (error: Error | null) => {
+        if (error) committed = false;
+        remaining--;
+        if (remaining === 0) settle(committed ? "recorded" : "unavailable");
+      };
+      for (const [predicate, value] of facts) {
+        try {
+          execFile(
+            process.env.NORTH_BIN ?? "north",
+            ["tell", id, predicate, value],
+            { timeout: Math.max(1, Math.floor(timeoutMs)) },
+            (error) => factSettled(error),
+          );
+        } catch {
+          factSettled(new Error("run telemetry process unavailable"));
+        }
+      }
+      return;
     }
-    return;
-  }
-  try {
-    execFile("bb", [
-      internalWriter,
-      process.env.NORTH_PORT ?? "7977",
-      id,
-      JSON.stringify(facts),
-    ], () => {});
-  } catch {
-    /* telemetry must never replace the run's real terminal result */
-  }
+    try {
+      execFile("bb", [
+        internalWriter,
+        process.env.NORTH_PORT ?? "7977",
+        id,
+        JSON.stringify(facts),
+      ], { timeout: Math.max(1, Math.floor(timeoutMs)) }, (error) => {
+        settle(error ? "unavailable" : "recorded");
+      });
+    } catch {
+      settle("unavailable");
+    }
+  });
 }
 
 export function newRunId(agent: string): string {

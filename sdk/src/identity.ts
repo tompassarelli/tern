@@ -65,6 +65,7 @@ export interface ManagedLaneIdentity extends ObservedAgentIdentity {
 }
 
 export type AgentIdentity = ObservedAgentIdentity;
+export type TerminalPublicationStatus = "recorded" | "unavailable";
 
 const component = (value?: string) => {
   const normalized = value?.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -160,6 +161,7 @@ function writeHarnessAgentOperation(
   operation: "publish" | "route" | "terminal",
   subject: string,
   value: string,
+  timeoutMs = INTERNAL_WRITER_TIMEOUT_MS,
 ) {
   if (process.env.NORTH_IDENTITY_TEST_REDIRECT === "1") {
     // Hermetic tests point NORTH_BIN at a tiny capture engine. Preserve the
@@ -168,8 +170,14 @@ function writeHarnessAgentOperation(
     // readback/commit protocol below.
     if (operation === "terminal") {
       const facts = JSON.parse(value) as Record<string, string>;
-      for (const [predicate, factValue] of Object.entries(facts))
-        execFileSync(northBin(), ["tell", subject, predicate, factValue], { stdio: "ignore", timeout: 10_000 });
+      const startedAt = performance.now();
+      for (const [predicate, factValue] of Object.entries(facts)) {
+        const remaining = Math.max(1, Math.floor(timeoutMs - (performance.now() - startedAt)));
+        execFileSync(northBin(), ["tell", subject, predicate, factValue], {
+          stdio: "ignore",
+          timeout: remaining,
+        });
+      }
       return;
     }
     if (operation === "publish") {
@@ -197,11 +205,11 @@ function writeHarnessAgentOperation(
       encoding: "utf8",
       env: {
         ...process.env,
-        NORTH_IDENTITY_WRITER_TIMEOUT_MS: String(INTERNAL_WRITER_TIMEOUT_MS),
+        NORTH_IDENTITY_WRITER_TIMEOUT_MS: String(timeoutMs),
         NORTH_IDENTITY_WRITE_LEASE_TTL_MS: String(INTERNAL_WRITE_LEASE_TTL_MS),
       },
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: INTERNAL_WRITER_TIMEOUT_MS,
+      timeout: timeoutMs,
     });
   } catch (cause) {
     const raw = cause && typeof cause === "object" && "stderr" in cause
@@ -273,8 +281,12 @@ export function updateAgentRoute(agentId: string, f: AgentIdentity): void {
 // and is safely reaped after the presence-lapse bar. recordRun is a secondary,
 // independently committed trail. This synchronous write remains non-fatal:
 // lifecycle finalization must not throw merely because the evidence sink failed.
-export function writeAgentTerminal(agentId: string, terminal: ExecutionTerminal): void {
-  if (!terminal.processOutcome) return;
+export function writeAgentTerminal(
+  agentId: string,
+  terminal: ExecutionTerminal,
+  timeoutMs = INTERNAL_WRITER_TIMEOUT_MS,
+): TerminalPublicationStatus {
+  if (!terminal.processOutcome) return "unavailable";
   try {
     writeHarnessAgentOperation("terminal", `agent:${agentId}`, JSON.stringify({
       outcome: terminal.processOutcome,
@@ -289,9 +301,11 @@ export function writeAgentTerminal(agentId: string, terminal: ExecutionTerminal)
         ? { delivery_attestation: terminal.deliveryProof.deliveryAttestation } : {}),
       ...(terminal.deliveryProof?.deliveryAttestationSha256
         ? { delivery_attestation_sha256: terminal.deliveryProof.deliveryAttestationSha256 } : {}),
-    }));
+    }), timeoutMs);
+    return "recorded";
   } catch {
     // Non-fatal; presence-lapse reap catches absent or torn terminal evidence.
+    return "unavailable";
   }
 }
 

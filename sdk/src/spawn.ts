@@ -8,7 +8,7 @@ import {
 } from "./harness";
 import { normalizeUsage } from "./usage";
 import { newRunId, recordRun } from "./telemetry";
-import { notifyDeath } from "./death";
+import { deathReason, notifyDeath } from "./death";
 import { inputChannel } from "./coordination";
 import {
   bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute, goalFromPrompt,
@@ -49,6 +49,9 @@ import {
 } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal } from "./execution-outcome";
+import {
+  notifyTerminalSettlement, TerminalPublicationBudget, type TerminalNotification,
+} from "./terminal-notification";
 import { assessThreadDelivery, type DeliveryAssessment } from "./delivery-verification";
 import { getThreadFacts, normalizeNorthEntityId } from "./north-client";
 import {
@@ -257,16 +260,18 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
   // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) readMessages() THROWS exitError
   // here. Without this try/catch the throw escaped -> recordRun skipped, no death signal,
-  // channel leaked. Now: catch -> outcome "died" + notifyDeath (fact + peer ping); finally
+  // channel leaked. Now: catch -> outcome "died" + durable death fact; finally
   // -> ALWAYS end the channel + record the run; return the PARTIAL result (supervision, not
   // fail-fast) so one worker's death never rejects a spawnParallel Promise.all batch.
   // Stream watchdog (thread 019f4d54): a stall (no SDK message for N min while the
   // query is open) is otherwise INVISIBLE — the iterator neither yields nor throws, so
   // the catch below never fires. Wrap the iterator: N min silence -> stalled fact +
-  // coordinator ping (surface); 2N -> abort + outcome=stalled + notifyDeath (terminal).
+  // coordinator ping (diagnostic); 2N -> abort + outcome=stalled + durable death fact.
+  // Every terminal peer wake is deferred until the terminal and run publications settle.
   const coordHandle = opts.coordinator;
   const window = stallMs();
   let stallAborted = false;
+  let terminalSignal: Pick<TerminalNotification, "detail" | "subject"> = {};
   // Background-task refusal (thread 019f4ed2): a lane that ends its turn while a
   // harness-tracked background Bash task is live must NOT finalize — the SDK
   // auto-continues the model on task settlement, but only if we keep the loop alive
@@ -371,7 +376,9 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       if (cap) {
         end(cap === "error_max_turns" ? "max_turns" : "capped");
         const partial = result.trim() ? `partial: ${result.trim().slice(0, 200)}` : "no partial result";
-        notifyTurnCap(agentId, `${cap} — ${partial}`, { coordinator: coordHandle });
+        const detail = `${cap} — ${partial}`;
+        terminalSignal = { subject: "TURN CAP", detail };
+        notifyTurnCap(agentId, detail);
         break;
       }
       const providerError = msg.subtype !== "success"
@@ -472,12 +479,15 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   }
   if (stallAborted) {
     // 2N of silence: make the stall TERMINAL + VISIBLE. Interrupt the hung query, record
-    // outcome=stalled, and fire the death path (agent_death fact + coordinator ping) so a
-    // stall is never a silent hang again.
+    // outcome=stalled, and record the death path durably. Its terminal peer wake
+    // is deferred until the authoritative terminal and run publications settle.
     outcome = "stalled";
     await interruptQuery();
-    notifyDeath(agentId, new Error(`stalled — no SDK output for ${Math.max(2, 2 * Math.round(window / 60_000))}min`),
-      { thread: undefined, coordinator: coordHandle });
+    const err = new Error(
+      `stalled — no SDK output for ${Math.max(2, 2 * Math.round(window / 60_000))}min`,
+    );
+    terminalSignal = { subject: "AGENT DEATH", detail: deathReason(err) };
+    notifyDeath(agentId, err, { thread: undefined });
   }
   } catch (err) {
     if (err instanceof ResourceEnvelopeExceededError) {
@@ -488,7 +498,8 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       console.error(`[preflight] @agent:${agentId} ${err.message}`);
     } else {
       outcome = "died";
-      notifyDeath(agentId, err, { thread: undefined, coordinator: opts.coordinator });
+      terminalSignal = { subject: "AGENT DEATH", detail: deathReason(err) };
+      notifyDeath(agentId, err, { thread: undefined });
     }
   } finally {
     end(outcome); // idempotent: close the channel so the query + any leak unwinds
@@ -515,7 +526,15 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     }
   }
   if (finalChildren.kind === "live") {
-    notifyEarlyExitChildren(agentId, finalChildren.live, { coordinator: coordHandle });
+    notifyEarlyExitChildren(agentId, finalChildren.live);
+    const childDetail =
+      `${finalChildren.live.length} live child(ren): ${finalChildren.live.join(",")}`;
+    terminalSignal = terminalSignal.subject
+      ? {
+          ...terminalSignal,
+          detail: [terminalSignal.detail, childDetail].filter(Boolean).join("; "),
+        }
+      : { subject: "EARLY EXIT WITH LIVE CHILDREN", detail: childDetail };
   } else if (orchestrator && finalChildren.kind === "unavailable") {
     console.error(
       `[harness] @agent:${agentId} CHILD SETTLEMENT UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
@@ -580,7 +599,12 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     }
   }
   const terminal = classifyExecutionTerminal(outcome, delivery);
-  writeAgentTerminal(agentId, terminal);
+  const publicationBudget = new TerminalPublicationBudget();
+  const terminalPublication = writeAgentTerminal(
+    agentId,
+    terminal,
+    publicationBudget.publicationTimeout(2),
+  );
 
   const tokenUsage = normalizeUsage(terminalMessages, routing.provider);
   const finalRoute = activeRoute();
@@ -589,7 +613,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     // A retry-safe preflight block proves the provider accepted no turn. This
     // zero is North-observed; every other missing provider value stays absent.
     : terminal.processOutcome === "blocked_preflight" ? 0 : undefined;
-  recordRun({
+  const runPublication = await recordRun({
     thread: opts.thread ?? "(ad-hoc)", agent: agentId, posture: "spawn",
     // Effective FINAL dial (rung() reflects any in-flight escalation); env-fallback
     // mirrors the identity write so a bare AGENT_MODEL spawn is still attributed.
@@ -618,22 +642,19 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     numTurns,
     errorCount: st.totalErrors, escalationTier: tier,
     escalations: escalations.length ? escalations : undefined,
-  }, runId);
-  // completion ping mirrors the death ping: the coordinator's inbox hook surfaces it.
-  // Suppress it for outcomes that already fired a dedicated ping (died -> AGENT DEATH,
-  // stalled -> AGENT DEATH via notifyDeath, max_turns/capped -> TURN CAP) — one terminal
-  // event, one ping, no contradictory "COMPLETE outcome=stalled" noise.
-  const coord = opts.coordinator;
-  const alreadySignaled = new Set(["died", "stalled", "max_turns", "capped"]);
-  if (coord && !alreadySignaled.has(outcome)) {
-    try {
-      const { execFileSync } = await import("node:child_process");
-      execFileSync("bb", [`${REPO_ROOT}/cli/msg-cli.clj`, process.env.NORTH_PORT ?? "7977",
-        "send", agentId, coord, "AGENT COMPLETE",
-        `process=${terminal.processOutcome} delivery=${terminal.deliveryOutcome}`],
-      { stdio: "ignore", timeout: 10000 });
-    } catch { /* non-fatal */ }
-  }
+  }, runId, publicationBudget.publicationTimeout(1));
+  notifyTerminalSettlement(
+    agentId,
+    coordHandle,
+    {
+      outcome,
+      terminal,
+      terminalPublication,
+      runPublication,
+      ...terminalSignal,
+    },
+    publicationBudget.notificationTimeout(),
+  );
   console.log(`[spawn] @agent:${agentId} complete (process=${outcome}, delivery=${terminal.deliveryOutcome}` +
     `${escalations.length ? `, ${escalations.length} escalation(s) -> ${rung().model}/${rung().effort}` : ""})`);
   return result;
