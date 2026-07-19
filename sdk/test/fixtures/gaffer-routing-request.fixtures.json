@@ -39,6 +39,23 @@
       }
     },
     {
+      "name": "reviewer stock template",
+      "request": {
+        "role": "reviewer",
+        "taskGrade": "senior",
+        "domainRequirements": [],
+        "topology": "worker",
+        "tier": "senior",
+        "reasoning": "high",
+        "posture": "evaluate",
+        "composition": {
+          "kind": "preset",
+          "id": "reviewer",
+          "overrides": []
+        }
+      }
+    },
+    {
       "name": "complete bespoke contract",
       "request": {
         "role": "migration-forensics", "taskGrade": "senior", "domainRequirements": ["schema history"],
@@ -83,14 +100,13 @@
       }
     },
     {
-      "name": "director stripped of orchestration authority",
-      "errorContains": "director cannot use worker topology",
+      "name": "director stock topology mutation requires bespoke",
+      "errorContains": "stock-template topology is fixed at 'orchestrator'",
       "request": {
         "role": "director", "taskGrade": "staff", "domainRequirements": [],
         "topology": "worker", "tier": "frontier", "reasoning": "xhigh", "posture": "deliver",
         "composition": {
-          "kind": "preset", "id": "director", "overrides": ["topology"],
-          "overrideReason": "attempted contradiction"
+          "kind": "preset", "id": "director", "overrides": []
         }
       }
     },
@@ -125,14 +141,13 @@
       }
     },
     {
-      "name": "preset topology override has incompatible fixed capabilities",
-      "errorContains": "orchestrator topology requires coordination",
+      "name": "worker stock topology mutation requires bespoke",
+      "errorContains": "stock-template topology is fixed at 'worker'",
       "request": {
         "role": "integrator", "taskGrade": "senior", "domainRequirements": [],
         "topology": "orchestrator", "tier": "senior", "reasoning": "high", "posture": "deliver",
         "composition": {
-          "kind": "preset", "id": "integrator", "overrides": ["topology"],
-          "overrideReason": "attempted topology projection"
+          "kind": "preset", "id": "integrator", "overrides": []
         }
       }
     },

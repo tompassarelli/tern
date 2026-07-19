@@ -113,6 +113,14 @@ export function applyGafferStaffing(metadata: RoutingMetadata, catalog = loadGaf
       + "use a distinct role name for a bespoke composition",
     );
   }
+  // Stock-template topology is fixed by the preset, not an overridable axis: a
+  // different topology is a different capability boundary and requires a
+  // bespoke composition, never a preset override.
+  if (metadata.topology !== undefined && metadata.topology !== preset.topology) {
+    throw new Error(
+      `stock-template topology is fixed at '${preset.topology}'; project a different topology through a bespoke composition`,
+    );
+  }
   const base = {
     taskGrade: preset.taskGrade,
     domainRequirements: [],
@@ -122,7 +130,7 @@ export function applyGafferStaffing(metadata: RoutingMetadata, catalog = loadGaf
     posture: preset.posture ?? catalog.defaults.posture,
   };
   const overrideFields: RoutingOverrideField[] = [
-    "taskGrade", "domainRequirements", "topology", "tier", "reasoning", "posture",
+    "taskGrade", "domainRequirements", "tier", "reasoning", "posture",
   ];
   const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
   const actualOverrides = overrideFields.filter((field) =>
@@ -143,8 +151,6 @@ export function applyGafferStaffing(metadata: RoutingMetadata, catalog = loadGaf
     if (!actualOverrides.length && composition.overrideReason !== undefined)
       throw new Error("unchanged preset must omit composition.overrideReason");
   }
-  if (role === "director" && (metadata.topology ?? preset.topology) === "worker")
-    throw new Error("director cannot use worker topology; choose a worker role for atomic work");
   validateTopologyCapabilities(
     (metadata.topology ?? preset.topology) as "worker" | "orchestrator",
     preset.capabilities,

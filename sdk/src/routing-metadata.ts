@@ -174,8 +174,6 @@ export function validateRoutingMetadata(value: RoutingMetadata): RoutingMetadata
       };
     }
   }
-  if (canonicalRole(role) === "director" && topology === "worker")
-    throw new Error("director cannot use worker topology; choose a worker role for atomic work");
   return {
     ...(role ? { role: canonicalRole(role) } : {}),
     ...(taskGrade ? { taskGrade } : {}),
