@@ -116,8 +116,15 @@ gatedTest("loopback-bind", "admission probes the validated lane coordinator port
   const requests: string[] = [];
   const expectedLog = "/tmp/north admission corpus.log";
   const server = createServer((socket) => {
-    socket.once("data", (chunk) => {
-      const request = chunk.toString("utf8");
+    let request = "";
+    const onData = (chunk: Buffer) => {
+      request += chunk.toString("utf8");
+      if (Buffer.byteLength(request, "utf8") > 4096) {
+        socket.destroy();
+        return;
+      }
+      if (!request.includes("\n")) return;
+      socket.off("data", onData);
       requests.push(request);
       if (request.includes(":for-log")) {
         socket.end("{:version 7}\n");
@@ -126,7 +133,8 @@ gatedTest("loopback-bind", "admission probes the validated lane coordinator port
           `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(expectedLog)}}\n`,
         );
       }
-    });
+    };
+    socket.on("data", onData);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

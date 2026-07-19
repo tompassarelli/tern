@@ -10,6 +10,9 @@ import type { RoutingMetadata } from "../src/routing-metadata";
 import { runFacts } from "../src/telemetry";
 import { codexGlobalArguments, codexHarnessArguments } from "../src/providers/openai";
 import {
+  MANAGED_CODEX_DISABLED_FEATURES, MANAGED_CODEX_ENABLED_FEATURES,
+} from "../src/providers/codex-app-server";
+import {
   compileProviderAuthoritySurface, formatProviderAuthoritySurface,
 } from "../src/providers";
 import { resolveTier } from "../src/providers/catalog";
@@ -29,6 +32,10 @@ afterEach(() => {
 });
 
 const preset = (role: string): RoutingMetadata => applyGafferStaffing({ role });
+const managedCodexPreview = [
+  ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
+  ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),
+];
 
 const bespoke: RoutingMetadata = {
   role: "migration-forensics",
@@ -99,7 +106,7 @@ test("domain requirements install a before-side-effect context gate, not an expe
 test("topology controls prompt and tools with positive-only orchestration authority", async () => {
   process.env.AGENT_LAWS = "off";
   const worker = harnessOptions({
-    self: "worker-topology", provider: "openai", model: "gpt-5.6-terra",
+    self: "worker-topology", provider: "openai",
     presenceRegistrar: false, routingMetadata: preset("integrator"),
   }) as any;
   expect(worker.systemPrompt).toContain("TOPOLOGY: WORKER (two-tier law)");
@@ -161,6 +168,7 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   expect(loggedSurface).toBe(
     "provider=anthropic; capabilities=filesystem.read,filesystem.search,shell.readonly; "
     + "native-multi-agent=disabled; "
+    + "live-input=streaming; "
     + "authoring-hooks=harness-exact; "
     + "north enabled_tools=capture,tell,evidence_record,show,ready,next,board,plate; "
     + "web=disabled; sdk builtins=Read,Grep,Glob; "
@@ -197,9 +205,7 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   ]));
   expect(integrator.disallowedTools).toEqual(expect.arrayContaining(["WebSearch", "WebFetch"]));
   expect(codexGlobalArguments(integrator)).toEqual([]);
-  expect(codexHarnessArguments(integrator)).toEqual(expect.arrayContaining([
-    "--sandbox", "workspace-write", "--config", 'web_search="disabled"',
-  ]));
+  expect(codexHarnessArguments(integrator)).toEqual(managedCodexPreview);
 });
 
 test("managed capacity resolves from the complete request before the provider seal", () => {
@@ -246,7 +252,10 @@ test("model calibration uses exact catalog keys and never applies stale alias de
 
   const fallback = applyHarnessRoute(opus, "openai", "gpt-5.6-sol");
   expect(fallback.options.systemPrompt).not.toContain("Fluency alarm");
-  expect(fallback.evidence?.modelDelta).toMatchObject({ provider: "openai", model: "gpt-5.6-sol", kind: "none" });
+  expect(fallback.evidence?.modelDelta).toEqual({
+    provider: "openai", model: "gpt-5.6-sol", kind: "calibrated",
+    path: "docs/deltas/gpt-5.6-sol.md",
+  });
 
   expect(() => harnessOptions({
     self: "delta-substring", provider: "anthropic", model: "custom-opus-lookalike",

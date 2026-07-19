@@ -16,13 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
-  bootstrapAccountConfig,
-  codexConfigArguments,
-  liveCodexAuthState,
-  providerEnvironmentForTarget,
-  type AccountAuthState,
+  bootstrapAccountConfig, codexConfigArguments, providerEnvironmentForTarget,
 } from "../src/accounts";
-import { runAccountStatus } from "../src/account-cli";
 
 const root = join(import.meta.dir, "..");
 const cli = join(root, "src/account-cli.ts");
@@ -53,7 +48,7 @@ function fixture() {
   writeFileSync(join(codex, "state.sqlite"), "never-link-this\n");
 
   const fake = join(bin, "fake-provider.cjs");
-  writeFileSync(fake, `#!/usr/bin/env node
+  writeFileSync(fake, `#!/usr/bin/env bun
 const fs = require("node:fs");
 const path = require("node:path");
 const isClaude = Boolean(process.env.CLAUDE_CONFIG_DIR);
@@ -65,9 +60,9 @@ const login = isClaude ? process.argv[2] === "auth" && process.argv[3] === "logi
   : process.argv[2] === "login" && process.argv[3] !== "status";
 if (login) { fs.writeFileSync(path.join(root, "logged-in"), "yes"); process.exit(0); }
 const loggedIn = fs.existsSync(path.join(root, "logged-in"));
-if (isClaude) fs.writeSync(1, JSON.stringify({ loggedIn, authMethod: loggedIn ? "claude.ai" : "none" }) + "\\n");
-else if (loggedIn) fs.writeSync(1, "Logged in using ChatGPT\\n");
-else fs.writeSync(2, "Not logged in\\n");
+if (isClaude) console.log(JSON.stringify({ loggedIn, authMethod: loggedIn ? "claude.ai" : "none" }));
+else if (loggedIn) console.log("Logged in using ChatGPT");
+else console.error("Not logged in");
 process.exit(loggedIn ? 0 : 1);
 `);
   chmodSync(fake, 0o755);
@@ -97,7 +92,7 @@ process.exit(loggedIn ? 0 : 1);
     CODEX_PRIVATE_CREDENTIAL: "must-not-propagate",
   };
   const run = (...args: string[]) => spawnSync("bun", ["run", cli, ...args], { env, encoding: "utf8" });
-  return { home, policy, env, run };
+  return { home, policy, run };
 }
 
 test("add preserves routing fields, isolates roots, and links only allowlisted config", () => {
@@ -125,17 +120,19 @@ test("add preserves routing fields, isolates roots, and links only allowlisted c
   expect(readlinkSync(join(claudeRoot, "CLAUDE.md"))).toBe(join(home, ".claude/CLAUDE.md"));
   expect(lstatSync(join(claudeRoot, "skills")).isSymbolicLink()).toBe(true);
   expect(lstatSync(join(codexRoot, "AGENTS.md")).isSymbolicLink()).toBe(true);
-  expect(lstatSync(join(codexRoot, "config.toml")).isSymbolicLink()).toBe(true);
   for (const forbidden of [
     join(claudeRoot, ".credentials.json"), join(claudeRoot, "sessions"),
+    join(codexRoot, "config.toml"), join(codexRoot, "hooks.json"), join(codexRoot, "rules"),
     join(codexRoot, "auth.json"), join(codexRoot, "log"), join(codexRoot, "state.sqlite"),
   ]) expect(() => lstatSync(forbidden)).toThrow();
 });
 
-test("OpenAI bootstrap idempotently retires only North's legacy ambient hooks link", () => {
+test("OpenAI bootstrap retires only North's legacy authority links and refuses bespoke state", () => {
   const { home } = fixture();
   const ambientHooks = join(home, ".codex/hooks.json");
+  const ambientRules = join(home, ".codex/rules");
   writeFileSync(ambientHooks, "{}\n");
+  mkdirSync(ambientRules);
   const account = {
     id: "codex-migrate",
     provider: "openai" as const,
@@ -146,21 +143,23 @@ test("OpenAI bootstrap idempotently retires only North's legacy ambient hooks li
   bootstrapAccountConfig(account, { home });
   writeFileSync(join(account.root, "auth.json"), "keep auth\n");
   symlinkSync(ambientHooks, join(account.root, "hooks.json"));
+  symlinkSync(join(home, ".codex/config.toml"), join(account.root, "config.toml"));
+  symlinkSync(ambientRules, join(account.root, "rules"));
   const agentsLink = readlinkSync(join(account.root, "AGENTS.md"));
-  const configLink = readlinkSync(join(account.root, "config.toml"));
 
   bootstrapAccountConfig(account, { home });
   bootstrapAccountConfig(account, { home });
 
-  expect(() => lstatSync(join(account.root, "hooks.json"))).toThrow();
+  for (const name of ["config.toml", "hooks.json", "rules"])
+    expect(() => lstatSync(join(account.root, name))).toThrow();
   expect(readlinkSync(join(account.root, "AGENTS.md"))).toBe(agentsLink);
-  expect(readlinkSync(join(account.root, "config.toml"))).toBe(configLink);
   expect(readFileSync(join(account.root, "auth.json"), "utf8")).toBe("keep auth\n");
 
   const customHooks = join(home, "custom-hooks.json");
   writeFileSync(customHooks, "{}\n");
   symlinkSync(customHooks, join(account.root, "hooks.json"));
-  bootstrapAccountConfig(account, { home });
+  expect(() => bootstrapAccountConfig(account, { home }))
+    .toThrow("refusing authority-bearing Codex account path");
   expect(readlinkSync(join(account.root, "hooks.json"))).toBe(customHooks);
 });
 
@@ -275,8 +274,8 @@ test("login and status use disjoint provider homes and normalized account identi
 
   writeFileSync(join(home, ".claude/logged-in"), "ambient login must not count\n");
   writeFileSync(join(home, ".codex/logged-in"), "ambient login must not count\n");
-  const empty = run("list");
-  expect(empty.status).toBe(0);
+  const empty = run("status");
+  expect(empty.status).toBe(1);
   expect(empty.stdout).toBe([
     "Claude / Anthropic",
     "  claude-work  not logged in",
@@ -287,8 +286,8 @@ test("login and status use disjoint provider homes and normalized account identi
   ].join("\n"));
 
   expect(run("login", "claude-work").status).toBe(0);
-  const split = run("list");
-  expect(split.status).toBe(0);
+  const split = run("status");
+  expect(split.status).toBe(1);
   expect(split.stdout).toBe([
     "Claude / Anthropic",
     "  claude-work  logged in",
@@ -316,7 +315,7 @@ test("login and status use disjoint provider homes and normalized account identi
   expect(listed.stdout).not.toContain("\u001b[");
 
   expect(run("login", "codex-personal").status).toBe(0);
-  const ready = run("list");
+  const ready = run("status");
   expect(ready.status).toBe(0);
   expect(ready.stdout).toContain("  claude-work  logged in");
   expect(ready.stdout).toContain("  codex-personal  logged in");
@@ -344,94 +343,7 @@ test("login and status use disjoint provider homes and normalized account identi
   expect(codexCalls.every((call) => call.argv.includes('cli_auth_credentials_store="file"'))).toBe(true);
   expect(codexCalls.every((call) => call.argv.includes('forced_login_method="chatgpt"'))).toBe(true);
   expect(codexCalls.every((call) => call.argv.includes('model_provider="openai"'))).toBe(true);
-});
-
-async function captureStatusOutput(
-  account: { id: string; provider: "openai"; profile: string; authMode: "isolated"; root: string },
-  state: AccountAuthState,
-): Promise<{ exit: number; stdout: string }> {
-  const lines: string[] = [];
-  const original = console.log;
-  console.log = (...values: unknown[]) => { lines.push(values.map(String).join(" ")); };
-  try {
-    const exit = await runAccountStatus([account], async () => new Map([[account.id, state]]));
-    return { exit, stdout: `${lines.join("\n")}\n` };
-  } finally {
-    console.log = original;
-  }
-}
-
-test("status rejects a locally cached Codex login after live token invalidation", async () => {
-  const { home, run } = fixture();
-  expect(run("add", "codex-personal", "openai").status).toBe(0);
-  expect(run("login", "codex-personal").status).toBe(0);
-  const root = join(home, ".local/state/north/accounts/openai/codex-personal");
-
-  const local = run("list");
-  expect(local.status).toBe(0);
-  expect(local.stdout).toContain("codex-personal  logged in");
-
-  const account = { id: "codex-personal", provider: "openai", profile: "codex-personal", authMode: "isolated", root } as const;
-  const state = await liveCodexAuthState(account, { home }, async () => {
-    throw Object.assign(new Error("normalized"), { reason: "codex_usage_subscription_auth_required" });
-  });
-  expect(await captureStatusOutput(account, state)).toEqual({
-    exit: 1,
-    stdout: "Codex / OpenAI\n  codex-personal  auth required\n",
-  });
-});
-
-test("status keeps Codex transport failure distinct from revoked authentication", async () => {
-  const { home, run } = fixture();
-  expect(run("add", "codex-personal", "openai").status).toBe(0);
-  expect(run("login", "codex-personal").status).toBe(0);
-  const root = join(home, ".local/state/north/accounts/openai/codex-personal");
-  const account = { id: "codex-personal", provider: "openai", profile: "codex-personal", authMode: "isolated", root } as const;
-  const state = await liveCodexAuthState(account, { home }, async () => {
-    throw Object.assign(new Error("normalized"), { reason: "codex_usage_transport_failed" });
-  });
-  expect(await captureStatusOutput(account, state)).toEqual({
-    exit: 1,
-    stdout: "Codex / OpenAI\n  codex-personal  auth unverifiable\n",
-  });
-});
-
-test("healthy isolated Codex status uses the isolated target root", async () => {
-  const { home } = fixture();
-  const root = join(home, ".local/state/north/accounts/openai/codex-personal");
-  const account = { id: "codex-personal", provider: "openai", profile: "codex-personal", authMode: "isolated", root } as const;
-  let probedRoot: string | undefined;
-  const state = await liveCodexAuthState(account, { home }, async ({ target, env, timeoutMs }) => {
-    expect(timeoutMs).toBe(10_000);
-    probedRoot = providerEnvironmentForTarget("openai", target, { env }).CODEX_HOME;
-  });
-  expect(probedRoot).toBe(root);
-  expect(await captureStatusOutput(account, state)).toEqual({
-    exit: 0,
-    stdout: "Codex / OpenAI\n  codex-personal  logged in\n",
-  });
-});
-
-test("a live rate-limit response remains an auth signal when usage windows are unavailable", async () => {
-  const { home } = fixture();
-  const target = { id: "openai", provider: "openai", authMode: "ambient" } as const;
-  expect(await liveCodexAuthState(target, { home }, async () => {
-    throw Object.assign(new Error("normalized"), { reason: "codex_usage_windows_unavailable" });
-  })).toBe("logged-in");
-});
-
-test("live Codex authentication probe supports an ambient target", async () => {
-  const { home, env } = fixture();
-  let probedRoot: string | undefined;
-  expect(await liveCodexAuthState({
-    id: "openai",
-    provider: "openai",
-    authMode: "ambient",
-  }, { home, env }, async ({ target, env: probeEnv }) => {
-    probedRoot = providerEnvironmentForTarget("openai", target, { env: probeEnv }).CODEX_HOME;
-  })).toBe("logged-in");
-  expect(probedRoot).toBe(join(home, ".codex"));
-});
+}, 15_000);
 
 test("account help advertises the grouped list and verbose diagnostics", () => {
   const { run } = fixture();
@@ -504,6 +416,8 @@ test("subscription targets deny hostile provider transports while preserving ord
     PATH: process.env.PATH,
     TERM: "xterm-256color",
     NORTH_TRACE: "keep",
+    NORTH_MKFIFO_BIN: "/nix/store/wrapper-sealed-mkfifo",
+    NORTH_MANAGED_CODEX_BIN: "/nix/store/wrapper-sealed-codex",
     ANTHROPIC_LOG: "keep-anthropic-log",
     OPENAI_LOG: "keep-openai-log",
     AWS_MAX_ATTEMPTS: "7",
@@ -539,7 +453,8 @@ test("subscription targets deny hostile provider transports while preserving ord
     CODEX_PROFILE: "hostile",
   } satisfies NodeJS.ProcessEnv;
   const forbidden = Object.keys(hostile).filter((key) => ![
-    "HOME", "PATH", "TERM", "NORTH_TRACE", "ANTHROPIC_LOG", "OPENAI_LOG", "AWS_MAX_ATTEMPTS",
+    "HOME", "PATH", "TERM", "NORTH_TRACE", "NORTH_MKFIFO_BIN", "NORTH_MANAGED_CODEX_BIN",
+    "ANTHROPIC_LOG", "OPENAI_LOG", "AWS_MAX_ATTEMPTS",
     "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CODEX_SQLITE_HOME",
   ].includes(key));
 
@@ -552,6 +467,8 @@ test("subscription targets deny hostile provider transports while preserving ord
       HOME: home,
       TERM: "xterm-256color",
       NORTH_TRACE: "keep",
+      NORTH_MKFIFO_BIN: "/nix/store/wrapper-sealed-mkfifo",
+      NORTH_MANAGED_CODEX_BIN: "/nix/store/wrapper-sealed-codex",
       ANTHROPIC_LOG: "keep-anthropic-log",
       OPENAI_LOG: "keep-openai-log",
       AWS_MAX_ATTEMPTS: "7",
@@ -563,6 +480,7 @@ test("subscription targets deny hostile provider transports while preserving ord
     } else {
       expect(env.CODEX_HOME).toBe(root);
       expect(env.CODEX_SQLITE_HOME).toBe(join(root, "sqlite"));
+      expect(env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED).toBe("1");
       expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
       expect(codexConfigArguments(env)).toContain('model_provider="openai"');
     }

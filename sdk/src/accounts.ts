@@ -75,8 +75,14 @@ export const ACCOUNT_CONFIG_ALLOWLIST: Record<AccountProvider, readonly string[]
     "keybindings",
     "themes",
   ],
-  openai: ["AGENTS.md", "config.toml", "rules", "skills"],
+  // A managed Codex lane authenticates from this home, but all executable
+  // authority is supplied at CLI/session precedence and proven in the same
+  // app-server process that executes the turn. User config and rules therefore
+  // must not be projected into an isolated account.
+  openai: ["AGENTS.md", "skills"],
 };
+
+const OPENAI_LEGACY_AUTHORITY_LINKS = ["config.toml", "hooks.json", "rules"] as const;
 
 function homeOf(context: AccountContext): string {
   return resolve(context.home ?? context.env?.HOME ?? process.env.HOME ?? homedir());
@@ -190,21 +196,20 @@ export function bootstrapAccountConfig(account: ProviderAccount, context: Accoun
   ensurePrivateDirectory(account.root);
   if (account.provider === "openai") ensurePrivateDirectory(join(account.root, "sqlite"));
 
-  // Codex hooks are now enforced exclusively by root-managed requirements.
-  // Retire only the exact legacy ambient symlink North itself created; a user
-  // file or differently targeted link is outside this migration's authority
-  // and remains untouched (and ignored by allow_managed_hooks_only policy).
+  // Retire only links created by North's former account projection. A bespoke
+  // file or differently targeted link is an authority-bearing account state,
+  // so admission fails instead of silently ignoring or replacing it.
   if (account.provider === "openai") {
-    const legacySource = join(sourceRoot, "hooks.json");
-    const legacyDestination = join(account.root, "hooks.json");
-    try {
-      if (matchesConfigLink(legacyDestination, legacySource))
+    for (const name of OPENAI_LEGACY_AUTHORITY_LINKS) {
+      const legacySource = join(sourceRoot, name);
+      const legacyDestination = join(account.root, name);
+      try {
+        if (!matchesConfigLink(legacyDestination, legacySource))
+          throw new Error(`refusing authority-bearing Codex account path ${legacyDestination}`);
         unlinkSync(legacyDestination);
-    } catch (error) {
-      if (!isErrno(error, "ENOENT")) {
-        const info = lstatSync(legacyDestination);
-        if (info.isSymbolicLink() && readlinkSync(legacyDestination) === legacySource)
-          throw error;
+      } catch (error) {
+        if (isErrno(error, "ENOENT")) continue;
+        throw error;
       }
     }
   }
@@ -370,6 +375,7 @@ export function accountEnvironment(account: ProviderAccount, context: AccountCon
   } else {
     env.CODEX_HOME = account.root;
     env.CODEX_SQLITE_HOME = join(account.root, "sqlite");
+    env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED = "1";
     delete env.CLAUDE_CONFIG_DIR;
   }
   return env;
@@ -401,6 +407,7 @@ export function providerEnvironmentForTarget(
   if (provider === "openai") {
     env.CODEX_HOME ??= join(homeOf(context), ".codex");
     env.CODEX_SQLITE_HOME ??= env.CODEX_HOME;
+    env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED = "1";
   }
   return env;
 }

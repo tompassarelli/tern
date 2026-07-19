@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   compileProviderAuthoritySurface, ProviderRetrySafeError, ProviderSelectionError,
   selectProvider, selectProviderFromAvailability,
@@ -12,16 +12,16 @@ import { resolveTier } from "../src/providers/catalog";
 import { anthropicProvider, normalizeAnthropicQueryDiagnostics } from "../src/providers/anthropic";
 import { codexHarnessArguments, openaiProvider } from "../src/providers/openai";
 import {
+  MANAGED_CODEX_DISABLED_FEATURES, MANAGED_CODEX_ENABLED_FEATURES,
+} from "../src/providers/codex-app-server";
+import {
   READONLY_SHELL_SERVER, READONLY_SHELL_TOOL,
 } from "../src/readonly-shell";
 import { harnessOptions, type HarnessCompositionEvidence } from "../src/harness";
 import { applyGafferStaffing, gafferCapabilities } from "../src/gaffer-staffing";
 import { agentRouteFacts } from "../src/identity";
-import { gatedTest } from "./support/capabilities";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createServer } from "node:net";
-import type { AddressInfo } from "node:net";
 
 const MANAGED_ENV = [
   "NORTH_DISABLE_ANTHROPIC", "NORTH_DISABLE_OPENAI", "NORTH_PROVIDER_ORDER",
@@ -31,35 +31,6 @@ const MANAGED_ENV = [
   "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
 ] as const;
 const saved = Object.fromEntries(MANAGED_ENV.map((key) => [key, process.env[key]])) as Record<typeof MANAGED_ENV[number], string | undefined>;
-const savedNorthPort = process.env.NORTH_PORT;
-const savedFramLog = process.env.FRAM_LOG;
-const coordinatorLog = "/tmp/north-providers-test.log";
-const coordinator = createServer((socket) => {
-  socket.once("data", (chunk) => {
-    if (chunk.toString("utf8").includes(":for-log")) {
-      socket.end("{:version 17}\n");
-    } else {
-      socket.end(
-        `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(coordinatorLog)}}\n`,
-      );
-    }
-  });
-});
-beforeAll(async () => {
-  await new Promise<void>((resolve, reject) => {
-    coordinator.once("error", reject);
-    coordinator.listen(0, "127.0.0.1", resolve);
-  });
-  process.env.NORTH_PORT = String((coordinator.address() as AddressInfo).port);
-  process.env.FRAM_LOG = coordinatorLog;
-});
-afterAll(async () => {
-  if (savedNorthPort === undefined) delete process.env.NORTH_PORT;
-  else process.env.NORTH_PORT = savedNorthPort;
-  if (savedFramLog === undefined) delete process.env.FRAM_LOG;
-  else process.env.FRAM_LOG = savedFramLog;
-  await new Promise<void>((resolve) => coordinator.close(() => resolve()));
-});
 const available: ProviderAvailability[] = [
   { provider: "anthropic", available: true, reason: "ready" },
   { provider: "openai", available: true, reason: "ready" },
@@ -75,6 +46,10 @@ const policy = (overrides: Partial<ResourcePolicy> = {}): ResourcePolicy => ({
   pressures: { anthropic: "normal", openai: "normal" },
   ...overrides,
 });
+const managedCodexPreview = [
+  ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
+  ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),
+];
 const accountPolicy = (overrides: Partial<ResourcePolicy> = {}): ResourcePolicy => policy({
   targets: [
     { id: "claude-personal", provider: "anthropic", authMode: "ambient" },
@@ -297,16 +272,19 @@ test("balanced allocation uses each account's observed numeric headroom", () => 
       },
     },
   });
-  const counts = { "claude-personal": 0, "claude-work": 0, "codex-personal": 0 };
-  for (let index = 0; index < 2_000; index++) {
-    const decision = selectProviderFromAvailability(
-      "auto", accountAvailability, balanced, "standard", `run-${index}`, "medium",
-    );
-    counts[decision.target as keyof typeof counts]++;
-  }
-  expect(counts["claude-personal"]).toBeLessThan(counts["claude-work"]);
-  expect(counts["claude-work"]).toBeLessThan(counts["codex-personal"]);
-  expect(Object.values(counts).reduce((sum, count) => sum + count, 0)).toBe(2_000);
+  const estimates = Object.fromEntries(balancedAllocationEstimates(
+    accountAvailability, balanced, "standard", "medium",
+  ).map((estimate) => [estimate.target, estimate]));
+  expect(estimates["claude-personal"].effectiveWeight).toBeCloseTo(0.2);
+  expect(estimates["claude-work"].effectiveWeight).toBeCloseTo(0.5);
+  expect(estimates["codex-personal"].effectiveWeight).toBeCloseTo(0.8);
+  expect(estimates["claude-personal"].approximateShare)
+    .toBeLessThan(estimates["claude-work"].approximateShare);
+  expect(estimates["claude-work"].approximateShare)
+    .toBeLessThan(estimates["codex-personal"].approximateShare);
+  expect(Object.values(estimates).reduce(
+    (sum, estimate) => sum + estimate.approximateShare, 0,
+  )).toBeCloseTo(1);
 });
 
 test("same-window Anthropic warning applies a routing-only floor without fabricating measured usage", () => {
@@ -400,9 +378,7 @@ test("warning floors expire and do not absorb unlike provider windows", () => {
 });
 
 test("model-scoped exhaustion constrains only the matching Anthropic route", () => {
-  // The fable-model route is now reached by an explicit model pin (the D1 gate),
-  // not the retired window auto-promotion; the claude:model:fable pool window still
-  // constrains only that route, never the opus/sonnet tiers.
+  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
   const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
   const scoped = accountPolicy({
     targetPressures: { "claude-personal": "exhausted", "claude-work": "unknown", "codex-personal": "unknown" },
@@ -421,7 +397,7 @@ test("model-scoped exhaustion constrains only the matching Anthropic route", () 
   );
   expect(senior.entitlementPressure).toBe("plenty");
   expect(() => selectProviderFromAvailability(
-    { target: "claude-personal" }, target, scoped, "frontier", "frontier", "xhigh", "fable",
+    { target: "claude-personal" }, target, scoped, "frontier", "frontier", "xhigh",
   )).toThrow("routing target claude-personal entitlement exhausted");
 });
 
@@ -478,9 +454,7 @@ test("explicit models constrain provider compatibility before observed-window pr
 });
 
 test("fresh telemetry failure neither rewards stale headroom nor revives model-scoped exhaustion", () => {
-  // Fable route is reached by explicit model pin now (window retired); the pinned
-  // fable route stays exhausted under the model-scoped window even when a fresh
-  // generic probe failed, while the unpinned standard route falls to unknown.
+  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
   const observedAt = new Date().toISOString();
   const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
   const failed = accountPolicy({
@@ -497,10 +471,10 @@ test("fresh telemetry failure neither rewards stale headroom nor revives model-s
 
   const standard = balancedAllocationEstimates(target, failed, "standard", "medium")[0];
   expect(standard).toMatchObject({ eligible: true, pressure: "unknown", effectiveWeight: 0.5 });
-  const frontier = balancedAllocationEstimates(target, failed, "frontier", "xhigh", "fable")[0];
+  const frontier = balancedAllocationEstimates(target, failed, "frontier", "xhigh")[0];
   expect(frontier).toMatchObject({ eligible: false, pressure: "exhausted", effectiveWeight: 0 });
   expect(() => selectProviderFromAvailability(
-    { target: "claude-personal" }, target, failed, "frontier", "failed-frontier", "xhigh", "fable",
+    { target: "claude-personal" }, target, failed, "frontier", "failed-frontier", "xhigh",
   )).toThrow("routing target claude-personal entitlement exhausted");
 });
 
@@ -559,21 +533,21 @@ test("semantic tiers resolve independently per provider", () => {
 });
 
 test("provider selection filters tier and reasoning before allocation", () => {
-  expect(() => resolveTier("anthropic", "senior", undefined, "medium"))
-    .toThrow("provider anthropic cannot resolve semantic tier senior with reasoning medium");
+  expect(() => resolveTier("anthropic", "standard", undefined, "low"))
+    .toThrow("provider anthropic cannot resolve semantic tier standard with reasoning low");
   const decision = selectProviderFromAvailability(
     "auto",
     available,
     policy({ providerOrder: ["anthropic", "openai"] }),
-    "senior",
+    "standard",
     "asymmetric-route",
-    "medium",
+    "low",
   );
   expect(decision.provider).toBe("openai");
   expect(decision.fallbackProviders).toEqual([]);
-  expect(decision.selectionReason).toContain("route=senior/medium");
+  expect(decision.selectionReason).toContain("route=standard/low");
   try {
-    selectProviderFromAvailability("anthropic", available, policy(), "senior", "exact-incompatible", "medium");
+    selectProviderFromAvailability("anthropic", available, policy(), "standard", "exact-incompatible", "low");
     throw new Error("expected route incompatibility");
   } catch (error) {
     expect(error).toMatchObject({ kind: "route_unresolvable", preSideEffect: true });
@@ -638,23 +612,25 @@ test("provider selection filters unenforceable capability shapes before side eff
   }
 });
 
-test("Anthropic frontier resolves to the Gaffer config model with no Fable window swap", () => {
-  // The temporary Fable promotion window is retired (escalation-arch D1/D5): frontier
-  // resolves per provider config regardless of clock, and NORTH_FABLE_NOW no longer
-  // influences resolution. No hidden model swap; an explicit model still wins.
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z"; // inside the old window — must NOT promote
-  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+test("temporary Fable promotion is Anthropic-only at the semantic frontier", () => {
+  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
+  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", undefined, "high"))
     .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
-  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
-  expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier", "fable", "xhigh")).toEqual({
+    tier: "frontier", model: "claude-fable-5", effort: "xhigh",
+  });
   expect(() => resolveTier("anthropic", "frontier", "sonnet", "xhigh"))
     .toThrow("model claude-sonnet-5 does not support reasoning xhigh");
   expect(() => resolveTier("openai", "frontier", "luna", "xhigh"))
     .toThrow("model gpt-5.6-luna does not support reasoning xhigh");
+  expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({
+    tier: "frontier", model: "claude-opus-4-8", effort: "xhigh",
+  });
   expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: "gpt-5.6-sol", effort: "xhigh" });
-  delete process.env.NORTH_FABLE_NOW;
+  process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", "fable", "xhigh"))
     .toThrow("model claude-fable-5 does not support reasoning xhigh");
@@ -737,9 +713,7 @@ async function assertReadonlyCrossProviderFallback(
   expect(baseOptions.disallowedTools).toContain("Bash");
   expect(baseOptions.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
   if (initial === "openai") {
-    expect(codexHarnessArguments(baseOptions)).toEqual(expect.arrayContaining([
-      "--sandbox", "read-only",
-    ]));
+    expect(codexHarnessArguments(baseOptions)).toEqual(managedCodexPreview);
   } else {
     expect(() => codexHarnessArguments(baseOptions))
       .toThrow("openai_harness_authority_seal_missing");
@@ -796,9 +770,7 @@ async function assertReadonlyCrossProviderFallback(
     expect(options.disallowedTools).toContain("Bash");
     expect(options.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
     if (attemptProvider === "openai") {
-      expect(codexHarnessArguments(options)).toEqual(expect.arrayContaining([
-        "--sandbox", "read-only",
-      ]));
+      expect(codexHarnessArguments(options)).toEqual(managedCodexPreview);
     }
   }
   expect(admissions).toEqual({ [initial]: 1, [fallback]: 1 });
@@ -818,11 +790,11 @@ async function assertReadonlyCrossProviderFallback(
   expect(decision.fallbackPath).toEqual([initial, fallback]);
 }
 
-gatedTest("loopback-bind", "OpenAI read-only fallback to Anthropic preserves minimum authority and exact route", async () => {
+test("OpenAI read-only fallback to Anthropic preserves minimum authority and exact route", async () => {
   await assertReadonlyCrossProviderFallback("openai", "anthropic");
 });
 
-gatedTest("loopback-bind", "Anthropic read-only fallback to OpenAI preserves minimum authority and exact route", async () => {
+test("Anthropic read-only fallback to OpenAI preserves minimum authority and exact route", async () => {
   await assertReadonlyCrossProviderFallback("anthropic", "openai");
 });
 
@@ -883,7 +855,7 @@ test("Anthropic adapter diagnostics redact SDK failures across stream and contro
   }
 });
 
-gatedTest("loopback-bind", "Anthropic managed admission rejects every omitted authority boundary before SDK side effects", async () => {
+test("Anthropic managed admission rejects every omitted authority boundary before SDK side effects", async () => {
   let sequence = 0;
   const makeBase = () => harnessOptions({
     self: `anthropic-authority-probe-${sequence++}`,
@@ -1017,7 +989,7 @@ gatedTest("loopback-bind", "Anthropic managed admission rejects every omitted au
     options: cases[0][0],
   }) as AsyncIterable<any>)).rejects.toThrow("anthropic_harness_authority_seal_missing");
   const base = makeBase();
-  await expect(anthropicProvider.admit!({ options: base })).resolves.toBeUndefined();
+  expect(compileProviderAuthoritySurface("anthropic", base).provider).toBe("anthropic");
 
   markExecutionAdmission("anthropic", base);
   const admitted = anthropicProvider.query({

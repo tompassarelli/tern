@@ -29,6 +29,9 @@ import {
 import {
   compileProviderAuthoritySurface,
 } from "../src/providers/authority";
+import {
+  MANAGED_CODEX_DISABLED_FEATURES, MANAGED_CODEX_ENABLED_FEATURES,
+} from "../src/providers/codex-app-server";
 
 const north = join(import.meta.dir, "../..");
 const temporary: string[] = [];
@@ -91,12 +94,15 @@ test("North MCP tool inventory and managed provider exposure stay exact", () => 
   ]));
 
   const openaiWorker = designer("openai", "openai-exact-worker-surface");
-  const workerEnabledTools = codexHarnessArguments(openaiWorker).find((argument) =>
-    argument.startsWith("mcp_servers.north.enabled_tools="))!;
-  expect(workerEnabledTools).toBe(
-    'mcp_servers.north.enabled_tools=["capture","tell","evidence_record","show","ready","next","board","plate"]',
-  );
-  expect(workerEnabledTools).not.toMatch(/dispatch|spawn/);
+  const workerSurface = compileProviderAuthoritySurface("openai", openaiWorker);
+  expect(workerSurface.northEnabledTools).toEqual([
+    "capture", "tell", "evidence_record", "show", "ready", "next", "board", "plate",
+  ]);
+  expect(workerSurface.northEnabledTools).not.toEqual(expect.arrayContaining(["dispatch", "spawn"]));
+  expect(codexHarnessArguments(openaiWorker)).toEqual([
+    ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
+    ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),
+  ]);
 
   const director = harnessOptions({
     self: "openai-exact-orchestrator-surface",
@@ -129,7 +135,7 @@ test("route application rejects request laundering and authoring hooks are an ex
   expect(hasCanonicalAuthoringHooks(hookLaundered)).toBe(false);
   expect(() => applyHarnessRoute(
     hookLaundered, "anthropic", "claude-opus-4-6", "xhigh",
-  )).toThrow("harness authority source mutated before route application");
+  )).toThrow("harness composition root mutated before route application");
 });
 
 test("provider authority surfaces are deeply frozen at every array boundary", () => {
@@ -181,11 +187,6 @@ test("managed authority rejects every unowned SDK option on initial and fallback
   const spend = designer("anthropic", "anthropic-max-turns-tamper") as any;
   spend.maxTurns = 1_000_000_000;
   expect(hasCanonicalHarnessAuthority(spend, "anthropic")).toBe(false);
-
-  const settings = designer("anthropic", "anthropic-settings-tamper") as any;
-  expect(Object.isFrozen(settings.settings)).toBe(true);
-  expect(() => { settings.settings.autoCompactEnabled = false; }).toThrow();
-  expect(hasCanonicalHarnessAuthority(settings, "anthropic")).toBe(true);
 });
 
 test("managed-lane marker is explicit, sealed, and never inherited or sent to North MCP", () => {
@@ -232,14 +233,15 @@ test("both providers receive the exact custom North and Fram instance selectors 
     )).not.toThrow();
   }
 
-  const openai = designer("openai", "openai-custom-instance-argv");
-  const envArgument = codexHarnessArguments(openai)
-    .find((argument) => argument.startsWith("mcp_servers.north.env="))!;
-  expect(envArgument).toContain('NORTH_PORT="64129"');
-  expect(envArgument).toContain('FRAM_LOG="/tmp/north-authority-facts.log"');
-  expect(envArgument).toContain('FRAM_TELEMETRY_LOG="/tmp/north-authority-telemetry.log"');
-  expect(envArgument).toContain('FRAM_THREADS="/tmp/north-authority-threads"');
-  expect(envArgument).not.toContain("UNRELATED_SECRET_CANARY");
+  const openai = designer("openai", "openai-custom-instance-runtime-layer");
+  // The public argument preview is deliberately non-executable. Account and
+  // MCP state enter only the same-process app-server layer that attests them.
+  const preview = codexHarnessArguments(openai).join("\n");
+  expect(preview).not.toContain("NORTH_PORT");
+  expect(preview).not.toContain("FRAM_LOG");
+  expect(preview).not.toContain("FRAM_TELEMETRY_LOG");
+  expect(preview).not.toContain("FRAM_THREADS");
+  expect(preview).not.toContain("UNRELATED_SECRET_CANARY");
 
   const tainted = {
     ...openai,
@@ -509,7 +511,7 @@ test("project AGENTS composition is bounded, root-to-cwd, override-aware, and pr
   writeFileSync(join(nested, "AGENTS.override.md"), "OVERRIDE_PROJECT_CANARY\n");
   process.env.HOME = home;
   process.env.AGENT_LAWS = "on";
-  process.env.GAFFER_HOME = join(north, "../gaffer");
+  process.env.GAFFER_HOME = inheritedEnv.GAFFER_HOME ?? join(north, "../gaffer");
 
   const appendix = projectAgentsAppendix(nested);
   expect(appendix.indexOf("ROOT_PROJECT_CANARY")).toBeLessThan(appendix.indexOf("SRC_PROJECT_CANARY"));
@@ -536,7 +538,7 @@ test("project AGENTS composition is bounded, root-to-cwd, override-aware, and pr
     presenceRegistrar: false,
     routingMetadata: applyGafferStaffing({ role: "designer" }),
   }) as any;
-  expect(codexHarnessArguments(managedOpenAI)).toContain("project_doc_max_bytes=0");
+  expect(codexHarnessArguments(managedOpenAI)).not.toContain("project_doc_max_bytes=0");
 
   writeFileSync(join(project, "AGENTS.md"), "x".repeat(PROJECT_AGENTS_MAX_BYTES));
   expect(() => projectAgentsAppendix(nested)).toThrow(

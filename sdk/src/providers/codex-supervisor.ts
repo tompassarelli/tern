@@ -2,21 +2,41 @@
 /**
  * Own one Codex process tree independently of the North host's survival.
  *
- * The host keeps supervisor stdin open after sending one bounded prompt frame.
- * Kernel EOF therefore proves host death even under SIGKILL. Codex runs in its
- * own process group; every supervisor exit path terminates and waits for that
- * whole group before emitting its terminal receipt.
+ * The host keeps supervisor stdin open solely as a liveness lease; one-shot
+ * prompts arrive on immutable fd 4 and duplex RPC arrives through the bounded
+ * private spool/FIFO. Kernel EOF therefore proves host death even under
+ * SIGKILL. Codex runs in its own process group; every supervisor exit path
+ * terminates and waits for that whole group before emitting its terminal receipt.
  */
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { writeSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  closeSync, constants, createReadStream, fstatSync, lstatSync, openSync, readFileSync,
+  realpathSync, rmSync, statSync, unlinkSync, watch, writeSync,
+} from "node:fs";
 
 const PROMPT = "NORTH_CODEX_PROMPT ";
 const MAX_PROMPT_BYTES = 16 * 1024 * 1024;
+const MAX_DUPLEX_FRAME_BYTES = 1024 * 1024;
+const DUPLEX_FRAME_PREFIX = "NORTH_CODEX_RPC 1 ";
+const MAX_DUPLEX_HEADER_BYTES = 128;
+const MAX_DUPLEX_FILE_BYTES = MAX_DUPLEX_FRAME_BYTES + MAX_DUPLEX_HEADER_BYTES;
+const MAX_DUPLEX_TOTAL_BYTES = 64 * 1024 * 1024;
+const MAX_DUPLEX_FRAMES = 20_000;
+const MAX_SCAN_FRAMES_PER_TICK = 128;
+const MAX_SCAN_BYTES_PER_TICK = 4 * 1024 * 1024;
 const TERM_MS = 750;
 const KILL_MS = 750;
 const PIPE_CLOSE_MS = 750;
 const POSIX_GROUP = process.platform !== "win32";
-const [executable, ...args] = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const duplex = rawArgs[0] === "--duplex";
+const controlPath = duplex ? rawArgs[1] : undefined;
+const [executable, ...args] = duplex ? rawArgs.slice(2) : rawArgs;
+const trace = (value: string) => {
+  if (process.env.NORTH_TEST_TRACE_SUPERVISOR === "1")
+    process.stderr.write(`TRACE ${Date.now()} ${value}\n`);
+};
 
 function receipt(value: string): void {
   const bytes = Buffer.from(`${value}\n`, "utf8");
@@ -30,18 +50,109 @@ function receipt(value: string): void {
   }
 }
 
+function decodeDuplexFrame(frame: Buffer): Buffer {
+  const newline = frame.indexOf(0x0a);
+  if (newline < 0 || newline >= MAX_DUPLEX_HEADER_BYTES)
+    throw new Error("managed Codex control frame header is invalid");
+  const header = frame.subarray(0, newline).toString("ascii");
+  const match = /^NORTH_CODEX_RPC 1 (0|[1-9][0-9]*) ([0-9a-f]{64})$/.exec(header);
+  if (!match) throw new Error("managed Codex control frame header is invalid");
+  const length = Number(match[1]);
+  if (!Number.isSafeInteger(length) || length <= 0 || length > MAX_DUPLEX_FRAME_BYTES)
+    throw new Error("managed Codex control frame length is invalid");
+  const payload = frame.subarray(newline + 1);
+  if (payload.byteLength !== length)
+    throw new Error("managed Codex control frame is incomplete");
+  const digest = createHash("sha256").update(payload).digest("hex");
+  if (digest !== match[2])
+    throw new Error("managed Codex control frame checksum is invalid");
+  return payload;
+}
+
 if (!executable) {
   receipt("UNAVAILABLE");
   process.exit(127);
 }
 
+let controlDirectory: string | undefined;
+let providerInputFd: number | undefined;
+let providerWriterFd: number | undefined;
+let stopControl = () => {};
+if (duplex) {
+  try {
+    if (!controlPath) throw new Error("missing control directory");
+    controlDirectory = realpathSync(controlPath);
+    const metadata = statSync(controlDirectory);
+    if (!metadata.isDirectory() || (metadata.mode & 0o077) !== 0
+        || (typeof process.getuid === "function" && metadata.uid !== process.getuid()))
+      throw new Error("unsafe control directory");
+    stopControl = () => {
+      if (providerInputFd !== undefined) {
+        try { closeSync(providerInputFd); } catch {}
+        providerInputFd = undefined;
+      }
+      if (providerWriterFd !== undefined) {
+        try { closeSync(providerWriterFd); } catch {}
+        providerWriterFd = undefined;
+      }
+      try { rmSync(controlDirectory!, { recursive: true, force: true }); } catch {}
+    };
+    const mkfifo = process.env.NORTH_MKFIFO_BIN;
+    if (!mkfifo) throw new Error("sealed mkfifo path missing");
+    const coreutils = realpathSync(mkfifo);
+    if (!/^\/nix\/store\/[0-9a-z]{32}-coreutils(?:-full)?-[^/]+\/bin\/coreutils$/.test(coreutils))
+      throw new Error("trusted mkfifo unavailable");
+    const fifo = `${controlDirectory}/provider-input.fifo`;
+    const created = spawnSync(coreutils, ["--coreutils-prog=mkfifo", "-m", "600", fifo], {
+      env: { LC_ALL: "C", PATH: "" },
+      stdio: "ignore",
+    });
+    if (created.status !== 0 || created.error || !lstatSync(fifo).isFIFO())
+      throw new Error("managed Codex provider FIFO unavailable");
+    const guard = openSync(fifo, constants.O_RDWR);
+    try {
+      providerInputFd = openSync(fifo, constants.O_RDONLY);
+      providerWriterFd = openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK);
+    } finally {
+      closeSync(guard);
+    }
+  } catch {
+    stopControl();
+    receipt("UNAVAILABLE");
+    process.exit(127);
+  }
+}
+process.once("exit", () => { stopControl(); });
+
 let child: ChildProcessWithoutNullStreams;
+const providerInputIdentity = duplex && providerInputFd !== undefined
+  ? fstatSync(providerInputFd)
+  : undefined;
 try {
+  const providerEnv = { ...process.env };
+  delete providerEnv.NORTH_MKFIFO_BIN;
   child = spawn(executable, args, {
     detached: POSIX_GROUP,
-    env: process.env,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+    env: providerEnv,
+    stdio: [duplex ? providerInputFd! : "pipe", "pipe", "pipe"],
+  }) as unknown as ChildProcessWithoutNullStreams;
+  if (duplex && providerInputFd !== undefined) {
+    const inheritedFd = providerInputFd;
+    setImmediate(() => {
+      if (providerInputFd !== inheritedFd) return;
+      providerInputFd = undefined;
+      try {
+        const current = fstatSync(inheritedFd);
+        if (providerInputIdentity
+            && current.dev === providerInputIdentity.dev
+            && current.ino === providerInputIdentity.ino)
+          closeSync(inheritedFd);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "EBADF"))
+          void shutdown();
+      }
+    });
+  }
 } catch {
   receipt("UNAVAILABLE");
   process.exit(127);
@@ -51,7 +162,7 @@ let providerExit:
   | { code: number | null; signal: NodeJS.Signals | null }
   | undefined;
 let shutdownPromise: Promise<void> | undefined;
-let promptAccepted = false;
+let promptAccepted = duplex;
 
 function groupExists(): boolean {
   if (!POSIX_GROUP || child.pid === undefined) return false;
@@ -79,11 +190,13 @@ async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<b
 }
 
 async function terminateProvider(): Promise<void> {
+  trace("terminate:start");
   signalGroup("SIGTERM");
   const goneAfterTerm = POSIX_GROUP
     ? await waitUntil(() => !groupExists(), TERM_MS)
     : await waitUntil(() => child.exitCode !== null || child.signalCode !== null, TERM_MS);
-  if (goneAfterTerm) return;
+  if (goneAfterTerm) { trace("terminate:term-gone"); return; }
+  trace("terminate:kill");
   signalGroup("SIGKILL");
   if (POSIX_GROUP)
     await waitUntil(() => !groupExists(), KILL_MS);
@@ -92,7 +205,13 @@ async function terminateProvider(): Promise<void> {
 }
 
 function shutdown(): Promise<void> {
-  shutdownPromise ??= terminateProvider();
+  shutdownPromise ??= (async () => {
+    trace("shutdown:control");
+    stopControl();
+    trace("shutdown:provider");
+    await terminateProvider();
+    trace("shutdown:done");
+  })();
   return shutdownPromise;
 }
 
@@ -131,13 +250,31 @@ const noteClosed = () => {
   closeResolved = true;
   resolveClose();
 };
-child.once("error", () => {
+let startReceipt: "pending" | "started" | "unavailable" = "pending";
+const noteStarted = () => {
+  if (startReceipt !== "pending") return;
+  startReceipt = "started";
+  receipt("STARTED");
+};
+const noteUnavailable = () => {
+  if (startReceipt !== "pending") return;
+  startReceipt = "unavailable";
   receipt("UNAVAILABLE");
+};
+child.once("error", () => {
+  noteUnavailable();
   providerExit = { code: 127, signal: null };
   noteClosed();
 });
-child.once("spawn", () => receipt("STARTED"));
+child.once("spawn", noteStarted);
+// Bun can expose a live pid before a subsequently attached `spawn` listener
+// observes the event. A live pid is the same successful-exec proof, and the
+// idempotent receipt keeps the ordinary event path exact.
+setTimeout(() => {
+  if (child.pid !== undefined) noteStarted();
+}, 0);
 child.once("exit", (code, signal) => {
+  trace(`provider:exit:${code ?? "null"}:${signal ?? "null"}`);
   providerExit = { code, signal };
   // Reap any inherited descendants left in the direct Codex process group.
   void shutdown();
@@ -146,12 +283,15 @@ child.once("close", noteClosed);
 
 let input = Buffer.alloc(0);
 let promptBytes: number | undefined;
-process.stdin.on("data", (chunk: Buffer | string) => {
+// Bun's global process.stdin can miss pipe traffic in a nested Bun host. A
+// direct fd stream preserves kernel EOF semantics. Duplex provider traffic is
+// an atomic, private spool feeding a mode-0600 FIFO because nested Bun drops
+// parent-to-child pipe/IPC traffic in practice. The transport remains bounded,
+// ordered, and outside argv/env.
+const hostInput = createReadStream("/dev/null", { fd: 0, autoClose: false });
+const acceptProviderBytes = (bytes: Buffer) => {
   if (promptAccepted) return;
-  input = Buffer.concat([
-    input,
-    Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
-  ]);
+  input = Buffer.concat([input, bytes]);
   if (promptBytes === undefined) {
     const newline = input.indexOf(0x0a);
     if (newline < 0) {
@@ -176,24 +316,178 @@ process.stdin.on("data", (chunk: Buffer | string) => {
   promptAccepted = true;
   child.stdin.end(input);
   input = Buffer.alloc(0);
-});
-process.stdin.once("end", () => { void shutdown(); });
-process.stdin.once("close", () => { void shutdown(); });
-process.stdin.once("error", () => { void shutdown(); });
-process.stdin.resume();
+};
+if (duplex) {
+  let nextFrame = 1;
+  let duplexBytes = 0;
+  let scanning = false;
+  let rescanTimer: ReturnType<typeof setTimeout> | undefined;
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  const providerQueue: Buffer[] = [];
+  let providerQueueOffset = 0;
+  let flushing = false;
+  const scheduleFlush = () => {
+    if (flushTimer || shutdownPromise) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      flushProviderQueue();
+    }, 10);
+  };
+  const flushProviderQueue = () => {
+    if (flushing || shutdownPromise || providerWriterFd === undefined) return;
+    flushing = true;
+    try {
+      while (providerQueue.length) {
+        const bytes = providerQueue[0]!;
+        let written: number;
+        try {
+          written = writeSync(
+            providerWriterFd, bytes, providerQueueOffset,
+            bytes.byteLength - providerQueueOffset,
+          );
+        } catch (error) {
+          const code = error instanceof Error && "code" in error ? error.code : undefined;
+          if (code === "EAGAIN" || code === "EWOULDBLOCK") {
+            scheduleFlush();
+            return;
+          }
+          throw error;
+        }
+        if (written <= 0) {
+          scheduleFlush();
+          return;
+        }
+        providerQueueOffset += written;
+        if (providerQueueOffset === bytes.byteLength) {
+          providerQueue.shift();
+          providerQueueOffset = 0;
+        }
+      }
+    } catch {
+      trace("flush:reject");
+      void shutdown();
+    } finally {
+      flushing = false;
+    }
+  };
+  const scheduleScan = () => {
+    if (rescanTimer || shutdownPromise) return;
+    rescanTimer = setTimeout(() => {
+      rescanTimer = undefined;
+      scan();
+    }, 0);
+  };
+  const scan = () => {
+    if (scanning || shutdownPromise) return;
+    scanning = true;
+    try {
+      let tickFrames = 0;
+      let tickBytes = 0;
+      while (nextFrame <= MAX_DUPLEX_FRAMES) {
+        const request = `${controlDirectory}/${String(nextFrame).padStart(12, "0")}.req`;
+        let requestFd: number | undefined;
+        try {
+          requestFd = openSync(request, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+        }
+        catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") break;
+          throw error;
+        }
+        let frame: Buffer;
+        try {
+          const metadata = fstatSync(requestFd);
+          if (!metadata.isFile() || metadata.size > MAX_DUPLEX_FILE_BYTES
+              || (metadata.mode & 0o077) !== 0
+              || metadata.nlink !== 1
+              || (typeof process.getuid === "function" && metadata.uid !== process.getuid()))
+            throw new Error("unsafe managed Codex control frame");
+          frame = readFileSync(requestFd);
+          const after = fstatSync(requestFd);
+          const current = lstatSync(request);
+          if (after.dev !== metadata.dev || after.ino !== metadata.ino
+              || after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs
+              || after.ctimeMs !== metadata.ctimeMs || current.dev !== metadata.dev
+              || current.ino !== metadata.ino || current.size !== metadata.size)
+            throw new Error("managed Codex control frame changed while reading");
+        } finally {
+          closeSync(requestFd);
+        }
+        const bytes = decodeDuplexFrame(frame);
+        duplexBytes += bytes.byteLength;
+        if (duplexBytes > MAX_DUPLEX_TOTAL_BYTES)
+          throw new Error("managed Codex control exceeded its bound");
+        unlinkSync(request);
+        nextFrame += 1;
+        providerQueue.push(bytes);
+        tickFrames += 1;
+        tickBytes += bytes.byteLength;
+        flushProviderQueue();
+        if (tickFrames >= MAX_SCAN_FRAMES_PER_TICK || tickBytes >= MAX_SCAN_BYTES_PER_TICK) {
+          scheduleScan();
+          break;
+        }
+      }
+      if (nextFrame > MAX_DUPLEX_FRAMES) {
+        const overflow = `${controlDirectory}/${String(nextFrame).padStart(12, "0")}.req`;
+        try {
+          lstatSync(overflow);
+          throw new Error("managed Codex control emitted too many frames");
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        }
+      }
+    } catch {
+      trace("scan:reject");
+      void shutdown();
+    } finally {
+      scanning = false;
+    }
+  };
+  let watcher: ReturnType<typeof watch> | undefined;
+  try { watcher = watch(controlDirectory!, scan); } catch { /* interval remains authoritative */ }
+  const interval = setInterval(scan, 10);
+  const closeDuplexControl = stopControl;
+  stopControl = () => {
+    try { watcher?.close(); } catch {}
+    clearInterval(interval);
+    if (rescanTimer) clearTimeout(rescanTimer);
+    if (flushTimer) clearTimeout(flushTimer);
+    rescanTimer = undefined;
+    flushTimer = undefined;
+    providerQueue.length = 0;
+    closeDuplexControl();
+  };
+  scan();
+} else {
+  const providerInput = createReadStream("/dev/null", { fd: 4, autoClose: true });
+  providerInput.on("data", (chunk: Buffer | string) => {
+    acceptProviderBytes(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  providerInput.once("end", () => { if (!promptAccepted) void shutdown(); });
+  providerInput.once("close", () => { if (!promptAccepted) void shutdown(); });
+  providerInput.once("error", () => { void shutdown(); });
+  providerInput.resume();
+}
+hostInput.once("end", () => { trace("host:end"); void shutdown(); });
+hostInput.once("close", () => { trace("host:close"); void shutdown(); });
+hostInput.once("error", () => { trace("host:error"); void shutdown(); });
+hostInput.resume();
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const)
-  process.on(signal, () => { void shutdown(); });
+  process.on(signal, () => { trace(`host:signal:${signal}`); void shutdown(); });
 
 await waitUntil(() => providerExit !== undefined || shutdownPromise !== undefined, 2 ** 31 - 1);
 await shutdown();
-if (!await waitUntil(() => closeResolved, PIPE_CLOSE_MS)) {
+trace("main:shutdown-done");
+const pipeDeadline = Date.now() + PIPE_CLOSE_MS;
+const pipeTimeRemaining = () => Math.max(0, pipeDeadline - Date.now());
+if (!await waitUntil(() => closeResolved, pipeTimeRemaining())) {
   child.stdout.destroy();
   child.stderr.destroy();
 }
 await Promise.race([
   pipesClosed,
-  new Promise<void>((resolve) => setTimeout(resolve, PIPE_CLOSE_MS)),
+  new Promise<void>((resolve) => setTimeout(resolve, pipeTimeRemaining())),
 ]);
 
 const exitCode = !providerExit
@@ -209,7 +503,8 @@ const exitCode = !providerExit
     );
 await Promise.race([
   Promise.all([closeOutput(process.stdout), closeOutput(process.stderr)]),
-  new Promise<void>((resolve) => setTimeout(resolve, PIPE_CLOSE_MS)),
+  new Promise<void>((resolve) => setTimeout(resolve, pipeTimeRemaining())),
 ]);
 receipt(`EXIT ${exitCode}`);
+trace(`main:exit-${exitCode}`);
 process.exit(exitCode);

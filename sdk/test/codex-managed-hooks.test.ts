@@ -12,6 +12,7 @@ function requirements(
   const document: any = {
     allow_managed_hooks_only: true,
     allow_remote_control: false,
+    managed_hook_failure_mode: "block",
     features: { hooks: true },
     hooks: {
       managed_dir: managedDir,
@@ -22,9 +23,11 @@ function requirements(
   const lines = [
     `allow_managed_hooks_only = ${JSON.stringify(document.allow_managed_hooks_only)}`,
     `allow_remote_control = ${JSON.stringify(document.allow_remote_control)}`,
+    `managed_hook_failure_mode = ${JSON.stringify(document.managed_hook_failure_mode)}`,
     ...Object.entries(document)
       .filter(([key]) => ![
-        "allow_managed_hooks_only", "allow_remote_control", "features", "hooks",
+        "allow_managed_hooks_only", "allow_remote_control", "managed_hook_failure_mode",
+        "features", "hooks",
       ].includes(key))
       .map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
     "",
@@ -69,8 +72,8 @@ test("managed Codex requirements admit the exact full lifecycle policy", () => {
 
 test("North's managed hook contract admits Firn's source requirements exactly", () => {
   const path = resolve(
-    import.meta.dir,
-    "..", "..", "..", "nixos-config", "modules", "codex", "requirements.toml",
+    process.env.NORTH_FIRN_ROOT ?? resolve(import.meta.dir, "..", "..", "..", "nixos-config"),
+    "modules", "codex", "requirements.toml",
   );
   expect(existsSync(path)).toBe(true);
   expect(() => validateManagedCodexRequirements(readFileSync(path, "utf8")))
@@ -81,6 +84,8 @@ test("managed Codex requirements reject every authority-bearing drift", () => {
   const hostile: Array<(document: any) => void> = [
     (document) => { document.allow_managed_hooks_only = false; },
     (document) => { document.allow_remote_control = true; },
+    (document) => { document.managed_hook_failure_mode = "continue"; },
+    (document) => { delete document.managed_hook_failure_mode; },
     (document) => { document.features.hooks = false; },
     (document) => { document.features.remote_control = false; },
     (document) => { document.unreviewed_root_authority = true; },

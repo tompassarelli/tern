@@ -137,13 +137,18 @@ export function validateManagedCodexRequirements(
     throw new Error("managed Codex requirements must be a TOML document");
   exact(
     Object.keys(parsed).sort(),
-    ["allow_managed_hooks_only", "allow_remote_control", "features", "hooks"].sort(),
+    [
+      "allow_managed_hooks_only", "allow_remote_control", "features", "hooks",
+      "managed_hook_failure_mode",
+    ].sort(),
     "managed Codex requirements root surface",
   );
   if (parsed.allow_managed_hooks_only !== true)
     throw new Error("managed Codex requirements must enforce allow_managed_hooks_only=true");
   if (parsed.allow_remote_control !== false)
     throw new Error("managed Codex requirements must enforce allow_remote_control=false");
+  if (parsed.managed_hook_failure_mode !== "block")
+    throw new Error('managed Codex requirements must enforce managed_hook_failure_mode="block"');
   exact(parsed.features, { hooks: true }, "managed Codex feature requirements");
   if (parsed.hooks?.managed_dir !== managedDir)
     throw new Error(`managed Codex requirements must pin hooks.managed_dir=${managedDir}`);
