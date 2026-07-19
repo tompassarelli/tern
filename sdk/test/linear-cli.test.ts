@@ -45,6 +45,7 @@ class FakeGraph implements GraphStore {
   beforeSchemaCommit?: (subject: string, predicate: string, value: string) => void | Promise<void>;
   reservations: { link: string; thread: string }[] = [];
   private matchingWrites = 0;
+  private version = 0;
 
   async show(subject: string): Promise<readonly GraphFact[]> {
     this.showReads++;
@@ -94,6 +95,7 @@ class FakeGraph implements GraphStore {
     if (!next.some((fact) => fact.predicate === predicate && fact.value === value)) next.push({ predicate, value });
     this.rows.set(subject, next);
     this.writes.push({ subject, predicate, value });
+    this.version++;
     this.afterPut?.(subject, predicate, value);
   }
 
@@ -131,69 +133,26 @@ class FakeGraph implements GraphStore {
     threadInput: string,
     remoteServer: string,
   ): Promise<void> {
-    const lease = reservation.identityLease;
-    await lease.fence();
     const link = linkInput.replace(/^@/, "");
     const thread = threadInput.replace(/^@/, "");
     const threadRef = `@${thread}`;
     const linkRef = `@${link}`;
-    const existing = new Set((this.rows.get(link) ?? [])
-      .filter(({ predicate }) => predicate === "linked_thread").map(({ value }) => value));
-    if (existing.size > 1 || (existing.size === 1 && !existing.has(threadRef)))
-      throw new Error("canonical Linear identity is already reserved for a different North thread");
-    const reverse = [...this.rows.entries()].filter(([subject, facts]) =>
-      subject !== link && subject.startsWith("link:linear:")
-      && facts.some(({ predicate, value }) =>
-        predicate === "linked_thread" && value === threadRef));
-    const reverseElections = [...this.rows.entries()].flatMap(([subject, facts]) =>
-      subject.startsWith("linear-bootstrap:")
-        ? facts.filter(({ predicate }) => predicate === "bootstrap_election")
-          .map(({ value }) => parseBootstrapElection(value))
-          .filter((election) =>
-            election.linkedThread === threadRef && election.canonicalLink !== linkRef)
-        : []);
-    const reverseLegacy = [...this.rows.entries()].filter(([subject, facts]) =>
-      subject.startsWith("linear-bootstrap:")
-      && !facts.some(({ predicate }) => predicate === "bootstrap_election")
-      && facts.some(({ predicate, value }) =>
-        predicate === "linked_thread" && value === threadRef)
-      && facts.some(({ predicate, value }) =>
-        predicate === "canonical_link" && value !== linkRef));
-    if (reverse.length || reverseElections.length || reverseLegacy.length)
-      throw new Error("requested North thread is already reserved by another Linear authority");
-    const threadLinks = new Set((this.rows.get(thread) ?? [])
-      .filter(({ predicate }) => predicate === "linear_link").map(({ value }) => value));
-    if (threadLinks.size > 1 || (threadLinks.size === 1 && !threadLinks.has(linkRef)))
-      throw new Error("requested North thread already has a different canonical Linear link");
-    const servers = new Set((this.rows.get(link) ?? [])
-      .filter(({ predicate }) => predicate === "remote_server").map(({ value }) => value));
-    if (servers.size > 1 || (servers.size === 1 && !servers.has(remoteServer)))
-      throw new Error("partial Linear link conflicts on remote_server");
     const bootstrapInitialKey = reservation.kind === "linear-uuid"
       ? undefined
       : reservation.evidence.initialKey;
-    const bootstrapKeys = new Set((this.rows.get(link) ?? [])
-      .filter(({ predicate }) => predicate === "bootstrap_initial_key").map(({ value }) => value));
-    if (bootstrapKeys.size > 1
-        || (bootstrapInitialKey && bootstrapKeys.size === 1 && !bootstrapKeys.has(bootstrapInitialKey)))
-      throw new Error("partial Linear link conflicts on bootstrap_initial_key");
-    if (reservation.kind !== "linear-uuid") {
-      await reservation.evidenceLease.fence();
-      const evidenceSubject = bootstrapEvidenceSubject(reservation.evidence);
-      const evidenceRows = this.rows.get(evidenceSubject) ?? [];
-      const election = serializeBootstrapElection(
+    const evidenceSubject = reservation.kind === "linear-uuid"
+      ? undefined
+      : bootstrapEvidenceSubject(reservation.evidence);
+    const election = reservation.kind === "linear-uuid"
+      ? undefined
+      : serializeBootstrapElection(
         reservation.evidence,
         linkRef,
         threadRef,
       );
-      const compatible = (predicate: string, expected: string): void => {
-        const values = new Set(evidenceRows
-          .filter((fact) => fact.predicate === predicate)
-          .map((fact) => fact.value));
-        if (values.size > 1 || (values.size === 1 && !values.has(expected)))
-          throw new Error(`Linear bootstrap evidence conflicts on ${predicate}`);
-      };
-      const projections = [
+    const projections = reservation.kind === "linear-uuid"
+      ? []
+      : [
         ["kind", "linear_bootstrap_reservation"],
         ["bootstrap_connector", reservation.evidence.connector],
         ["bootstrap_created_at", reservation.evidence.createdAt],
@@ -201,40 +160,156 @@ class FakeGraph implements GraphStore {
         ["canonical_link", linkRef],
         ["linked_thread", threadRef],
       ] as const;
-      const elections = new Set(evidenceRows
-        .filter((fact) => fact.predicate === "bootstrap_election")
+    const values = (subject: string, predicate: string): Set<string> =>
+      new Set((this.rows.get(subject) ?? [])
+        .filter((fact) => fact.predicate === predicate)
         .map((fact) => fact.value));
-      if (elections.size > 1 || (elections.size === 1 && !elections.has(election)))
-        throw new Error("Linear bootstrap evidence conflicts on bootstrap_election");
-      if (elections.size === 0) {
-        const legacyPresent = projections.some(([predicate]) =>
-          evidenceRows.some((fact) => fact.predicate === predicate));
-        const legacyComplete = projections.every(([predicate, expected]) => {
-          const values = new Set(evidenceRows
-            .filter((fact) => fact.predicate === predicate)
-            .map((fact) => fact.value));
-          return values.size === 1 && values.has(expected);
-        });
-        if (legacyPresent && !legacyComplete)
-          throw new Error("legacy Linear bootstrap evidence is partial or conflicting");
+    const compatible = (
+      subject: string, predicate: string, expected: string, message: string,
+    ): void => {
+      const found = values(subject, predicate);
+      if (found.size > 1 || (found.size === 1 && !found.has(expected)))
+        throw new Error(message);
+    };
+    const validate = (): void => {
+      const existing = values(link, "linked_thread");
+      if (existing.size > 1 || (existing.size === 1 && !existing.has(threadRef)))
+        throw new Error("canonical Linear identity is already reserved for a different North thread");
+      const reverseLinks = [...this.rows.entries()].filter(([subject, facts]) =>
+        subject !== link && subject.startsWith("link:linear:")
+        && facts.some(({ predicate, value }) =>
+          predicate === "linked_thread" && value === threadRef));
+      if (reverseLinks.length)
+        throw new Error("requested North thread is already reserved by another Linear authority");
+
+      const bootstrapSubjects = [...this.rows.keys()]
+        .filter((subject) => subject.startsWith("linear-bootstrap:"));
+      if (bootstrapSubjects.length > 10_000)
+        throw new Error("Linear reservation found too many bootstrap authorities");
+      for (const subject of bootstrapSubjects) {
+        const electionValues = values(subject, "bootstrap_election");
+        const projectedLinks = values(subject, "canonical_link");
+        const projectedThreads = values(subject, "linked_thread");
+        if (electionValues.size > 1)
+          throw new Error("Linear reservation found an ambiguous bootstrap election");
+        if (electionValues.size === 1) {
+          const stored = [...electionValues][0]!;
+          if (Buffer.byteLength(stored, "utf8") > 4096)
+            throw new Error("Linear reservation found an oversized bootstrap election");
+          const parsed = parseBootstrapElection(stored);
+          if (bootstrapEvidenceSubject(parsed) !== subject)
+            throw new Error("Linear reservation found a bootstrap election on the wrong evidence subject");
+          if (projectedLinks.size > 1
+              || (projectedLinks.size === 1 && !projectedLinks.has(parsed.canonicalLink))
+              || projectedThreads.size > 1
+              || (projectedThreads.size === 1 && !projectedThreads.has(parsed.linkedThread))) {
+            throw new Error("Linear reservation found conflicting bootstrap projections");
+          }
+          if (parsed.linkedThread === threadRef && parsed.canonicalLink !== linkRef)
+            throw new Error("requested North thread is already reserved by another Linear authority");
+        } else if (projectedThreads.size) {
+          if (projectedThreads.size !== 1 || projectedLinks.size !== 1)
+            throw new Error("Linear reservation found partial legacy bootstrap authority");
+          if (projectedThreads.has(threadRef) && !projectedLinks.has(linkRef))
+            throw new Error("requested North thread is already reserved by another Linear authority");
+        }
       }
+
+      const threadLinks = values(thread, "linear_link");
+      if (threadLinks.size > 1 || (threadLinks.size === 1 && !threadLinks.has(linkRef)))
+        throw new Error("requested North thread already has a different canonical Linear link");
+      compatible(link, "kind", "integration_link", "partial Linear link conflicts on kind");
+      compatible(
+        link, "identity_kind", reservation.kind,
+        "partial Linear link conflicts on identity_kind",
+      );
+      compatible(
+        link, "remote_server", remoteServer,
+        "partial Linear link conflicts on remote_server",
+      );
+      compatible(
+        link, "sync_policy", "north-primary",
+        "partial Linear link conflicts on sync_policy",
+      );
+      compatible(
+        link, "sync_schema", "linear-sync-v1",
+        "partial Linear link conflicts on sync_schema",
+      );
+      if (bootstrapInitialKey)
+        compatible(
+          link, "bootstrap_initial_key", bootstrapInitialKey,
+          "partial Linear link conflicts on bootstrap_initial_key",
+        );
+      if (reservation.kind !== "linear-uuid") {
+        const evidenceRows = this.rows.get(evidenceSubject!) ?? [];
+        const electionValues = values(evidenceSubject!, "bootstrap_election");
+        if (electionValues.size > 1
+            || (electionValues.size === 1 && !electionValues.has(election!)))
+          throw new Error("Linear bootstrap evidence conflicts on bootstrap_election");
+        if (electionValues.size === 0) {
+          const legacyPresent = projections.some(([predicate]) =>
+            evidenceRows.some((fact) => fact.predicate === predicate));
+          const legacyComplete = projections.every(([predicate, expected]) => {
+            const found = values(evidenceSubject!, predicate);
+            return found.size === 1 && found.has(expected);
+          });
+          if (legacyPresent && !legacyComplete)
+            throw new Error("legacy Linear bootstrap evidence is partial or conflicting");
+        }
+        for (const [predicate, expected] of projections)
+          compatible(
+            evidenceSubject!, predicate, expected,
+            `Linear bootstrap evidence conflicts on ${predicate}`,
+          );
+      }
+    };
+    const casPut = async (
+      lease: SyncLease, subject: string, predicate: string, value: string,
+    ): Promise<void> => {
+      for (let attempt = 0; attempt < 16; attempt++) {
+        const base = this.version;
+        validate();
+        await lease.fence();
+        if (this.version !== base) continue;
+        if (values(subject, predicate).has(value)) return;
+        await this.put(subject, predicate, value);
+        return;
+      }
+      throw new Error(`Linear reservation raced while healing ${predicate}`);
+    };
+
+    validate();
+    await this.beforeReservationPut?.();
+    if (reservation.kind !== "linear-uuid") {
+      await casPut(
+        reservation.evidenceLease,
+        evidenceSubject!,
+        "bootstrap_election",
+        election!,
+      );
+      const compatible = (predicate: string, expected: string): void => {
+        const found = values(evidenceSubject!, predicate);
+        if (found.size > 1 || (found.size === 1 && !found.has(expected)))
+          throw new Error(`Linear bootstrap evidence conflicts on ${predicate}`);
+      };
       for (const [predicate, expected] of projections)
         compatible(predicate, expected);
-      await this.beforeReservationPut?.();
-      for (const [predicate, value] of [
-        ["bootstrap_election", election],
-        ...projections,
-      ] as const) {
-        if (!(this.rows.get(evidenceSubject) ?? []).some((fact) =>
-          fact.predicate === predicate && fact.value === value))
-          await this.put(evidenceSubject, predicate, value);
-      }
-    } else {
-      await this.beforeReservationPut?.();
+      for (const [predicate, value] of projections)
+        await casPut(reservation.evidenceLease, evidenceSubject!, predicate, value);
     }
-    if (bootstrapInitialKey && !bootstrapKeys.has(bootstrapInitialKey))
-      await this.put(link, "bootstrap_initial_key", bootstrapInitialKey);
-    if (!existing.has(threadRef)) await this.put(link, "linked_thread", threadRef);
+    if (bootstrapInitialKey)
+      await casPut(
+        reservation.identityLease,
+        link,
+        "bootstrap_initial_key",
+        bootstrapInitialKey,
+      );
+    await casPut(
+      reservation.identityLease,
+      link,
+      "linked_thread",
+      threadRef,
+    );
     this.reservations.push({ link, thread });
   }
 
@@ -242,6 +317,7 @@ class FakeGraph implements GraphStore {
     const rows = this.rows.get(subject) ?? [];
     rows.push({ predicate, value });
     this.rows.set(subject, rows);
+    this.version++;
   }
 
   replace(subject: string, predicate: string, value: string) {
@@ -249,6 +325,7 @@ class FakeGraph implements GraphStore {
       .filter((fact) => fact.predicate !== predicate);
     rows.push({ predicate, value });
     this.rows.set(subject, rows);
+    this.version++;
   }
 }
 
@@ -2868,6 +2945,124 @@ test("v1 and v2 identities sharing bootstrap evidence elect one durable winner",
   expect((await graph.show(bootstrapEvidenceSubject(evidence)))
     .filter(({ predicate }) => predicate === "canonical_link"))
     .toEqual([{ predicate: "canonical_link", value: `@${linkSubject(v1)}` }]);
+});
+
+test("FakeGraph reservation mirrors the production bootstrap authority denial matrix", async () => {
+  const evidence = {
+    connector: "linear-test",
+    createdAt: "2026-07-16T14:20:00.639Z",
+    initialKey: "MSA-430",
+  };
+  const identity = bootstrapIdentityFromEvidence("mcp-bootstrap-v2", evidence);
+  const candidateLink = linkSubject(identity);
+  const candidateLinkRef = `@${candidateLink}`;
+  const thread = "thread-authority-matrix";
+  const threadRef = `@${thread}`;
+  const lease = (resource: string): SyncLease => ({
+    resource,
+    holder: `holder:${resource}`,
+    epoch: 1,
+    renew: async () => {},
+    fence: async () => {},
+    release: async () => {},
+  });
+  const reservation: LinearBindingReservation = {
+    kind: "mcp-bootstrap-v2",
+    identityLease: lease(`linear-sync:identity:${encodeURIComponent(
+      `linear:${identity.identityKind}:${identity.connector}:${identity.fingerprint}`,
+    )}`),
+    evidenceLease: lease(`linear-sync:bootstrap:${
+      bootstrapEvidenceSubject(evidence).replace("linear-bootstrap:", "")
+    }`),
+    evidence,
+  };
+  const reserve = (graph: FakeGraph) => graph.reserveLinearBinding(
+    reservation,
+    candidateLink,
+    thread,
+    evidence.connector,
+  );
+  const validElection = serializeBootstrapElection(
+    evidence,
+    candidateLinkRef,
+    threadRef,
+  );
+  const duplicateElection = validElection.replace(
+    `"canonicalLink":${JSON.stringify(candidateLinkRef)}`,
+    `"canonicalLink":${JSON.stringify(candidateLinkRef)},`
+      + `"canonicalLink":${JSON.stringify(candidateLinkRef)}`,
+  );
+  const otherEvidence = {
+    connector: "linear-other-authority",
+    createdAt: "2026-07-16T14:21:00.639Z",
+    initialKey: "MSA-431",
+  };
+  const otherIdentity = bootstrapIdentityFromEvidence("mcp-bootstrap-v2", otherEvidence);
+  const otherSubject = bootstrapEvidenceSubject(otherEvidence);
+  const otherElection = serializeBootstrapElection(
+    otherEvidence,
+    `@${linkSubject(otherIdentity)}`,
+    threadRef,
+  );
+  const corruptions: Array<(graph: FakeGraph) => void> = [
+    (graph) => graph.seed(
+      "linear-bootstrap:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bootstrap_election",
+      "{",
+    ),
+    (graph) => graph.seed(
+      bootstrapEvidenceSubject(evidence),
+      "bootstrap_election",
+      duplicateElection,
+    ),
+    (graph) => graph.seed(
+      bootstrapEvidenceSubject(evidence),
+      "bootstrap_election",
+      JSON.stringify({
+        canonicalLink: candidateLinkRef,
+        connector: evidence.connector,
+        createdAt: evidence.createdAt,
+        initialKey: "x".repeat(5000),
+        linkedThread: threadRef,
+      }),
+    ),
+    (graph) => graph.seed(
+      "linear-bootstrap:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bootstrap_election",
+      validElection,
+    ),
+    (graph) => {
+      graph.seed(otherSubject, "bootstrap_election", otherElection);
+      graph.seed(otherSubject, "canonical_link", candidateLinkRef);
+    },
+    (graph) => graph.seed(
+      "linear-bootstrap:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "linked_thread",
+      threadRef,
+    ),
+    (graph) => graph.seed(otherSubject, "bootstrap_election", otherElection),
+  ];
+  for (const seedCorruption of corruptions) {
+    const graph = new FakeGraph();
+    seedCorruption(graph);
+    await expect(reserve(graph)).rejects.toThrow();
+    expect(graph.reservations).toHaveLength(0);
+  }
+
+  const raced = new FakeGraph();
+  raced.beforeReservationPut = () => {
+    raced.beforeReservationPut = undefined;
+    raced.seed(
+      "link:linear:uuid:11111111-1111-8111-8111-111111111111:22222222-2222-8222-8222-222222222222",
+      "linked_thread",
+      threadRef,
+    );
+  };
+  await expect(reserve(raced))
+    .rejects.toThrow("requested North thread is already reserved");
+  expect((await raced.show(bootstrapEvidenceSubject(evidence)))
+    .filter(({ predicate }) => predicate === "bootstrap_election"))
+    .toHaveLength(0);
 });
 
 test("a crash after bootstrap election heals only the same winner", async () => {
