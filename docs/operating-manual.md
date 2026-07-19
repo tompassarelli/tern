@@ -924,6 +924,17 @@ an owner dies without running `concern done`:
    identity. This closes the claim-before-identity crash window without guessing
    about older id formats.
 
+4. **Managed-worktree janitor.** The reactor's same sweep reclaims a registered
+   lane worktree only after the canonical full lane-terminal/committed-run join
+   resolves it, its graph registration exactly names `repo`, `worktree`, and the
+   derived `lane-<agent-id>` branch, and real Git proves that provenance plus a
+   clean status. Cleanup is only non-force `git worktree remove` followed by
+   `git branch -d`, with exit codes and postconditions checked. Dirty trees stay
+   byte-for-byte intact and gain one idempotent `worktree_orphaned` fact;
+   liveness, torn terminals, hostile facts, and any Git uncertainty all keep the
+   tree. The one-shot probe is the normal reactor surface:
+   `bb ~/code/north/cli/north-reactor.clj sweep-once [--dry-run]`.
+
 The **activity heartbeat** that powers all of the above: the `north-on-tooluse`
 PostToolUse hook renews the owner's presence lease on tool calls, **throttled to
 once per 60s** (marker in `XDG_RUNTIME_DIR`). A renewal therefore *means*

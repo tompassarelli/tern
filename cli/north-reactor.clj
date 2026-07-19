@@ -40,6 +40,11 @@
 ;; PURE reap decisions (verdict off in-memory facts) — split out so reap_test.clj can
 ;; drive the join/lapse/verdict logic with no live daemon. Sibling of coord.clj.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/reap.clj"))
+;; Side-effect-free managed-worktree janitor. It is deliberately owned by this
+;; reactor: `sweep-once` and the five-minute loop execute the same function with
+;; this file's canonical full terminal/run resolver.
+(load-file (str (.getParent (io/file (System/getProperty "babashka.file")))
+                "/worktree-janitor.clj"))
 ;; DURABLE last-sweep heartbeat — the reactor's liveness trace `north doctor` reads.
 ;; Shared writer/reader lib (doctor loads the same file); we stamp it at each sweep.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/reactor-heartbeat.clj"))
@@ -390,6 +395,17 @@
 (defn sweep! [dry?]
   (let [nc (sweep-concerns! dry?) nl (sweep-lanes! dry?)
         nd (sweep-unpublished-driver-claims! dry?)
+        wt (try
+             (north.worktree-janitor/sweep-worktrees!
+              {:port port
+               :dry? dry?
+               :repo-filter sweep-repo
+               :lane-resolved? lane-resolved?*})
+             (catch Throwable t
+               (println (str "[sweep] worktree janitor error: " (.getMessage t)))
+               {:scanned 0 :unresolved 0 :dirty 0 :uncertain 0
+                :removed 0 :would-remove 0 :orphan-facts-written 0
+                :errors 1}))
         al (sweep-agent-logs! dry?)
         ;; Spend-guard backstop (step 3): burn-rate breach TRIPS the global breaker;
         ;; a tripped breaker SIGKILLs every verified live breached lane + settles it.
@@ -398,18 +414,28 @@
                   (catch Throwable t (println (str "[sweep] burn error: " (.getMessage t))) {:tripped false}))
         nk (try (north.spend-breaker/sweep-kill! port dry?)
                 (catch Throwable t (println (str "[sweep] sweep-kill error: " (.getMessage t))) 0))
-        ca (maybe-clock-audit! dry?)]
+        ca (maybe-clock-audit! dry?)
+        summary {:concerns nc :lanes nl :unpublished-drivers nd
+                 :worktrees wt :agent-logs al :breaker burn
+                 :lanes-killed nk :clock-audit ca}]
     ;; Durable last-sweep heartbeat — write ONLY on a real sweep so doctor can tell a
-    ;; running reactor from a dead one. --dry-run leaves no trace (mirrors clock-audit).
-    (when-not dry? (north.reactor-heartbeat/write-heartbeat! port))
+    ;; running reactor from a dead one. The same record carries the janitor result,
+    ;; so an operator can distinguish "reactor alive" from "cleanup actually ran".
+    ;; --dry-run leaves no trace (mirrors clock-audit).
+    (when-not dry?
+      (north.reactor-heartbeat/write-heartbeat! port {:worktrees wt}))
     (println (str "[sweep] " (when dry? "(dry-run) ") "concerns abandoned=" nc
                   " lanes reaped=" nl " unpublished drivers released=" nd
+                  " worktrees removed=" (:removed wt)
+                  " dirty-kept=" (:dirty wt)
+                  " uncertain-kept=" (:uncertain wt)
+                  " orphan-facts=" (:orphan-facts-written wt)
+                  " worktree-errors=" (get wt :errors 0)
                   " logs deleted=" (:deleted al) " capped=" (:capped al)
                   " breaker-tripped=" (:tripped burn) " lanes-killed=" nk
                   " clock-audit=" (name ca)))
     (flush)
-    {:concerns nc :lanes nl :unpublished-drivers nd :agent-logs al
-     :breaker burn :lanes-killed nk :clock-audit ca}))
+    summary))
 
 (defn sweep-loop []
   (loop []

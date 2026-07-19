@@ -63,6 +63,19 @@
            (and (zero? (:exit w)) parsed age (>= age 0) (< age 60000))
            (str "raw=" (pr-str raw))))
 
+  ;; 2b. A real sweep atomically carries its janitor summary while the legacy
+  ;; Instant reader and liveness classification keep the same contract.
+  (.delete hb-file)
+  (let [r (run-bb
+           (lib-expr
+            "(north.reactor-heartbeat/write-heartbeat! \"7977\" {:worktrees {:removed 2 :dirty 1}}) "
+            "(let [s (north.reactor-heartbeat/heartbeat-status \"7977\")] "
+            "  (println (pr-str [(:state s) (get-in s [:details :worktrees :removed]) "
+            "                    (boolean (:ts s))])))"))]
+    (check "structured heartbeat preserves timestamp liveness + sweep details"
+           (= "[:fresh 2 true]" (:out r))
+           (pr-str r)))
+
   ;; 3. atomic write leaves no .tmp sibling behind.
   (check "atomic write leaves no .tmp sibling"
          (not (.exists (io/file (str hb-path ".tmp")))))

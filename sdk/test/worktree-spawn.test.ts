@@ -169,3 +169,62 @@ test("OPT-IN (worktree:true) => real worktree, cwd inside it, payload appended, 
   const branches = execFileSync("git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" });
   expect(branches.trim()).toBe("");
 });
+
+test("explicit worktree provisioning failure aborts before provider, admission, identity, or run side effects", async () => {
+  const { spawn } = await import("./support/spawn");
+  const agentId = "wt-provision-fail-1";
+  const branch = `lane-${agentId}`;
+  const expectedPath = `/tmp/${require("node:path").basename(repo)}-${branch}`;
+  const beforeLog = existsSync(log) ? readFileSync(log, "utf8") : "";
+  const sharedBytes = readFileSync(join(repo, "a.txt"), "utf8");
+  const sink: { options?: any } = {};
+  let providerQueries = 0;
+  let clockAdmissions = 0;
+  let envelopeAdmissions = 0;
+
+  // Plant a real `git worktree add -b` failure: the exact derived branch
+  // already exists. The branch is harmless and points at the scratch repo HEAD.
+  execFileSync("git", ["-C", repo, "branch", branch, "HEAD"]);
+  process.chdir(repo);
+  let thrown: unknown;
+  try {
+    await spawn({
+      prompt: "must never reach provider execution",
+      agentId,
+      worktree: true,
+      routingMetadata: presetRequest("integrator"),
+      queryFn: (args: any) => {
+        providerQueries++;
+        return capturingQuery(sink)(args);
+      },
+      feedSubscriber: () => readySubscription(),
+      admitBillableClock: () => {
+        clockAdmissions++;
+        throw new Error("clock admission must be unreachable");
+      },
+      admitResourceEnvelope: async () => {
+        envelopeAdmissions++;
+        throw new Error("envelope admission must be unreachable");
+      },
+    });
+  } catch (error) {
+    thrown = error;
+  } finally {
+    process.chdir(origCwd);
+  }
+
+  expect(String(thrown)).toContain("explicit worktree provisioning failed");
+  expect(String(thrown)).toContain("spawn aborted before provider execution");
+  expect(providerQueries).toBe(0);
+  expect(clockAdmissions).toBe(0);
+  expect(envelopeAdmissions).toBe(0);
+  expect(sink.options).toBeUndefined();
+  expect(existsSync(expectedPath)).toBe(false);
+  expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe(sharedBytes);
+  expect(execFileSync("git", ["-C", repo, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+  // NORTH_BIN captures every identity/run writer invocation. Exact byte equality
+  // proves the failed isolated spawn published neither.
+  expect(existsSync(log) ? readFileSync(log, "utf8") : "").toBe(beforeLog);
+
+  execFileSync("git", ["-C", repo, "branch", "-d", "--", branch]);
+});

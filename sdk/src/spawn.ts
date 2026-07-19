@@ -6,7 +6,9 @@ import {
   DEFAULT_SYSTEM_PROMPT, harnessCompositionEvidence, harnessOptions, renewHarnessPresence,
   type Effort, type HarnessCompositionEvidence,
 } from "./harness";
-import { provisionWorktree, worktreeFinalize, worktreePayload } from "./worktree";
+import {
+  provisionWorktree, rollbackProvisionedWorktree, worktreeFinalize, worktreePayload,
+} from "./worktree";
 import { normalizeUsage } from "./usage";
 import { newRunId, recordRun } from "./telemetry";
 import { deathReason, notifyDeath } from "./death";
@@ -147,6 +149,13 @@ interface ManagedClockLease {
   finalized: boolean;
 }
 
+interface ManagedWorktreeLease {
+  path: string;
+  branch: string;
+  repoRoot: string;
+  finalized: boolean;
+}
+
 function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetadata: RoutingRequest } {
   const routingMetadata = admitRoutingRequest(
     opts.routingMetadata ?? {}, "managed North spawn",
@@ -183,6 +192,7 @@ async function runSpawn(
   clockLease?: ManagedClockLease,
   injected: SpawnRuntime = {},
   termination: ManagedQueryTermination = new ManagedQueryTermination(),
+  worktreeLease?: ManagedWorktreeLease,
 ): Promise<string> {
   const runStartedAt = process.hrtime.bigint();
   // Composition is deliberately complete before admission and stays immutable
@@ -243,22 +253,8 @@ async function runSpawn(
   // env relabel this child as an alias or a different role.
   const identityRole = routingMetadata.role!;
   const composition = routingMetadata.composition!;
-  // OPT-IN per-lane git worktree. Default OFF => no cwd => SDK's process.cwd()
-  // => byte-identical to pre-worktree behavior. When on, the lane operates in
-  // its own worktree (own index + tree). Provisioning fails LOUD; a git failure
-  // must never brick a spawn, so we catch, shout, and fall back to the shared
-  // tree rather than dropping the whole lane.
-  const repoRoot = process.cwd();
-  let wt: { path: string; branch: string } | null = null;
-  if (opts.worktree ?? process.env.AGENT_WORKTREE === "1") {
-    try {
-      wt = provisionWorktree(agentId, { repoRoot, setupCmd: opts.setupCmd ?? process.env.AGENT_SETUP_CMD });
-      console.log(`[spawn] @agent:${agentId} worktree ${wt.path} on ${wt.branch}`);
-    } catch (err) {
-      console.error(`[spawn] @agent:${agentId} worktree provisioning FAILED — falling back to shared tree: ${(err as any)?.message ?? err}`);
-      wt = null;
-    }
-  }
+  const repoRoot = worktreeLease?.repoRoot ?? process.cwd();
+  const wt = worktreeLease;
   const identityBase = {
     kind: "lane" as const,
     role: identityRole,
@@ -669,7 +665,10 @@ async function runSpawn(
   // Salvage-gated worktree cleanup (only if this spawn provisioned one): remove
   // on a clean ran, KEEP + surface a worktree_orphaned fact on any
   // crash/cap/dirty tail. Fail-open.
-  if (wt) worktreeFinalize(agentId, outcome, { path: wt.path, branch: wt.branch, repoRoot });
+  if (wt) {
+    worktreeFinalize(agentId, outcome, { path: wt.path, branch: wt.branch, repoRoot });
+    wt.finalized = true;
+  }
 
   // Commit the lane's process/delivery terminal (SYNC, digest marker last)
   // before exit so the reactor cannot mistake a completed lane for silence.
@@ -833,6 +832,30 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   // Pin the generated id so admission, telemetry, and the provider run name the
   // same lane. Admission completes before entitlement refresh or provider query.
   composed.agentId = agentId;
+  // Explicit isolation is an admission requirement, not a preference. Provision
+  // before clocks, resource reservations, provider probes, stream/identity facts,
+  // run reservations, or the provider query. A failure rejects this spawn and can
+  // never silently execute in the shared checkout.
+  let worktreeLease: ManagedWorktreeLease | undefined;
+  if (composed.worktree ?? process.env.AGENT_WORKTREE === "1") {
+    const repoRoot = process.cwd();
+    try {
+      const provisioned = provisionWorktree(agentId, {
+        repoRoot,
+        setupCmd: composed.setupCmd ?? process.env.AGENT_SETUP_CMD,
+      });
+      worktreeLease = { ...provisioned, repoRoot, finalized: false };
+      console.log(
+        `[spawn] @agent:${agentId} worktree ${provisioned.path} on ${provisioned.branch}`,
+      );
+    } catch (error) {
+      throw new Error(
+        `[spawn] @agent:${agentId} explicit worktree provisioning failed; `
+        + `spawn aborted before provider execution: ${(error as any)?.message ?? error}`,
+        { cause: error },
+      );
+    }
+  }
   const termination = new ManagedQueryTermination(injected?.registerTermination);
   let clockLease: ManagedClockLease | undefined;
   let admission: EnvelopeAdmission | undefined;
@@ -859,7 +882,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       console.warn(`[envelope] advisory: ${advisory}`);
     result = await runSpawn(
       composed, judgmentGrade, strugglePolicy,
-      admission, clockLease, injected, termination,
+      admission, clockLease, injected, termination, worktreeLease,
     );
   } catch (error) {
     failed = true;
@@ -879,6 +902,10 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   finally {
     termination.cleanupSettled();
     termination.release();
+  }
+  if (worktreeLease && !worktreeLease.finalized) {
+    rollbackProvisionedWorktree(agentId, worktreeLease);
+    worktreeLease.finalized = true;
   }
   const errors = failed ? [primaryError, ...cleanupErrors] : cleanupErrors;
   if (errors.length === 1) throw errors[0];

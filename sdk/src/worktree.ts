@@ -9,14 +9,23 @@
 // are unit-testable with no live git; the impure shell-outs are thin. Two hard rules match
 // the rest of the finalize surface:
 //   - provisionWorktree FAILS LOUD (throws) — a provisioning failure must NEVER silently
-//     fall back to the shared tree (that would reintroduce the shared-index bug); spawn
-//     catches the throw and decides (it falls back to NO worktree, loudly).
+//     fall back to the shared tree (that would reintroduce the shared-index bug); an
+//     explicitly isolated spawn aborts before provider/identity/run side effects.
 //   - worktreeFinalize is FAIL-OPEN (never throws) — a finalizing lane must never be
 //     bricked by a cleanup hiccup, exactly like clockFinalize / notifyDeath.
 import { execFileSync } from "node:child_process";
-import { basename } from "node:path";
+import { basename, resolve } from "node:path";
 
-const northBin = () => process.env.NORTH_BIN ?? `${process.env.HOME}/code/north/bin/north`;
+const SOURCE_ROOT = resolve(import.meta.dir, "..", "..");
+
+export function worktreeNorthExecutable(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env.NORTH_BIN) return env.NORTH_BIN;
+  return resolve(env.NORTH_HOME ?? SOURCE_ROOT, "bin", "north");
+}
+
+const northBin = () => worktreeNorthExecutable();
 
 // ---- PURE builders (no I/O; testable off strings) --------------------------------------
 
@@ -126,14 +135,42 @@ export function provisionWorktree(agentId: string, opts: { repoRoot: string; set
 }
 
 // `git -C <path> status --porcelain` non-empty => uncommitted changes present.
-function worktreeDirty(path: string): boolean {
+// null is uncertainty, never cleanliness.
+function worktreeDirty(path: string): boolean | null {
   try {
     return git(["-C", path, "status", "--porcelain"]).trim().length > 0;
   } catch {
-    // Can't read the tree (already gone / not a worktree) => treat as clean-but-unknown; the
-    // caller keeps on any non-`ran` outcome anyway, and a `ran` lane whose tree vanished has
-    // nothing to remove.
-    return false;
+    return null;
+  }
+}
+
+// A worktree can be provisioned successfully and then lose a later admission
+// race before runSpawn owns it. Reclaim that unused clean tree without force;
+// keep and surface anything dirty or unreadable. Provisioning failures never
+// reach this function, so they still produce zero identity/run writes.
+export function rollbackProvisionedWorktree(
+  agentId: string,
+  loc: { path: string; branch: string; repoRoot: string },
+): void {
+  try {
+    const dirty = worktreeDirty(loc.path);
+    if (dirty === null) {
+      tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; git status unavailable — manual check");
+      return;
+    }
+    if (dirty) {
+      tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; tree dirty — manual salvage");
+      return;
+    }
+    const rm = removeArgs(agentId, loc.repoRoot);
+    try {
+      git(rm.worktree);
+      git(rm.branch);
+    } catch {
+      tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; non-force cleanup refused");
+    }
+  } catch {
+    /* fail-open: preserve the tree */
   }
 }
 
@@ -151,6 +188,10 @@ function tellOrphaned(agentId: string, path: string, reason: string): void {
 export function worktreeFinalize(agentId: string, outcome: string, loc: { path: string; branch: string; repoRoot: string }): void {
   try {
     const dirty = worktreeDirty(loc.path);
+    if (dirty === null) {
+      tellOrphaned(agentId, loc.path, "git status unavailable at finalize — kept for manual check");
+      return;
+    }
     const decision = worktreeCleanupDecision(outcome, dirty);
     if (decision === "remove") {
       const rm = removeArgs(agentId, loc.repoRoot);

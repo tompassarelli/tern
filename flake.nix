@@ -673,6 +673,17 @@ EOF
             # Exercise every packaged TypeScript CLI entrypoint with hermetic
             # subscription/auth fixtures. These probes never make a model turn.
             smoke=$(mktemp -d)
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/poison-home" \
+              NORTH_HOME="$out" \
+              WORKTREE_MODULE="$out/sdk/src/worktree.ts" \
+              EXPECTED_NORTH_BIN="$out/bin/north" \
+              ${pkgs.bun}/bin/bun -e '
+                const module = await import(process.env.WORKTREE_MODULE);
+                const actual = module.worktreeNorthExecutable(process.env);
+                if (actual !== process.env.EXPECTED_NORTH_BIN)
+                  throw new Error("packaged worktree North CLI mismatch: " + actual);
+              '
             coord_pid=
             cleanup_smoke() {
               if [ -n "$coord_pid" ]; then

@@ -10,6 +10,7 @@ import {
   removeArgs,
   worktreeCleanupDecision,
   worktreePayload,
+  worktreeNorthExecutable,
 } from "../src/worktree";
 
 describe("branch + path naming", () => {
@@ -39,6 +40,20 @@ describe("git command builders", () => {
     expect(rm.worktree).toEqual(["-C", "/repo", "worktree", "remove", "/tmp/repo-lane-abc"]);
     expect(rm.branch).toEqual(["-C", "/repo", "branch", "-d", "lane-abc"]);
     expect(rm.worktree).not.toContain("--force");
+  });
+});
+
+describe("North CLI authority", () => {
+  test("NORTH_BIN wins; otherwise canonical NORTH_HOME wins and HOME is irrelevant", () => {
+    expect(worktreeNorthExecutable({
+      NORTH_BIN: "/exact/wrapped/north",
+      NORTH_HOME: "/ignored/root",
+      HOME: "/poisoned/home",
+    })).toBe("/exact/wrapped/north");
+    expect(worktreeNorthExecutable({
+      NORTH_HOME: "/nix/store/example-north",
+      HOME: "/poisoned/home",
+    })).toBe("/nix/store/example-north/bin/north");
   });
 });
 

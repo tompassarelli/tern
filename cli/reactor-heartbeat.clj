@@ -22,7 +22,8 @@
 ;;
 ;; Loaded (not required) the same way north-reactor.clj loads coord.clj / reap.clj.
 (ns north.reactor-heartbeat
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str])
   (:import [java.time Instant]
            [java.time.temporal ChronoUnit]
@@ -41,36 +42,65 @@
     (io/file (System/getenv "HOME") ".cache" "north"
              (str "reactor-heartbeat-" port))))
 
+(defn- write-heartbeat-record!
+  [port details? details]
+  (let [f   (heartbeat-file port)
+        dir (.getParentFile f)]
+    (when dir (.mkdirs dir))
+    (let [now (Instant/now)
+          tmp (io/file (str (.getPath f) ".tmp"))
+          payload (if details?
+                    (pr-str {:at (str now) :details details})
+                    (str now))]
+      (spit tmp payload)
+      (Files/move (.toPath tmp) (.toPath f)
+                  (into-array StandardCopyOption
+                              [StandardCopyOption/ATOMIC_MOVE
+                               StandardCopyOption/REPLACE_EXISTING]))
+      now)))
+
 (defn write-heartbeat!
   "Stamp the current instant (strict ISO-8601) into the heartbeat file for `port`.
    Crash-safe: writes a sibling .tmp then ATOMIC_MOVE over the target, so a reader
    never sees a torn write. Best-effort — a filesystem failure is logged, never fatal
-   to the sweep. Returns the Instant written, or nil on failure."
-  [port]
-  (try
-    (let [f   (heartbeat-file port)
-          dir (.getParentFile f)]
-      (when dir (.mkdirs dir))
-      (let [now (Instant/now)
-            tmp (io/file (str (.getPath f) ".tmp"))]
-        (spit tmp (str now))
-        (Files/move (.toPath tmp) (.toPath f)
-                    (into-array StandardCopyOption
-                                [StandardCopyOption/ATOMIC_MOVE
-                                 StandardCopyOption/REPLACE_EXISTING]))
-        now))
-    (catch Throwable t
-      (println (str "[reactor] heartbeat write failed: " (.getMessage t)))
-      nil)))
+   to the sweep. The two-argument form atomically carries bounded sweep details
+   with the timestamp; the legacy one-argument timestamp stays readable. Returns
+   the Instant written, or nil on failure."
+  ([port]
+   (try
+     (write-heartbeat-record! port false nil)
+     (catch Throwable t
+       (println (str "[reactor] heartbeat write failed: " (.getMessage t)))
+       nil)))
+  ([port details]
+   (try
+     (write-heartbeat-record! port true details)
+     (catch Throwable t
+       (println (str "[reactor] heartbeat write failed: " (.getMessage t)))
+       nil))))
 
-(defn read-heartbeat
-  "The Instant last stamped for `port`, or nil if the file is absent/unreadable/torn."
+(defn read-heartbeat-record
+  "Read either the legacy ISO instant or the current EDN heartbeat envelope."
   [port]
   (try
     (let [f (heartbeat-file port)]
       (when (.isFile f)
-        (Instant/parse (str/trim (slurp f)))))
+        (let [raw (str/trim (slurp f))]
+          (try
+            {:ts (Instant/parse raw) :details nil}
+            (catch Throwable _
+              (let [record (edn/read-string raw)
+                    at (:at record)
+                    details (:details record)]
+                (when (and (map? record) (string? at)
+                           (or (nil? details) (map? details)))
+                  {:ts (Instant/parse at) :details details})))))))
     (catch Throwable _ nil)))
+
+(defn read-heartbeat
+  "The Instant last stamped for `port`, or nil if the file is absent/unreadable/torn."
+  [port]
+  (:ts (read-heartbeat-record port)))
 
 (defn heartbeat-status
   "Classify reactor liveness from the durable heartbeat for `port`:
@@ -81,10 +111,11 @@
                or dead, NOT healthy.
    :fresh    — stamped within STALE-MS: a sweep landed recently, healthy."
   [port]
-  (if-let [ts (read-heartbeat port)]
+  (if-let [{:keys [ts details]} (read-heartbeat-record port)]
     (let [age (.between ChronoUnit/MILLIS ts (Instant/now))]
-      {:state (if (>= age STALE-MS) :stale :fresh) :ts ts :age-ms age})
-    {:state :missing :ts nil :age-ms nil}))
+      {:state (if (>= age STALE-MS) :stale :fresh)
+       :ts ts :age-ms age :details details})
+    {:state :missing :ts nil :age-ms nil :details nil}))
 
 (defn humanize-age
   "A compact human age for an age in ms (e.g. '42s', '7m', '3h', '2d')."
