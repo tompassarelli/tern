@@ -844,12 +844,16 @@ scrub it along with parent run credentials. A composite thread records only the
 aggregate reduction/checkpoint contract. Each child receives its own
 title-bearing thread linked with `part_of`, its own run reservation, and its own
 evidence. A successful orchestrator terminal additionally requires an explicit
-child reconciliation result. Live children cause a bounded continuation (real
-state progress resets the bound); an unavailable reconciliation source or a
-no-progress cap records a blocked, never-ran terminal. North repeats the
-reconciliation gate immediately before publication to narrow the late-child
-race window to that publication seam. Terminal workers retain the loud
-early-exit notification behavior.
+child settlement result **and** a completed parent reduction turn for the exact
+nonempty settled child-set signature. Child terminality is not reduction: the
+first observation of each new settled set injects a provider continuation, and
+only the subsequent successful provider result acknowledges that signature.
+Live children cause a bounded continuation (real state progress resets the
+bound); an unavailable settlement source, a no-progress cap, or an
+unacknowledged settled set records a blocked, never-ran terminal. North repeats
+the settlement/reduction gate immediately before publication to narrow the
+late-child race window to that publication seam. Terminal workers retain the
+loud early-exit notification behavior.
 
 **Ownership rule** (2026-07-09): a cockpit verb earns its place ONLY when it
 COMPOSES multiple tools (`dashboard`, `doctor`, `profile`, `spawn` = gaffer dials

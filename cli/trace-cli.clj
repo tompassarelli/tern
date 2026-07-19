@@ -9,7 +9,7 @@
 ;; same committed identity projection. The verdict maps the failure to a
 ;; workflow-map F-mode (F1–F7) with the remedy.
 ;;
-;;   ✓ present/healthy   · expected-absent / n-a   ✗ genuine failure
+;;   ✓ present/healthy   ! incomplete proof   · expected-absent / n-a   ✗ genuine failure
 ;;   usage: north trace <agent-id>
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str])
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/coord.clj"))
@@ -133,11 +133,20 @@
        (when-let [reason (:reason delivery-state)]
          (str " (" reason ")"))))
 
+(defn delivery-proof-class [delivery-state]
+  (case (or (:outcome delivery-state) "unrecorded")
+    "reported" :reported
+    "unverified" :incomplete
+    "unrecorded" :incomplete
+    "blocked" :blocked
+    :inconsistent))
+
 (defn trace-verdict
   [{:keys [id on-roster terminal-state delivery-state online lease lineage
            identity-complete deaths]}]
   (let [terminal? (:terminal? terminal-state)
         terminal-kind (:kind terminal-state)
+        delivery-class (delivery-proof-class delivery-state)
         summary (terminal-summary terminal-state delivery-state)]
     (cond
       (not on-roster)
@@ -161,17 +170,25 @@
            id "` for outcome=died-unreported).")
       (and (= lineage :sdk-lane) (not identity-complete))
       (red "F6 — SDK-lane missing identity facts: possible id-collision/aliasing, or writeAgentFacts failed. Check `north show @agent:<id>` for contradictory repos/goals.")
-      (and (= terminal-kind :ran) online)
-      (grn (str "healthy — " summary "; lease remains online. No failure."))
+      (and (= terminal-kind :ran) (= delivery-class :reported))
+      (grn (str "execution succeeded; " summary
+                ". Delivery is evidence-backed same-UID self-report, not independent verification"
+                (if online "; lease remains online." "; lease lapsed as expected.")))
+      (and (= terminal-kind :ran) (= delivery-class :incomplete))
+      (ylw (str "execution succeeded but delivery proof is incomplete; " summary
+                ". This is not a done claim"
+                (if online "; lease remains online." "; lease lapsed as expected.")))
       (= terminal-kind :ran)
-      (grn (str "healthy — " summary "; lease lapsed as expected. No failure."))
+      (red (str "terminal inconsistency; " summary
+                ". A ran process with blocked or inconsistent delivery is not a done claim"
+                (if online "; lease remains online." ".")))
       online
       (grn "healthy — online and advancing (no terminal signal yet). No failure.")
       :else (dim "no failing stage detected."))))
 
 ;; ---- render one stage line ---------------------------------------------------
 (defn stage [n mark label detail cmd]
-  (let [g (case mark :ok (grn "✓") :na (dim "·") :fail (red "✗"))]
+  (let [g (case mark :ok (grn "✓") :warn (ylw "!") :na (dim "·") :fail (red "✗"))]
     (format "%s %-11s %s %-46s %s" g label (str "") (str detail) (dim cmd))))
 
 (defn -main [args]
@@ -279,21 +296,28 @@
                         (str "bb " NORTH "/cli/msg-cli.clj " PORT " inbox " id)))
         ;; 6 COMPLETION / DEATH
         (let [death-notification (last deaths)
-              mark (cond (= terminal-kind :ran) :ok
+              proof-class (delivery-proof-class delivery-state)
+              mark (cond (and (= terminal-kind :ran) (= proof-class :reported)) :ok
+                         (and (= terminal-kind :ran) (= proof-class :incomplete)) :warn
+                         (= terminal-kind :ran) :fail
                          terminal-kind :fail
                          death-notification :fail
                          online :na
                          :else :fail)
               detail (case terminal-kind
-                       :ran (str (grn (terminal-summary terminal-state delivery-state))
-                                 (when last-run (str " " (ago (- NOW (:ms last-run))) " ago")))
+                       :ran (let [summary (str (terminal-summary terminal-state delivery-state)
+                                               (when last-run (str " " (ago (- NOW (:ms last-run))) " ago")))]
+                              (case proof-class
+                                :reported (grn summary)
+                                :incomplete (ylw summary)
+                                (red summary)))
                        :died (str (red (terminal-summary terminal-state delivery-state))
                                   (when death-notification
                                     (str " · notification: \"" (:reason death-notification) "\"")))
                        :died-unreported
                        (red (str (terminal-summary terminal-state delivery-state)
                                  " (reactor-reaped silent death)"))
-                       :stopped (ylw (terminal-summary terminal-state delivery-state))
+                       :stopped (red (terminal-summary terminal-state delivery-state))
                        (cond
                          death-notification
                          (str (red "agent_death notification without committed terminal")

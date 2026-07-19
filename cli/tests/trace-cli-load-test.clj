@@ -61,6 +61,38 @@
       (reduce-kv north.agent-provenance/fold-fact {} blocked-modern)
       blocked-state (execution-terminal-state blocked-folded nil [])
       blocked-delivery (terminal-delivery-state blocked-folded blocked-state)
+      ran-state {:outcome "ran" :source :agent :terminal? true
+                 :kind :ran :death-notifications 0}
+      verdict-base {:id "ran-agent" :on-roster true
+                    :terminal-state ran-state :online false :lease nil
+                    :lineage :sdk-lane :identity-complete true :deaths []}
+      reported-verdict
+      (trace-verdict
+       (assoc verdict-base :delivery-state
+              {:outcome "reported"
+               :reason "complete_run_scoped_done_bar_evidence_self_reported"}))
+      unverified-verdict
+      (trace-verdict
+       (assoc verdict-base :delivery-state
+              {:outcome "unverified"
+               :reason "provider_terminal_success_without_external_verification"}))
+      unrecorded-verdict
+      (trace-verdict (assoc verdict-base :delivery-state nil))
+      blocked-ran-verdict
+      (trace-verdict
+       (assoc verdict-base :delivery-state
+              {:outcome "blocked" :reason "inconsistent_terminal"}))
+      inconsistent-ran-verdict
+      (trace-verdict
+       (assoc verdict-base :delivery-state
+              {:outcome "verified" :reason "unsupported_legacy_projection"}))
+      online-active-verdict
+      (trace-verdict
+       {:id "active-agent" :on-roster true
+        :terminal-state {:outcome nil :source nil :terminal? false
+                         :kind nil :death-notifications 0}
+        :delivery-state nil :online true :lease {:exp (+ NOW 60000)}
+        :lineage :session :identity-complete false :deaths []})
       blocked-verdict
       (trace-verdict
        {:id "blocked-agent" :on-roster true
@@ -93,6 +125,42 @@
          (= (str "process=blocked_preflight · delivery=blocked "
                  "(execution_preflight_blocked)")
             (terminal-summary blocked-state blocked-delivery)))
+  (check "reported delivery is evidence-backed self-report, never independent verification"
+         (= (str "execution succeeded; process=ran · delivery=reported "
+                 "(complete_run_scoped_done_bar_evidence_self_reported). "
+                 "Delivery is evidence-backed same-UID self-report, not independent "
+                 "verification; lease lapsed as expected.")
+            reported-verdict))
+  (check "unverified delivery is yellow-class incomplete proof, not a done claim"
+         (and (= :incomplete
+                 (delivery-proof-class
+                  {:outcome "unverified"}))
+              (= (str "execution succeeded but delivery proof is incomplete; "
+                      "process=ran · delivery=unverified "
+                      "(provider_terminal_success_without_external_verification). "
+                      "This is not a done claim; lease lapsed as expected.")
+                 unverified-verdict)))
+  (check "unrecorded delivery is incomplete proof, not success"
+         (= (str "execution succeeded but delivery proof is incomplete; "
+                 "process=ran · delivery=unrecorded. "
+                 "This is not a done claim; lease lapsed as expected.")
+            unrecorded-verdict))
+  (check "ran plus blocked delivery is a red-class terminal inconsistency"
+         (and (= :blocked (delivery-proof-class {:outcome "blocked"}))
+              (= (str "terminal inconsistency; process=ran · delivery=blocked "
+                      "(inconsistent_terminal). A ran process with blocked or "
+                      "inconsistent delivery is not a done claim.")
+                 blocked-ran-verdict)))
+  (check "ran plus unsupported delivery state is a red-class inconsistency"
+         (and (= :inconsistent
+                 (delivery-proof-class {:outcome "verified"}))
+              (= (str "terminal inconsistency; process=ran · delivery=verified "
+                      "(unsupported_legacy_projection). A ran process with blocked or "
+                      "inconsistent delivery is not a done claim.")
+                 inconsistent-ran-verdict)))
+  (check "online without a terminal remains healthy"
+         (= "healthy — online and advancing (no terminal signal yet). No failure."
+            online-active-verdict))
   (check "terminal blocked_preflight dominates live presence in the verdict"
          (and (str/includes? blocked-verdict
                              "terminal execution did not succeed")

@@ -13,8 +13,9 @@ import { notifyDeath } from "./death";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import {
-  childContinuationMessage, decideChildTurnEnd, initialChildContinuationState,
-  notifyEarlyExitChildren, reconcileChildren, type ChildReconciliation,
+  assessChildFinalization, childContinuationMessage, childReductionMessage,
+  decideChildTurnEnd, initialChildContinuationState, notifyEarlyExitChildren,
+  settleChildren, type ChildSettlement,
 } from "./children";
 import {
   bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute,
@@ -79,8 +80,8 @@ export interface DispatchDependencies {
     reserve: (context: DeliveryRunContext) => DeliveryReservation;
     load: (runId: string) => DeliveryRunState;
   };
-  /** Hermetic graph seam for orchestrator child reconciliation. */
-  childReconciler?: (agentId: string) => ChildReconciliation;
+  /** Hermetic graph seam for orchestrator child settlement observation. */
+  childSettlementReader?: (agentId: string) => ChildSettlement;
 }
 
 export function createDispatchAgentId(threadId: string, now = Date.now(), uuid = randomUUID()): string {
@@ -110,7 +111,7 @@ async function runDispatch(
   hydratedChildren?: ReturnType<typeof getChildren>,
   loadTerminalFacts: typeof getThreadFacts = getThreadFacts,
   deliveryRuntime?: DispatchDependencies["deliveryRuntime"],
-  childReconciler: (agentId: string) => ChildReconciliation = reconcileChildren,
+  childSettlementReader: (agentId: string) => ChildSettlement = settleChildren,
 ): Promise<DispatchResult> {
   const runStartedAt = process.hrtime.bigint();
   const routingMetadata = hydratedMetadata ?? validateRoutingMetadata(applyGafferStaffing(routingMetadataFromEnv()));
@@ -350,15 +351,22 @@ async function runDispatch(
           if (orchestrator) {
             const decision = decideChildTurnEnd(
               childContinuation,
-              childReconciler(agentId),
+              childSettlementReader(agentId),
               maxBgContinuations(),
             );
             childContinuation = decision.state;
             if (decision.action === "continue") {
-              console.error(
-                `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
-              );
-              ch.push(childContinuationMessage(decision.live));
+              if (decision.reason === "children_live") {
+                console.error(
+                  `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
+                );
+                ch.push(childContinuationMessage(decision.live));
+              } else {
+                console.error(
+                  `[harness] @agent:${agentId} requiring post-settlement reduction — ${decision.children.length} settled child lane(s): ${decision.children.join(", ")}`,
+                );
+                ch.push(childReductionMessage(decision.children));
+              }
               continue;
             }
             if (decision.action === "block") {
@@ -419,16 +427,21 @@ async function runDispatch(
   // Final child gate is deliberately adjacent to terminal publication. It
   // catches a child appearing after the last provider result and treats graph
   // unavailability as unknown, never as an empty child set.
-  const finalChildren = childReconciler(agentId);
+  const finalChildren = childSettlementReader(agentId);
   if (orchestrator && outcome === "ran") {
-    if (finalChildren.kind === "live") outcome = "orchestrator_children_incomplete";
-    if (finalChildren.kind === "unavailable") outcome = "child_reconciliation_unavailable";
+    const finalization = assessChildFinalization(childContinuation, finalChildren);
+    if (!finalization.ok) outcome = finalization.outcome;
   }
   if (finalChildren.kind === "live") {
     notifyEarlyExitChildren(agentId, finalChildren.live, { coordinator: coordHandle });
   } else if (orchestrator && finalChildren.kind === "unavailable") {
     console.error(
-      `[harness] @agent:${agentId} CHILD RECONCILIATION UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
+      `[harness] @agent:${agentId} CHILD SETTLEMENT UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
+    );
+  } else if (orchestrator && outcome === "orchestrator_reduction_incomplete"
+             && finalChildren.kind === "settled") {
+    console.error(
+      `[harness] @agent:${agentId} CHILD RESULTS UNREDUCED: settled set changed or lacked a completed reduction turn (${finalChildren.children.join(", ")}); terminal cannot be process=ran`,
     );
   }
 
@@ -581,7 +594,7 @@ export async function dispatch(
       threadId, admission, routingMetadata, workingDirectory, agentId, dependencies.queryFn,
       facts, children, dependencies.loadThreadFacts ?? getThreadFacts,
       dependencies.deliveryRuntime,
-      dependencies.childReconciler,
+      dependencies.childSettlementReader,
     );
   } finally {
     try { await completeResourceEnvelope(admission); }

@@ -23,8 +23,9 @@ import {
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import {
-  childContinuationMessage, decideChildTurnEnd, initialChildContinuationState,
-  notifyEarlyExitChildren, reconcileChildren, type ChildReconciliation,
+  assessChildFinalization, childContinuationMessage, childReductionMessage,
+  decideChildTurnEnd, initialChildContinuationState, notifyEarlyExitChildren,
+  settleChildren, type ChildSettlement,
 } from "./children";
 import { clockStart, clockFinalize } from "./clock";
 import {
@@ -83,8 +84,8 @@ export interface SpawnOptions {
   };
   /** Hermetic terminal thread read for delivery assessment. */
   loadThreadFacts?: typeof getThreadFacts;
-  /** Hermetic graph seam for orchestrator child reconciliation. */
-  childReconciler?: (agentId: string) => ChildReconciliation;
+  /** Hermetic graph seam for orchestrator child settlement observation. */
+  childSettlementReader?: (agentId: string) => ChildSettlement;
 }
 
 export function createSpawnAgentId(now = Date.now(), uuid = randomUUID()): string {
@@ -274,7 +275,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   const bgTracker = makeBgTracker();
   let bgContinuations = 0;
   const orchestrator = routingMetadata.topology === "orchestrator";
-  const reconcile = opts.childReconciler ?? reconcileChildren;
+  const readChildSettlement = opts.childSettlementReader ?? settleChildren;
   let childContinuation = initialChildContinuationState();
   try {
   // Reserve only at the last pre-provider seam. Earlier routing/admission
@@ -423,15 +424,22 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
         if (orchestrator) {
           const decision = decideChildTurnEnd(
             childContinuation,
-            reconcile(agentId),
+            readChildSettlement(agentId),
             maxBgContinuations(),
           );
           childContinuation = decision.state;
           if (decision.action === "continue") {
-            console.error(
-              `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
-            );
-            ch.push(childContinuationMessage(decision.live));
+            if (decision.reason === "children_live") {
+              console.error(
+                `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
+              );
+              ch.push(childContinuationMessage(decision.live));
+            } else {
+              console.error(
+                `[harness] @agent:${agentId} requiring post-settlement reduction — ${decision.children.length} settled child lane(s): ${decision.children.join(", ")}`,
+              );
+              ch.push(childReductionMessage(decision.children));
+            }
             continue;
           }
           if (decision.action === "block") {
@@ -487,16 +495,21 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   // provider result, and an unavailable graph is not evidence of zero children.
   // Workers keep historical best-effort notification semantics; only a
   // successful orchestrator is prevented from publishing process=ran.
-  const finalChildren = reconcile(agentId);
+  const finalChildren = readChildSettlement(agentId);
   if (orchestrator && outcome === "ran") {
-    if (finalChildren.kind === "live") outcome = "orchestrator_children_incomplete";
-    if (finalChildren.kind === "unavailable") outcome = "child_reconciliation_unavailable";
+    const finalization = assessChildFinalization(childContinuation, finalChildren);
+    if (!finalization.ok) outcome = finalization.outcome;
   }
   if (finalChildren.kind === "live") {
     notifyEarlyExitChildren(agentId, finalChildren.live, { coordinator: coordHandle });
   } else if (orchestrator && finalChildren.kind === "unavailable") {
     console.error(
-      `[harness] @agent:${agentId} CHILD RECONCILIATION UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
+      `[harness] @agent:${agentId} CHILD SETTLEMENT UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
+    );
+  } else if (orchestrator && outcome === "orchestrator_reduction_incomplete"
+             && finalChildren.kind === "settled") {
+    console.error(
+      `[harness] @agent:${agentId} CHILD RESULTS UNREDUCED: settled set changed or lacked a completed reduction turn (${finalChildren.children.join(", ")}); terminal cannot be process=ran`,
     );
   }
 

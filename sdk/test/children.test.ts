@@ -3,9 +3,11 @@
 // coordinator. The impure graph query remains covered by the E2E probe.
 import { test, expect, describe } from "bun:test";
 import {
+  assessChildFinalization,
+  childReductionMessage,
   decideChildTurnEnd,
   earlyExitCommands,
-  gatherChildReconciliation,
+  gatherChildSettlement,
   initialChildContinuationState,
   resolveChildLifecycle,
 } from "../src/children";
@@ -64,24 +66,24 @@ describe("committed child lifecycle evidence", () => {
     expect(laneResolvedByFacts([], [committedRun])).toBe(true);
   });
 
-  test("no children and all resolved children are explicit reconciled states", () => {
-    expect(gatherChildReconciliation(
+  test("no children and all terminal children are explicit settled states", () => {
+    expect(gatherChildSettlement(
       "director",
       () => [],
       () => false,
-    )).toEqual({ kind: "reconciled", children: [] });
-    expect(gatherChildReconciliation(
+    )).toEqual({ kind: "settled", children: [] });
+    expect(gatherChildSettlement(
       "director",
       () => ["@agent:one", "@agent:two"],
       () => true,
     )).toEqual({
-      kind: "reconciled",
+      kind: "settled",
       children: ["@agent:one", "@agent:two"],
     });
   });
 
   test("live children and read failures can never collapse to the same state", () => {
-    expect(gatherChildReconciliation(
+    expect(gatherChildSettlement(
       "director",
       () => ["@agent:done", "@agent:live"],
       (child) => child.endsWith("done"),
@@ -90,12 +92,12 @@ describe("committed child lifecycle evidence", () => {
       children: ["@agent:done", "@agent:live"],
       live: ["@agent:live"],
     });
-    expect(gatherChildReconciliation(
+    expect(gatherChildSettlement(
       "director",
       () => { throw new Error("coordinator unavailable"); },
       () => false,
     )).toEqual({ kind: "unavailable", reason: "coordinator unavailable" });
-    expect(gatherChildReconciliation(
+    expect(gatherChildSettlement(
       "director",
       () => ["@agent:child"],
       () => { throw new Error("terminal read failed"); },
@@ -111,15 +113,81 @@ describe("committed child lifecycle evidence", () => {
 });
 
 describe("orchestrator child continuation state", () => {
-  test("live children resolve on a later provider terminal", () => {
+  test("an already-settled child requires one post-settlement provider result", () => {
     const first = decideChildTurnEnd(initialChildContinuationState(), {
+      kind: "settled", children: ["@agent:a"],
+    }, 2);
+    expect(first).toMatchObject({
+      action: "continue",
+      reason: "child_reduction_required",
+      children: ["@agent:a"],
+    });
+    expect(assessChildFinalization(first.state, {
+      kind: "settled", children: ["@agent:a"],
+    })).toMatchObject({
+      ok: false,
+      outcome: "orchestrator_reduction_incomplete",
+    });
+    const acknowledged = decideChildTurnEnd(first.state, {
+      kind: "settled", children: ["@agent:a"],
+    }, 2);
+    expect(acknowledged).toMatchObject({
+      action: "finish",
+      state: { acknowledgedSettledSignature: "@agent:a", noProgress: 0 },
+    });
+    expect(assessChildFinalization(acknowledged.state, {
+      kind: "settled", children: ["@agent:a"],
+    })).toEqual({ ok: true });
+  });
+
+  test("terminality after a live observation still forces a reduction turn", () => {
+    const live = decideChildTurnEnd(initialChildContinuationState(), {
       kind: "live", children: ["@agent:a"], live: ["@agent:a"],
     }, 2);
-    expect(first).toMatchObject({ action: "continue", attempt: 1, cap: 2 });
-    const settled = decideChildTurnEnd(first.state, {
-      kind: "reconciled", children: ["@agent:a"],
+    expect(live).toMatchObject({
+      action: "continue", reason: "children_live", attempt: 1, cap: 2,
+    });
+    const newlySettled = decideChildTurnEnd(live.state, {
+      kind: "settled", children: ["@agent:a"],
     }, 2);
-    expect(settled).toEqual({ action: "finish", state: { noProgress: 0 } });
+    expect(newlySettled).toMatchObject({
+      action: "continue", reason: "child_reduction_required",
+    });
+    const reduced = decideChildTurnEnd(newlySettled.state, {
+      kind: "settled", children: ["@agent:a"],
+    }, 2);
+    expect(reduced).toMatchObject({ action: "finish" });
+  });
+
+  test("each changed settled child-set signature requires another reduction turn", () => {
+    const onePending = decideChildTurnEnd(initialChildContinuationState(), {
+      kind: "settled", children: ["@agent:a"],
+    }, 2);
+    const changed = decideChildTurnEnd(onePending.state, {
+      kind: "settled", children: ["@agent:b", "@agent:a"],
+    }, 2);
+    expect(changed).toMatchObject({
+      action: "continue",
+      reason: "child_reduction_required",
+      children: ["@agent:b", "@agent:a"],
+      state: {
+        acknowledgedSettledSignature: "@agent:a",
+        pendingSettledSignature: "@agent:a\u0000@agent:b",
+      },
+    });
+    expect(assessChildFinalization(changed.state, {
+      kind: "settled", children: ["@agent:a", "@agent:b"],
+    })).toMatchObject({
+      ok: false,
+      outcome: "orchestrator_reduction_incomplete",
+    });
+    const reduced = decideChildTurnEnd(changed.state, {
+      kind: "settled", children: ["@agent:a", "@agent:b"],
+    }, 2);
+    expect(reduced).toMatchObject({ action: "finish" });
+    expect(assessChildFinalization(reduced.state, {
+      kind: "settled", children: ["@agent:a", "@agent:b"],
+    })).toEqual({ ok: true });
   });
 
   test("state advance resets consecutive no-progress while an unchanged set hits the cap", () => {
@@ -147,13 +215,50 @@ describe("orchestrator child continuation state", () => {
     });
   });
 
-  test("an unavailable reconciliation blocks immediately", () => {
+  test("an unavailable settlement read blocks immediately", () => {
     expect(decideChildTurnEnd(initialChildContinuationState(), {
       kind: "unavailable", reason: "graph offline",
     }, 5)).toMatchObject({
       action: "block",
       reason: "child_reconciliation_unavailable",
     });
+  });
+
+  test("the final gate rejects live, unavailable, and unacknowledged settled sets", () => {
+    const initial = initialChildContinuationState();
+    expect(assessChildFinalization(initial, {
+      kind: "live", children: ["a"], live: ["a"],
+    })).toEqual({
+      ok: false,
+      outcome: "orchestrator_children_incomplete",
+      live: ["a"],
+    });
+    expect(assessChildFinalization(initial, {
+      kind: "unavailable", reason: "graph offline",
+    })).toEqual({
+      ok: false,
+      outcome: "child_reconciliation_unavailable",
+      reason: "graph offline",
+    });
+    expect(assessChildFinalization(initial, {
+      kind: "settled", children: ["a"],
+    })).toEqual({
+      ok: false,
+      outcome: "orchestrator_reduction_incomplete",
+      children: ["a"],
+    });
+  });
+
+  test("the reduction continuation explicitly reaches the provider", () => {
+    expect(childReductionMessage(["@agent:a"])).toContain(
+      "post-settlement reduction turn",
+    );
+    expect(childReductionMessage(["@agent:a"])).toContain(
+      "Consume their completion pings/reports",
+    );
+    expect(childReductionMessage(["@agent:a"])).toContain(
+      "changed settled child set requires another reduction turn",
+    );
   });
 });
 

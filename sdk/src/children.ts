@@ -10,10 +10,11 @@
 // is a 30-minute-late signal. This fires it IMMEDIATELY, at the moment of exit, so the
 // coordinator learns "I am leaving children behind" now, loudly, with the ids named.
 //
-// A child is RESOLVED (not orphaned) only by a committed lifecycle signal:
+// A child is SETTLED (not orphaned) only by a committed lifecycle signal:
 // a digest-marked modern lane terminal (or a true pre-process_outcome legacy
 // lane), or a tagged run whose last-write kind=run marker landed. Everything
-// here is explicit: graph unavailability is not the same state as no children.
+// here is explicit: settlement is not parent reduction, and graph
+// unavailability is not the same state as no children.
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { getThreadFacts } from "./north-client";
@@ -26,7 +27,7 @@ const port = () => process.env.NORTH_PORT ?? "7977";
 
 // Run a single-column rules query against the engine; return the bare string values
 // (rows arrive as JSON arrays like ["@agent:x"]). Any transport/protocol defect
-// throws into the explicit `unavailable` reconciliation state below.
+// throws into the explicit `unavailable` settlement state below.
 function queryCol(rules: unknown): string[] {
   const out = execFileSync(northBin(), ["query", JSON.stringify(rules)], {
     encoding: "utf8",
@@ -38,30 +39,39 @@ function queryCol(rules: unknown): string[] {
   return lines.map((line) => {
     const row = JSON.parse(line);
     if (!Array.isArray(row) || row.length !== 1 || typeof row[0] !== "string") {
-      throw new Error("child reconciliation query returned an invalid row");
+      throw new Error("child settlement query returned an invalid row");
     }
     return row[0];
   });
 }
 
-export type ChildReconciliation =
-  | { kind: "reconciled"; children: string[] }
+export type ChildSettlement =
+  | { kind: "settled"; children: string[] }
   | { kind: "live"; children: string[]; live: string[] }
   | { kind: "unavailable"; reason: string };
 
 export interface ChildContinuationState {
-  signature?: string;
+  liveSignature?: string;
   noProgress: number;
+  pendingSettledSignature?: string;
+  acknowledgedSettledSignature?: string;
 }
 
 export type ChildTurnEndDecision =
   | { action: "finish"; state: ChildContinuationState }
   | {
     action: "continue";
+    reason: "children_live";
     state: ChildContinuationState;
     live: string[];
     attempt: number;
     cap: number;
+  }
+  | {
+    action: "continue";
+    reason: "child_reduction_required";
+    state: ChildContinuationState;
+    children: string[];
   }
   | {
     action: "block";
@@ -70,47 +80,139 @@ export type ChildTurnEndDecision =
     live?: string[];
   };
 
+export type ChildFinalizationDecision =
+  | { ok: true }
+  | {
+    ok: false;
+    outcome:
+      | "orchestrator_children_incomplete"
+      | "child_reconciliation_unavailable"
+      | "orchestrator_reduction_incomplete";
+    live?: string[];
+    children?: string[];
+    reason?: string;
+  };
+
 export function initialChildContinuationState(): ChildContinuationState {
   return { noProgress: 0 };
 }
 
+function setSignature(children: string[]): string {
+  return [...new Set(children)].sort().join("\u0000");
+}
+
+function afterSuccessfulProviderResult(
+  previous: ChildContinuationState,
+): ChildContinuationState {
+  if (!previous.pendingSettledSignature) return previous;
+  return {
+    noProgress: previous.noProgress,
+    liveSignature: previous.liveSignature,
+    acknowledgedSettledSignature: previous.pendingSettledSignature,
+  };
+}
+
 export function decideChildTurnEnd(
   previous: ChildContinuationState,
-  reconciliation: ChildReconciliation,
+  settlement: ChildSettlement,
   cap: number,
 ): ChildTurnEndDecision {
   if (!Number.isSafeInteger(cap) || cap < 0) {
     throw new Error("child continuation cap must be a non-negative safe integer");
   }
-  if (reconciliation.kind === "reconciled") {
-    return { action: "finish", state: initialChildContinuationState() };
+  // This function is called only after a successful provider result. Therefore
+  // a pending settled signature can be acknowledged now: the provider has
+  // completed the continuation that North injected for that exact child set.
+  const acknowledged = afterSuccessfulProviderResult(previous);
+  if (settlement.kind === "settled") {
+    if (settlement.children.length === 0) {
+      return {
+        action: "finish",
+        state: { ...acknowledged, liveSignature: undefined, noProgress: 0 },
+      };
+    }
+    const signature = setSignature(settlement.children);
+    if (acknowledged.acknowledgedSettledSignature === signature) {
+      return {
+        action: "finish",
+        state: { ...acknowledged, liveSignature: undefined, noProgress: 0 },
+      };
+    }
+    return {
+      action: "continue",
+      reason: "child_reduction_required",
+      state: {
+        ...acknowledged,
+        liveSignature: undefined,
+        noProgress: 0,
+        pendingSettledSignature: signature,
+      },
+      children: settlement.children,
+    };
   }
-  if (reconciliation.kind === "unavailable") {
+  if (settlement.kind === "unavailable") {
     return {
       action: "block",
-      state: previous,
+      state: acknowledged,
       reason: "child_reconciliation_unavailable",
     };
   }
-  const signature = [...reconciliation.live].sort().join("\u0000");
-  const noProgress = previous.signature === signature
-    ? previous.noProgress + 1
+  const liveSignature = `${setSignature(settlement.children)}\u0001${setSignature(settlement.live)}`;
+  const noProgress = acknowledged.liveSignature === liveSignature
+    ? acknowledged.noProgress + 1
     : 1;
-  const state = { signature, noProgress };
+  const state = {
+    ...acknowledged,
+    liveSignature,
+    noProgress,
+    pendingSettledSignature: undefined,
+  };
   if (noProgress > cap) {
     return {
       action: "block",
       state,
       reason: "children_live_at_continuation_cap",
-      live: reconciliation.live,
+      live: settlement.live,
     };
   }
   return {
     action: "continue",
+    reason: "children_live",
     state,
-    live: reconciliation.live,
+    live: settlement.live,
     attempt: noProgress,
     cap,
+  };
+}
+
+export function assessChildFinalization(
+  state: ChildContinuationState,
+  settlement: ChildSettlement,
+): ChildFinalizationDecision {
+  if (settlement.kind === "unavailable") {
+    return {
+      ok: false,
+      outcome: "child_reconciliation_unavailable",
+      reason: settlement.reason,
+    };
+  }
+  if (settlement.kind === "live") {
+    return {
+      ok: false,
+      outcome: "orchestrator_children_incomplete",
+      live: settlement.live,
+    };
+  }
+  if (settlement.children.length === 0) return { ok: true };
+  const signature = setSignature(settlement.children);
+  if (state.acknowledgedSettledSignature === signature
+      && state.pendingSettledSignature === undefined) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    outcome: "orchestrator_reduction_incomplete",
+    children: settlement.children,
   };
 }
 
@@ -160,31 +262,32 @@ function childResolved(childSubject: string): boolean {
   });
 }
 
-// Reconcile every child under one snapshot attempt. An empty or fully-resolved
-// set is explicit `reconciled`; a read failure remains `unavailable`.
-export function gatherChildReconciliation(
+// Classify every child under one snapshot attempt. An empty or fully-terminal
+// set is `settled`; this says nothing yet about parent reduction. A read failure
+// remains `unavailable`.
+export function gatherChildSettlement(
   coordId: string,
   readChildren: (id: string) => string[],
   resolved: (child: string) => boolean,
-): ChildReconciliation {
+): ChildSettlement {
   try {
-    if (!coordId) return { kind: "reconciled", children: [] };
+    if (!coordId) return { kind: "settled", children: [] };
     const kids = readChildren(coordId);
-    if (!kids.length) return { kind: "reconciled", children: [] };
+    if (!kids.length) return { kind: "settled", children: [] };
     const live = kids.filter((child) => !resolved(child));
     return live.length
       ? { kind: "live", children: kids, live }
-      : { kind: "reconciled", children: kids };
+      : { kind: "settled", children: kids };
   } catch (error) {
     return {
       kind: "unavailable",
-      reason: error instanceof Error ? error.message : "unknown child reconciliation failure",
+      reason: error instanceof Error ? error.message : "unknown child settlement failure",
     };
   }
 }
 
-export function reconcileChildren(coordId: string): ChildReconciliation {
-  return gatherChildReconciliation(coordId, childrenOf, childResolved);
+export function settleChildren(coordId: string): ChildSettlement {
+  return gatherChildSettlement(coordId, childrenOf, childResolved);
 }
 
 export function childContinuationMessage(liveIds: string[]): string {
@@ -192,6 +295,14 @@ export function childContinuationMessage(liveIds: string[]): string {
     `North refuses orchestrator turn-end: ${liveIds.length} child lane(s) remain live (${liveIds.join(", ")}).`,
     "Keep this turn active, consume the North listener/peer results, reconcile completed work into the prebound thread,",
     "and return a later terminal result only after every child has a committed lifecycle terminal.",
+  ].join(" ");
+}
+
+export function childReductionMessage(settledIds: string[]): string {
+  return [
+    `North requires a post-settlement reduction turn: ${settledIds.length} child lane(s) are terminal (${settledIds.join(", ")}).`,
+    "Consume their completion pings/reports, inspect the child results as needed, and reduce those results into the prebound parent thread.",
+    "Return a new terminal result only after that reduction; a changed settled child set requires another reduction turn.",
   ].join(" ");
 }
 
