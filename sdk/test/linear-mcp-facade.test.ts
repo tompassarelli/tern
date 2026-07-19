@@ -72,7 +72,13 @@ test("advertises four concise Linear tools with truthful safety annotations", ()
   expect(Object.keys(tools.linear_get.inputSchema.properties)).toEqual(["issue", "server"]);
   expect(Object.keys(tools.linear_import.inputSchema.properties)).toEqual(["issue", "server"]);
   expect(Object.keys(tools.linear_plan.inputSchema.properties)).toEqual(["thread", "server"]);
-  expect(Object.keys(tools.linear_sync.inputSchema.properties)).toEqual(["thread", "apply", "server"]);
+  expect(Object.keys(tools.linear_sync.inputSchema.properties)).toEqual([
+    "thread", "apply", "expectedPlanHash", "server",
+  ]);
+  expect(tools.linear_sync.inputSchema.properties.expectedPlanHash).toMatchObject({
+    type: "string",
+    pattern: "^(none|[0-9a-f]{64})$",
+  });
 });
 
 test("forwards exact north linear argv and keeps sync plan-only by default", () => {
@@ -82,6 +88,13 @@ test("forwards exact north linear argv and keeps sync plan-only by default", () 
     call(3, "linear_plan", { thread: "2026-07-16-120000", server: "linear-mcp-msa-new" }),
     call(4, "linear_sync", { thread: "2026-07-16-120000", apply: false }),
     call(5, "linear_sync", { thread: "2026-07-16-120000", apply: true, server: "linear-mcp-msa-new" }),
+    call(6, "linear_sync", {
+      thread: "2026-07-16-120000", apply: true, expectedPlanHash: "none",
+    }),
+    call(7, "linear_sync", {
+      thread: "2026-07-16-120000", apply: true, expectedPlanHash: "a".repeat(64),
+      server: "linear-mcp-msa-new",
+    }),
   ]);
   expect(argv(responses[0])).toEqual(["linear", "get", "MSA-101"]);
   expect(argv(responses[1])).toEqual(["linear", "import", "MSA-102", "--server", "linear-mcp-msa-new"]);
@@ -90,6 +103,35 @@ test("forwards exact north linear argv and keeps sync plan-only by default", () 
   expect(argv(responses[4])).toEqual([
     "linear", "sync", "2026-07-16-120000", "--apply", "--server", "linear-mcp-msa-new",
   ]);
+  expect(argv(responses[5])).toEqual([
+    "linear", "sync", "2026-07-16-120000", "--apply", "--expect-plan-hash", "none",
+  ]);
+  expect(argv(responses[6])).toEqual([
+    "linear", "sync", "2026-07-16-120000", "--apply",
+    "--expect-plan-hash", "a".repeat(64), "--server", "linear-mcp-msa-new",
+  ]);
+});
+
+test("rejects malformed or unarmed expected plan hashes before invoking North", () => {
+  const responses = rpc([
+    call(1, "linear_sync", {
+      thread: "2026-07-16-120000", expectedPlanHash: "none",
+    }),
+    call(2, "linear_sync", {
+      thread: "2026-07-16-120000", apply: true, expectedPlanHash: "A".repeat(64),
+    }),
+  ]);
+  expect(responses[0].result).toMatchObject({
+    isError: true,
+    content: [{ type: "text", text: "expectedPlanHash requires apply=true" }],
+  });
+  expect(responses[1].result).toMatchObject({
+    isError: true,
+    content: [{
+      type: "text",
+      text: "expectedPlanHash must be 'none' or a 64-character lowercase SHA-256 hash",
+    }],
+  });
 });
 
 test("passes tool failures through as bounded text", () => {

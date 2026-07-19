@@ -38,7 +38,7 @@ const HELP = `north linear — deterministic North ↔ Linear projection
   north linear get <KEY> [--server NAME]
   north linear import <KEY> [--owner X] [--thread ID] [--dry-run] [--server NAME]
   north linear plan <THREAD> [--server NAME]
-  north linear sync <THREAD> [--apply] [--server NAME]
+  north linear sync <THREAD> [--apply [--expect-plan-hash <HASH|none>]] [--server NAME]
 
 North is canonical. plan and sync without --apply are read-only. Only sync --apply writes Linear.`;
 
@@ -74,16 +74,28 @@ interface ParsedOptions {
   server?: string;
   owner?: string;
   thread?: string;
+  expectPlanHash?: string;
   dryRun: boolean;
   apply: boolean;
 }
 
 function parseOptions(args: readonly string[]): ParsedOptions {
   const result: ParsedOptions = { positional: [], dryRun: false, apply: false };
+  let sawExpectedPlanHash = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
     if (arg === "--dry-run") result.dryRun = true;
     else if (arg === "--apply") result.apply = true;
+    else if (arg === "--expect-plan-hash") {
+      if (sawExpectedPlanHash) throw new Error("duplicate option --expect-plan-hash");
+      sawExpectedPlanHash = true;
+      const value = args[++index];
+      if (!value || value.startsWith("--"))
+        throw new Error("--expect-plan-hash requires a value");
+      if (value !== "none" && !/^[0-9a-f]{64}$/.test(value))
+        throw new Error("--expect-plan-hash must be 'none' or a 64-character lowercase SHA-256 hash");
+      result.expectPlanHash = value;
+    }
     else if (["--server", "--owner", "--thread"].includes(arg)) {
       const value = args[++index];
       if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value`);
@@ -1245,7 +1257,12 @@ async function applyOperation(
   return { remoteId, manifest: nextManifest };
 }
 
-async function applySync(thread: string, gateway: LinearGateway, deps: LinearCliDependencies): Promise<unknown> {
+async function applySync(
+  thread: string,
+  gateway: LinearGateway,
+  deps: LinearCliDependencies,
+  expectedPlanHash?: string,
+): Promise<unknown> {
   const initialLink = await loadLinkForThread(deps.graph, thread);
   if (initialLink.remoteServer !== gateway.server)
     throw new Error(`Linear link requires MCP server ${initialLink.remoteServer}, not ${gateway.server}`);
@@ -1267,6 +1284,26 @@ async function applySync(thread: string, gateway: LinearGateway, deps: LinearCli
     const link = await leaseBoundary(scope, () => loadLinkForThread(deps.graph, thread));
     assertSameLockedEndpoint(initialLink, link, gateway);
 
+    let guardedPlan: PlannedSync | undefined;
+    if (expectedPlanHash !== undefined) {
+      if (link.manifest.pending)
+        throw new Error(`Linear guarded sync refuses pending ${link.manifest.pending.kind} recovery before plan comparison`);
+      await scope.renew();
+      guardedPlan = await computePlanForLink(link, gateway, deps.graph, scope.thread);
+      await scope.renew();
+      const observedPlanHash = guardedPlan.plan?.hash ?? "none";
+      if (observedPlanHash !== expectedPlanHash) {
+        throw new Error(
+          `Linear guarded sync plan precondition failed: expected ${expectedPlanHash}, observed ${observedPlanHash}; refusing apply`,
+        );
+      }
+      if (guardedPlan.reconciliation.conflicts.length) {
+        throw new Error(`Linear sync conflict: ${guardedPlan.reconciliation.conflicts.map(({ field, category }) => `${field}:${category}`).join(", ")}`);
+      }
+      if (expectedPlanHash === "none" && guardedPlan.reconciliation.state !== "in-sync")
+        throw new Error(`Linear guarded sync expected an in-sync no-op, observed ${guardedPlan.reconciliation.state}; refusing apply`);
+    }
+
     // Validate/repair the durable bijection before pending recovery, remote
     // reads, remote writes, or any mutable link assertion.
     await scope.renew();
@@ -1287,11 +1324,12 @@ async function applySync(thread: string, gateway: LinearGateway, deps: LinearCli
     // The thread lease is the transaction fence for all apply state. The
     // durable reservation makes identity -> thread immutable, while both raw
     // endpoint leases remain held and every renewal validates both.
-    let manifest = await confirmOrRefusePending(
-      gateway, deps.graph, scope.thread, link, deps.now(),
-    );
+    let manifest = expectedPlanHash === undefined
+      ? await confirmOrRefusePending(gateway, deps.graph, scope.thread, link, deps.now())
+      : link.manifest;
     await scope.renew();
-    const planned = await computePlanForLink(link, gateway, deps.graph, scope.thread);
+    const planned = guardedPlan
+      ?? await computePlanForLink(link, gateway, deps.graph, scope.thread);
     await scope.renew();
     if (planned.reconciliation.conflicts.length)
       throw new Error(`Linear sync conflict: ${planned.reconciliation.conflicts.map(({ field, category }) => `${field}:${category}`).join(", ")}`);
@@ -1394,19 +1432,26 @@ export async function runLinearCommand(argv: readonly string[], dependencies: Pa
   const reject = (condition: boolean, message: string) => { if (condition) throw new Error(message); };
   if (verb === "doctor") {
     reject(options.positional.length > 0, "doctor takes no positional arguments");
-    reject(options.apply || options.dryRun || Boolean(options.owner || options.thread), "doctor accepts only --server");
+    reject(options.apply || options.dryRun || options.expectPlanHash !== undefined
+      || Boolean(options.owner || options.thread), "doctor accepts only --server");
   } else if (verb === "get") {
     required("get");
-    reject(options.apply || options.dryRun || Boolean(options.owner || options.thread), "get accepts only --server");
+    reject(options.apply || options.dryRun || options.expectPlanHash !== undefined
+      || Boolean(options.owner || options.thread), "get accepts only --server");
   } else if (verb === "import") {
     required("import");
-    reject(options.apply, "import does not accept --apply");
+    reject(options.apply || options.expectPlanHash !== undefined,
+      "import does not accept --apply or --expect-plan-hash");
   } else if (verb === "plan") {
     required("plan");
-    reject(options.apply || options.dryRun || Boolean(options.owner || options.thread), "plan accepts only --server");
+    reject(options.apply || options.dryRun || options.expectPlanHash !== undefined
+      || Boolean(options.owner || options.thread), "plan accepts only --server");
   } else if (verb === "sync") {
     required("sync");
-    reject(options.dryRun || Boolean(options.owner || options.thread), "sync accepts only --apply and --server");
+    reject(options.expectPlanHash !== undefined && !options.apply,
+      "--expect-plan-hash requires sync --apply");
+    reject(options.dryRun || Boolean(options.owner || options.thread),
+      "sync accepts only --apply, --expect-plan-hash, and --server");
   } else throw new Error(`unknown north linear verb ${verb}`);
 
   let server = options.server;
@@ -1449,7 +1494,7 @@ export async function runLinearCommand(argv: readonly string[], dependencies: Pa
     else if (verb === "sync") {
       const thread = required("sync");
       result = options.apply
-        ? await applySync(thread, gateway, deps)
+        ? await applySync(thread, gateway, deps, options.expectPlanHash)
         : publicPlan(await computePlan(thread, gateway, deps.graph));
     } else throw new Error(`unknown north linear verb ${verb}`);
     operationCompleted = true;

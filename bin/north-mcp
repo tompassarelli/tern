@@ -69,6 +69,18 @@
     "observed must be a non-empty string"
     :else nil))
 
+(defn linear-sync-argument-problem [arguments]
+  (let [expected (get arguments "expectedPlanHash")]
+    (cond
+      (and (some? expected)
+           (not (and (string? expected)
+                     (or (= expected "none")
+                         (re-matches #"[0-9a-f]{64}" expected)))))
+      "expectedPlanHash must be 'none' or a 64-character lowercase SHA-256 hash"
+      (and (some? expected) (not (true? (get arguments "apply"))))
+      "expectedPlanHash requires apply=true"
+      :else nil)))
+
 (def tools
   [{:name "ready"        :desc "Threads doable now (committed, unblocked, not active, not done). Default: kind=thread, top-15 by leverage. Pass all=true for the full unscoped list. Returns JSON [{id,title,condition,emoji}]."
     :schema {:type "object" :properties {:all {:type "boolean" :description "return every ready thread, unscoped (default false: kind=thread top-15 by leverage)"}}}
@@ -161,15 +173,20 @@
     :argv (fn [a] (cond-> ["linear" "plan" (get a "thread")]
                     (get a "server") (conj "--server" (get a "server"))))}
    {:name "linear_sync"
-    :desc "Plan synchronization for one North thread. Remote writes occur only when apply=true; the default is read-only."
+    :desc "Plan synchronization for one North thread. Remote writes occur only when apply=true; expectedPlanHash makes apply compare the freshly locked plan before mutation."
     :schema {:type "object"
              :properties {:thread {:type "string" :minLength 1}
                           :apply {:type "boolean" :description "Apply the plan to Linear (default false)"}
+                          :expectedPlanHash {:type "string"
+                                             :pattern "^(none|[0-9a-f]{64})$"
+                                             :description "Require this exact fresh plan hash, or none for an in-sync no-op"}
                           :server server-property}
              :required ["thread"] :additionalProperties false}
     :annotations remote-write-annotations
+    :argument-problem linear-sync-argument-problem
     :argv (fn [a] (cond-> ["linear" "sync" (get a "thread")]
                     (true? (get a "apply")) (conj "--apply")
+                    (get a "expectedPlanHash") (conj "--expect-plan-hash" (get a "expectedPlanHash"))
                     (get a "server") (conj "--server" (get a "server"))))}])
 
 ;; --- SDK agent tools (dispatch/spawn) — shell out to bun, not the engine ----

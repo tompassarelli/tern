@@ -21,6 +21,7 @@ north linear import MSA-236 [--owner msa] [--thread <north-id>] [--dry-run]
 north linear plan <north-id>
 north linear sync <north-id>
 north linear sync <north-id> --apply
+north linear sync <north-id> --apply --expect-plan-hash <hash|none>
 ```
 
 `get`, `--dry-run`, `plan`, and `sync` without `--apply` are read-only. `doctor`
@@ -36,14 +37,38 @@ remembers its server, so later plan/sync commands do not depend on ambiguous
 auto-discovery.
 
 The mechanical verification sequence is `doctor` → `get` → `import` → `plan` →
-`sync --apply` → `plan`. The final plan must report `state: "in-sync"` with no
-actions. Repeating `import` must return the same thread and integration-link
+guarded `sync --apply` → `plan`. Supply the exact lowercase SHA-256 hash from
+`plan.actions.hash`, or `none` when the plan reports `actions: []`. The final
+plan must report `state: "in-sync"` with no actions. Repeating `import` must
+return the same thread and integration-link
 identity. Import acquires the canonical identity endpoint and then the North
 thread endpoint; concurrent callers for either endpoint serialize, and the
 later caller either reuses the post-lease link or fails with the conflicting
 canonical binding before creating another link. With a canonical bounded
 manifest, a second `sync --apply` in that state performs zero Linear writes and
 zero graph writes.
+
+### Guarded compare-and-apply
+
+`--expect-plan-hash` is valid only with `sync --apply`. It accepts one exact
+64-character lowercase SHA-256 plan hash or the literal `none`; duplicate,
+uppercase, shortened, extended, or otherwise malformed values fail before a
+gateway opens. After acquiring the established bootstrap/identity/thread lease
+scope, guarded apply freshly reads both North and Linear and compares
+`planned.plan?.hash ?? "none"` with the caller's expectation before any
+bridge-owned graph mutation or Linear write. A mismatch reports both values and
+releases the leases without reserving, repairing, finalizing, or calling
+`save_issue`/`save_comment`.
+
+Guarded mode never recovers an existing pending intent: it refuses before the
+fresh plan comparison or provider read. Run the ordinary recovery-aware
+`sync --apply` deliberately, inspect a new plan, and only then return to guarded
+apply. A matching nonempty hash retains the immediate remote issue/comment
+preconditions and aggregate post-apply verification. Matching `none` requires
+an in-sync reconciliation and returns `writes: 0`, `state: "in-sync"`, and
+`planHash: null`; its transport calls are read-only and its receipt still proves
+zero model turns, usage events, and tokens. Unguarded `sync --apply` remains the
+backward-compatible recovery and one-shot surface.
 
 Every transport-backed command returns a `transportReceipt`. It records the
 selected Linear server, ephemeral app-server thread, exact outgoing method

@@ -1713,6 +1713,178 @@ test("first apply consumes unchanged imported description once and comments dedu
   expect(h.graph.writes).toHaveLength(graphWritesAfterFirstApply);
 });
 
+test("guarded apply accepts the exact fresh plan hash and preserves exact-zero model use", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const plan = await runLinearCommand(["plan", thread], h.dependencies) as {
+    actions: { hash: string };
+  };
+  const graphWrites = h.graph.writes.length;
+  const reservations = h.graph.reservations.length;
+  await expect(runLinearCommand(
+    ["sync", thread, "--apply", "--expect-plan-hash", "none"],
+    h.dependencies,
+  )).rejects.toThrow(
+    `Linear guarded sync plan precondition failed: expected none, observed ${plan.actions.hash}; refusing apply`,
+  );
+  expect(h.graph.writes).toHaveLength(graphWrites);
+  expect(h.graph.reservations).toHaveLength(reservations);
+  expect(h.gateway.issueWrites).toBe(0);
+
+  const applied = await runLinearCommand(
+    ["sync", thread, "--apply", "--expect-plan-hash", plan.actions.hash],
+    h.dependencies,
+  ) as {
+    writes: number;
+    state: string;
+    planHash: string;
+    transportReceipt: ModelFreeTransportReceipt;
+  };
+
+  expect(applied).toMatchObject({
+    writes: 1,
+    state: "in-sync",
+    planHash: plan.actions.hash,
+    transportReceipt: {
+      modelTurnsStarted: 0,
+      usageEvents: 0,
+      tokenTotalStatus: "exact-zero-protocol",
+    },
+  });
+  expect(h.gateway.issueWrites).toBe(1);
+  expect(h.gateway.commentWrites).toBe(0);
+});
+
+test("guarded none is a repeatable read-only no-op with an exact-zero receipt", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  await runLinearCommand(["sync", thread, "--apply"], h.dependencies);
+  const graphWrites = h.graph.writes.length;
+  const issueWrites = h.gateway.issueWrites;
+  const commentWrites = h.gateway.commentWrites;
+  const issueReads = h.gateway.issueReadCalls;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const applied = await runLinearCommand(
+      ["sync", thread, "--apply", "--expect-plan-hash", "none"],
+      h.dependencies,
+    ) as {
+      writes: number;
+      state: string;
+      planHash: null;
+      transportReceipt: ModelFreeTransportReceipt;
+    };
+    expect(applied).toMatchObject({
+      writes: 0,
+      state: "in-sync",
+      planHash: null,
+      transportReceipt: {
+        modelTurnsStarted: 0,
+        usageEvents: 0,
+        tokenTotalStatus: "exact-zero-protocol",
+      },
+    });
+    expect(applied.transportReceipt.mcpCalls.every(({ access }) => access === "read")).toBe(true);
+  }
+
+  expect(h.gateway.issueReadCalls).toBeGreaterThan(issueReads);
+  expect(h.gateway.issueWrites).toBe(issueWrites);
+  expect(h.gateway.commentWrites).toBe(commentWrites);
+  expect(h.graph.writes).toHaveLength(graphWrites);
+});
+
+test("guarded apply rejects a plan-to-apply race before reservation, graph mutation, or remote write", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const original = await runLinearCommand(["plan", thread], h.dependencies) as {
+    actions: { hash: string };
+  };
+  await h.graph.put(thread, "progress", "Changed after the reviewed plan.");
+  const raced = await runLinearCommand(["plan", thread], h.dependencies) as {
+    actions: { hash: string };
+  };
+  expect(raced.actions.hash).not.toBe(original.actions.hash);
+  const graphWrites = h.graph.writes.length;
+  const reservations = h.graph.reservations.length;
+
+  await expect(runLinearCommand(
+    ["sync", thread, "--apply", "--expect-plan-hash", original.actions.hash],
+    h.dependencies,
+  )).rejects.toThrow(
+    `Linear guarded sync plan precondition failed: expected ${original.actions.hash}, observed ${raced.actions.hash}; refusing apply`,
+  );
+
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+  expect(h.graph.writes).toHaveLength(graphWrites);
+  expect(h.graph.reservations).toHaveLength(reservations);
+  expect(h.leases.activeResources()).toEqual([]);
+  expect(h.gateway.transportReceipt()).toMatchObject({
+    modelTurnsStarted: 0,
+    usageEvents: 0,
+    tokenTotalStatus: "exact-zero-protocol",
+  });
+});
+
+test("guarded apply rejects pending recovery before comparison or provider reads", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const link = (await h.graph.show(thread))
+    .find(({ predicate }) => predicate === "linear_link")!.value.replace(/^@/, "");
+  h.graph.failSubjectPrefix = link;
+  h.graph.failPredicate = "sync_manifest";
+  h.graph.failAfter = 1;
+  await expect(runLinearCommand(["sync", thread, "--apply"], h.dependencies))
+    .rejects.toThrow("injected graph crash");
+  const manifest = JSON.parse((await h.graph.show(link))
+    .find(({ predicate }) => predicate === "sync_manifest")!.value);
+  expect(manifest.pending).toMatchObject({ kind: "issue" });
+  const issueReads = h.gateway.issueReadCalls;
+  const commentReads = h.gateway.commentReadCalls;
+  const graphWrites = h.graph.writes.length;
+  const reservations = h.graph.reservations.length;
+  const issueWrites = h.gateway.issueWrites;
+
+  await expect(runLinearCommand(
+    ["sync", thread, "--apply", "--expect-plan-hash", "none"],
+    h.dependencies,
+  )).rejects.toThrow(
+    "Linear guarded sync refuses pending issue recovery before plan comparison",
+  );
+
+  expect(h.gateway.issueReadCalls).toBe(issueReads);
+  expect(h.gateway.commentReadCalls).toBe(commentReads);
+  expect(h.gateway.issueWrites).toBe(issueWrites);
+  expect(h.gateway.commentWrites).toBe(0);
+  expect(h.graph.writes).toHaveLength(graphWrites);
+  expect(h.graph.reservations).toHaveLength(reservations);
+  expect(h.leases.activeResources()).toEqual([]);
+});
+
+test("a matching guarded hash retains the immediate remote issue precondition", async () => {
+  const h = harness();
+  const thread = await importThread(h);
+  const plan = await runLinearCommand(["plan", thread], h.dependencies) as {
+    actions: { hash: string };
+  };
+  h.gateway.afterCommentRead = () => {
+    h.gateway.afterCommentRead = undefined;
+    h.gateway.issue.title = "Concurrent remote edit after guarded planning";
+  };
+  const graphWrites = h.graph.writes.length;
+
+  await expect(runLinearCommand(
+    ["sync", thread, "--apply", "--expect-plan-hash", plan.actions.hash],
+    h.dependencies,
+  )).rejects.toThrow(
+    "Linear issue changed after planning; refusing stale save_issue payload",
+  );
+
+  expect(h.gateway.issueWrites).toBe(0);
+  expect(h.gateway.commentWrites).toBe(0);
+  expect(h.graph.writes).toHaveLength(graphWrites);
+});
+
 test("apply re-reads managed comments immediately before intent and refuses a stale create", async () => {
   const h = harness();
   const thread = await importThread(h);
@@ -3089,6 +3261,50 @@ test("marker relocation rejects duplicate issue keys before last-write-wins coll
   h.gateway.duplicateIssueKey = true;
   await expect(runLinearCommand(["plan", thread], h.dependencies))
     .rejects.toThrow("duplicate issue key NEW-1");
+});
+
+test("expected-plan option parsing is strict and scoped only to sync apply", async () => {
+  const h = harness();
+  const malformed = [
+    "0".repeat(63),
+    "0".repeat(65),
+    "A".repeat(64),
+    "g".repeat(64),
+    "NONE",
+    " none",
+  ];
+  for (const value of malformed) {
+    await expect(runLinearCommand(
+      ["sync", "thread", "--apply", "--expect-plan-hash", value],
+      h.dependencies,
+    )).rejects.toThrow(
+      "--expect-plan-hash must be 'none' or a 64-character lowercase SHA-256 hash",
+    );
+  }
+  await expect(runLinearCommand(
+    ["sync", "thread", "--apply", "--expect-plan-hash"],
+    h.dependencies,
+  )).rejects.toThrow("--expect-plan-hash requires a value");
+  await expect(runLinearCommand(
+    ["sync", "thread", "--apply", "--expect-plan-hash", "none", "--expect-plan-hash", "none"],
+    h.dependencies,
+  )).rejects.toThrow("duplicate option --expect-plan-hash");
+  await expect(runLinearCommand(
+    ["sync", "thread", "--expect-plan-hash", "none"],
+    h.dependencies,
+  )).rejects.toThrow("--expect-plan-hash requires sync --apply");
+  await expect(runLinearCommand(
+    ["plan", "thread", "--expect-plan-hash", "none"],
+    h.dependencies,
+  )).rejects.toThrow("plan accepts only --server");
+  await expect(runLinearCommand(
+    ["import", "MSA-236", "--expect-plan-hash", "none"],
+    h.dependencies,
+  )).rejects.toThrow("import does not accept --apply or --expect-plan-hash");
+  expect(h.opened).toEqual([]);
+
+  const help = await runLinearCommand(["help"], h.dependencies) as { help: string };
+  expect(help.help).toContain("--expect-plan-hash <HASH|none>");
 });
 
 test("doctor bootstraps graph schema exactly once; get stays read-only and irrelevant flags fail closed", async () => {
