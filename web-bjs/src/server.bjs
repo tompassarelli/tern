@@ -97,7 +97,8 @@
   (threads/list-view port)))
 
 (js/export (defn api-agents [(port :- Int)] :- (Promise Any)
-  (let [r (js/await (presence/roster port))] {"agents" r})))
+  (let [r (js/await (presence/roster port))]
+    {"version" "north:agent-roster:v1" "agents" r})))
 
 (js/export (defn api-presence [(port :- Int)] :- (Promise Any)
   (let [roster (js/await (presence/roster port))]

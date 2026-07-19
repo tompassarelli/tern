@@ -319,6 +319,29 @@ EOF
                 'await import(process.argv[1])' \
                 "$out/libexec/north-web/north/boot.js"
 
+            if ${pkgs.coreutils}/bin/env -i PATH= \
+              "$out/bin/north-web" \
+              > "$TMPDIR/missing-corpus.out" \
+              2> "$TMPDIR/missing-corpus.err"; then
+              echo "north-web started without FRAM_LOG" >&2
+              exit 1
+            fi
+            ${pkgs.gnugrep}/bin/grep -Fq \
+              'FRAM_LOG must name an existing corpus before north-web can start' \
+              "$TMPDIR/missing-corpus.err"
+
+            if ${pkgs.coreutils}/bin/env -i \
+              PATH= FRAM_LOG="$TMPDIR/nonexistent/facts.log" \
+              "$out/bin/north-web" \
+              > "$TMPDIR/nonexistent-corpus.out" \
+              2> "$TMPDIR/nonexistent-corpus.err"; then
+              echo "north-web started with a nonexistent FRAM_LOG" >&2
+              exit 1
+            fi
+            ${pkgs.gnugrep}/bin/grep -Fq \
+              'FRAM_LOG must name an existing corpus before north-web can start' \
+              "$TMPDIR/nonexistent-corpus.err"
+
             smoke="$TMPDIR/north-web-smoke"
             mkdir -p "$smoke"
             : > "$smoke/facts.log"

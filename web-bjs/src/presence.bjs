@@ -53,6 +53,32 @@
     (const parts (.split normalized "-"))
     (const families (array "opus" "sonnet" "haiku" "fable" "sol" "terra" "luna"))
     (return (or (.find families (=> (family) (.includes parts family))) normalized))))
+  ;; Corpus+port keyed promise singleflight. There is deliberately no TTL:
+  ;; concurrent tabs share only the exact in-flight refresh, then the entry is
+  ;; deleted on either fulfillment or rejection so the next sequential read is
+  ;; fresh. The promise itself is the cache value, preventing a check/set race.
+  (const rosterFlights (new Map))
+  (export (function rosterSingleflight (corpus port loader)
+    (if (! (and (=== (typeof corpus) "string") (> (dot corpus length) 0)))
+      (return (.reject Promise (new Error
+        "FRAM_LOG must name an existing corpus before reading the agent roster"))))
+    (const key (tpl "" corpus "\u0000" port))
+    (const existing (.get rosterFlights key))
+    (if existing (return existing))
+    (let shared null)
+    (const flight (.then (.resolve Promise) loader))
+    (= shared
+       ((bracket flight "finally") (=>
+         ()
+         (if (!== (.get rosterFlights key) shared) (return 0))
+         ((bracket rosterFlights "delete") key)
+         0)))
+    (.set rosterFlights key shared)
+    (return shared)))
+  (export (function requireBoundedRosterBundle (bundle)
+    (if (or (! bundle) (!== (bracket bundle "bounded") true))
+      (throw (new Error "agent roster coordinator projection failed")))
+    (return bundle)))
   ;; Strict delivery-evidence reader shared semantically with the SDK and CLI.
   ;; The web roster must never display a terminal that either canonical reader
   ;; rejects: lifecycle text is an authority boundary, not decorative JSON.
@@ -245,6 +271,8 @@
 (declare-extern safePresetOverrides [Any -> Any])
 (declare-extern slugValue [Any -> String])
 (declare-extern modelFamily [Any -> String])
+(declare-extern rosterSingleflight [String Int Any -> (Promise Any)])
+(declare-extern requireBoundedRosterBundle [Any -> Any])
 (declare-extern validReportedEvidence [Any Any -> Bool])
 
 ;; ---- usage -----------------------------------------------------------------
@@ -552,23 +580,6 @@
          (slugValue (gaffer-provenance facts)) "-"
          (slugValue suffix)))))
 
-(defn display-name [(id :- String) (facts :- Any)] :- String
-  (or (fact-one facts "display_name")
-      (let [goal (fact-one facts "goal")
-            abbreviated (if (and (some? goal) (> (count goal) 40))
-                          (str (.slice goal 0 37) "…") goal)]
-        (str (semantic-handle id facts)
-             (if (some? abbreviated) (str " — " abbreviated) "")))))
-
-(defn display-handle [(id :- String) (facts :- Any)] :- String
-  (or (fact-one facts "display_handle")
-      (let [name (fact-one facts "display_name")]
-        (if (and (= "session" (fact-one facts "kind"))
-                 (some? name)
-                 (member? (fact-values facts "display_handle") name))
-          name nil))
-      (semantic-handle id facts)))
-
 (defn meaningful-task [(value :- Any)] :- Any
   (let [task (known value)]
     (if (member? ["CONTEXT BRIEF:" "DELEGATE TASK:" "TASK:"] (or task ""))
@@ -586,6 +597,22 @@
                (some? (fact-one facts "repo")))
         (str "native session in " (fact-one facts "repo"))
         "unknown")))
+
+(defn role-axis [(facts :- Any)] :- String
+  (let [role (fact-one facts "role")
+        composition-kind (fact-one facts "composition_kind")]
+    (if (and (some? role)
+             (not (member? ["preset" "bespoke"] (or composition-kind ""))))
+      (str " · role:" (slugValue role))
+      "")))
+
+(defn primary-line
+  [(facts :- Any) (state-label :- String) (task :- String)] :- String
+  ;; Stored display_name/display_handle are publisher receipts. Every read
+  ;; derives current semantic identity from authority-bearing route facts.
+  (str (provider-axis facts) " · " (model-axis facts) " · "
+       (effort-axis facts) " · " (gaffer-provenance facts)
+       (role-axis facts) " · " state-label ": " task))
 
 ;; Modern terminals become visible only after the terminal digest commits and
 ;; the delivery shape is internally coherent. True legacy rows have `outcome`
@@ -717,7 +744,7 @@
                        (axis-value facts "vendor") ""))
         provider-target (if (axis-conflict? facts "provider_target")
                           "conflict" (or (axis-value facts "provider_target") ""))]
-    (->Row h h (display-name h facts) (display-handle h facts)
+    (->Row h h (primary-line facts state-label task) (semantic-handle h facts)
            (or (fact-one facts "kind") "unclassified")
            provider provider-target (provider-axis facts) model (model-axis facts)
            (effort-axis facts) (gaffer-provenance facts)
@@ -741,10 +768,11 @@
 ;; Exactly two indexed coordinator calls when at least one live lease exists:
 ;; one lease scan and one literal-subject union. Richer identity fields do not
 ;; add round trips. Expired leases are removed before subject construction.
-(js/export (defn roster [(port :- Int)] :- (Promise Any)
+(defn load-roster [(port :- Int)] :- (Promise Any)
   (let [now (nowMs)
         tokens (js/await (fram/agent-tokens port))
-        bundle (js/await (fram/agent-roster-bundle port now))
+        bundle (requireBoundedRosterBundle
+                (js/await (fram/agent-roster-bundle port now)))
         facts-by-subject (fold-bundle (get bundle "rows" []))
         rows
         (reduce
@@ -754,7 +782,12 @@
                  session (get facts-by-subject (str "@session:" h) {})]
              (pushArr out (project-agent h facts session lease tokens now))))
          (mkArr) (get bundle "leases" []))]
-    (sortArr rows (fn [a b] (row-cmp a b))))))
+    (sortArr rows (fn [a b] (row-cmp a b)))))
+
+(js/export (defn roster [(port :- Int)] :- (Promise Any)
+  (let [corpus (fram/corpus-log)]
+    (js/await
+     (rosterSingleflight corpus port (fn [] (load-roster port)))))))
 
 (js/export (defn online-refs [(port :- Int)] :- (Promise Any)
   (let [now (nowMs)

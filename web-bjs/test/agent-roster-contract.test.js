@@ -10,6 +10,7 @@ import {
   agentBundleOp,
   boundedAgentBundleRows,
   liveAgentLeases,
+  validCoordinatorQuery,
   validAgentControl,
 } from "../out/north/fram.js";
 import {
@@ -73,6 +74,8 @@ function committedTerminal(facts) {
   return { ...facts, terminal_manifest_sha256: sha256(canonical) };
 }
 
+const queryReply = (ok) => ({ ok, version: 1, engine: "index" });
+
 async function listen(server) {
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -103,8 +106,8 @@ describe("semantic agent roster contract", () => {
       expect(projected, fixture.name).toMatchObject({
         uuid: fixture.id,
         control_id: fixture.id,
-        display_name: fixture.expected.displayName,
-        display_handle: fixture.facts.display_handle,
+        display_name: fixture.expected.primaryLine,
+        display_handle: fixture.expected.semanticHandle,
         provider_label: fixture.expected.providerLabel,
         model_display: fixture.expected.modelDisplay,
         effort: fixture.expected.effortDisplay,
@@ -138,7 +141,7 @@ describe("semantic agent roster contract", () => {
       expect(semantic_handle(native.id, facts), observationCase.name)
         .toBe(observationCase.expected.semanticHandle);
       expect(projected, observationCase.name).toMatchObject({
-        display_name: observationCase.expected.displayName,
+        display_name: observationCase.expected.primaryLine,
         display_handle: observationCase.expected.displayHandle,
         provider_label: observationCase.expected.providerLabel,
         model_display: observationCase.expected.modelDisplay,
@@ -332,6 +335,8 @@ describe("semantic agent roster contract", () => {
       Date.now(),
     )).toMatchObject({
       task: fixture.facts.goal,
+      display_name: fixture.expected.primaryLine,
+      display_handle: fixture.expected.semanticHandle,
       focus: false,
       thinking: false,
     });
@@ -344,6 +349,8 @@ describe("semantic agent roster contract", () => {
       Date.now(),
     )).toMatchObject({
       task: "Implement the roster",
+      display_name:
+        "anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:designer · working: Implement the roster",
       focus: true,
       thinking: true,
     });
@@ -375,22 +382,56 @@ describe("semantic agent roster contract", () => {
     expect(boundedAgentBundleRows([
       ["@agent:lane-a", "provider", "openai"],
       ["@session:lane-a", "current_thread", "work"],
-    ])).toHaveLength(2);
+    ], ["lane-a"])).toHaveLength(2);
+    expect(boundedAgentBundleRows([
+      ["@agent:lane-b", "provider", "openai"],
+    ], ["lane-a"])).toBeNull();
     expect(boundedAgentBundleRows([["@other:lane-a", "provider", "openai"]])).toBeNull();
     expect(boundedAgentBundleRows([["@agent:lane-a", "provider"]])).toBeNull();
     expect(boundedAgentBundleRows([[["@agent:lane-a"], "provider", "openai"]])).toBeNull();
   });
 
-  test("lease fold excludes expired and malformed controls while retaining the newest lease", () => {
+  test("lease fold excludes expired and non-session controls", () => {
     expect(liveAgentLeases([
-      ["@lease:session:live", "live|2100|1"],
       ["@lease:session:live", "live|2300|2"],
       ["@lease:session:expired", "expired|1900|1"],
-      ["@lease:session:bad control", "bad control|2400|1"],
-      ["@lease:session:exponent", "exponent|2e3|1"],
-      [["@lease:session:array"], "array|2400|1"],
       ["@other:session:ignored", "ignored|2400|1"],
     ], 2_000)).toEqual([{ control: "live", expires_s: 0 }]);
+  });
+
+  test("malformed query and lease projections fail closed instead of becoming empty", () => {
+    expect(validCoordinatorQuery(queryReply([]))).toBeTrue();
+    expect(validCoordinatorQuery({ ok: [] })).toBeFalse();
+    expect(validCoordinatorQuery({ error: [], version: 1, engine: "index" })).toBeFalse();
+    expect(validCoordinatorQuery({ ok: [], version: -1, engine: "index" })).toBeFalse();
+    expect(validCoordinatorQuery({
+      ok: [],
+      version: Number.MAX_SAFE_INTEGER + 1,
+      engine: "index",
+    })).toBeFalse();
+    expect(liveAgentLeases([
+      ["@lease:session:bad control", "bad control|2400|1"],
+    ], 2_000)).toBeNull();
+    expect(liveAgentLeases([
+      ["@lease:session:exponent", "exponent|2e3|1"],
+    ], 2_000)).toBeNull();
+    expect(liveAgentLeases([
+      ["@lease:session:unsafe-integer", "unsafe-integer|9007199254740992|1"],
+    ], 2_000)).toBeNull();
+    expect(liveAgentLeases([
+      [["@lease:session:array"], "array|2400|1"],
+    ], 2_000)).toBeNull();
+    expect(liveAgentLeases([
+      ["@lease:session:wrong-holder", "someone-else|2400|1"],
+    ], 2_000)).toBeNull();
+    expect(liveAgentLeases([
+      ["@lease:session:duplicate", "duplicate|2400|1"],
+      ["@lease:session:duplicate", "duplicate|2500|2"],
+    ], 2_000)).toBeNull();
+    expect(liveAgentLeases([
+      ["@lease:session:duplicate", "duplicate|2400|1"],
+      ["@lease:session:duplicate", "duplicate|2400|1"],
+    ], 2_000)).toBeNull();
   });
 
   test("live API performs two indexed calls and retains a just-finished valid lease", async () => {
@@ -411,16 +452,14 @@ describe("semantic agent roster contract", () => {
         if (!request.includes("\n")) return;
         requests.push(request);
         if (requests.length === 1) {
-          socket.end(`${JSON.stringify({
-            ok: [
+          socket.end(`${JSON.stringify(queryReply([
               ["@lease:session:live", `live|${now + 60_000}|1`],
               ["@lease:session:expired", `expired|${now - 1}|1`],
-            ],
-          })}\n`);
+            ]))}\n`);
         } else if (requests.length === 2) {
-          socket.end(`${JSON.stringify({ ok: factRows })}\n`);
+          socket.end(`${JSON.stringify(queryReply(factRows))}\n`);
         } else {
-          socket.end(`${JSON.stringify({ ok: [] })}\n`);
+          socket.end(`${JSON.stringify(queryReply([]))}\n`);
         }
       });
     });
@@ -436,10 +475,13 @@ describe("semantic agent roster contract", () => {
       expect(requests[1]).not.toContain("@session:expired");
       expect(requests[1]).not.toContain('{:var "s"}');
       expect(result.agents).toHaveLength(1);
+      expect(result.version).toBe("north:agent-roster:v1");
       expect(result.agents[0]).toMatchObject({
         uuid: "live",
         control_id: "live",
-        display_name: fixture.expected.displayName,
+        display_name:
+          "anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:designer · finished(process:ran, delivery:unrecorded): Finalize semantic roster",
+        display_handle: fixture.expected.semanticHandle.replace("a205e9ce", "live"),
         provider_label: fixture.expected.providerLabel,
         model_display: fixture.expected.modelDisplay,
         effort: fixture.expected.effortDisplay,
@@ -448,6 +490,80 @@ describe("semantic agent roster contract", () => {
         state: "finished",
         state_label: "finished(process:ran, delivery:unrecorded)",
       });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test("twenty concurrent roster reads share one exact two-call refresh", async () => {
+    configureEmptyLogs();
+    const now = Date.now();
+    const requests = [];
+    const fixture = fixtures.find(({ name }) => name === "exact-preset");
+    if (!fixture) throw new Error("missing exact-preset fixture");
+    const factRows = Object.entries(fixture.facts)
+      .map(([predicate, value]) => ["@agent:live", predicate, value]);
+    factRows.push(["@session:live", "current_thread", "Singleflight roster refresh"]);
+
+    const server = createServer((socket) => {
+      let request = "";
+      socket.on("data", (chunk) => {
+        request += chunk.toString("utf8");
+        if (!request.includes("\n")) return;
+        requests.push(request);
+        const payload = request.includes('"session_lease"')
+          ? queryReply([["@lease:session:live", `live|${now + 60_000}|1`]])
+          : queryReply(factRows);
+        setTimeout(() => socket.end(`${JSON.stringify(payload)}\n`), 20);
+      });
+    });
+    const port = await listen(server);
+
+    try {
+      const concurrent = await Promise.all(
+        Array.from({ length: 20 }, () => api_agents(port)),
+      );
+      expect(requests).toHaveLength(2);
+      expect(new Set(concurrent.map((value) => JSON.stringify(value))).size).toBe(1);
+      expect(concurrent[0]).toMatchObject({
+        version: "north:agent-roster:v1",
+        agents: [{
+          control_id: "live",
+          task: "Singleflight roster refresh",
+        }],
+      });
+
+      const sequential = await api_agents(port);
+      expect(requests).toHaveLength(4);
+      expect(sequential).toEqual(concurrent[0]);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  test("API rejects a coordinator error instead of publishing an empty roster", async () => {
+    configureEmptyLogs();
+    const requests = [];
+    const server = createServer((socket) => {
+      let request = "";
+      socket.on("data", (chunk) => {
+        request += chunk.toString("utf8");
+        if (!request.includes("\n")) return;
+        requests.push(request);
+        socket.end(`${JSON.stringify({
+          error: ["coordinator unavailable"],
+          version: 1,
+          engine: "index",
+        })}\n`);
+      });
+    });
+    const port = await listen(server);
+
+    try {
+      await expect(api_agents(port)).rejects.toThrow(
+        "agent roster coordinator projection failed",
+      );
+      expect(requests).toHaveLength(1);
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }

@@ -47,6 +47,21 @@
   (apply proc/sh {:out :string :err :string :continue true
                   :extra-env {"FRAM_LOG" @test-log}}
          "bb" presence-cli (str port) args))
+(defn run-against-response [response]
+  (with-open [server (java.net.ServerSocket. 0)]
+    (let [served
+          (future
+            (with-open [socket (.accept server)
+                        reader (io/reader (.getInputStream socket))]
+              (.readLine reader)
+              (let [writer (.getOutputStream socket)]
+                (.write writer
+                        (.getBytes (str (pr-str response) "\n")
+                                   java.nio.charset.StandardCharsets/UTF_8))
+                (.flush writer))))
+          result (run-presence (.getLocalPort server) "presence-online-json")]
+      @served
+      result)))
 
 (let [port (free-port)
       tmp (.toFile
@@ -78,6 +93,60 @@
              (and (str/includes? full "live-session")
                   (str/includes? full "lapsed-session")
                   (str/includes? full "lapsed"))))
+    (let [error-result
+          (run-against-response
+           {:error ["coordinator unavailable"] :version 1 :engine "index"})
+          malformed-row-result
+          (run-against-response
+           {:ok [["@lease:session:broken"]] :version 1 :engine "index"})
+          unsafe-version-result
+          (run-against-response
+           {:ok [] :version 9007199254740992 :engine "index"})
+          malformed-lease-result
+          (run-against-response
+           {:ok [["@lease:session:broken" "not-a-lease"]]
+            :version 1 :engine "index"})
+          wrong-holder-result
+          (run-against-response
+           {:ok [["@lease:session:broken" "someone-else|9999999999999|1"]]
+            :version 1 :engine "index"})
+          overflow-result
+          (run-against-response
+           {:ok [["@lease:session:broken"
+                  "broken|9007199254740992|1"]]
+            :version 1 :engine "index"})
+          duplicate-distinct-result
+          (run-against-response
+           {:ok [["@lease:session:duplicate" "duplicate|9999999999999|1"]
+                 ["@lease:session:duplicate" "duplicate|9999999999998|2"]]
+            :version 1 :engine "index"})
+          duplicate-exact-result
+          (run-against-response
+           {:ok [["@lease:session:duplicate" "duplicate|9999999999999|1"]
+                 ["@lease:session:duplicate" "duplicate|9999999999999|1"]]
+            :version 1 :engine "index"})]
+      (check "coordinator error cannot become a successful empty JSON roster"
+             (and (not (zero? (:exit error-result)))
+                  (not (str/includes? (:out error-result)
+                                      "north:presence-online:v1"))))
+      (check "malformed coordinator rows fail the JSON roster closed"
+             (and (not (zero? (:exit malformed-row-result)))
+                  (not (str/includes? (:out malformed-row-result)
+                                      "north:presence-online:v1"))))
+      (check "unsafe coordinator versions fail the JSON roster closed"
+             (not (zero? (:exit unsafe-version-result))))
+      (check "malformed lease values fail the JSON roster closed"
+             (and (not (zero? (:exit malformed-lease-result)))
+                  (not (str/includes? (:out malformed-lease-result)
+                                      "north:presence-online:v1"))))
+      (check "session lease holder mismatch fails the JSON roster closed"
+             (not (zero? (:exit wrong-holder-result))))
+      (check "overflowing lease integers fail the JSON roster closed"
+             (not (zero? (:exit overflow-result))))
+      (check "distinct duplicate session leases fail the JSON roster closed"
+             (not (zero? (:exit duplicate-distinct-result))))
+      (check "exact duplicate session leases fail the JSON roster closed"
+             (not (zero? (:exit duplicate-exact-result)))))
     (finally
       (proc/destroy-tree daemon)
       (doseq [file (reverse (file-seq tmp))]

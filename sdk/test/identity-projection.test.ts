@@ -16,6 +16,7 @@ interface RosterFixture {
     gafferProvenance: string;
     semanticHandle: string;
     displayName: string;
+    primaryLine: string;
   };
 }
 
@@ -56,8 +57,8 @@ test("shared roster fixtures preserve semantic identity across provider adapters
     expect(providerTargetLabel(identity), fixture.name).toBe(fixture.expected.providerLabel);
     expect(gafferProvenance(identity), fixture.name).toBe(fixture.expected.gafferProvenance);
     expect(semanticHandle(fixture.id, identity), fixture.name).toBe(fixture.expected.semanticHandle);
-    if (fixture.name !== "missing-managed-axes")
-      expect(renderDisplayName(fixture.id, identity), fixture.name).toBe(fixture.expected.displayName);
+    expect(renderDisplayName(fixture.id, identity), fixture.name).toBe(fixture.expected.displayName);
+    expect(fixture.facts.display_name, fixture.name).not.toBe(fixture.expected.primaryLine);
   }
 });
 

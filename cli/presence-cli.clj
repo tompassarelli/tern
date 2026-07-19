@@ -15,6 +15,7 @@
 ;;   bb presence-cli.clj <port> task     <handle> "<task>"
 ;;   bb presence-cli.clj <port> presence                             ; projection (replaces ls presence/ + age math)
 ;;   bb presence-cli.clj <port> presence-online                      ; bounded live-only projection for cockpit/roster
+;;   bb presence-cli.clj <port> presence-online-json                 ; stable machine projection (never parse columns)
 ;;   bb presence-cli.clj <port> slackers [minutes]                   ; derived: online + holds no work-lease
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str]
          '[cheshire.core :as json])
@@ -50,27 +51,106 @@
          vec)))
 
 (def lease-session-prefix "@lease:session:")
+(def max-session-lease-rows 100000)
+(def max-live-session-controls 256)
+(def max-control-bytes 256)
+(def max-safe-integer 9007199254740991)
+(def control-pattern #"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+(defn valid-control? [value]
+  (and (string? value)
+       (<= (alength (.getBytes value java.nio.charset.StandardCharsets/UTF_8))
+           max-control-bytes)
+       (boolean (re-matches control-pattern value))))
+
+(defn strict-query-rows
+  "Return an exact coordinator query result or throw. A transport/protocol
+   failure is not an empty graph: callers must never publish a successful empty
+   roster after the coordinator failed or returned a malformed row."
+  [response]
+  (when-not (and (map? response)
+                 (= #{:ok :version :engine} (set (keys response)))
+                 (integer? (:version response))
+                 (not (neg? (:version response)))
+                 (<= (:version response) max-safe-integer)
+                 (#{"index" "scan"} (:engine response))
+                 (vector? (:ok response))
+                 (every? #(and (vector? %)
+                               (= 2 (count %))
+                               (string? (nth % 0))
+                               (string? (nth % 1)))
+                         (:ok response)))
+    (throw (ex-info "coordinator returned a malformed live-session lease projection"
+                    {:type :malformed-presence-query
+                     :response response})))
+  (:ok response))
+
+(defn strict-lease
+  [entity value]
+  (let [parts (str/split value #"\|" -1)
+        exp (when (= 3 (count parts)) (parse-long (nth parts 1)))
+        epoch (when (= 3 (count parts)) (parse-long (nth parts 2)))]
+    (when-not (and (= 3 (count parts))
+                   (not (str/blank? (nth parts 0)))
+                   (re-matches #"[0-9]+" (nth parts 1))
+                   (re-matches #"[0-9]+" (nth parts 2))
+                   (some? exp)
+                   (some? epoch)
+                   (<= exp max-safe-integer)
+                   (<= epoch max-safe-integer))
+      (throw (ex-info "coordinator returned a malformed lease value"
+                      {:type :malformed-presence-lease
+                       :entity entity})))
+    {:holder (nth parts 0)
+     :exp exp
+     :epoch epoch}))
 
 (defn online-sessions
   "Return only unexpired session leases using one indexed graph query. The full
    historical session registry contains thousands of lapsed rows, so enriching
    all of it and filtering later makes live rosters grow without bound."
   [port now]
-  (let [rows (:ok (send-op port {:op :query
-                                 :query {:find "lease"
-                                         :rules [{:head {:rel "lease" :args [{:var "e"} {:var "v"}]}
-                                                  :body [{:rel "triple" :args [{:var "e"} "lease" {:var "v"}]}]}]}}))]
-    (->> (or rows [])
-         (keep (fn [[entity value]]
-                 (let [entity (str entity)
-                       lease (decode-lease value)]
-                   (when (and (str/starts-with? entity lease-session-prefix)
-                              lease (> (:exp lease) now))
-                     (let [handle (subs entity (count lease-session-prefix))]
-                       {:entity (str "@session:" handle) :handle handle :lease lease})))))
-         (reduce (fn [by-handle session] (assoc by-handle (:handle session) session)) {})
-         vals
-         vec)))
+  (let [rows (strict-query-rows
+              (send-op port {:op :query
+                             :query {:find "lease"
+                                     :rules [{:head {:rel "lease" :args [{:var "e"} {:var "v"}]}
+                                              :body [{:rel "triple" :args [{:var "e"} "lease" {:var "v"}]}]}]}}))]
+    (when (> (count rows) max-session-lease-rows)
+      (throw (ex-info "live session lease projection exceeds its bounded input"
+                      {:rows (count rows) :max max-session-lease-rows})))
+    (let [parsed (mapv (fn [[entity value]]
+                         {:entity entity
+                          :lease (strict-lease entity value)})
+                       rows)
+          session-entities (->> parsed
+                                (map :entity)
+                                (filter #(str/starts-with? % lease-session-prefix))
+                                vec)]
+      (when-not (= (count session-entities) (count (distinct session-entities)))
+        (throw (ex-info "coordinator returned duplicate session lease rows"
+                        {:type :duplicate-presence-lease})))
+      (let [live
+            (->> parsed
+                 (keep (fn [{:keys [entity lease]}]
+                         (when (and (str/starts-with? entity lease-session-prefix)
+                                    (> (:exp lease) now))
+                           (let [handle (subs entity (count lease-session-prefix))]
+                             (when-not (= handle (:holder lease))
+                               (throw (ex-info "session lease holder does not match its control"
+                                               {:type :malformed-presence-lease
+                                                :entity entity})))
+                             (when-not (valid-control? handle)
+                               (throw (ex-info "session lease control is malformed"
+                                               {:type :malformed-presence-control
+                                                :entity entity})))
+                             {:entity (str "@session:" handle)
+                              :handle handle
+                              :lease lease}))))
+                 vec)]
+        (when (> (count live) max-live-session-controls)
+          (throw (ex-info "live session roster exceeds its bounded control set"
+                          {:controls (count live) :max max-live-session-controls})))
+        (->> live (sort-by :handle) vec)))))
 
 (defn print-presence!
   [port now session-rows]
@@ -92,6 +172,18 @@
     (doseq [r sorted]
       (println (format "%-14s %-4s %-6s %-7s %-26s %s"
                        (:h r) (if (:pinned r) " *" "") (if (:on r) "yes" "no") (:exp r) (:roles r) (:focus r))))))
+
+(defn print-presence-json!
+  [now session-rows]
+  (println
+   (json/generate-string
+    {"version" "north:presence-online:v1"
+     "sessions"
+     (mapv (fn [{:keys [handle lease]}]
+             {"control_id" handle
+              "online" true
+              "expires_s" (max 0 (quot (- (:exp lease) now) 1000))})
+           session-rows)})))
 
 (let [[port verb & args] *command-line-args*
       port (Integer/parseInt port)
@@ -218,6 +310,9 @@
 
     "presence-online"                       ; bounded projection used by live-only UIs
     (print-presence! port now (online-sessions port now))
+
+    "presence-online-json"                  ; stable bounded machine projection
+    (print-presence-json! now (online-sessions port now))
 
     "slackers"                              ; derived; replaces the polling slacker-detector/reaper
     (let [_mins (if (seq args) (parse-long (first args)) 10)
@@ -365,5 +460,5 @@
         (println "                                |identify|card  (agent card)")
         (println "                                |define-role|assign|unassign|roles|holders  (roles)")
         (println "                                |watch|unwatch|subscriptions  (thread subs)")
-        (println "                                |presence|slackers}  (projections)")
+        (println "                                |presence|presence-online|presence-online-json|slackers}  (projections)")
         (System/exit 2))))

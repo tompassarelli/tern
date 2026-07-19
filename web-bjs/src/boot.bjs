@@ -498,6 +498,13 @@
 
   ;; ---- server bootstrap ----
   (export (function startServer ()
+    ;; An import-only smoke opts out of autostart below. Every real server,
+    ;; including a packaged one, requires an explicit existing corpus before it
+    ;; binds a port; serving an empty 200 roster is split-brain, not resilience.
+    (const corpus (.corpus-log fram))
+    (if (! corpus)
+      (throw (new Error
+        "FRAM_LOG must name an existing corpus before north-web can start")))
     (const subscription (startSubscribe))
     (let server null)
     (try

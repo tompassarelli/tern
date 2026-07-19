@@ -46,8 +46,9 @@
                           " · " (get expected "gafferProvenance"))]]
       (and (= (get expected "gafferProvenance") (gaffer-provenance facts))
            (= (get expected "semanticHandle") (semantic-handle id facts))
+           (= (get expected "primaryLine") line)
            (str/starts-with? line axes)
-           (= (get expected "displayName") (get facts "display_name"))
+           (not= line (get facts "display_name"))
            ;; Display text is output only. It cannot repair missing structured axes.
            (or (not= name "missing-managed-axes")
                (and (str/includes? line "gaffer:legacy-debt")
@@ -69,12 +70,18 @@
            (= (get expected "gafferProvenance") (gaffer-provenance facts))
            (= (get expected "semanticHandle")
               (semantic-handle "session-native-7841e6b2" facts))
-           (str/starts-with?
-            line
-            (str (get expected "providerLabel") " · "
-                 (get expected "modelDisplay") " · "
-                 (get expected "effortDisplay") " · "
-                 (get expected "gafferProvenance"))))))))
+           (= (get expected "primaryLine") line))))))
+
+(check "session current task outranks stale lane goal and stored presentation receipts"
+       (= "anthropic:ambient · opus · xhigh · gaffer:designer · working: Current session task"
+          (agent-primary-line
+           {:online true}
+           (managed
+            {"kind" "lane" "provider" "anthropic" "model" "opus" "effort" "xhigh"
+             "composition_kind" "preset" "role" "designer" "composition_id" "designer"
+             "composition_overrides" "[]" "goal" "Stale lane goal"
+             "display_name" "STALE presentation receipt"})
+           {"current_thread" "Current session task"})))
 
 (check "preset roster line uses canonical structured axes"
        (= "anthropic:ambient · opus · xhigh · gaffer:designer · working: build the roster"
@@ -303,28 +310,57 @@
          (and (= bulk (first @calls))
               (= 3 (count @calls)))))
 
-(let [out (with-redefs [presence-rows (fn [] {:agents [{:id "lane-active" :online true :expires "10s"}
-                                                        {:id "session-active" :online true :expires "20s"}
-                                                        {:id "lane-done" :online true :expires "30s"}]})
-                        agent-facts (fn [_] {"lane-active" {"kind" "lane" "provider" "openai"
-                                                            "model" "gpt-5.6-sol" "effort" "high"
-                                                            "role" "integrator" "composition_kind" "preset"
-                                                            "composition_id" "integrator" "composition_overrides" "[]"}
-                                             "session-active" {"kind" "session" "provider" "anthropic"
-                                                               "model" "claude-opus-4-8" "effort" "xhigh"}
-                                             "lane-done" {"kind" "lane" "provider" "openai"
-                                                          "model" "gpt-5.6-sol" "effort" "high"
-                                                          "role" "designer" "composition_kind" "preset"
-                                                          "composition_id" "designer" "composition_overrides" "[]"
-                                                          "outcome" "ran" "process_outcome" "ran"
-                                                          "delivery_outcome" "unverified"
-                                                          "delivery_reason" "provider_terminal_success_without_external_verification"
-                                                          "terminal_manifest_sha256"
-                                                          (north.terminal-projection/terminal-manifest-sha256
-                                                           {"outcome" "ran"
-                                                            "process_outcome" "ran"
-                                                            "delivery_outcome" "unverified"
-                                                            "delivery_reason" "provider_terminal_success_without_external_verification"})}})]
+(let [bulk [(str root "/bin/north") "json" "show-many"
+            "agent:lane-a,session:lane-a"]
+      calls (atom [])
+      failed
+      (with-redefs [run (fn [argv & _]
+                          (swap! calls conj argv)
+                          {:ok false :exit 1})]
+        (roster-facts
+         (mapv #(str "lane-" %) (range max-live-controls))))
+      valid-empty
+      (with-redefs [run (fn [& _] {:ok true :exit 0 :out "[]"})]
+        (roster-facts ["lane-a"]))
+      malformed
+      (with-redefs [run (fn [& _]
+                          {:ok true :exit 0
+                           :out "[{\"subject\":\"agent:lane-a\",\"predicate\":\"task\"}]"})]
+        (roster-facts ["lane-a"]))]
+  (check "bulk roster failure performs one bounded call, never a 2N fallback"
+         (and (= 1 (count @calls))
+              (= "agent subject projection unavailable" (:err failed))))
+  (check "a successful empty bulk projection remains distinguishable from failure"
+         (= {:agents {} :sessions {}} valid-empty))
+  (check "malformed bulk subject rows fail closed"
+         (= "agent subject projection was malformed" (:err malformed))))
+
+(let [out (with-redefs [presence-rows (fn [] {:agents [{:id "lane-active" :online true :expires "10s" :expires-s 10}
+                                                        {:id "session-active" :online true :expires "20s" :expires-s 20}
+                                                        {:id "lane-done" :online true :expires "30s" :expires-s 30}]})
+                        roster-facts
+                        (fn [_]
+                          {:agents
+                           {"lane-active" {"kind" "lane" "provider" "openai"
+                                           "model" "gpt-5.6-sol" "effort" "high"
+                                           "role" "integrator" "composition_kind" "preset"
+                                           "composition_id" "integrator" "composition_overrides" "[]"}
+                            "session-active" {"kind" "session" "provider" "anthropic"
+                                              "model" "claude-opus-4-8" "effort" "xhigh"}
+                            "lane-done" {"kind" "lane" "provider" "openai"
+                                         "model" "gpt-5.6-sol" "effort" "high"
+                                         "role" "designer" "composition_kind" "preset"
+                                         "composition_id" "designer" "composition_overrides" "[]"
+                                         "outcome" "ran" "process_outcome" "ran"
+                                         "delivery_outcome" "unverified"
+                                         "delivery_reason" "provider_terminal_success_without_external_verification"
+                                         "terminal_manifest_sha256"
+                                         (north.terminal-projection/terminal-manifest-sha256
+                                          {"outcome" "ran"
+                                           "process_outcome" "ran"
+                                           "delivery_outcome" "unverified"
+                                           "delivery_reason" "provider_terminal_success_without_external_verification"})}}
+                           :sessions {}})]
             (with-out-str (cmd-agents [])))]
   (check "roster summary separates active and recently finished counts"
          (and (str/includes? out "3 roster entries · 2 active · 1 recently finished")
@@ -337,10 +373,93 @@
          (not (str/includes? out "presence-cli.clj"))))
 
 (let [out (with-redefs [presence-rows (fn [] {:agents []})
-                        agent-facts (fn [_] {})]
+                        roster-facts (fn [_] {:agents {} :sessions {}})]
             (with-out-str (cmd-agents ["--verbose"])))]
   (check "verbose roster output retains the internal presence probe"
          (str/includes? out "presence-cli.clj")))
+
+(let [valid (with-redefs [run (fn [& _]
+                                {:ok true
+                                 :out "{\"version\":\"north:presence-online:v1\",\"sessions\":[{\"control_id\":\"lane-a\",\"online\":true,\"expires_s\":7}]}"})]
+              (presence-rows))
+      prose (with-redefs [run (fn [& _]
+                                {:ok true :out "AGENT ONLINE EXPIRES\nlane-a yes 7s\n"})]
+              (presence-rows))]
+  (check "roster intake consumes the strict presence JSON contract"
+         (= [{:id "lane-a" :online true :expires-s 7 :expires "7s"}]
+            (:agents valid)))
+  (check "roster intake rejects prose instead of scraping human columns"
+         (= "presence projection was malformed" (:err prose))))
+
+(let [identity
+      {"control_id" "lane-a"
+       "display_handle" "openai-sol-high-gaffer-integrator-a"
+       "kind" "lane"
+       "provider" "openai"
+       "provider_target" "codex-personal"
+       "provider_label" "openai:codex-personal"
+       "model" "gpt-5.6-sol"
+       "model_display" "sol"
+       "effort" "high"
+       "gaffer_provenance" "gaffer:integrator"}
+      cli {"version" ROSTER-CONTRACT-VERSION
+           "agents" [(merge identity
+                            {"display_name" "working: old task"
+                             "state" "working"
+                             "state_label" "working"
+                             "task" "old task"})]}
+      web {"version" ROSTER-CONTRACT-VERSION
+           "agents" [(merge identity
+                            {"display_name" "finished: new task"
+                             "state" "finished"
+                             "state_label" "finished(process:ran, delivery:reported)"
+                             "task" "new task"})]}]
+  (check "CLI/web parity compares stable semantic identity, not a volatile task snapshot"
+         (= (comparable-roster cli) (comparable-roster web)))
+  (check "CLI/web parity still detects a semantic handle mismatch"
+         (not=
+          (comparable-roster cli)
+          (comparable-roster
+           (assoc-in web ["agents" 0 "display_handle"]
+                     "anthropic-opus-xhigh-gaffer-designer-a"))))
+  (let [web-samples (atom [web web])
+        refreshes (atom 0)
+        converged
+        (parity-with-resample
+         (assoc-in cli ["agents" 0 "display_handle"] "stale-route-a")
+         #(let [sample (first @web-samples)]
+            (swap! web-samples subvec 1)
+            sample)
+         #(do (swap! refreshes inc) {:snapshot web}))
+        persistent
+        (parity-with-resample
+         cli
+         (constantly
+          (assoc-in web ["agents" 0 "display_handle"]
+                    "persistently-different-a"))
+         #(do (swap! refreshes inc) {:snapshot cli}))]
+    (check "parity accepts a stable second sample after one honest route transition"
+           (and (:ok converged) (= 2 (:attempts converged))))
+    (check "parity fails after one bounded resample when semantic drift persists"
+           (and (false? (:ok persistent)) (= 2 (:attempts persistent))))
+    (check "parity performs at most one fresh CLI resample per comparison"
+           (= 2 @refreshes))))
+
+(let [help (proc/shell {:out :string :err :string :continue true
+                        :extra-env {"NO_COLOR" "1"}}
+                       (str root "/bin/north") "agents" "--help")
+      unknown (proc/shell {:out :string :err :string :continue true
+                           :extra-env {"NO_COLOR" "1"}}
+                          (str root "/bin/north") "agents" "--bogus")]
+  (check "agents help documents the versioned JSON and parity modes"
+         (and (zero? (:exit help))
+              (str/includes? (:out help) "north:agent-roster:v1")
+              (str/includes? (:out help) "--check-web")))
+  (check "agents rejects unknown options without probing presence"
+         (and (= 1 (:exit unknown))
+              (str/includes? (:err unknown) "unknown option --bogus")
+              (not (str/includes? (str (:out unknown) (:err unknown))
+                                  "presence-cli.clj")))))
 
 (let [steer (proc/shell {:out :string :err :string :continue true
                          :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}

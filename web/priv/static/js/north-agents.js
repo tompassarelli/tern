@@ -51,8 +51,58 @@
   let selected = null; // the selected agent's uuid (used as the stream handle)
   let chatEl = null;
 
+  // Trailing debounce plus a one-flight gate. A burst before a request starts
+  // becomes one fetch; frames that arrive while it is running become exactly
+  // one trailing fetch. At no point can two roster reads overlap.
+  function createRefreshController(load, delay = 120) {
+    let timer = null;
+    let inFlight = false;
+    let trailing = false;
+
+    async function execute() {
+      if (inFlight) {
+        trailing = true;
+        return;
+      }
+      inFlight = true;
+      try {
+        await load();
+      } finally {
+        inFlight = false;
+        if (trailing) {
+          trailing = false;
+          await execute();
+        }
+      }
+    }
+
+    return {
+      immediate: execute,
+      request() {
+        if (timer !== null) clearTimeout(timer);
+        timer = setTimeout(() => {
+          timer = null;
+          void execute();
+        }, delay);
+      },
+    };
+  }
+
   function handleOf(a) { return a.uuid; }
   function find(handle) { return agents.find((a) => handleOf(a) === handle) || null; }
+  async function loadRoster(fetcher = fetch) {
+    try {
+      const response = await fetcher("/api/agents");
+      if (!response || response.ok !== true) return null;
+      const data = await response.json();
+      if (!data || Array.isArray(data) ||
+          data.version !== "north:agent-roster:v1" ||
+          !Array.isArray(data.agents)) return null;
+      return data.agents;
+    } catch (_) {
+      return null;
+    }
+  }
   function semanticName(a) {
     return a.display_name || a.display_handle || "unnamed agent";
   }
@@ -229,9 +279,11 @@
 
   async function render(root) {
     rosterEl = root;
-    let data;
-    try { data = await fetch("/api/agents").then((r) => r.json()); } catch (_) { return; }
-    agents = data.agents || [];
+    const nextAgents = await loadRoster();
+    // A failed refresh is not an empty roster. Keep the last known-good
+    // projection on screen until a complete versioned response arrives.
+    if (nextAgents === null) return;
+    agents = nextAgents;
 
     // default-select the first online agent; keep selection if it still exists.
     if (!selected || !find(selected)) {
@@ -248,18 +300,18 @@
     renderChat();
   }
 
-  function liveRefresh(root) {
+  function liveRefresh(refresh) {
     let ws;
     const open = () => {
       try {
         const proto = location.protocol === "https:" ? "wss" : "ws";
         ws = new WebSocket(`${proto}://${location.host}/api/live?graph=board`);
-        ws.onmessage = () => render(root);
+        ws.onmessage = () => refresh.request();
         ws.onclose = () => setTimeout(open, 2000);
       } catch (_) { setTimeout(open, 2000); }
     };
     open();
-    setInterval(() => render(root), 15000); // backstop poll
+    setInterval(() => refresh.request(), 15000); // backstop poll
     setInterval(() => loadStream(), 4000);  // re-poll the open agent's stream
   }
 
@@ -293,9 +345,16 @@
     rosterEl = el("div", `flex:0 0 auto;max-height:30vh;overflow:auto;border-top:1px solid ${EF.edge};`);
 
     root.append(chatEl, cli, rosterEl);
-    render(rosterEl);
-    liveRefresh(rosterEl);
+    const refresh = createRefreshController(() => render(rosterEl));
+    void refresh.immediate();
+    liveRefresh(refresh);
   };
+
+  // Opt-in test seam: production creates no additional global.
+  if (window.__NORTH_AGENT_TEST__) {
+    window.__NORTH_AGENT_TEST__.createRefreshController = createRefreshController;
+    window.__NORTH_AGENT_TEST__.loadRoster = loadRoster;
+  }
 
   // Standalone boot when loaded on /agents directly.
   document.addEventListener("DOMContentLoaded", () => {

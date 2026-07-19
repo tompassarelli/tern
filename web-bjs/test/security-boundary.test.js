@@ -1,4 +1,7 @@
 import { afterAll, afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const inherited = {
   allowedOrigins: process.env.NORTH_WEB_ALLOWED_ORIGINS,
@@ -30,9 +33,16 @@ const {
 } = await import("../out/north/boot.js?security-boundary");
 
 const originalServe = Bun.serve;
+const originalConnect = Bun.connect;
+const temporaryDirectories = [];
 
 afterEach(() => {
   Bun.serve = originalServe;
+  Bun.connect = originalConnect;
+  delete process.env.FRAM_LOG;
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 afterAll(() => {
@@ -60,6 +70,14 @@ function request(path, { body, method = "OPTIONS", origin } = {}) {
   if (origin !== undefined) headers.origin = origin;
   if (body !== undefined) headers["content-type"] = "application/json";
   return new Request(`http://127.0.0.1:18088${path}`, { body, method, headers });
+}
+
+function existingCorpus() {
+  const directory = mkdtempSync(join(tmpdir(), "north-web-startup-"));
+  const corpus = join(directory, "facts.log");
+  writeFileSync(corpus, "");
+  temporaryDirectories.push(directory);
+  return corpus;
 }
 
 test("web port and bind configuration fail closed on malformed values", () => {
@@ -336,9 +354,35 @@ test("POST bodies are strict JSON objects with an explicit wire-byte cap", async
   expect(invalidUtf8.status).toBe(400);
 });
 
-test("server startup passes the loopback bind explicitly to Bun", () => {
+test("normal server startup fails before binding without an explicit existing corpus", () => {
+  let serves = 0;
+  Bun.serve = () => {
+    serves += 1;
+    throw new Error("must not bind");
+  };
+
+  delete process.env.FRAM_LOG;
+  expect(() => startServer()).toThrow(
+    "FRAM_LOG must name an existing corpus before north-web can start",
+  );
+  process.env.FRAM_LOG = join(tmpdir(), "north-web-definitely-missing", "facts.log");
+  expect(() => startServer()).toThrow(
+    "FRAM_LOG must name an existing corpus before north-web can start",
+  );
+  const directory = mkdtempSync(join(tmpdir(), "north-web-corpus-directory-"));
+  temporaryDirectories.push(directory);
+  process.env.FRAM_LOG = directory;
+  expect(() => startServer()).toThrow(
+    "FRAM_LOG must name an existing corpus before north-web can start",
+  );
+  expect(serves).toBe(0);
+});
+
+test("server startup with an existing corpus passes the loopback bind explicitly to Bun", () => {
   let options;
   let stops = 0;
+  process.env.FRAM_LOG = existingCorpus();
+  Bun.connect = () => new Promise(() => {});
   Bun.serve = (provided) => {
     options = provided;
     return {

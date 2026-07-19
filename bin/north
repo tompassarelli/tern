@@ -116,7 +116,7 @@ north — your one card. Type a command to do the thing next to it.
                                        shell: intake must classify atomic vs composite
 
   DRIVE AGENTS
-    north agents                       who's live now + heartbeat
+    north agents [--json]              who's live now + stable machine roster
     north watch <id>                   tail an agent's transcript
     north steer <id> "<msg>"           inject a message into a running agent
     north retask <id> "<goal>"         redirect a running agent's goal

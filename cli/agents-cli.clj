@@ -8,6 +8,7 @@
 
 (require '[babashka.process :as p]
          '[clojure.string :as str]
+         '[clojure.set :as set]
          '[clojure.java.io :as io]
          '[clojure.walk :as walk]
          '[cheshire.core :as json])
@@ -21,6 +22,7 @@
 (def GAFFER-STAFFING (or (System/getenv "GAFFER_STAFFING_CATALOG")
                          (str GAFFER "/staffing/catalog.json")))
 (def PORT (or (System/getenv "NORTH_PORT") "7977"))
+(def ROSTER-CONTRACT-VERSION "north:agent-roster:v1")
 
 (load-file (str NORTH "/cli/spawn-process.clj"))
 (load-file (str NORTH "/cli/topology-authority.clj"))
@@ -179,6 +181,86 @@
            (bulk-agent-facts)
            ids)))
 
+(def control-id-pattern #"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+(def max-control-id-bytes 256)
+(def max-live-controls 256)
+(def max-roster-fact-rows 32768)
+(def roster-conflict-key "__roster_conflicts")
+
+(defn- valid-control-id? [value]
+  (and (string? value)
+       (<= (alength (.getBytes value java.nio.charset.StandardCharsets/UTF_8))
+           max-control-id-bytes)
+       (boolean (re-matches control-id-pattern value))))
+
+(defn- fold-roster-fact [facts predicate value]
+  (let [absent (Object.)
+        prior (get facts predicate absent)
+        next (north.agent-provenance/fold-fact facts predicate value)
+        prior-has-value?
+        (cond
+          (identical? prior absent) false
+          (set? prior) (contains? prior value)
+          (and (sequential? prior) (not (string? prior)))
+          (boolean (some #(= value %) prior))
+          :else (= prior value))]
+    (if (or (= predicate "holds")
+            (identical? prior absent)
+            prior-has-value?)
+      next
+      (update next roster-conflict-key (fnil conj #{}) predicate))))
+
+(defn- fold-roster-subjects [rows allowed-subjects]
+  (when-not
+   (and (sequential? rows)
+        (<= (count rows) max-roster-fact-rows)
+        (every? #(and (map? %)
+                      (= #{:subject :predicate :value} (set (keys %)))
+                      (string? (:subject %))
+                      (contains? allowed-subjects (:subject %))
+                      (string? (:predicate %))
+                      (string? (:value %)))
+                rows))
+    (throw (ex-info "agent subject projection was malformed" {})))
+  (reduce
+   (fn [out {:keys [subject predicate value]}]
+     (cond
+       (str/starts-with? subject "agent:")
+       (update-in out [:agents (subs subject (count "agent:"))]
+                  #(fold-roster-fact (or % {}) predicate value))
+
+       (str/starts-with? subject "session:")
+       (update-in out [:sessions (subs subject (count "session:"))]
+                  #(fold-roster-fact (or % {}) predicate value))
+
+       :else out))
+   {:agents {} :sessions {}}
+   rows))
+
+(defn roster-facts
+  "Read the exact live agent and session subjects in one structured fold. The
+  machine roster never parses a human presence table or a stored display fact."
+  [ids]
+  (let [ids (vec (distinct ids))]
+    (if (or (> (count ids) max-live-controls)
+            (not-every? valid-control-id? ids))
+      {:err "presence returned an invalid or over-broad control set"}
+      (let [subjects (mapcat (fn [id] [(str "agent:" id) (str "session:" id)]) ids)
+            subjects (vec subjects)
+            allowed-subjects (set subjects)
+            r (run [(str NORTH "/bin/north") "json" "show-many"
+                    (str/join "," subjects)] :timeout 10000)]
+        (if (:ok r)
+          (try
+            (fold-roster-subjects (json/parse-string (:out r) true)
+                                  allowed-subjects)
+            (catch Exception _ {:err "agent subject projection was malformed"}))
+          ;; Do not recover an O(1) bulk failure with 2N sequential subprocesses:
+          ;; at the maximum live set that was 512 × 3s (25.6 minutes), exactly
+          ;; the timeout pathology this roster replaces. One failed bounded
+          ;; projection is an unavailable roster, never 256 fabricated empties.
+          {:err "agent subject projection unavailable"})))))
+
 (defn current-repo []
   (let [r (run ["git" "remote" "get-url" "origin"] :timeout 1500)]
     (if (:ok r)
@@ -187,6 +269,12 @@
 
 (defn- known [value]
   (let [s (some-> value str str/trim)] (when (seq s) s)))
+
+(defn- fact-one [facts predicate]
+  (when-not (or (contains? (get facts north.agent-provenance/conflict-key #{})
+                           predicate)
+                (contains? (get facts roster-conflict-key #{}) predicate))
+    (known (get facts predicate))))
 
 (defn- slug [value]
   (or (some-> (known value) str/lower-case
@@ -206,11 +294,13 @@
     (when-not (#{"CONTEXT BRIEF:" "DELEGATE TASK:" "TASK:"} task) task)))
 
 (defn- axis-observation [facts predicate]
-  (if (= "session" (get facts "kind"))
+  (if (= "session" (fact-one facts "kind"))
     (north.agent-provenance/native-axis facts predicate)
-    {:value (known (get facts predicate))
-     :conflict (contains? (get facts north.agent-provenance/conflict-key #{})
-                          predicate)}))
+    {:value (fact-one facts predicate)
+     :conflict (or
+                (contains? (get facts north.agent-provenance/conflict-key #{})
+                           predicate)
+                (contains? (get facts roster-conflict-key #{}) predicate))}))
 
 (defn- composition-overrides [facts]
   (north.agent-provenance/composition-overrides facts))
@@ -234,6 +324,104 @@
                                   "ambient" target))
       :else provider)))
 
+(defn- provider-axis-label [facts]
+  (let [native? (= "session" (fact-one facts "kind"))
+        provider-observation (axis-observation facts "provider")
+        vendor-observation (axis-observation facts "vendor")
+        provider-conflict? (or (:conflict provider-observation)
+                               (and (nil? (:value provider-observation))
+                                    (:conflict vendor-observation)))
+        provider-value (or (:value provider-observation) (:value vendor-observation))]
+    (cond
+      provider-conflict? "provider:conflict"
+      (and native? (nil? provider-value)) "provider:historical-unrecorded"
+      (= provider-value "unobserved") "provider:unobserved"
+      :else (provider-target-label facts))))
+
+(defn- model-axis-label [facts]
+  (let [native? (= "session" (fact-one facts "kind"))
+        observation (axis-observation facts "model")
+        value (:value observation)]
+    (cond
+      (:conflict observation) "model:conflict"
+      (and native? (nil? value)) "model:historical-unrecorded"
+      (= value "unobserved") "model:unobserved"
+      :else (model-display (or value "unknown")))))
+
+(defn- effort-axis-label [facts]
+  (let [native? (= "session" (fact-one facts "kind"))
+        observation (axis-observation facts "effort")
+        value (:value observation)]
+    (cond
+      (:conflict observation) "effort:conflict"
+      (and native? (nil? value)) "effort:historical-unrecorded"
+      (= value "unobserved") "effort:unobserved"
+      :else (slug (or value "unknown")))))
+
+(defn- raw-provider [facts]
+  (let [provider (axis-observation facts "provider")
+        vendor (axis-observation facts "vendor")]
+    (if (or (:conflict provider)
+            (and (nil? (:value provider)) (:conflict vendor)))
+      "conflict"
+      (or (:value provider) (:value vendor) ""))))
+
+(defn- raw-provider-target [facts]
+  (let [observation (axis-observation facts "provider_target")]
+    (if (:conflict observation) "conflict" (or (:value observation) ""))))
+
+(defn- raw-model [facts]
+  (let [observation (axis-observation facts "model")]
+    (if (:conflict observation) "conflict" (or (:value observation) ""))))
+
+(defn- task-of [presence facts session]
+  (or (meaningful-task (fact-one session "current_thread"))
+      (meaningful-task (fact-one session "active_workflow"))
+      (meaningful-task (fact-one session "task"))
+      (meaningful-task (fact-one facts "current_thread"))
+      (meaningful-task (fact-one facts "active_workflow"))
+      (meaningful-task (fact-one facts "task"))
+      (meaningful-task (fact-one facts "goal"))
+      (meaningful-task (:focus presence))
+      (when (and (= "session" (fact-one facts "kind"))
+                 (fact-one facts "repo"))
+        (str "native session in " (fact-one facts "repo")))
+      "unknown"))
+
+(defn- terminal-state [presence facts]
+  (let [process-outcome (north.terminal-projection/terminal-process-outcome facts)
+        delivery-outcome (north.terminal-projection/terminal-delivery-outcome facts)
+        delivery-attestation
+        (when (= "verified" delivery-outcome)
+          (try
+            (json/parse-string
+             (north.terminal-projection/singleton-value facts "delivery_attestation"))
+            (catch Exception _ nil)))
+        delivery-label
+        (if-let [actor (get delivery-attestation "actor")]
+          (str delivery-outcome " by:" actor
+               (when-let [role (get delivery-attestation "role")]
+                 (str "/" role)))
+          (or delivery-outcome "unrecorded"))
+        state (cond
+                process-outcome "finished"
+                (fact-one facts "stalled") "stalled"
+                (:online presence) "working"
+                :else "offline")
+        state-label
+        (if process-outcome
+          (str "finished(process:" process-outcome ", delivery:" delivery-label ")")
+          state)]
+    {:process-outcome (or process-outcome "")
+     :delivery-outcome (or delivery-outcome "")
+     :state state
+     :state-label state-label}))
+
+(defn- role-axis [facts]
+  (when (and (fact-one facts "role")
+             (not (#{"preset" "bespoke"} (fact-one facts "composition_kind"))))
+    (str " · role:" (slug (fact-one facts "role")))))
+
 (defn semantic-handle [id facts]
   (let [provider-axis (provider-target-label facts)
         composition (gaffer-provenance facts)
@@ -254,135 +442,325 @@
         g (when goal (str " — " (if (> (count goal) 40) (str (subs goal 0 37) "…") goal)))]
     (str (semantic-handle id facts) g)))
 
-(defn agent-primary-line [presence facts]
-  (let [native? (= "session" (get facts "kind"))
-        provider-observation (axis-observation facts "provider")
-        vendor-observation (axis-observation facts "vendor")
-        provider-conflict? (or (:conflict provider-observation)
-                               (and (nil? (:value provider-observation))
-                                    (:conflict vendor-observation)))
-        provider-value (or (:value provider-observation) (:value vendor-observation))
-        provider-axis (cond
-                        provider-conflict? "provider:conflict"
-                        (and native? (nil? provider-value)) "provider:historical-unrecorded"
-                        (= provider-value "unobserved") "provider:unobserved"
-                        :else (provider-target-label facts))
-        model-observation (axis-observation facts "model")
-        model-value (:value model-observation)
-        model-axis (cond
-                     (:conflict model-observation) "model:conflict"
-                     (and native? (nil? model-value)) "model:historical-unrecorded"
-                     (= model-value "unobserved") "model:unobserved"
-                     :else (model-display (or model-value "unknown")))
-        effort-observation (axis-observation facts "effort")
-        effort-value (:value effort-observation)
-        effort-axis (cond
-                      (:conflict effort-observation) "effort:conflict"
-                      (and native? (nil? effort-value)) "effort:historical-unrecorded"
-                      (= effort-value "unobserved") "effort:unobserved"
-                      :else (slug (or effort-value "unknown")))
-        task (or (meaningful-task (get facts "current_thread"))
-                 (meaningful-task (get facts "active_workflow"))
-                 (meaningful-task (get facts "task"))
-                 (meaningful-task (get facts "goal"))
-                 (meaningful-task (:focus presence))
-                 (when (and native? (known (get facts "repo")))
-                   (str "native session in " (get facts "repo")))
-                 "unknown")
-        process-outcome (north.terminal-projection/terminal-process-outcome facts)
-        delivery-outcome (north.terminal-projection/terminal-delivery-outcome facts)
-        delivery-attestation
-        (when (= "verified" delivery-outcome)
-          (try
-            (json/parse-string
-             (north.terminal-projection/singleton-value facts "delivery_attestation"))
-            (catch Exception _ nil)))
-        delivery-label
-        (if-let [actor (get delivery-attestation "actor")]
-          (str delivery-outcome " by:" actor
-               (when-let [role (get delivery-attestation "role")]
-                 (str "/" role)))
-          (or delivery-outcome "unrecorded"))
-        state (cond
-                process-outcome (str "finished(process:" process-outcome
-                                     ", delivery:" delivery-label ")")
-                (known (get facts "stalled")) "stalled"
-                (:online presence) "working"
-                :else "offline")
-        gaffer (gaffer-provenance facts)
-        role-axis (when (and (known (get facts "role"))
-                             (not (#{"preset" "bespoke"} (get facts "composition_kind"))))
-                    (str " · role:" (slug (get facts "role"))))]
-    (str provider-axis " · " model-axis " · " effort-axis " · "
-         gaffer role-axis " · " state ": " task)))
+(defn agent-primary-line
+  ([presence facts] (agent-primary-line presence facts {}))
+  ([presence facts session]
+   (let [task (task-of presence facts session)
+         state (:state-label (terminal-state presence facts))]
+     (str (provider-axis-label facts) " · " (model-axis-label facts) " · "
+          (effort-axis-label facts) " · " (gaffer-provenance facts)
+          (role-axis facts) " · " state ": " task))))
+
+(defn roster-json-row [presence facts session]
+  (let [{:keys [process-outcome delivery-outcome state state-label]}
+        (terminal-state presence facts)
+        task (task-of presence facts session)
+        control (:id presence)]
+    {"uuid" control
+     "control_id" control
+     "display_name" (agent-primary-line presence facts session)
+     "display_handle" (semantic-handle control facts)
+     "kind" (or (fact-one facts "kind") "unclassified")
+     "provider" (raw-provider facts)
+     "provider_target" (raw-provider-target facts)
+     "provider_label" (provider-axis-label facts)
+     "model" (raw-model facts)
+     "model_display" (model-axis-label facts)
+     "effort" (effort-axis-label facts)
+     "gaffer_provenance" (gaffer-provenance facts)
+     "goal" (or (fact-one facts "goal") "")
+     "task" task
+     "state" state
+     "state_label" state-label
+     "lifecycle" (or (fact-one facts "lifecycle") state)
+     "process_outcome" process-outcome
+     "delivery_outcome" delivery-outcome
+     "online" (boolean (:online presence))
+     "expires_s" (:expires-s presence)}))
 
 (defn roster-category [facts]
   (cond
     (north.terminal-projection/terminal-process-outcome facts) :recently-finished
-    (= "lane" (get facts "kind")) :active-agent
-    (= "session" (get facts "kind")) :native-session
+    (= "lane" (fact-one facts "kind")) :active-agent
+    (= "session" (fact-one facts "kind")) :native-session
     :else :unclassified))
 
 ;; ---- presence ---------------------------------------------------------------
 (defn presence-rows []
-  (let [r (run ["bb" (str NORTH "/cli/presence-cli.clj") PORT "presence-online"] :timeout 6000)]
+  (let [r (run ["bb" (str NORTH "/cli/presence-cli.clj") PORT "presence-online-json"]
+               :timeout 6000)]
     (cond
       (:timeout r) {:err "presence probe timed out"}
       (not (:ok r)) {:err "presence unavailable"}
       :else
-      {:agents
-       (for [ln (->> (str/split-lines (:out r)) (drop 1) (remove str/blank?))
-             :let [toks (str/split (str/trim ln) #"\s+")
-                   agent (first toks)
-                   online (some #{"yes" "no"} toks)
-                   expires (some #(when (re-matches #"\d+s|lapsed" %) %) toks)
-                   focus (last toks)]
-             :when (and agent (seq agent))]
-         {:id agent :online (= online "yes") :expires (or expires "?")
-          :focus (when-not (#{"-" online expires} focus) focus)})})))
+      (try
+        (let [payload (json/parse-string (:out r) true)
+              sessions (:sessions payload)
+              valid-row?
+              (fn [row]
+                (and (= #{:control_id :online :expires_s} (set (keys row)))
+                     (valid-control-id? (:control_id row))
+                     (true? (:online row))
+                     (integer? (:expires_s row))
+                     (not (neg? (:expires_s row)))))]
+          (if (and (= "north:presence-online:v1" (:version payload))
+                   (= #{:version :sessions} (set (keys payload)))
+                   (vector? sessions)
+                   (<= (count sessions) max-live-controls)
+                   (every? valid-row? sessions)
+                   (= (count sessions) (count (set (map :control_id sessions)))))
+            {:agents
+             (mapv (fn [{:keys [control_id expires_s]}]
+                     {:id control_id :online true :expires-s expires_s
+                      :expires (str expires_s "s")})
+                   sessions)}
+            {:err "presence projection was malformed"}))
+        (catch Exception _ {:err "presence projection was malformed"})))))
 
 (defn agent-online? [id]
   (let [presence (presence-rows)]
     (boolean (some #(and (= id (:id %)) (:online %)) (:agents presence)))))
 
 ;; ---- verbs -------------------------------------------------------------------
+(defn agents-usage []
+  (println "north agents — provider-neutral live roster")
+  (println)
+  (println "Usage:")
+  (println "  north agents")
+  (println "  north agents --verbose")
+  (println "  north agents --json")
+  (println "  north agents --check-web http://127.0.0.1:8088")
+  (println)
+  (println "--json emits the versioned north:agent-roster:v1 machine contract.")
+  (println "--check-web mechanically compares the CLI projection with /api/agents."))
+
+(defn- agents-error! [message]
+  (binding [*out* *err*]
+    (println (str "north agents: " message))
+    (println "run 'north agents --help' for usage"))
+  (System/exit 1))
+
+(defn- parse-agents-options [args]
+  (loop [remaining (vec args) options {:mode :human :verbose false}]
+    (if (empty? remaining)
+      options
+      (let [[arg & more] remaining]
+        (cond
+          (#{"--help" "-h" "help"} arg)
+          (if (empty? more) (assoc options :help true)
+              (agents-error! "help cannot be combined with other options"))
+
+          (#{"--verbose" "--debug"} arg)
+          (if (or (:verbose options) (not= :human (:mode options)))
+            (agents-error! (str "conflicting or duplicate option " arg))
+            (recur (vec more) (assoc options :verbose true)))
+
+          (= "--json" arg)
+          (if (or (:verbose options) (not= :human (:mode options)))
+            (agents-error! "conflicting or duplicate option --json")
+            (recur (vec more) (assoc options :mode :json)))
+
+          (= "--check-web" arg)
+          (let [url (first more)]
+            (when (or (nil? url) (str/starts-with? url "-"))
+              (agents-error! "--check-web requires one loopback HTTP URL"))
+            (when (or (:verbose options) (not= :human (:mode options)))
+              (agents-error! "conflicting or duplicate option --check-web"))
+            (recur (vec (rest more)) (assoc options :mode :check-web :web-url url)))
+
+          :else (agents-error! (str "unknown option " arg)))))))
+
+(defn- roster-row-key [row]
+  [(case (get row "state")
+     "finished" 3
+     (case (get row "kind") "lane" 0 "session" 1 2))
+   (get row "display_name")
+   (get row "control_id")])
+
+(defn- roster-contract [presence agents sessions]
+  {"version" ROSTER-CONTRACT-VERSION
+   "agents"
+   (->> presence
+        (mapv (fn [row]
+                (roster-json-row row
+                                 (get agents (:id row) {})
+                                 (get sessions (:id row) {}))))
+        (sort-by roster-row-key)
+        vec)})
+
+(def comparable-roster-fields
+  ;; Parity is identity, not a distributed snapshot transaction. Task and
+  ;; lifecycle can honestly change between the CLI coordinator read and the
+  ;; following HTTP read, so volatile presentation/state fields are excluded.
+  ["control_id" "display_handle" "kind"
+   "provider" "provider_target" "provider_label"
+   "model" "model_display" "effort" "gaffer_provenance"])
+
+(defn- read-roster-snapshot []
+  (let [presence (presence-rows)]
+    (if (:err presence)
+      {:err (:err presence)}
+      (let [rows (vec (filter :online (:agents presence)))
+            facts (roster-facts (mapv :id rows))]
+        (if (:err facts)
+          {:err (:err facts)}
+          (let [agents (:agents facts)
+                sessions (:sessions facts)]
+            {:rows rows
+             :agents agents
+             :sessions sessions
+             :snapshot (roster-contract rows agents sessions)}))))))
+
+(defn- comparable-roster [snapshot]
+  (when (and (= ROSTER-CONTRACT-VERSION (get snapshot "version"))
+             (vector? (get snapshot "agents")))
+    (let [rows (get snapshot "agents")]
+      (when (and (every? #(and (map? %)
+                               (every? (fn [field] (contains? % field))
+                                       comparable-roster-fields))
+                         rows)
+                 (= (count rows) (count (set (map #(get % "control_id") rows)))))
+        (->> rows
+             (mapv #(select-keys % comparable-roster-fields))
+             (sort-by #(get % "control_id"))
+             vec)))))
+
+(defn- canonical-web-roster-url [raw]
+  (try
+    (let [base (java.net.URI/create raw)
+          host (some-> (.getHost base) str/lower-case)
+          scheme (.getScheme base)]
+      (when-not (and (= "http" scheme)
+                     (#{"127.0.0.1" "localhost" "::1"} host)
+                     (pos? (.getPort base))
+                     (nil? (.getUserInfo base))
+                     (nil? (.getQuery base))
+                     (nil? (.getFragment base)))
+        (throw (ex-info "not an explicit loopback HTTP origin" {})))
+      (let [path (or (.getPath base) "")
+            endpoint (cond
+                       (= path "/api/agents") raw
+                       (= path "") (str raw "/api/agents")
+                       (= path "/") (str/replace raw #"/$" "/api/agents")
+                       :else (throw (ex-info "path must be / or /api/agents" {})))]
+        endpoint))
+    (catch Exception _
+      (agents-error! "--check-web requires http://127.0.0.1:<port>[/api/agents]"))))
+
+(defn- fetch-web-roster [raw-url]
+  (let [url (canonical-web-roster-url raw-url)
+        client (java.net.http.HttpClient/newBuilder)
+        client (-> client
+                   (.connectTimeout (java.time.Duration/ofSeconds 3))
+                   (.build))
+        request (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                    (.timeout (java.time.Duration/ofSeconds 10))
+                    (.GET)
+                    (.build))
+        response (.send client request
+                        (java.net.http.HttpResponse$BodyHandlers/ofString))]
+    (when-not (= 200 (.statusCode response))
+      (agents-error! (str "web roster returned HTTP " (.statusCode response))))
+    (try
+      (json/parse-string (.body response))
+      (catch Exception _ (agents-error! "web roster returned malformed JSON")))))
+
+(defn- parity-with-resample [initial-snapshot sample-web refresh-cli]
+  (loop [snapshot initial-snapshot attempt 1]
+    (let [cli (comparable-roster snapshot)
+          web (comparable-roster (sample-web))]
+      (cond
+        (nil? cli) {:error "CLI roster violated north:agent-roster:v1"}
+        (nil? web) {:error "web roster violated north:agent-roster:v1"}
+        (= cli web) {:ok true :cli cli :web web :attempts attempt}
+        (= attempt 1)
+        (let [fresh (refresh-cli)]
+          (if (:err fresh)
+            {:error (:err fresh)}
+            (recur (:snapshot fresh) 2)))
+        :else {:ok false :cli cli :web web :attempts attempt}))))
+
+(defn- check-web-parity! [snapshot url]
+  (let [{:keys [ok error cli web attempts]}
+        (parity-with-resample snapshot
+                              #(fetch-web-roster url)
+                              read-roster-snapshot)]
+    (cond
+      error (agents-error! error)
+      (not ok)
+      (let [cli-ids (set (map #(get % "control_id") cli))
+            web-ids (set (map #(get % "control_id") web))
+            mismatch (first (remove (fn [[left right]] (= left right))
+                                    (map vector cli web)))]
+        (binding [*out* *err*]
+          (println "north agents: CLI/web roster parity FAILED")
+          (println "  CLI-only controls:" (str/join "," (sort (set/difference cli-ids web-ids))))
+          (println "  web-only controls:" (str/join "," (sort (set/difference web-ids cli-ids))))
+          (when mismatch
+            (println "  first projection mismatch:" (json/generate-string mismatch))))
+        (System/exit 1))
+      :else
+      (println (str "agent roster parity: OK · " (count cli)
+                    " active controls · " ROSTER-CONTRACT-VERSION
+                    (when (= attempts 2) " · stable after one resample"))))))
+
 (defn cmd-agents [args]
-  ;; The implementation probe is useful when diagnosing the roster, but it is
-  ;; not part of the user-facing report. Keep it available without making every
-  ;; ordinary `north agents` invocation explain its internals.
-  (when (some #{"--verbose" "--debug"} args)
-    (echo-cmd "bb" (str NORTH "/cli/presence-cli.clj") PORT "presence-online"))
-  (let [pr (presence-rows)]
-    (if (:err pr)
-      (println (ylw (:err pr)))
-      (let [rows (vec (filter :online (:agents pr)))
-            af (agent-facts (mapv :id rows))
-            categorized (group-by (fn [a] (roster-category (get af (:id a) {}))) rows)
-            active-agents (vec (get categorized :active-agent []))
-            native-sessions (vec (get categorized :native-session []))
-            unclassified (vec (get categorized :unclassified []))
-            finished (vec (get categorized :recently-finished []))
-            active (+ (count active-agents) (count native-sessions) (count unclassified))
-            render-section
-            (fn [title note section]
-              (when (seq section)
-                (println)
-                (if note
-                  (println (bold (str title " (" (count section) ")")) (dim note))
-                  (println (bold (str title " (" (count section) ")"))))
-                (doseq [a section]
-                  (let [facts (get af (:id a) {})
-                        handle (semantic-handle (:id a) facts)]
-                    (println (str "  " (grn "●") " " (agent-primary-line a facts)))
-                    (println (dim (str "    " handle " · control " (:id a) " · ttl " (:expires a))))))))]
-        (println (bold (str (count rows) " roster entries"))
-                 (dim (str "· " active " active · " (count finished) " recently finished")))
-        (render-section "active agents" nil active-agents)
-        (render-section "native sessions" "(active provider CLI sessions)" native-sessions)
-        (render-section "unclassified presence" "(legacy or missing identity facts)" unclassified)
-        (render-section "recently finished"
-                        "(process is terminal; delivery evidence is shown separately; presence lease has not lapsed)"
-                        finished)))))
+  (let [{:keys [mode verbose help web-url]} (parse-agents-options args)]
+    (if help
+      (agents-usage)
+      (do
+        ;; The implementation probe is useful when diagnosing the roster, but
+        ;; never contaminates the JSON or parity surfaces.
+        (when verbose
+          (echo-cmd "bb" (str NORTH "/cli/presence-cli.clj") PORT "presence-online-json"))
+        (let [loaded (read-roster-snapshot)]
+          (if (:err loaded)
+            (if (= mode :human)
+              (println (ylw (:err loaded)))
+              (agents-error! (:err loaded)))
+            (let [rows (:rows loaded)
+                  af (:agents loaded)
+                  sf (:sessions loaded)
+                  snapshot (:snapshot loaded)]
+              (case mode
+                :json (println (json/generate-string snapshot))
+                :check-web (check-web-parity! snapshot web-url)
+                (let [categorized
+                          (group-by (fn [a] (roster-category (get af (:id a) {}))) rows)
+                          active-agents (vec (get categorized :active-agent []))
+                          native-sessions (vec (get categorized :native-session []))
+                          unclassified (vec (get categorized :unclassified []))
+                          finished (vec (get categorized :recently-finished []))
+                          active (+ (count active-agents)
+                                    (count native-sessions)
+                                    (count unclassified))
+                          render-section
+                          (fn [title note section]
+                            (when (seq section)
+                              (println)
+                              (if note
+                                (println (bold (str title " (" (count section) ")")) (dim note))
+                                (println (bold (str title " (" (count section) ")"))))
+                              (doseq [a section]
+                                (let [facts (get af (:id a) {})
+                                      session (get sf (:id a) {})
+                                      handle (semantic-handle (:id a) facts)]
+                                  (println (str "  " (grn "●") " "
+                                                (agent-primary-line a facts session)))
+                                  (println (dim (str "    " handle " · control "
+                                                     (:id a) " · ttl " (:expires a))))))))]
+                      (println (bold (str (count rows) " roster entries"))
+                               (dim (str "· " active " active · "
+                                         (count finished) " recently finished")))
+                      (render-section "active agents" nil active-agents)
+                      (render-section "native sessions"
+                                      "(active provider CLI sessions)" native-sessions)
+                      (render-section "unclassified presence"
+                                      "(legacy or missing identity facts)" unclassified)
+                  (render-section
+                   "recently finished"
+                   "(process is terminal; delivery evidence is shown separately; presence lease has not lapsed)"
+                   finished))))))))))
 
 (def spawn-flags
   {"--notify" :notify "--provider" :provider "--target" :target "--taskGrade" :taskGrade "--task-grade" :taskGrade
