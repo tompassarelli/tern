@@ -678,9 +678,24 @@ class CodexQuery implements AgentQuery {
     if (this.options.effort) args.push("--config", `model_reasoning_effort=${JSON.stringify(this.options.effort)}`);
     if (this.options.cwd) args.push("--cd", this.options.cwd);
     args.push("-");
+    // Resolve the executable path before the process boundary. A genuinely
+    // missing/unselectable Codex binary (unmanaged NORTH_CODEX_BIN is a bare
+    // string and never throws here; managed trusted-store selection can) is a
+    // deterministic pre-side-effect condition, not yet an execution failure —
+    // classify it the same retry-safe way as the supervisor's own "no such
+    // executable" receipt below, and keep it out of the generic catch, which
+    // exists to fold in-flight/post-acceptance failures instead.
+    let resolvedCommand: string;
+    try {
+      resolvedCommand = command(env, managed);
+    } catch (cause) {
+      throw new ProviderRetrySafeError(
+        "openai_provider_executable_unavailable_before_acceptance", { cause },
+      );
+    }
     const child = spawn(
       process.execPath,
-      [CODEX_SUPERVISOR, command(env, managed), ...args],
+      [CODEX_SUPERVISOR, resolvedCommand, ...args],
       {
         cwd: this.options.cwd ?? process.cwd(),
         env,
