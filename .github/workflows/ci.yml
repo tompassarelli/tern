@@ -274,10 +274,10 @@ jobs:
         with:
           path: north
 
-      # The public runner image carries SDKs this repository never uses. Reclaim
-      # them before Nix so the exact release/LTO build has room for bounded swap
-      # and its store closure without depending on undocumented free space.
+      # The ephemeral public runner image carries SDKs this repository never
+      # uses. Never mutate these system roots on a persistent self-hosted runner.
       - name: Reclaim unused hosted-runner SDK space
+        if: ${{ runner.environment == 'github-hosted' }}
         run: |
           set -euo pipefail
           df -h /
@@ -292,10 +292,15 @@ jobs:
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
       - name: Provision deterministic Rust build memory
+        env:
+          NORTH_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -euo pipefail
           readonly gib_kib=$((1024 * 1024))
           readonly min_physical_kib=$((15 * gib_kib))
+          # A nominal 32 GB runner reports less after GB/GiB conversion and
+          # firmware/kernel reservation. Thirty GiB is the class boundary.
+          readonly min_self_hosted_physical_kib=$((30 * gib_kib))
           readonly min_total_kib=$((24 * gib_kib))
           readonly min_swap_kib=$((8 * gib_kib))
           readonly max_swap_kib=$((16 * gib_kib))
@@ -303,9 +308,35 @@ jobs:
 
           physical_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
           existing_swap_kib="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
+          if [[ "$NORTH_RUNNER_ENVIRONMENT" == "self-hosted" ]]; then
+            echo "NORTH_CI_SWAP_FILE=" >> "$GITHUB_ENV"
+            if (( physical_kib < min_self_hosted_physical_kib )); then
+              echo "North's self-hosted package build requires a 32 GB runner class" >&2
+              echo "reporting at least 30 GiB physical RAM." >&2
+              exit 1
+            fi
+            available_kib="$(df -Pk /nix | awk 'NR == 2 { print $4 }')"
+            if (( available_kib < build_disk_reserve_kib )); then
+              echo "North's self-hosted package runner requires a 24 GiB Nix-store disk reserve." >&2
+              exit 1
+            fi
+            printf 'runner=%s physical_kib=%s swap_kib=%s total_kib=%s disk_kib=%s\n' \
+              "$NORTH_RUNNER_ENVIRONMENT" "$physical_kib" "$existing_swap_kib" \
+              "$((physical_kib + existing_swap_kib))" "$available_kib"
+            exit 0
+          fi
+          if [[ "$NORTH_RUNNER_ENVIRONMENT" != "github-hosted" ]]; then
+            echo "Unknown runner environment: $NORTH_RUNNER_ENVIRONMENT" >&2
+            exit 1
+          fi
           if (( physical_kib < min_physical_kib )); then
             echo "North's exact Codex release build requires at least 15 GiB physical RAM." >&2
             echo "Configure NORTH_PACKAGE_RUNNER with a >=32 GiB runner label." >&2
+            exit 1
+          fi
+          available_kib="$(df -Pk "${RUNNER_TEMP:?}" | awk 'NR == 2 { print $4 }')"
+          if (( available_kib < build_disk_reserve_kib )); then
+            echo "North's hosted package runner requires a 24 GiB build disk reserve." >&2
             exit 1
           fi
 
@@ -324,7 +355,6 @@ jobs:
             fi
 
             swap_file="${RUNNER_TEMP:?}/north-package-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}.swap"
-            available_kib="$(df -Pk "${RUNNER_TEMP:?}" | awk 'NR == 2 { print $4 }')"
             if (( available_kib < swap_kib + build_disk_reserve_kib )); then
               echo "Insufficient disk for bounded CI swap plus a 24 GiB build reserve." >&2
               echo "Configure NORTH_PACKAGE_RUNNER with a >=32 GiB runner label." >&2
@@ -365,7 +395,7 @@ jobs:
           test -x "$out/bin/north"
 
       - name: Remove CI swap
-        if: ${{ always() }}
+        if: ${{ always() && runner.environment == 'github-hosted' }}
         run: |
           set -euo pipefail
           if [[ -z "${NORTH_CI_SWAP_FILE:-}" ]]; then
