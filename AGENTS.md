@@ -17,7 +17,8 @@ North is the provider-neutral coordination substrate. Read
 - Assume concurrent agents may be working in the same checkout.
 - Use North concerns before editing overlapping code.
 - Preserve unrelated dirty work.
-- Run `cd sdk && bun run check && bun test ./test` for SDK changes.
+- Run `cd ~/code/north/sdk && bun run check && bun run test` for SDK changes. The package
+  script owns the hermetic preloads and test isolation; do not bypass it.
 - A provider fallback is permitted only before side effects are observable.
 
 Claude Code-specific compatibility remains documented in `CLAUDE.md`; this file

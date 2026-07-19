@@ -103,6 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           bash bin/tests/github-flake-input-pin-test.sh
+          bash bin/tests/sdk-test-entrypoint-test.sh
           bash cli/tests/package-helper-smoke-test.sh
           bash bin/tests/north-on-stop-test.sh
 
@@ -236,7 +237,7 @@ jobs:
           test "$(bun --version)" = 1.3.13
           bun install --frozen-lockfile
           bun run check
-          bun test
+          bun run test
 
       - name: Build pinned Beagle compiler
         id: beagle
