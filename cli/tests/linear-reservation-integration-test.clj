@@ -3,6 +3,7 @@
 ;; schema compare-and-set helpers.
 (require '[babashka.process :as proc]
          '[cheshire.core :as json]
+         '[clojure.edn :as edn]
          '[clojure.java.io :as io]
          '[clojure.string :as str])
 
@@ -113,6 +114,46 @@
             (release! port identity-resource i-holder i-epoch))))
       (finally
         (release! port evidence-resource e-holder e-epoch)))))
+
+(defn reserve-uuid-once!
+  [log reserve port identity-resource link thread connector suffix]
+  (let [holder (str "identity-uuid-" suffix)
+        epoch (acquire! port identity-resource holder)]
+    (try
+      (helper!
+       log reserve (str port)
+       identity-resource holder (str epoch)
+       link thread connector "linear-uuid")
+      (finally
+        (release! port identity-resource holder epoch)))))
+
+(defn forwarding-proxy
+  [real-port before-request! after-response!]
+  (let [server (java.net.ServerSocket. 0)
+        running (atom true)
+        worker
+        (future
+          (while @running
+            (try
+              (with-open [socket (.accept server)
+                          reader (io/reader (.getInputStream socket))
+                          writer (io/writer (.getOutputStream socket))]
+                (let [envelope (edn/read-string (.readLine reader))
+                      request (:request envelope)
+                      _ (before-request! request)
+                      response (north.coord/send-op real-port request)]
+                  (after-response! request response)
+                  (.write writer (str (pr-str response) "\n"))
+                  (.flush writer)))
+              (catch java.net.SocketException _
+                (when @running
+                  (throw (ex-info "Linear coordinator proxy failed" {})))))))]
+    {:port (.getLocalPort server)
+     :stop!
+     (fn []
+       (reset! running false)
+       (.close server)
+       (deref worker 5000 nil))}))
 
 (let [port (free-port)
       dir (.toFile
@@ -244,6 +285,263 @@
       (check!
        "a corrected retry succeeds after the rejected wrong-thread attempt"
        (integer? (get corrected "ok"))))
+
+    (let [metadata-cases
+          [{:label "kind" :target :link
+            :predicate "kind" :value "wrong-kind"
+            :needle "conflicts on kind"}
+           {:label "identity_kind" :target :link
+            :predicate "identity_kind" :value "mcp-bootstrap-v1"
+            :needle "conflicts on identity_kind"}
+           {:label "remote_server" :target :link
+            :predicate "remote_server" :value "linear-wrong-server"
+            :needle "conflicts on remote_server"}
+           {:label "sync_policy" :target :link
+            :predicate "sync_policy" :value "linear-primary"
+            :needle "conflicts on sync_policy"}
+           {:label "sync_schema" :target :link
+            :predicate "sync_schema" :value "linear-sync-v0"
+            :needle "conflicts on sync_schema"}
+           {:label "remote_fingerprint" :target :link
+            :predicate "remote_fingerprint"
+            :value
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            :needle "conflicts on remote_fingerprint"}
+           {:label "bootstrap_initial_key" :target :link
+            :predicate "bootstrap_initial_key" :value "MSA-WRONG"
+            :needle "conflicts on bootstrap_initial_key"}
+           {:label "thread linear_link" :target :thread
+            :predicate "linear_link"
+            :value
+            "@link:linear:uuid:33333333-3333-8333-8333-333333333333:44444444-4444-8444-8444-444444444444"
+            :needle "another canonical Linear link"}]
+          results
+          (doall
+           (map-indexed
+            (fn [index {:keys [label target predicate value needle]}]
+              (let [case-connector (str "linear-metadata-" index)
+                    case-created-at
+                    (format "2026-07-16T15:20:%02d.639Z" index)
+                    case-key (str "MSA-" (+ 500 index))
+                    case-hash
+                    (canonical-hash
+                     {"connector" case-connector
+                      "createdAt" case-created-at})
+                    case-subject (str "linear-bootstrap:" case-hash)
+                    case-evidence-resource
+                    (str "linear-sync:bootstrap:" case-hash)
+                    case-identity-key
+                    (str "linear:mcp-bootstrap-v2:"
+                         case-connector ":" case-hash)
+                    case-link (str "link:" case-identity-key)
+                    case-thread (str "thread-metadata-" index)
+                    case-identity-resource
+                    (str "linear-sync:identity:"
+                         (encode-uri-component case-identity-key))
+                    fact-subject
+                    (if (= target :link)
+                      (str "@" case-link)
+                      (str "@" case-thread))
+                    _ (assert-fact! port fact-subject predicate value)
+                    result
+                    (reserve-once!
+                     log reserve port case-evidence-resource
+                     case-identity-resource case-link case-thread
+                     case-connector case-created-at case-key case-subject
+                     (str "metadata-" index))
+                    unelected?
+                    (empty?
+                     (north.coord/many
+                      port (str "@" case-subject) "bootstrap_election"))]
+                [label
+                 (and (str/includes? (get result "reject" "") needle)
+                      unelected?)]))
+            metadata-cases))]
+      (doseq [[label passed?] results]
+        (check!
+         (str "real helper rejects conflicting " label " before election")
+         passed?)))
+
+    (let [uuid-cases
+          [["remote_workspace"
+            "33333333-3333-8333-8333-333333333333"]
+           ["remote_uuid"
+            "44444444-4444-8444-8444-444444444444"]]
+          results
+          (doall
+           (map-indexed
+            (fn [index [predicate wrong-value]]
+              (let [workspace
+                    (format
+                     "22222222-2222-8222-8222-%012d"
+                     (inc index))
+                    issue-id
+                    (format
+                     "11111111-1111-8111-8111-%012d"
+                     (inc index))
+                    identity-key
+                    (str "linear:uuid:" workspace ":" issue-id)
+                    link (str "link:" identity-key)
+                    thread (str "thread-uuid-metadata-" index)
+                    resource
+                    (str "linear-sync:identity:"
+                         (encode-uri-component identity-key))
+                    _ (assert-fact!
+                       port (str "@" link) predicate wrong-value)
+                    result
+                    (reserve-uuid-once!
+                     log reserve port resource link thread
+                     "linear-uuid-metadata" (str index))]
+                [predicate
+                 (and
+                  (str/includes?
+                   (get result "reject" "")
+                   (str "conflicts on " predicate))
+                  (empty?
+                   (north.coord/many
+                    port (str "@" link) "linked_thread")))]))
+            uuid-cases))]
+      (doseq [[predicate passed?] results]
+        (check!
+         (str "real helper rejects conflicting UUID " predicate)
+         passed?)))
+
+    (let [workspace "55555555-5555-8555-8555-555555555555"
+          issue-id "66666666-6666-8666-8666-666666666666"
+          identity-key (str "linear:uuid:" workspace ":" issue-id)
+          link (str "link:" identity-key)
+          resource
+          (str "linear-sync:identity:"
+               (encode-uri-component identity-key))
+          remote-server-cases
+          [["U+0085" "linear-\u0085-server"]
+           ["U+FEFF" "linear-\uFEFF-server"]
+           ["oversized" (apply str (repeat 257 "x"))]]
+          results
+          (doall
+           (map-indexed
+            (fn [index [label remote-server]]
+              (let [result
+                    (reserve-uuid-once!
+                     log reserve port resource link
+                     (str "thread-uuid-server-" index)
+                     remote-server (str "server-" index))]
+                [label
+                 (and
+                  (str/includes?
+                   (get result "reject" "")
+                   "remote server is not a bounded canonical authority token")
+                  (empty?
+                   (north.coord/many
+                    port (str "@" link) "linked_thread")))]))
+            remote-server-cases))]
+      (doseq [[label passed?] results]
+        (check!
+         (str "real UUID helper rejects " label " remote server")
+         passed?)))
+
+    (let [race-connector "linear-election-replacement"
+          race-created-at "2026-07-16T15:30:00.639Z"
+          race-key "MSA-520"
+          race-hash
+          (canonical-hash
+           {"connector" race-connector "createdAt" race-created-at})
+          race-subject (str "linear-bootstrap:" race-hash)
+          race-evidence-resource (str "linear-sync:bootstrap:" race-hash)
+          race-identity-key
+          (str "linear:mcp-bootstrap-v2:" race-connector ":" race-hash)
+          race-link (str "link:" race-identity-key)
+          race-thread "thread-election-replacement"
+          race-identity-resource
+          (str "linear-sync:identity:"
+               (encode-uri-component race-identity-key))
+          correct-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink" (str "@" race-link)
+             "connector" race-connector
+             "createdAt" race-created-at
+             "initialKey" race-key
+             "linkedThread" (str "@" race-thread)}))
+          replacement-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink" (str "@" race-link)
+             "connector" race-connector
+             "createdAt" race-created-at
+             "initialKey" race-key
+             "linkedThread" "@thread-election-replacement-attacker"}))
+          state
+          (atom {:final-projection? false
+                 :post-projection-reads 0
+                 :poisoned? false})
+          proxy
+          (forwarding-proxy
+           port
+           (fn [request]
+             (when (and (:final-projection? @state)
+                        (>= (:post-projection-reads @state) 7)
+                        (not (:poisoned? @state))
+                        (= :version (:op request)))
+               (retract-fact!
+                port (str "@" race-subject)
+                "bootstrap_election" correct-election)
+               (assert-fact!
+                port (str "@" race-subject)
+                "bootstrap_election" replacement-election)
+               (swap! state assoc :poisoned? true)))
+           (fn [request response]
+             (when (and (:final-projection? @state)
+                        (not (:poisoned? @state))
+                        (= :resolved (:op request)))
+               (swap! state update :post-projection-reads inc))
+             (when (and (= :assert-at-version-with-fence (:op request))
+                        (= (str "@" race-subject) (:te request))
+                        (= "linked_thread" (:p request))
+                        (integer? (:ok response)))
+               (swap! state assoc
+                      :final-projection? true
+                      :post-projection-reads 0))))
+          evidence-holder "evidence-election-replacement"
+          identity-holder "identity-election-replacement"
+          evidence-epoch
+          (acquire! port race-evidence-resource evidence-holder)
+          identity-epoch
+          (acquire! port race-identity-resource identity-holder)
+          result
+          (try
+            (helper!
+             log reserve (str (:port proxy))
+             race-identity-resource identity-holder (str identity-epoch)
+             race-link race-thread race-connector "mcp-bootstrap-v2"
+             race-evidence-resource evidence-holder (str evidence-epoch)
+             race-connector race-created-at race-key race-subject)
+            (finally
+              ((:stop! proxy))
+              (release!
+               port race-identity-resource identity-holder identity-epoch)
+              (release!
+               port race-evidence-resource evidence-holder evidence-epoch)))]
+      (check!
+       "real coordinator rejects an election replaced after projection validation"
+       (and
+        (:poisoned? @state)
+        (str/includes? (get result "reject" "") "bootstrap_election")
+        (empty?
+         (north.coord/many
+          port (str "@" race-link) "bootstrap_initial_key"))
+        (empty?
+         (north.coord/many
+          port (str "@" race-link) "linked_thread"))))
+      ;; Keep the global authority corpus coherent for every later fixture.
+      (retract-fact!
+       port (str "@" race-subject)
+       "bootstrap_election" replacement-election)
+      (assert-fact!
+       port (str "@" race-subject)
+       "bootstrap_election" correct-election))
 
     (let [winner-connector "linear-crash-winner"
           winner-created-at "2026-07-16T14:11:00.639Z"
@@ -496,6 +794,45 @@
              "createdAt" control-created-at
              "initialKey" "MSA-422"
              "linkedThread" "@thread-control"}))
+          next-line-connector "linear-next\u0085line"
+          next-line-created-at "2026-07-16T14:15:10.639Z"
+          next-line-hash
+          (canonical-hash
+           {"connector" next-line-connector
+            "createdAt" next-line-created-at})
+          next-line-subject (str "@linear-bootstrap:" next-line-hash)
+          next-line-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink"
+             (str
+              "@link:linear:mcp-bootstrap-v2:"
+              (encode-uri-component next-line-connector)
+              ":" next-line-hash)
+             "connector" next-line-connector
+             "createdAt" next-line-created-at
+             "initialKey" "MSA-422-NEL"
+             "linkedThread" "@thread-next-line"}))
+          bom-connector "linear-bom\uFEFFconnector"
+          bom-created-at "2026-07-16T14:15:20.639Z"
+          bom-hash
+          (canonical-hash
+           {"connector" bom-connector "createdAt" bom-created-at})
+          bom-subject (str "@linear-bootstrap:" bom-hash)
+          bom-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink"
+             (str
+              "@link:linear:mcp-bootstrap-v2:"
+              (encode-uri-component bom-connector)
+              ":" bom-hash)
+             "connector" bom-connector
+             "createdAt" bom-created-at
+             "initialKey" "MSA-422-BOM"
+             "linkedThread" "@thread-bom"}))
           oversize-connector "linear-oversize-election"
           oversize-created-at "2026-07-16T14:16:00.639Z"
           oversize-subject
@@ -514,12 +851,39 @@
              "createdAt" oversize-created-at
              "initialKey" (apply str (repeat 5000 "x"))
              "linkedThread" "@thread-oversize"}))
+          foreign-connector "linear-foreign-election"
+          foreign-created-at "2026-07-16T14:17:00.639Z"
+          foreign-subject
+          (str
+           "@linear-bootstrap:"
+           (canonical-hash
+            {"connector" foreign-connector
+             "createdAt" foreign-created-at}))
+          foreign-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink"
+             (str
+              "@link:linear:mcp-bootstrap-v2:"
+              foreign-connector
+              ":eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+             "connector" foreign-connector
+             "createdAt" foreign-created-at
+             "initialKey" "MSA-423"
+             "linkedThread" "@thread-foreign"}))
           corruptions
           [["malformed JSON" "@linear-bootstrap:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "{"]
            ["duplicate authority key" duplicate-subject duplicate-election]
            ["noncanonical timestamp" bad-time-subject bad-time-election]
            ["control-bearing connector" control-subject control-election]
-           ["oversized envelope" oversize-subject oversize-election]]
+           ["U+0085-bearing connector"
+            next-line-subject next-line-election]
+           ["U+FEFF-bearing connector"
+            bom-subject bom-election]
+           ["oversized envelope" oversize-subject oversize-election]
+           ["evidence-inconsistent canonical link"
+            foreign-subject foreign-election]]
           rejected?
           (doall
            (map-indexed

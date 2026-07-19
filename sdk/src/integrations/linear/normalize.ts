@@ -11,6 +11,9 @@ import { assertWellFormedUnicode } from "../../strict-json";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const RESERVED_MARKER = /<!--\s*\/?north:/i;
+// Shared with reserve-link.clj: Unicode White_Space, every control, and BOM
+// are forbidden anywhere in an identity-authority token.
+const AUTHORITY_FORBIDDEN = /[\p{White_Space}\p{Cc}\uFEFF]/u;
 export const MAX_LINEAR_CONNECTOR_BYTES = 256;
 export const MAX_LINEAR_REMOTE_KEY_BYTES = 512;
 export const MAX_LINEAR_THREAD_ID_BYTES = 512;
@@ -67,7 +70,7 @@ function utf8Bytes(value: string): number {
 
 export function normalizeLinearConnector(value: Nullable<string>): string {
   const normalized = requireNonempty("connector", value);
-  if (value !== normalized || /\s|[\u0000-\u001f\u007f]/u.test(normalized)
+  if (value !== normalized || AUTHORITY_FORBIDDEN.test(normalized)
       || utf8Bytes(normalized) > MAX_LINEAR_CONNECTOR_BYTES)
     throw new Error(`Linear connector must be canonical and at most ${MAX_LINEAR_CONNECTOR_BYTES} UTF-8 bytes`);
   return normalized;
@@ -80,7 +83,7 @@ export function normalizeLinearOpaqueToken(
 ): string {
   if (typeof value !== "string") throw new Error(`Linear ${name} must be a string`);
   assertWellFormedUnicode(value, `Linear ${name}`);
-  if (!value || value !== value.trim() || /[\u0000-\u001f\u007f]/u.test(value)
+  if (!value || value !== value.trim() || AUTHORITY_FORBIDDEN.test(value)
       || utf8Bytes(value) > maxBytes)
     throw new Error(`Linear ${name} must be canonical and at most ${maxBytes} UTF-8 bytes`);
   return value;
@@ -97,13 +100,20 @@ export function normalizeLinearUuid(name: string, value: Nullable<string>): stri
   return exact.toLowerCase();
 }
 
+/**
+ * Linear identity-authority timestamp profile: an RFC3339-shaped full
+ * date-time with seconds and an explicit known offset no wider than ±14:00.
+ * Leap seconds and the `-00:00` unknown-offset sentinel are unsupported;
+ * precision beyond milliseconds is accepted only when every discarded digit
+ * is zero.
+ */
 export function canonicalLinearInstant(value: Nullable<string>, name: string): string {
   const exact = normalizeLinearOpaqueToken(name, value, 128);
   const match = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(Z|([+-])([0-9]{2}):([0-9]{2}))$/.exec(exact);
   if (!match)
-    throw new Error(`Linear ${name} is not a valid RFC3339 instant`);
+    throw new Error(`Linear ${name} is not a supported canonical instant`);
   const [, yearRaw, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw,
-    fraction = "", zone, , offsetHourRaw, offsetMinuteRaw] = match;
+    fraction = "", zone, offsetSign, offsetHourRaw, offsetMinuteRaw] = match;
   const year = Number(yearRaw);
   const month = Number(monthRaw);
   const day = Number(dayRaw);
@@ -122,20 +132,21 @@ export function canonicalLinearInstant(value: Nullable<string>, name: string): s
       || hour > 23 || minute > 59 || second > 59
       || (zone !== "Z"
         && (offsetHour > 14 || offsetMinute > 59
-          || (offsetHour === 14 && offsetMinute !== 0)))) {
-    throw new Error(`Linear ${name} is not a valid RFC3339 instant`);
+          || (offsetHour === 14 && offsetMinute !== 0)
+          || (offsetSign === "-" && offsetHour === 0 && offsetMinute === 0)))) {
+    throw new Error(`Linear ${name} is not a supported canonical instant`);
   }
   if (fraction.length > 3 && /[1-9]/.test(fraction.slice(3)))
     throw new Error(`Linear ${name} has unsupported sub-millisecond precision`);
   const parsed = Date.parse(exact);
   if (!Number.isFinite(parsed))
-    throw new Error(`Linear ${name} is not a valid RFC3339 instant`);
+    throw new Error(`Linear ${name} is not a supported canonical instant`);
   return new Date(parsed).toISOString();
 }
 
 export function normalizeLinearRemoteKey(value: Nullable<string>): string {
   const normalized = requireNonempty("issue key", value);
-  if (value !== normalized || /\s|[\u0000-\u001f\u007f]/u.test(normalized)
+  if (value !== normalized || AUTHORITY_FORBIDDEN.test(normalized)
       || utf8Bytes(normalized) > MAX_LINEAR_REMOTE_KEY_BYTES)
     throw new Error(`Linear issue key must be canonical and at most ${MAX_LINEAR_REMOTE_KEY_BYTES} UTF-8 bytes`);
   return normalized;

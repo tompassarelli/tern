@@ -2,7 +2,7 @@ import type {
   McpAccess, McpBroker, McpBrokerOpenOptions, McpBrokerSession, McpServerInventory,
   McpToolDefinition, McpToolResult, ModelFreeTransportReceipt,
 } from "./mcp-broker";
-import fastUri from "fast-uri";
+import { isIP } from "node:net";
 import { canonicalJson, normalizeLinearConnector, normalizeLinearRemoteKey } from "./normalize";
 import { parseStrictJson } from "../../strict-json";
 
@@ -84,8 +84,15 @@ const SUPPORTED_SCHEMA_ASSERTIONS = new Set([
 ]);
 const SUPPORTED_SCHEMA_FORMATS = new Set(["uri"]);
 const MAX_SCHEMA_URI_BYTES = 16 * 1024;
-const ABSOLUTE_ASCII_URI
-  = /^[A-Za-z][A-Za-z0-9+.-]*:(?:[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=-]|%[0-9A-Fa-f]{2})*$/;
+const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/;
+const URI_PCHAR = /^(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})*$/;
+const URI_PATH = /^(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-Fa-f]{2})*$/;
+const URI_QUERY_OR_FRAGMENT
+  = /^(?:[A-Za-z0-9._~!$&'()*+,;=:@/?-]|%[0-9A-Fa-f]{2})*$/;
+const URI_USERINFO = /^(?:[A-Za-z0-9._~!$&'()*+,;=:-]|%[0-9A-Fa-f]{2})*$/;
+const URI_REG_NAME = /^(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2})*$/;
+const URI_IPV_FUTURE
+  = /^[vV][0-9A-Fa-f]+\.[A-Za-z0-9._~!$&'()*+,;=:-]+$/;
 
 function nonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -289,14 +296,104 @@ function schemaMatches(schema: unknown, value: unknown, path: string): boolean {
   }
 }
 
-function assertSchemaUri(value: string, path: string): void {
-  if (Buffer.byteLength(value, "utf8") > MAX_SCHEMA_URI_BYTES
-      || !ABSOLUTE_ASCII_URI.test(value)) {
-    throw new Error(`Linear MCP argument ${path} is not a valid absolute URI`);
+function invalidUri(path: string): Error {
+  return new Error(
+    `Linear MCP argument ${path} is outside North's supported absolute-URI profile`,
+  );
+}
+
+function assertUriAuthority(value: string, path: string): boolean {
+  const at = value.indexOf("@");
+  if (at !== value.lastIndexOf("@"))
+    throw invalidUri(path);
+  const hostPort = at === -1 ? value : value.slice(at + 1);
+  if (at !== -1 && !URI_USERINFO.test(value.slice(0, at)))
+    throw invalidUri(path);
+  if (hostPort.startsWith("[")) {
+    const close = hostPort.indexOf("]");
+    const literal = close < 0 ? "" : hostPort.slice(1, close);
+    if (close < 0 || hostPort.indexOf("]", close + 1) !== -1
+        || (isIP(literal) !== 6 && !URI_IPV_FUTURE.test(literal))) {
+      throw invalidUri(path);
+    }
+    const port = hostPort.slice(close + 1);
+    if (port && !/^:[0-9]+$/.test(port))
+      throw invalidUri(path);
+    return true;
   }
-  const parsed = fastUri.parse(value, { unicodeSupport: false, tolerant: false });
-  if (parsed.error || !parsed.scheme)
-    throw new Error(`Linear MCP argument ${path} is not a valid absolute URI`);
+  if (hostPort.includes("[") || hostPort.includes("]"))
+    throw invalidUri(path);
+  const colon = hostPort.lastIndexOf(":");
+  const host = colon === -1 ? hostPort : hostPort.slice(0, colon);
+  const port = colon === -1 ? undefined : hostPort.slice(colon + 1);
+  if (host.includes(":") || !URI_REG_NAME.test(host)
+      || (port !== undefined && !/^[0-9]+$/.test(port))) {
+    throw invalidUri(path);
+  }
+  return host.length > 0;
+}
+
+/**
+ * North intentionally accepts a bounded, deterministic absolute-URI profile
+ * instead of claiming universal RFC 3986 scheme semantics. Components are
+ * ASCII with exact percent escapes; IP literals are IPv6 or IPvFuture; web
+ * schemes require an authority and host; file may use an empty authority; and
+ * non-authority identifiers must carry a non-empty hierarchy.
+ */
+function assertSupportedAbsoluteUri(value: string, path: string): void {
+  const schemeAt = value.indexOf(":");
+  if (schemeAt < 1 || !URI_SCHEME.test(value.slice(0, schemeAt)))
+    throw invalidUri(path);
+  const scheme = value.slice(0, schemeAt).toLowerCase();
+  const remainder = value.slice(schemeAt + 1);
+  const fragmentAt = remainder.indexOf("#");
+  if (fragmentAt !== remainder.lastIndexOf("#"))
+    throw invalidUri(path);
+  const beforeFragment = fragmentAt === -1 ? remainder : remainder.slice(0, fragmentAt);
+  const fragment = fragmentAt === -1 ? undefined : remainder.slice(fragmentAt + 1);
+  if (fragment !== undefined && !URI_QUERY_OR_FRAGMENT.test(fragment))
+    throw invalidUri(path);
+  const queryAt = beforeFragment.indexOf("?");
+  const hierarchy = queryAt === -1
+    ? beforeFragment
+    : beforeFragment.slice(0, queryAt);
+  const query = queryAt === -1 ? undefined : beforeFragment.slice(queryAt + 1);
+  if (query !== undefined && !URI_QUERY_OR_FRAGMENT.test(query))
+    throw invalidUri(path);
+  let hasAuthority = false;
+  let hasHost = false;
+  if (hierarchy.startsWith("//")) {
+    hasAuthority = true;
+    const authorityAndPath = hierarchy.slice(2);
+    const pathAt = authorityAndPath.indexOf("/");
+    const authority = pathAt === -1
+      ? authorityAndPath
+      : authorityAndPath.slice(0, pathAt);
+    const uriPath = pathAt === -1 ? "" : authorityAndPath.slice(pathAt);
+    hasHost = assertUriAuthority(authority, path);
+    if (!URI_PATH.test(uriPath))
+      throw invalidUri(path);
+  } else {
+    const firstSegment = hierarchy.split("/")[0]!;
+    if (!URI_PATH.test(hierarchy)
+        || (!hierarchy.startsWith("/") && hierarchy.length > 0
+          && (firstSegment.length === 0 || !URI_PCHAR.test(firstSegment)))) {
+      throw invalidUri(path);
+    }
+  }
+  if ((scheme === "http" || scheme === "https") && (!hasAuthority || !hasHost))
+    throw invalidUri(path);
+  if (hasAuthority && !hasHost && scheme !== "file")
+    throw invalidUri(path);
+  if (!hasAuthority && hierarchy.length === 0)
+    throw invalidUri(path);
+}
+
+function assertSchemaUri(value: string, path: string): void {
+  if (Buffer.byteLength(value, "utf8") > MAX_SCHEMA_URI_BYTES) {
+    throw invalidUri(path);
+  }
+  assertSupportedAbsoluteUri(value, path);
 }
 
 function validateValue(schema: unknown, value: unknown, path: string): void {

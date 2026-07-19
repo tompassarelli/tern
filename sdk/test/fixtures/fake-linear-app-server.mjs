@@ -55,7 +55,8 @@ function sendResult(request, result) {
       return;
     }
     if (config.afterResponse.type === "cleanExit") {
-      process.stdout.write(`${JSON.stringify(response)}\n`, () => process.exit(0));
+      writeFileSync(1, `${JSON.stringify(response)}\n`);
+      process.exit(0);
       return;
     }
     if (["exitBeforeEndPartial", "exitBeforeEndPartialLong"].includes(config.afterResponse.type)) {
@@ -82,7 +83,10 @@ function sendResult(request, result) {
 process.on("SIGTERM", () => {
   if (reapedPath) writeFileSync(reapedPath, "SIGTERM");
   if (config.ignoreSigterm) return;
-  process.exit(0);
+  // Preserve terminal-signal provenance for the parent: the real single-client
+  // Codex stdio server does not translate SIGTERM into a clean code-0 exit.
+  process.removeAllListeners("SIGTERM");
+  process.kill(process.pid, "SIGTERM");
 });
 
 const input = readline.createInterface({ input: process.stdin });

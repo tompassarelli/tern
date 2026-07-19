@@ -43,16 +43,6 @@
               exact
             else
               throw "North requires an exact or caret-prefixed Claude SDK version, got ${declared}";
-        fastUriVersion =
-          let
-            declared = (builtins.fromJSON (builtins.readFile ./sdk/package.json))
-              .dependencies."fast-uri";
-          in
-            if builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+" declared != null then
-              declared
-            else
-              throw "North requires an exact fast-uri version, got ${declared}";
-
         # Runtime PATH for the bb-backed CLIs. util-linux supplies `setsid` for
         # managed lanes on every supported host. iproute2 supplies Linux's `ss`
         # for daemon-health probes, but has no Darwin package; keep that helper
@@ -114,10 +104,6 @@
         sdkPlatformSource = pkgs.fetchurl {
           inherit (sdkPlatform) url hash;
         };
-        fastUriSource = pkgs.fetchurl {
-          url = "https://registry.npmjs.org/fast-uri/-/fast-uri-${fastUriVersion}.tgz";
-          hash = "sha512-rVjf7ArG3LTk+FS6Yw81V1DLuZl1bRbNrev6Tmd/9RaroeeRRJhAt7jg/6YFxbvAQXUCavSoZhPPj6oOx+5KjQ==";
-        };
         runtimeSource = lib.fileset.toSource {
           root = ./.;
           fileset = lib.fileset.unions [
@@ -172,12 +158,11 @@
           '';
         };
 
-        # sdk.mjs is self-contained; at runtime it needs the public package,
-        # the exact native Claude binary for this host, and the small audited
-        # RFC 3986 validator used by Linear's live schema. Fetching those
-        # tarballs directly keeps each system's closure bounded instead of
-        # prefetching every 200+ MB optional OS/architecture package in npm's
-        # universal lockfile.
+        # sdk.mjs is self-contained; at runtime it needs the public package and
+        # the exact native Claude binary for this host. Fetching those tarballs
+        # directly keeps each system's closure bounded instead of prefetching
+        # every 200+ MB optional OS/architecture package in npm's universal
+        # lockfile.
         sdkRuntimeDependencies = pkgs.stdenvNoCC.mkDerivation {
           pname = "north-sdk-runtime-dependencies";
           version = sdkVersion;
@@ -187,18 +172,12 @@
             runHook preInstall
             mkdir -p \
               $out/node_modules/@anthropic-ai/claude-agent-sdk \
-              $out/node_modules/${sdkPlatform.packageName} \
-              $out/node_modules/fast-uri
+              $out/node_modules/${sdkPlatform.packageName}
             tar -xzf ${sdkSource} --strip-components=1 \
               -C $out/node_modules/@anthropic-ai/claude-agent-sdk
             tar -xzf ${sdkPlatformSource} --strip-components=1 \
               -C $out/node_modules/${sdkPlatform.packageName}
-            tar -xzf ${fastUriSource} --strip-components=1 \
-              -C $out/node_modules/fast-uri
             chmod +x $out/node_modules/${sdkPlatform.packageName}/claude
-            test -f $out/node_modules/fast-uri/LICENSE
-            grep -Fq 'Copyright (c) 2021-present The Fastify team' \
-              $out/node_modules/fast-uri/LICENSE
             runHook postInstall
           '';
         };
@@ -510,7 +489,6 @@ EOF
               test -f "$out/sdk/src/integrations/linear/$f"
             done
             test -f "$out/sdk/src/strict-json.ts"
-            test -f "$out/sdk/node_modules/fast-uri/LICENSE"
 
             wrapProgram $out/bin/north \
               --prefix PATH : ${runtimePath} \

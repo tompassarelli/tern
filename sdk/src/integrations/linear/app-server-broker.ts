@@ -102,6 +102,8 @@ class JsonlRpcClient {
   });
   private terminalError?: Error;
   private closePromise?: Promise<void>;
+  private clientTerminationRequested = false;
+  private requestedTerminationSignals = new Set<NodeJS.Signals>();
   private closingByClient = false;
   private closed = false;
   private childExited = false;
@@ -121,18 +123,18 @@ class JsonlRpcClient {
     child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.stdout.on("end", () => this.onStdoutEnd());
     child.stdout.on("error", () => {
-      if (!this.closingByClient && !this.closed)
+      if (!this.clientTerminationRequested && !this.closed)
         this.fail(new Error("Codex app-server stdout failed"));
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", () => { /* drain only; provider diagnostics may contain secrets */ });
     child.stderr.on("error", () => { /* diagnostics are non-authoritative; prevent an unhandled stream error */ });
     child.stdin.on("error", () => {
-      if (!this.closingByClient && !this.closed)
+      if (!this.clientTerminationRequested && !this.closed)
         this.fail(new Error("Codex app-server stdin failed"));
     });
     child.on("error", () => this.fail(new Error("could not start Codex app-server")));
-    child.on("exit", () => this.onChildExit());
+    child.on("exit", (code, signal) => this.onChildExit(code, signal));
     child.on("close", () => {
       this.childExited = true;
       if (!this.stdoutEnded) this.onStdoutEnd();
@@ -154,6 +156,17 @@ class JsonlRpcClient {
       try { this.child.kill("SIGTERM"); }
       catch { /* the original terminal error remains authoritative */ }
     }
+  }
+
+  private requestTermination(signal: NodeJS.Signals): boolean {
+    let signalled = false;
+    try { signalled = this.child.kill(signal); }
+    catch { signalled = false; }
+    if (signalled) {
+      this.clientTerminationRequested = true;
+      this.requestedTerminationSignals.add(signal);
+    }
+    return signalled;
   }
 
   private rejectServerRequest(id: RpcId, _method: string): void {
@@ -245,8 +258,13 @@ class JsonlRpcClient {
       this.fail(new Error("Codex app-server transport exited unexpectedly"));
   }
 
-  private onChildExit(): void {
+  private onChildExit(_code: number | null, signal: NodeJS.Signals | null): void {
     this.childExited = true;
+    // A successful kill(2) says only that the signal was accepted; it does not
+    // say that signal won a race with a provider's own exit. The observed
+    // terminal signal is the shutdown provenance boundary for stdio app-server.
+    if (signal && this.requestedTerminationSignals.has(signal))
+      this.closingByClient = true;
     // Node may emit `exit` before it has drained the child's stdout. Defer the
     // generic death classification so a buffered invalid/partial frame remains
     // the authoritative terminal error when `end` arrives.
@@ -357,38 +375,17 @@ class JsonlRpcClient {
       ]);
     };
 
-    let live = !this.childExited
+    const live = !this.childExited
       && this.child.exitCode === null
       && this.child.signalCode === null;
-    if (!this.terminalError && live) {
-      // A response and the provider's own exit can be queued in adjacent I/O
-      // callbacks. Give that already-initiated exit one bounded turn to become
-      // observable before deciding that North owns shutdown.
-      await Promise.race([
-        this.childClose,
-        new Promise<void>((resolve) => setTimeout(resolve, 10)),
-      ]);
-      live = !this.childExited
-        && this.child.exitCode === null
-        && this.child.signalCode === null;
-    }
-    if (!this.terminalError && live) {
-      let signalled = false;
-      try { signalled = this.child.kill("SIGTERM"); }
-      catch { signalled = false; }
-      // `kill(true)` is the only evidence that shutdown was initiated by this
-      // client. Merely entering close() must not launder a provider self-exit
-      // into a valid transport receipt.
-      if (signalled) this.closingByClient = true;
-    }
+    if (!this.terminalError && live) this.requestTermination("SIGTERM");
 
     let drained = await waitForClose();
     if (!drained && this.child.exitCode === null && this.child.signalCode === null) {
       // A terminal protocol failure may already have sent SIGTERM from fail().
       // Escalate it too, without relabeling that failure cleanup as a
       // client-initiated successful shutdown.
-      try { this.child.kill("SIGKILL"); }
-      catch { /* classified below if the close event still never arrives */ }
+      this.requestTermination("SIGKILL");
       drained = await waitForClose();
     }
     if (!drained && !this.terminalError) {

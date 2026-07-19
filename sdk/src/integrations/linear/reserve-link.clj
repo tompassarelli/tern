@@ -30,13 +30,16 @@
 
 (defn authority-token [label value max-bytes]
   (let [exact (required-text label value)]
+    ;; Shared with normalize.ts: Unicode whitespace/space separators, every
+    ;; control, and BOM are forbidden anywhere in identity-authority tokens.
     (when (or (> (utf8-bytes exact) max-bytes)
               (some
                (fn [character]
                  (let [codepoint (int character)]
                    (or (Character/isWhitespace codepoint)
                        (Character/isSpaceChar codepoint)
-                       (Character/isISOControl codepoint))))
+                       (Character/isISOControl codepoint)
+                       (= codepoint 0xfeff))))
                exact))
       (fail! (str label " is not a bounded canonical authority token")))
     exact))
@@ -165,7 +168,24 @@
           connector (get record "connector")
           created-at (get record "createdAt")
           initial-key (get record "initialKey")
-          linked-thread (get record "linkedThread")]
+          linked-thread (get record "linkedThread")
+          encoded-connector
+          (when (string? connector) (encode-uri-component connector))
+          candidate-links
+          (when (and (string? connector)
+                     (string? created-at)
+                     (string? initial-key))
+            #{(str
+               "@link:linear:mcp-bootstrap-v1:" encoded-connector ":"
+               (canonical-hash
+                {"connector" connector
+                 "createdAt" created-at
+                 "initialKey" initial-key}))
+              (str
+               "@link:linear:mcp-bootstrap-v2:" encoded-connector ":"
+               (canonical-hash
+                {"connector" connector
+                 "createdAt" created-at}))})]
       (when-not
        (and (re-matches #"@linear-bootstrap:[0-9a-f]{64}" subject)
             (= (set (keys record)) bootstrap-election-keys)
@@ -178,6 +198,7 @@
                (canonical-instant "bootstrap createdAt" created-at))
             (= initial-key
                (authority-token "bootstrap initial key" initial-key 512))
+            (contains? candidate-links canonical-link)
             (authority-row-string? linked-thread)
             (<= (utf8-bytes linked-thread) 513)
             (re-matches #"@[A-Za-z0-9][A-Za-z0-9._:-]*" linked-thread)
@@ -323,7 +344,8 @@
            :epoch (positive-long "identity epoch" identity-epoch-token)}
           bare-link (str/replace (required-text "link subject" bare-link-token) #"^@" "")
           bare-thread (str/replace (required-text "thread" bare-thread-token) #"^@" "")
-          remote-server (required-text "remote server" remote-server-token)
+          remote-server
+          (authority-token "remote server" remote-server-token 256)
           identity-kind (required-text "identity kind" identity-kind-token)
           bootstrap? (#{"mcp-bootstrap-v1" "mcp-bootstrap-v2"} identity-kind)
           _arity
@@ -341,6 +363,10 @@
           evidence-connector (when bootstrap?
                                (authority-token
                                 "bootstrap connector" evidence-connector 256))
+          _connector-authority
+          (when bootstrap?
+            (when-not (= remote-server evidence-connector)
+              (fail! "bootstrap connector does not match remote server")))
           evidence-created-at (when bootstrap?
                                 (canonical-instant
                                  "bootstrap createdAt" evidence-created-at))
@@ -479,7 +505,11 @@
                    "legacy Linear bootstrap evidence is partial or conflicting"))
                 (doseq [[predicate expected _] projection-values]
                   (compatible-singleton!
-                   port evidence-subject predicate expected)))))]
+                   port evidence-subject predicate expected)))))
+          validate-binding!
+          (fn []
+            (when bootstrap? (validate-evidence!))
+            (validate-link!))]
       (when bootstrap?
         ;; One literal binds every authority field in the cross-version
         ;; election, including the link <-> thread edge. Its validation reads
@@ -490,9 +520,7 @@
          (north.coord/assert-after-read-with-fence!
           port evidence-lease evidence-subject
           "bootstrap_election" bootstrap-election
-          (fn []
-            (validate-evidence!)
-            (validate-link!)))
+          validate-binding!)
          "Linear bootstrap evidence raced with another canonical winner")
         (doseq [[predicate value] evidence-projections]
           (assert-compatible-with-fence!
@@ -502,10 +530,10 @@
       (when bootstrap?
         (assert-compatible-with-fence!
          port identity-lease link "bootstrap_initial_key" evidence-initial-key
-         validate-link!))
+         validate-binding!))
       (let [result
             (north.coord/assert-after-read-with-fence!
-             port identity-lease link "linked_thread" thread validate-link!)]
+             port identity-lease link "linked_thread" thread validate-binding!)]
         (if (exact-success? result)
           (println (json/generate-string {"ok" (:ok result)}))
           (if (exact-reject? result)

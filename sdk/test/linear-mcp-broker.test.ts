@@ -301,7 +301,7 @@ test("a late duplicate app-server error response invalidates the command receipt
   })).rejects.toThrow("response for an unknown request");
 });
 
-test("an app-server self-exit after a valid tool response never becomes a client-close receipt", async () => {
+test("a natural code-0 app-server exit remains provider-caused when close races it", async () => {
   for (let attempt = 0; attempt < 20; attempt++) {
     const { broker } = harness({
       servers: [linearServer()],
@@ -325,6 +325,18 @@ test("an app-server self-exit after a valid tool response never becomes a client
       openGateway: ({ server }) => openLinearGateway(broker, { server }),
     })).rejects.toThrow("transport exited unexpectedly");
   }
+});
+
+test("client close escalates a TERM-resistant app-server to a reaped KILL", async () => {
+  const { broker, reaped, startup } = harness({
+    servers: [linearServer()],
+    ignoreSigterm: true,
+  });
+  const gateway = await openLinearGateway(broker);
+  const pid = JSON.parse(readFileSync(startup, "utf8")).pid as number;
+  await gateway.close();
+  expect(readFileSync(reaped, "utf8")).toBe("SIGTERM");
+  expect(() => process.kill(pid, 0)).toThrow();
 });
 
 test("split UTF-8 app-server output survives transport framing", async () => {
@@ -555,6 +567,9 @@ test("implements the live nested URI format and rejects unknown formats before d
     "http://example.com/a?b=c#fragment",
     "mailto:owner@example.com",
     "urn:isbn:0451450523",
+    "foo://[V1.a]/resource",
+    "foo://[2001:db8::1]/resource",
+    "file:///tmp/north-linear",
   ]) {
     await gateway.writeIssue({
       id: "MSA-236",
@@ -569,11 +584,24 @@ test("implements the live nested URI format and rejects unknown formats before d
     "https://example.com/space here",
     "https://example.com/\u0001",
     "https://example.com/café",
+    "foo:a[b]",
+    "http://x/#a#b",
+    "foo:path?query[bracket]",
+    "https://example.com:invalid/path",
+    "https://example.com:/path",
+    "http:///path",
+    "urn:",
+    "mailto:",
+    "foo://[::::]/",
+    "foo://[1:2:3:4:5:6:7:8:9]/",
+    "foo://[1.2.3.4]/",
+    "foo://[dead.beef]/",
+    "foo://[:]/",
   ]) {
     await expect(gateway.writeIssue({
       id: "MSA-236",
       links: [{ label: "North", url }],
-    })).rejects.toThrow("not a valid absolute URI");
+    })).rejects.toThrow("outside North's supported absolute-URI profile");
   }
   expect(requests(accepted.log)
     .filter(({ method }) => method === "mcpServer/tool/call")).toHaveLength(dispatched);
