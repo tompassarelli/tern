@@ -1009,9 +1009,17 @@
            (let [sid (fresh-sid idx (fram.rt/now-id))
                  ssub (str "@" sid)
                  now (fram.rt/now-iso)
-                 r1 (tell-retry port log "assert" ssub "session_of" te 5)
-                 r2 (tell-retry port log "assert" ssub "start_time" now 5)
-                 r3 (tell-retry port log "assert" ssub "clocked_by" me 5)]
+                 ;; session_of is the visibility/commit marker for clk/open?.
+                 ;; Write identity + timestamp first and publish session_of last,
+                 ;; so any failed prefix leaves only an inert partial subject,
+                 ;; never an open clock attributed to the legacy "user".
+                 r1 (tell-retry port log "assert" ssub "clocked_by" me 5)
+                 r2 (if (str/starts-with? r1 "ok:")
+                      (tell-retry port log "assert" ssub "start_time" now 5)
+                      "skipped: clocked_by failed")
+                 r3 (if (str/starts-with? r2 "ok:")
+                      (tell-retry port log "assert" ssub "session_of" te 5)
+                      "skipped: start_time failed")]
              (if (and (str/starts-with? r1 "ok:")
                       (and (str/starts-with? r2 "ok:") (str/starts-with? r3 "ok:")))
                (println (str "clocked in on " id " at " now "  (session " sid ", agent " me ")"))

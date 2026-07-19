@@ -598,9 +598,9 @@
   (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "clock start was not recorded")) (let [sid (fresh-sid idx (fram.rt/now-id))
    ssub (str "@" sid)
    now (fram.rt/now-iso)
-   r1 (tell-retry port log "assert" ssub "session_of" te 5)
-   r2 (tell-retry port log "assert" ssub "start_time" now 5)
-   r3 (tell-retry port log "assert" ssub "clocked_by" me 5)]
+   r1 (tell-retry port log "assert" ssub "clocked_by" me 5)
+   r2 (if (str/starts-with? r1 "ok:") (tell-retry port log "assert" ssub "start_time" now 5) "skipped: clocked_by failed")
+   r3 (if (str/starts-with? r2 "ok:") (tell-retry port log "assert" ssub "session_of" te 5) "skipped: start_time failed")]
   (if (and (str/starts-with? r1 "ok:") (and (str/starts-with? r2 "ok:") (str/starts-with? r3 "ok:"))) (println (str "clocked in on " id " at " now "  (session " sid ", agent " me ")")) (println (str "clock start FAILED to record (" r1 "/" r2 "/" r3 ") — retry")))))))))
 
 (defn cmd-clock-stop [^String log]
