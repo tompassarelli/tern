@@ -19,6 +19,7 @@
 ;;   bb pred-cli.clj <port> ls                                    every registered predicate
 ;;   bb pred-cli.clj <port> show   <name>                         one predicate (alias-resolved)
 ;;   bb pred-cli.clj <port> lint   [--strict]                     flag production cli/*.clj predicate literals with no registry entry
+;;   bb pred-cli.clj <port> census [logpath] [--strict]           fold the live coordination log; flag live literal predicates with no registry entry
 (require '[clojure.edn :as edn] '[clojure.java.io :as io] '[clojure.string :as str] '[clojure.walk :as walk])
 
 ;; shared coord substrate (Foundation Part B): the wire helpers live once in cli/coord.clj.
@@ -289,7 +290,42 @@
    ["run_at" "single" "literal" "instant an operational audit ran"]
    ["window" "single" "literal" "date window covered by an operational audit"]
    ["uncovered_count" "single" "literal" "uncovered commit count from a clock audit"]
-   ["repo_summary" "multi" "literal" "per-repository summary emitted by an operational audit"]])
+   ["repo_summary" "multi" "literal" "per-repository summary emitted by an operational audit"]
+   ;; --- clock / billing (north-timelog, north-invoice, clock-audit; cardinality
+   ;;     mirrors bin/north FRAM_SINGLE_VALUED for the executable fallback) ---
+   ["clocked_by"    "single" "literal" "session/agent handle that logged clock time against a thread"]
+   ["start_time"    "single" "literal" "clock session start instant"]
+   ["end_time"      "single" "literal" "clock session end instant (absent ⇒ session still open)"]
+   ["clock_orphaned" "single" "literal" "flag: a clock session was orphaned before a clean stop"]
+   ["estimate_hours" "single" "literal" "estimated hours of work for a thread"]
+   ["actual_hours"  "single" "literal" "reconciled actual billable hours for a thread"]
+   ["cost_usd"      "single" "literal" "computed cost of a run or thread in USD"]
+   ["rate"          "single" "literal" "hourly billing rate applied to a thread's owner"]
+   ["invoice_id"    "single" "literal" "invoice a thread's billable work is stamped onto"]
+   ["invoice_state" "single" "literal" "billing state: uninvoiced | invoice-sent | invoice-paid"]
+   ["billing_note"  "multi"  "literal" "manual billing-reconciliation note attached to a thread"]
+   ["clock_note"    "multi"  "literal" "clock-correction note attached to a thread"]
+   ["time_note"     "multi"  "literal" "billable-window note recorded for invoice reconstruction"]
+   ["time_evidence" "multi"  "literal" "observed evidence of a clock anomaly for time reconstruction"]
+   ;; --- thread lifecycle (dispatch, posture, north-invoice, merge) ---
+   ["abandoned"     "single" "literal" "date/marker a thread was abandoned (derived canceled lifecycle)"]
+   ["canceled"      "single" "literal" "reason/marker a thread was canceled"]
+   ["merged_into"   "single" "ref"     "the thread/topic this thread was merged into"]
+   ["do_on"         "single" "literal" "scheduled date to surface or act on a thread"]
+   ["valid_until"   "single" "literal" "date until which a thread's knowledge/reservation stays valid"]
+   ["planned"       "single" "literal" "flag: a thread's plan has been ratified"]
+   ["atomic"        "single" "literal" "flag: a thread is atomic and must not be decomposed"]
+   ["priority"      "single" "literal" "priority band of a thread (e.g. low|med|high)"]
+   ;; --- claims-log split snapshots (acquire claims substrate / log-split) ---
+   ["byte_offset"   "single" "literal" "byte offset a snapshot covers within the source claims log"]
+   ["covers_through" "single" "literal" "highest claim/tx a log snapshot covers"]
+   ["snapshot_hash" "single" "literal" "content hash of a claims-log snapshot"]
+   ["image_path"    "single" "literal" "filesystem path of a claims-log snapshot image"]
+   ["claim_count"   "single" "literal" "number of claims a snapshot covers"]
+   ;; --- aggregate batch usage rollup (north-map aggregate harness) ---
+   ["agg_run_tokens" "single" "literal" "tokens attributed to one aggregate batch run member"]
+   ["agg_done_worker" "single" "literal" "worker handle recorded for one aggregate batch DONE slot"]
+   ["agg_charge_tokens" "single" "literal" "charge tokens attributed to one aggregate batch member"]])
 
 ;; These are deliberately open predicate-authoring surfaces. Internal transports
 ;; with variable names (runFacts -> recordRun, identity projection -> scoped
@@ -397,6 +433,46 @@
     @acc))
 
 ;; ============================================================================
+;; CENSUS — fold the PHYSICAL coordination log and surface every descriptive
+;; domain literal predicate in live use with no registry entry. This is an exact
+;; log fold (never a daemon query) so live telemetry in the sibling telemetry.log
+;; cannot contaminate the coordination-predicate census. A value is literal when
+;; it is not an @-ref; a blank predicate from a torn read of the live tail is
+;; ignored. Fram executable-schema declarations (cardinality / value_kind /
+;; acyclic) describe predicate ENTITIES, not domain data, and are deliberately
+;; NOT descriptive-catalog members (see SCOPE NOTE above + the parity test that
+;; forbids cardinality/value_kind in VOCAB) — the census excludes them.
+;;
+;; A predicate name is registrable only if it is a bare identifier — the `define`
+;; verb and every wire writer produce such names. A torn merge write can leave a
+;; garbage predicate (e.g. a literal two-quote-char string) that can NEVER become
+;; a @pred:* entry; the fold skips it rather than reporting an un-fixable miss,
+;; and `census` prints the skipped set so the corruption stays visible.
+;; ============================================================================
+(def FRAM-SCHEMA-PREDICATES #{"cardinality" "value_kind" "acyclic"})
+(def VALID-PRED-NAME #"^[A-Za-z][A-Za-z0-9_]*$")
+
+(defn census-literal-preds
+  "Fold logpath → {:counts {pred->n} :skipped {non-registrable-pred->n}} over
+   assert/retract records whose value is a literal (non-@ref)."
+  [logpath]
+  (let [counts (atom {}) skipped (atom {})]
+    (with-open [rdr (io/reader logpath)]
+      (loop []
+        (when-let [line (.readLine rdr)]
+          (when-let [m (try (edn/read-string line) (catch Exception _ nil))]
+            (when (and (map? m) (#{"assert" "retract"} (:op m)))
+              (let [p (:p m) r (:r m)]
+                (when (and (string? p) (not (str/blank? p))
+                           (not (contains? FRAM-SCHEMA-PREDICATES p))
+                           (string? r) (not (str/starts-with? r "@")))
+                  (if (re-matches VALID-PRED-NAME p)
+                    (swap! counts update p (fnil inc 0))
+                    (swap! skipped update p (fnil inc 0)))))))
+          (recur))))
+    {:counts @counts :skipped @skipped}))
+
+;; ============================================================================
 (let [[ps verb & args] *command-line-args*
       port (Integer/parseInt (or ps "7977"))]
   (case verb
@@ -447,6 +523,25 @@
         (when (seq fwd) (println (str "  aliases  →  " (str/join ", " fwd))))
         (when (seq rev) (println (str "  aliased ← by  " (str/join ", " rev))))))
 
+    "census"
+    (let [strict (some #{"--strict"} args)
+          logpath (or (first (remove #{"--strict"} args)) (north.coord/expected-log))
+          reg (registry-set port)
+          {:keys [counts skipped]} (census-literal-preds logpath)
+          used (set (keys counts))
+          misses (->> used (remove reg) sort)]
+      (println (format "predicate census — %d distinct literal predicate(s) in %s; registry has %d entries"
+                       (count used) logpath (count reg)))
+      (when (seq skipped)
+        (println (str "  ⚠ " (count skipped) " non-registrable predicate name(s) skipped (torn/garbage writes):"))
+        (doseq [p (sort (keys skipped))] (println (format "    %-28s %d assertion(s)" (pr-str p) (skipped p)))))
+      (if (empty? misses)
+        (println "  ✓ zero unregistered live literal predicates")
+        (do (println (str "  ✗ " (count misses) " unregistered live literal predicate(s):"))
+            (doseq [p misses] (println (format "    %-28s %d assertion(s)" p (counts p))))
+            (println "  -> register each with `pred-cli.clj <port> define <name> <card> <kind>`")
+            (when strict (System/exit 1)))))
+
     "lint"
     (let [strict (some #{"--strict"} args)
           reg (registry-set port)
@@ -461,5 +556,5 @@
             (println "  -> add each with `pred-cli.clj <port> define <name> <card> <kind>` (or seed)")
             (when strict (System/exit 1)))))
 
-    (do (println "usage: pred-cli.clj <port> {seed | define <n> <card> <kind> [doc] | alias <old> <new> | ls | show <n> | lint [--strict]}")
+    (do (println "usage: pred-cli.clj <port> {seed | define <n> <card> <kind> [doc] | alias <old> <new> | ls | show <n> | lint [--strict] | census [logpath] [--strict]}")
         (System/exit 2))))

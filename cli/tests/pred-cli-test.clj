@@ -124,6 +124,8 @@
     ["cli/coord.clj" "assert-after-read!" "p"]
     ["cli/coord.clj" "assert-after-read-with-fence!" "p"]
     ["cli/delivery-evidence-internal.clj" "append!" "predicate"]
+    ;; lease-cli put-fenced carries a caller-supplied predicate under the fence.
+    ["cli/lease-cli.clj" "put-with-fence!" "(required-text \"predicate\" (nth args 4 nil))"]
     ["cli/msg-cli.clj" "put!" "(arg-pred k)"]
     ["cli/msg-cli.clj" "retract!" "predicate"]
     ["cli/north-listen.clj" "append!" "pred"]
