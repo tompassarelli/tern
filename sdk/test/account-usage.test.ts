@@ -10,6 +10,7 @@ import { AnthropicUsageUnavailableError } from "../src/providers/anthropic-usage
 import { writeProviderUsageObservations } from "../src/provider-observation-store";
 import { refreshCodexEntitlementIfStale } from "../src/codex-entitlement";
 import { automatedPressure, loadProviderUsageObservations } from "../src/resource-policy";
+import { ProviderRefreshCancelledError } from "../src/provider-cancellation";
 
 const temporary: string[] = [];
 afterEach(() => {
@@ -94,7 +95,7 @@ test("host abort is control flow and never persists a synthetic usage failure", 
       controller.abort(new Error("host shutdown"));
       throw new AnthropicUsageUnavailableError("anthropic_usage_probe_failed");
     },
-  })).rejects.toThrow("host shutdown");
+  })).rejects.toBeInstanceOf(ProviderRefreshCancelledError);
   expect(loadProviderUsageObservations(storePath)).toBeUndefined();
 });
 

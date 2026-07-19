@@ -56,6 +56,28 @@ const root = isClaude ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
 const record = { argv: process.argv.slice(2), root, sqlite: process.env.CODEX_SQLITE_HOME,
   sensitiveEnvPresent: Boolean(process.env.CLAUDE_PRIVATE_CREDENTIAL || process.env.CODEX_PRIVATE_CREDENTIAL) };
 fs.appendFileSync(path.join(process.env.HOME, "calls.jsonl"), JSON.stringify(record) + "\\n");
+if (!isClaude && process.argv[2] === "app-server") {
+  const loggedIn = fs.existsSync(path.join(root, "logged-in"));
+  const readline = require("node:readline");
+  readline.createInterface({ input: process.stdin }).on("line", (line) => {
+    const request = JSON.parse(line);
+    let result;
+    if (request.method === "initialize") result = { userAgent: "fake-account-status" };
+    else if (request.method === "account/read") result = {
+      account: loggedIn ? { type: "chatgpt", email: "person@example.invalid", planType: "pro" } : null,
+      requiresOpenaiAuth: true,
+    };
+    else if (request.method === "account/rateLimits/read") result = {
+      rateLimits: {
+        limitId: "codex", planType: "pro",
+        primary: { usedPercent: 0, resetsAt: 1800000000, windowDurationMins: 10080 },
+        secondary: null,
+      },
+    };
+    process.stdout.write(JSON.stringify({ id: request.id, result }) + "\\n");
+  });
+  return;
+}
 const login = isClaude ? process.argv[2] === "auth" && process.argv[3] === "login"
   : process.argv[2] === "login" && process.argv[3] !== "status";
 if (login) { fs.writeFileSync(path.join(root, "logged-in"), "yes"); process.exit(0); }
@@ -281,7 +303,7 @@ test("login and status use disjoint provider homes and normalized account identi
     "  claude-work  not logged in",
     "",
     "Codex / OpenAI",
-    "  codex-personal  not logged in",
+    "  codex-personal  auth required",
     "",
   ].join("\n"));
 
@@ -293,7 +315,7 @@ test("login and status use disjoint provider homes and normalized account identi
     "  claude-work  logged in",
     "",
     "Codex / OpenAI",
-    "  codex-personal  not logged in",
+    "  codex-personal  auth required",
     "",
   ].join("\n"));
   const one = run("status", "claude-work");

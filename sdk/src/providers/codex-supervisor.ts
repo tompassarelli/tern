@@ -26,6 +26,11 @@ const MAX_DUPLEX_FRAMES = 20_000;
 const MAX_SCAN_FRAMES_PER_TICK = 128;
 const MAX_SCAN_BYTES_PER_TICK = 4 * 1024 * 1024;
 const TERM_MS = 750;
+// Once the direct provider has exited, anything left in its process group is
+// an inherited orphan, not a still-running provider turn. Give TERM one short
+// scheduling window, then reap decisively so inherited pipes cannot consume
+// the host's entire outer teardown budget under load.
+const ORPHAN_TERM_MS = 100;
 const KILL_MS = 750;
 const PIPE_CLOSE_MS = 750;
 const POSIX_GROUP = process.platform !== "win32";
@@ -198,9 +203,10 @@ async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<b
 async function terminateProvider(): Promise<void> {
   trace("terminate:start");
   signalGroup("SIGTERM");
+  const termMs = providerExit === undefined ? TERM_MS : ORPHAN_TERM_MS;
   const goneAfterTerm = POSIX_GROUP
-    ? await waitUntil(() => !groupExists(), TERM_MS)
-    : await waitUntil(() => child.exitCode !== null || child.signalCode !== null, TERM_MS);
+    ? await waitUntil(() => !groupExists(), termMs)
+    : await waitUntil(() => child.exitCode !== null || child.signalCode !== null, termMs);
   if (goneAfterTerm) { trace("terminate:term-gone"); return; }
   trace("terminate:kill");
   signalGroup("SIGKILL");
