@@ -244,6 +244,39 @@ export function managedToolPolicy(
   };
 }
 
+export interface EffectiveCapabilitySurface {
+  capabilities: string[];
+  builtins: string[];
+  managedTools: string[];
+}
+
+/**
+ * The authority surface actually compiled into provider options. In particular,
+ * this is not the dispatch posture's requested tool hint: a Gaffer contract can
+ * and often does narrow that hint before the provider process is constructed.
+ */
+export function effectiveCapabilitySurface(options: {
+  northCapabilities?: unknown;
+  tools?: unknown;
+  allowedTools?: unknown;
+}): EffectiveCapabilitySurface {
+  const strings = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  return {
+    capabilities: strings(options.northCapabilities),
+    builtins: strings(options.tools),
+    managedTools: strings(options.allowedTools).filter((toolName) => toolName.startsWith("mcp__")),
+  };
+}
+
+export function formatEffectiveCapabilitySurface(
+  surface: EffectiveCapabilitySurface,
+): string {
+  const list = (values: readonly string[]) => values.length ? values.join(", ") : "(none)";
+  return `capabilities: ${list(surface.capabilities)}; `
+    + `builtins: ${list(surface.builtins)}; managed: ${list(surface.managedTools)}`;
+}
+
 function readonlyShellServer(cwd: string) {
   return createSdkMcpServer({
     name: READONLY_SHELL_SERVER,

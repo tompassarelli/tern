@@ -3,6 +3,7 @@ import { getThreadFacts, getChildren, normalizeNorthEntityId } from "./north-cli
 import { derivePosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
 import {
+  effectiveCapabilitySurface, formatEffectiveCapabilitySurface,
   harnessCompositionEvidence, harnessOptions, DEFAULT_SYSTEM_PROMPT,
   type Effort, type HarnessCompositionEvidence,
 } from "./harness";
@@ -142,7 +143,7 @@ async function runDispatch(
   const workingDirectory = hydratedWorkingDirectory ?? resolveDispatchWorkingDirectory(facts);
 
   const prompt = buildPrompt(threadId, posture, facts);
-  const tools = posture.atomic
+  const postureTools = posture.atomic
     ? EXEC_TOOLS
     : posture.planned
       ? SURVEY_TOOLS
@@ -219,7 +220,6 @@ async function runDispatch(
   };
 
   console.log(`[dispatch] @${threadId} — ${posture.title}`);
-  console.log(`[dispatch] posture: ${postureLabel}, provider: ${routing.provider}, target: ${routing.target} (${routing.reason}), tools: ${tools.join(",")}`);
 
   // Auto-clock (per-agent): open a session on this thread as THIS worker, so its
   // billable time attributes to the thread it actually worked — not one global
@@ -284,7 +284,7 @@ async function runDispatch(
     }
     const agentOptions = harnessOptions({
       self: agentId,
-      extraTools: tools,
+      extraTools: postureTools,
       model: resolved.model,
       effort: resolved.effort,
       provider: routing.provider,
@@ -295,6 +295,12 @@ async function runDispatch(
       deliveryRun: deliveryReservationReady ? runContext : undefined,
       systemPrompt: `You are a north agent executing thread @${threadId}. ${DEFAULT_SYSTEM_PROMPT}`,
     });
+    const effectiveSurface = effectiveCapabilitySurface(agentOptions);
+    console.log(
+      `[dispatch] posture: ${postureLabel}, provider: ${routing.provider}, `
+      + `target: ${routing.target} (${routing.reason}), effective `
+      + formatEffectiveCapabilitySurface(effectiveSurface),
+    );
     compositionEvidence = harnessCompositionEvidence(agentOptions);
     const queryArgs = {
       prompt: ch.stream(),

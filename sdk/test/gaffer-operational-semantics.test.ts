@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  applyHarnessRoute, gafferAppendix, harnessCompositionEvidence, harnessOptions,
+  applyHarnessRoute, effectiveCapabilitySurface, formatEffectiveCapabilitySurface,
+  gafferAppendix, harnessCompositionEvidence, harnessOptions,
 } from "../src/harness";
 import { applyGafferStaffing } from "../src/gaffer-staffing";
 import type { RoutingMetadata } from "../src/routing-metadata";
@@ -150,6 +151,17 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   ]));
   expect(designer.permissionMode).toBe("default");
   expect(designer.sandbox).toBeUndefined();
+  const loggedSurface = formatEffectiveCapabilitySurface(
+    effectiveCapabilitySurface(designer),
+  );
+  expect(loggedSurface).toBe(
+    "capabilities: filesystem.read, filesystem.search, shell.readonly; "
+    + "builtins: Read, Grep, Glob; managed: "
+    + "mcp__north-readonly-shell__run, mcp__north__capture, mcp__north__tell, "
+    + "mcp__north__evidence_record, mcp__north__show, mcp__north__ready, "
+    + "mcp__north__next, mcp__north__board, mcp__north__plate",
+  );
+  expect(loggedSurface).not.toMatch(/\b(Edit|Write|Bash)\b/);
 
   const director = harnessOptions({
     self: "capability-director", provider: "openai", model: "gpt-5.6-sol", cwd: north,
