@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Codex moves faster than the general runtime package set. Keep its package
+    # source explicit so consumers such as Firn can make this input follow their
+    # own canonical nixpkgs-master pin without changing North's package graph.
+    nixpkgs-master.url = "github:NixOS/nixpkgs/master";
     flake-utils.url = "github:numtide/flake-utils";
 
     # Fram owns and verifies its complete runtime closure. North consumes that
@@ -22,7 +26,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, fram, beagle, gaffer }:
+  outputs = { self, nixpkgs, nixpkgs-master, flake-utils, fram, beagle, gaffer }:
     # nixpkgs' current Babashka no longer supports x86_64-darwin. Publish only
     # the three systems whose complete North runtime closure is evaluable.
     flake-utils.lib.eachSystem [
@@ -32,7 +36,25 @@
     ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        codexPkgs = nixpkgs-master.legacyPackages.${system};
+        codexPkg =
+          codexPkgs.codex or
+            (throw "nixpkgs-master does not provide Codex for North's supported system ${system}");
         lib = pkgs.lib;
+        codexVersionSmoke = pkgs.runCommand
+          "north-codex-version-smoke-${codexPkg.version}"
+          { nativeBuildInputs = [ codexPkg ]; }
+          ''
+            expected='codex-cli ${codexPkg.version}'
+            actual="$(${codexPkg}/bin/codex --version)"
+            if [ "$actual" != "$expected" ]; then
+              echo "North Codex package version mismatch" >&2
+              echo "expected: $expected" >&2
+              echo "actual:   $actual" >&2
+              exit 1
+            fi
+            touch "$out"
+          '';
         sdkVersion =
           let
             declared = (builtins.fromJSON (builtins.readFile ./sdk/package.json))
@@ -446,9 +468,10 @@ EOF
         };
 
         # north CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
-        # packaged engine so the CLI is self-contained; an explicit env override
-        # still wins (the script reads ${FRAM_HOME:-...}). NORTH_BIN points the
-        # MCP server at the wrapped CLI in this same out.
+        # packaged engine so the CLI is self-contained. Package-owned code and
+        # provenance selectors are exact wrapper values; only public data/store
+        # selectors remain caller-configurable. NORTH_BIN points the MCP server
+        # at the wrapped CLI in this same out.
         northPkg = pkgs.stdenvNoCC.mkDerivation {
           pname = "north";
           version = "0.1.0";
@@ -492,60 +515,64 @@ EOF
 
             wrapProgram $out/bin/north \
               --prefix PATH : ${runtimePath} \
-              --set-default FRAM_HOME ${framRuntimeRoot} \
-              --set-default FRAM_BIN ${framPkg}/bin \
-              --set-default FRAM_OUT ${framBabashkaClasspath} \
-              --set-default GAFFER_HOME ${gafferContract} \
-              --set-default NORTH_HOME $out \
-              --set-default NORTH_BIN $out/bin/north \
-              --set-default NORTH_BB ${pkgs.babashka}/bin/bb \
-              --set-default NORTH_BUN ${pkgs.bun}/bin/bun \
-              --set-default NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
-              --set-default NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
-              --set-default NORTH_MCP_BUN ${pkgs.bun}/bin/bun \
-              --set-default NORTH_PACKAGE_MODE nix-store \
-              --set-default NORTH_PACKAGE_REV ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")} \
-              --set-default FRAM_PACKAGE_REV ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}
+              --set FRAM_HOME ${framRuntimeRoot} \
+              --set FRAM_BIN ${framPkg}/bin \
+              --set FRAM_OUT ${framBabashkaClasspath} \
+              --set GAFFER_HOME ${gafferContract} \
+              --set NORTH_HOME $out \
+              --set NORTH_BIN $out/bin/north \
+              --set NORTH_BB ${pkgs.babashka}/bin/bb \
+              --set NORTH_BUN ${pkgs.bun}/bin/bun \
+              --set NORTH_GIT_BIN ${pkgs.git}/bin/git \
+              --set NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
+              --set NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
+              --set NORTH_MCP_BUN ${pkgs.bun}/bin/bun \
+              --set NORTH_MANAGED_CODEX_BIN ${codexPkg}/bin/codex \
+              --set NORTH_PACKAGE_MODE nix-store \
+              --set NORTH_PACKAGE_REV ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")} \
+              --set FRAM_PACKAGE_REV ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}
 
             wrapProgram $out/bin/north-mcp \
               --prefix PATH : ${runtimePath} \
-              --set-default FRAM_HOME ${framRuntimeRoot} \
-              --set-default FRAM_BIN ${framPkg}/bin \
-              --set-default FRAM_OUT ${framBabashkaClasspath} \
-              --set-default GAFFER_HOME ${gafferContract} \
-              --set-default NORTH_HOME $out \
-              --set-default NORTH_BIN $out/bin/north \
-              --set-default NORTH_BB ${pkgs.babashka}/bin/bb \
-              --set-default NORTH_BUN ${pkgs.bun}/bin/bun \
-              --set-default NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
-              --set-default NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
-              --set-default NORTH_MCP_BUN ${pkgs.bun}/bin/bun
+              --set FRAM_HOME ${framRuntimeRoot} \
+              --set FRAM_BIN ${framPkg}/bin \
+              --set FRAM_OUT ${framBabashkaClasspath} \
+              --set GAFFER_HOME ${gafferContract} \
+              --set NORTH_HOME $out \
+              --set NORTH_BIN $out/bin/north \
+              --set NORTH_BB ${pkgs.babashka}/bin/bb \
+              --set NORTH_BUN ${pkgs.bun}/bin/bun \
+              --set NORTH_GIT_BIN ${pkgs.git}/bin/git \
+              --set NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
+              --set NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
+              --set NORTH_MCP_BUN ${pkgs.bun}/bin/bun \
+              --set NORTH_MANAGED_CODEX_BIN ${codexPkg}/bin/codex
 
             wrapProgram $out/bin/north-clock-audit \
               --prefix PATH : ${runtimePath} \
-              --set-default FRAM_HOME ${framRuntimeRoot} \
-              --set-default FRAM_OUT ${framBabashkaClasspath} \
-              --set-default NORTH_HOME $out \
-              --set-default NORTH_BB ${pkgs.babashka}/bin/bb
+              --set FRAM_HOME ${framRuntimeRoot} \
+              --set FRAM_OUT ${framBabashkaClasspath} \
+              --set NORTH_HOME $out \
+              --set NORTH_BB ${pkgs.babashka}/bin/bb
 
             wrapProgram $out/bin/north-stream-sync \
               --prefix PATH : ${runtimePath} \
-              --set-default NORTH_PACKAGE_MODE nix-store
+              --set NORTH_PACKAGE_MODE nix-store
 
             wrapProgram $out/bin/north-coord-up \
               --prefix PATH : ${runtimePath} \
-              --set-default FRAM_HOME ${framRuntimeRoot} \
-              --set-default FRAM_BIN ${framPkg}/bin \
-              --set-default NORTH_HOME $out
+              --set FRAM_HOME ${framRuntimeRoot} \
+              --set FRAM_BIN ${framPkg}/bin \
+              --set NORTH_HOME $out
 
             wrapProgram $out/bin/concern \
               --prefix PATH : ${runtimePath} \
-              --set-default NORTH_HOME $out \
-              --set-default NORTH_BB ${pkgs.babashka}/bin/bb
+              --set NORTH_HOME $out \
+              --set NORTH_BB ${pkgs.babashka}/bin/bb
 
             wrapProgram $out/bin/ensure-private-docs \
               --prefix PATH : ${runtimePath} \
-              --set-default NORTH_HOME $out
+              --set NORTH_HOME $out
 
             impurity_pattern='/(home|Users)/|/run/current-system/sw|/code/north(?:/|\b)|~/code/north|[$]HOME/code/north|[.]m2|[.]cpcache|[.]cache/babashka'
             if LC_ALL=C rg --hidden -n "$impurity_pattern" "$out"; then
@@ -582,6 +609,13 @@ if [ "$1 $2" = "login status" ]; then echo 'Logged in using ChatGPT'; exit 0; fi
 exit 2
 EOF
             chmod +x "$smoke/bin/claude" "$smoke/bin/codex"
+            # The managed OpenAI surface is an exact nixpkgs-master package,
+            # never the ambient PATH fixture used by account/auth probes below.
+            test -e ${codexVersionSmoke}
+            for wrapper in "$out/bin/north" "$out/bin/north-mcp"; do
+              grep -Fq "NORTH_MANAGED_CODEX_BIN" "$wrapper"
+              grep -Fq "${codexPkg}/bin/codex" "$wrapper"
+            done
             mkdir -p "$smoke/home/.local/state/north/threads"
             : > "$smoke/home/.local/state/north/facts.log"
             client_repo="$smoke/home/code/client/smoke/widget"
@@ -665,9 +699,14 @@ EOF
             test ! -e "$out/streams/raw"
             # Load North's compiled namespace graph against Fram's published bb
             # classpath. This is the seam the old partial packager left untested.
-            HOME="$smoke/home" FRAM_PORT=39123 \
+            HOME="$smoke/home" PATH="$smoke" NORTH_GIT_BIN="$smoke/forged-git" FRAM_PORT=39123 \
               $out/bin/north validate > "$smoke/validate.out"
             grep -q 'no violations' "$smoke/validate.out"
+            HOME="$smoke/home" PATH="$smoke" NORTH_GIT_BIN="${pkgs.git}/bin/git" \
+              ${pkgs.bun}/bin/bun -e \
+              'import { trustedGitExecutable } from "'$out'/sdk/src/clock.ts";
+               if (trustedGitExecutable() !== "${pkgs.git}/bin/git")
+                 throw new Error("north package smoke: clock did not consume packaged Git");'
             # Exercise the composed lifecycle seam, not merely namespace
             # loading: North's public revive command must start Fram's packaged
             # daemon through its public wrapper and verify the exact temp log.
@@ -684,10 +723,15 @@ EOF
             grep -q 'serving the canonical log' "$smoke/coord-doctor.out"
             ${pkgs.coreutils}/bin/env -i \
               HOME="$smoke/home" PATH= NO_COLOR=1 \
+              NORTH_PACKAGE_MODE=forged NORTH_PACKAGE_REV=forged FRAM_PACKAGE_REV=forged \
               NORTH_PORT="$coord_port" FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" \
               $out/bin/north doctor > "$smoke/doctor.out"
-            grep -Eq 'north  package rev [^? ]+' "$smoke/doctor.out"
-            grep -Eq 'fram  package rev [^? ]+' "$smoke/doctor.out"
+            grep -Fq 'north  package rev ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")}' "$smoke/doctor.out"
+            grep -Fq 'fram  package rev ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}' "$smoke/doctor.out"
+            if grep -q forged "$smoke/doctor.out"; then
+              echo "north package smoke: ambient provenance overrode the package pins" >&2
+              exit 1
+            fi
             # Cross the packaged TypeScript graph-store seam with FRAM_BIN in
             # its public form: a bin directory, never an executable path.
             HOME="$smoke/home" PATH="${runtimePath}" \
@@ -994,6 +1038,8 @@ EOF
           north-web = northWebPkg;
           fram-engine = framPkg;
         };
+
+        checks.codex-version = codexVersionSmoke;
 
         apps = {
           default = {
