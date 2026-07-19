@@ -50,16 +50,16 @@ test("Gaffer composition survives North validation into complete run telemetry",
   ]) expect(facts).toContainEqual(fact);
 });
 
-test("SDK role-only spawns inherit catalog axes while explicit axes win independently", () => {
+test("SDK presets inherit catalog axes while declared compatible overrides win independently", () => {
   const catalog = loadGafferStaffing(resolve(gaffer, "staffing/catalog.json"));
   expect(() => applyGafferStaffing({ role: "integrator", tier: "frontier" }, catalog))
     .toThrow("supply preset composition.overrides");
-  expect(applyGafferStaffing({ role: "integrator", tier: "frontier",
-    composition: { kind: "preset", id: "integrator", overrides: ["tier"],
+  expect(applyGafferStaffing({ role: "integrator", tier: "frontier", reasoning: "xhigh",
+    composition: { kind: "preset", id: "integrator", overrides: ["tier", "reasoning"],
       overrideReason: "cross-seam direction" } }, catalog)).toEqual({
     role: "integrator", taskGrade: "senior", domainRequirements: [], topology: "worker",
-    tier: "frontier", reasoning: "high", posture: "deliver",
-    composition: { kind: "preset", id: "integrator", overrides: ["tier"],
+    tier: "frontier", reasoning: "xhigh", posture: "deliver",
+    composition: { kind: "preset", id: "integrator", overrides: ["tier", "reasoning"],
       overrideReason: "cross-seam direction" },
   });
   expect(applyGafferStaffing({ role: "director" }, catalog)).toEqual({
@@ -128,8 +128,14 @@ test("North MCP advertises the complete composition contract", () => {
     expect(spawn.inputSchema.properties[field]).toBeDefined();
   const dispatch = response.result.tools.find((tool: any) => tool.name === "dispatch");
   expect(dispatch.inputSchema.properties.target).toBeDefined();
-  expect(spawn.inputSchema.required).toEqual(["prompt", "role"]);
-  expect(dispatch.inputSchema.required).toEqual(["id", "role"]);
+  expect(spawn.inputSchema.required).toEqual([
+    "prompt", "role", "taskGrade", "domainRequirements", "topology",
+    "tier", "reasoning", "posture", "composition",
+  ]);
+  expect(dispatch.inputSchema.required).toEqual([
+    "id", "role", "taskGrade", "domainRequirements", "topology",
+    "tier", "reasoning", "posture", "composition",
+  ]);
   expect(spawn.inputSchema.properties.reasoning.enum).toContain("xhigh");
   expect(spawn.inputSchema.properties.composition.oneOf).toHaveLength(2);
 });

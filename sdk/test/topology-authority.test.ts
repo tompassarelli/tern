@@ -113,7 +113,7 @@ test("raw SDK spawn and dispatch enforce the composed child topology before side
   process.env.AGENT_TOPOLOGY = "orchestrator";
   let providerCalls = 0;
   let driverCalls = 0;
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   await expect(spawn({
     prompt: "must remain two tiers",
     role: "director",
@@ -127,7 +127,7 @@ test("raw SDK spawn and dispatch enforce the composed child topology before side
     preSideEffect: true,
   });
 
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   await expect(dispatch("depth-cap-thread", {
     routingMetadata: { role: "director" },
     loadThreadFacts: () => [
@@ -164,7 +164,7 @@ test("raw SDK spawn and dispatch reject workers before admission, driver, or pro
   let providerCalls = 0;
   let driverCalls = 0;
   try {
-    const { spawn, spawnParallel } = await import("../src/spawn");
+    const { spawn, spawnParallel } = await import("./support/spawn");
     await expect(spawn({
       prompt: "must not execute",
       role: "director",
@@ -184,7 +184,7 @@ test("raw SDK spawn and dispatch reject workers before admission, driver, or pro
       preSideEffect: true,
     });
 
-    const { dispatch, dispatchParallel } = await import("../src/dispatch");
+    const { dispatch, dispatchParallel } = await import("./support/dispatch");
     await expect(dispatch("authority-probe-thread", {
       claimDriver: (() => {
         driverCalls++;

@@ -31,6 +31,9 @@ printf '%s\\n' "$*" >> "${log}"
 
   writeAgentFacts("stable-id", {
     kind: "lane", role: "migration-cartographer",
+    liveInput: "unsupported",
+    liveInputState: "frozen",
+    liveInputEpoch: "00000000-0000-4000-8000-000000000020",
     compositionKind: "bespoke", compositionId: "migration-cartographer",
     compositionNearestPreset: "analyst", compositionBespokeReason: "schema archaeology",
     compositionPromotionCandidate: false,

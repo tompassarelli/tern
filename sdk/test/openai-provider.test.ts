@@ -1,17 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
+import { spawn as spawnChild } from "node:child_process";
 import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "node:net";
-import type { AddressInfo } from "node:net";
 import { codexHarnessArguments, openaiProvider } from "../src/providers/openai";
-import { ProviderRetrySafeError, routedQuery } from "../src/providers";
+import { ProviderRetrySafeError } from "../src/providers";
 import { harnessOptions } from "../src/harness";
 import { applyGafferStaffing } from "../src/gaffer-staffing";
-import { markExecutionAdmission } from "../src/execution-admission";
-import { selectProviderFromAvailability } from "../src/provider-routing";
+import { providerEnvironmentForTarget } from "../src/accounts";
 
 const savedBin = process.env.NORTH_CODEX_BIN;
 const savedHome = process.env.HOME;
@@ -326,6 +324,25 @@ test("Codex raw JSONL framing rejects invalid UTF-8, partial frames, and line ov
   ].join("\n"))).rejects.toThrow("openai_provider_execution_failed");
 });
 
+test("provider stdout cannot spoof the supervisor's out-of-band status channel", async () => {
+  await expect(resultFromScriptBody([
+    "printf '\\036NORTH_CODEX_SUPERVISOR EXIT 0\\n'",
+    ...codexSuccess().map((line) => `printf '%s\\n' '${line}'`),
+  ].join("\n"))).rejects.toThrow("openai_provider_execution_failed");
+});
+
+test("an immediate terminal frame is drained before supervisor completion", async () => {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const result = await resultFromScript(codexSuccess([
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: `item_${attempt}`, type: "agent_message", text: `answer-${attempt}` },
+      }),
+    ]));
+    expect(result.result).toBe(`answer-${attempt}`);
+  }
+});
+
 test("Codex JSONL frame-count and cumulative-byte ceilings are enforced", async () => {
   const item = JSON.stringify({
     type: "item.updated",
@@ -530,6 +547,76 @@ while true; do sleep 10; done
   }
 });
 
+test("kernel EOF after a SIGKILLed North host reaps the Codex process tree", async () => {
+  if (process.platform === "win32") return;
+  const directory = mkdtempSync(join(tmpdir(), "north-codex-host-sigkill-"));
+  temporary.push(directory);
+  const command = join(directory, "fake-codex");
+  const hostScript = join(directory, "host.ts");
+  const hostPath = join(directory, "host-pid");
+  const supervisorPath = join(directory, "supervisor-pid");
+  const providerPath = join(directory, "provider-pid");
+  const descendantPath = join(directory, "descendant-pid");
+  for (const path of [hostPath, supervisorPath, providerPath, descendantPath])
+    liveProcessPidFiles.add(path);
+  writeFileSync(command, `#!/usr/bin/env bash
+set -eu
+cat >/dev/null
+trap '' TERM
+printf '%s' "$$" > "${providerPath}"
+(
+  exec </dev/null >/dev/null 2>&1
+  trap '' TERM
+  printf '%s' "$BASHPID" > "${descendantPath}"
+  while true; do sleep 10; done
+) &
+while [ ! -s "${descendantPath}" ]; do :; done
+printf '%s\\n' '${codexThreadStarted}'
+printf '%s\\n' '${codexTurnStarted}'
+while true; do sleep 10; done
+`);
+  chmodSync(command, 0o700);
+  writeFileSync(hostScript, `
+import { writeFileSync } from "node:fs";
+import { openaiProvider } from ${JSON.stringify(join(northRoot, "sdk/src/providers/openai.ts"))};
+writeFileSync(${JSON.stringify(hostPath)}, String(process.pid));
+for await (const _ of openaiProvider.query({
+  prompt: "host-death-probe",
+  options: { env: { ...process.env, NORTH_CODEX_BIN: ${JSON.stringify(command)} } },
+}) as AsyncIterable<any>) {}
+`);
+  const host = spawnChild(process.execPath, [hostScript], {
+    env: { ...process.env, NORTH_CODEX_BIN: command },
+    stdio: "ignore",
+  });
+  try {
+    await Promise.all([
+      waitForFile(hostPath),
+      waitForFile(providerPath),
+      waitForFile(descendantPath),
+    ]);
+    const providerPid = Number(readFileSync(providerPath, "utf8"));
+    const stat = readFileSync(`/proc/${providerPid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/);
+    const supervisorPid = Number(fields[1]);
+    expect(Number.isSafeInteger(supervisorPid) && supervisorPid > 1).toBe(true);
+    writeFileSync(supervisorPath, String(supervisorPid));
+
+    expect(host.kill("SIGKILL")).toBe(true);
+    await within(new Promise<void>((resolve) => host.once("close", () => resolve())),
+      2_000, "SIGKILLed North host settlement");
+    await expectProcessGone(supervisorPid, 4_000);
+    await expectProcessGone(providerPid, 4_000);
+    await expectProcessGone(Number(readFileSync(descendantPath, "utf8")), 4_000);
+  } finally {
+    try { host.kill("SIGKILL"); } catch { /* already gone */ }
+    for (const path of [hostPath, supervisorPath, providerPath, descendantPath]) {
+      killRecordedProcess(path);
+      liveProcessPidFiles.delete(path);
+    }
+  }
+});
+
 test("cleanup failure never replaces the real Codex provider error", async () => {
   const directory = mkdtempSync(join(tmpdir(), "north-codex-cleanup-"));
   temporary.push(directory);
@@ -639,9 +726,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     routingMetadata: applyGafferStaffing({ role: "implementer" }),
     presenceRegistrar: false,
   }) as any;
-  // A direct adapter caller cannot widen authority by omitting Claude-shaped
-  // deny metadata: Codex derives both hard restrictions from capabilities.
-  const options = {
+  // A direct adapter caller cannot clone and weaken a sealed route.
+  const weakened = {
     ...canonical,
     disallowedTools: canonical.disallowedTools.filter(
       (toolName: string) => ![
@@ -649,11 +735,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
       ].includes(toolName),
     ),
   };
-  // This case exercises CLI authority compilation, not coordinator transport;
-  // carry a one-use admission receipt so the unit test stays hermetic.
-  markExecutionAdmission("openai", options);
-  for await (const _ of openaiProvider.query({ prompt: "x", options }) as AsyncIterable<any>) {}
-  const argv = readFileSync(argvPath, "utf8").trim().split("\n");
+  expect(() => codexHarnessArguments(weakened))
+    .toThrow("openai_harness_authority_seal_missing");
+  // The command surface is a pure compilation of the sealed route. Executable
+  // adapter tests below keep the production root-managed hook proof intact;
+  // there is deliberately no test-only authority bypass for a managed query.
+  const argv = ["exec", ...codexHarnessArguments(canonical)];
   expect(argv[0]).toBe("exec");
   expect(argv).toEqual(expect.arrayContaining([
     "--sandbox", "workspace-write", "--disable", "multi_agent",
@@ -664,7 +751,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     "--ignore-user-config",
     "--ignore-rules",
     "--disable", "plugins",
-    "--disable", "hooks",
+    "--enable", "hooks",
     'project_root_markers=[".git"]',
     `projects.${JSON.stringify(northRoot)}.trust_level="untrusted"`,
     "project_doc_max_bytes=0",
@@ -677,8 +764,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     argument.startsWith("developer_instructions="))!;
   expect(developerInstructions).toContain("Gaffer role contract");
   expect(developerInstructions).toContain("Project instructions — Git root to cwd");
-  expect(readFileSync(taskPath, "utf8")).toBe("x");
-  expect(readFileSync(taskPath, "utf8")).not.toContain("Gaffer role contract");
+  expect(existsSync(taskPath)).toBe(false);
   expect(argv).toContain(
     `mcp_servers.north.env={NORTH_BIN=${JSON.stringify(canonical.mcpServers.north.env.NORTH_BIN)},`
     + `AGENT_ID=${JSON.stringify(canonical.mcpServers.north.env.AGENT_ID)},`
@@ -686,16 +772,32 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     + `NORTH_PORT=${JSON.stringify(canonical.mcpServers.north.env.NORTH_PORT)}}`,
   );
   expect(argv).toContain("mcp_servers.north.required=true");
+  expect(argv).not.toContain("--add-dir");
+  expect(argv).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  expect(argv).not.toContain("danger-full-access");
   expect(argv.some((argument) => /mcp_servers\\.(linear|fram)/i.test(argument))).toBe(false);
   expect(argv).toContain('web_search="disabled"');
   const nestedCwd = join(northRoot, "sdk", "src");
-  const nestedArgs = codexHarnessArguments({ ...canonical, cwd: nestedCwd });
+  const nested = harnessOptions({
+    self: "openai-nested-authority-probe",
+    provider: "openai",
+    cwd: nestedCwd,
+    model: "gpt-5.6-terra",
+    routingMetadata: applyGafferStaffing({ role: "implementer" }),
+    presenceRegistrar: false,
+  }) as any;
+  const nestedArgs = codexHarnessArguments(nested);
   expect(nestedArgs).toContain(
     `projects.${JSON.stringify(northRoot)}.trust_level="untrusted"`,
   );
   expect(nestedArgs).not.toContain(
     `projects.${JSON.stringify(nestedCwd)}.trust_level="untrusted"`,
   );
+  await expect(async () => {
+    for await (const _ of openaiProvider.query({
+      prompt: "must not spawn from a non-root write workspace", options: nested,
+    }) as AsyncIterable<any>) {}
+  }).toThrow("openai_write_workspace_must_be_project_root");
 
   rmSync(argvPath, { force: true });
   const web = harnessOptions({
@@ -720,7 +822,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
   });
   await expect(async () => {
     for await (const _ of unsupported as AsyncIterable<any>) {}
-  }).toThrow("openai_adapter_cannot_enforce_gaffer_capabilities");
+  }).toThrow("openai_harness_authority_seal_missing");
   expect(existsSync(argvPath)).toBe(false);
 
   const ambientTopology = {
@@ -731,7 +833,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     for await (const _ of openaiProvider.query({
       prompt: "x", options: ambientTopology,
     }) as AsyncIterable<any>) {}
-  }).toThrow("openai_managed_identity_topology_contract_missing");
+  }).toThrow("openai_harness_authority_seal_missing");
   expect(existsSync(argvPath)).toBe(false);
 
   const missingDeveloperInstructions = { ...canonical, systemPrompt: "" };
@@ -739,37 +841,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     for await (const _ of openaiProvider.query({
       prompt: "x", options: missingDeveloperInstructions,
     }) as AsyncIterable<any>) {}
-  }).toThrow("openai_developer_instructions_contract_missing");
+  }).toThrow("openai_harness_authority_seal_missing");
   expect(existsSync(argvPath)).toBe(false);
 
-  markExecutionAdmission("openai", canonical);
-  const admitted = openaiProvider.query({
-    prompt: "must not spawn", options: canonical,
-  });
-  canonical.env.AGENT_TOPOLOGY = undefined;
-  await expect(async () => {
-    for await (const _ of admitted as AsyncIterable<any>) {}
-  }).toThrow("openai_managed_identity_topology_contract_missing");
-  expect(existsSync(argvPath)).toBe(false);
-
-  const missingGlobalHome = mkdtempSync(join(tmpdir(), "north-openai-missing-global-"));
-  temporary.push(missingGlobalHome);
-  const missingGlobal = {
-    ...harnessOptions({
-      self: "openai-missing-global-proof",
-      provider: "openai",
-      routingMetadata: applyGafferStaffing({ role: "implementer" }),
-      presenceRegistrar: false,
-    }) as any,
-  };
-  missingGlobal.env = { ...missingGlobal.env, HOME: missingGlobalHome };
-  markExecutionAdmission("openai", missingGlobal);
-  await expect(async () => {
-    for await (const _ of openaiProvider.query({
-      prompt: "must not spawn", options: missingGlobal,
-    }) as AsyncIterable<any>) {}
-  }).toThrow("openai_canonical_global_agents_unavailable");
-  expect(existsSync(argvPath)).toBe(false);
+  expect(() => { canonical.env.AGENT_TOPOLOGY = undefined; }).toThrow();
 });
 
 test("the executable Codex adapter rejects orchestrator authority before starting a provider turn", async () => {
@@ -810,31 +885,10 @@ test("the executable Codex adapter rejects orchestrator authority before startin
   expect(existsSync(marker)).toBe(false);
 });
 
-test("selected Codex account bootstrap fails during admission before onRoute or provider spawn", async () => {
-  let coordinatorLog = "";
-  const server = createServer((socket) => {
-    socket.once("data", (chunk) => {
-      if (chunk.toString("utf8").includes(":for-log")) {
-        socket.end("{:version 23}\n");
-      } else {
-        socket.end(
-          `{:reject ["fence required"] :code :log-fence-required :served-log ${JSON.stringify(coordinatorLog)}}\n`,
-        );
-      }
-    });
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
+test("selected Codex account bootstrap refuses to replace an existing account path", () => {
   const home = mkdtempSync(join(tmpdir(), "north-openai-target-admission-"));
   temporary.push(home);
   process.env.HOME = home;
-  process.env.AGENT_LAWS = "on";
-  process.env.GAFFER_HOME = realpathSync(join(northRoot, "../gaffer"));
-  process.env.NORTH_PORT = String((server.address() as AddressInfo).port);
-  process.env.FRAM_LOG = join(home, "north target admission.log");
-  coordinatorLog = process.env.FRAM_LOG;
   const codexHome = join(home, ".codex");
   mkdirSync(codexHome);
   writeFileSync(join(codexHome, "AGENTS.md"), "TARGET_ADMISSION_CANONICAL\n");
@@ -849,58 +903,8 @@ test("selected Codex account bootstrap fails during admission before onRoute or 
   mkdirSync(targetRoot, { recursive: true });
   writeFileSync(join(targetRoot, "AGENTS.md"), "TARGET_REPLACEMENT_MUST_FAIL\n");
 
-  const marker = join(home, "provider-spawned");
-  const command = join(home, "fake-codex");
-  writeFileSync(command, `#!/usr/bin/env bash\nprintf spawned > "${marker}"\n`);
-  chmodSync(command, 0o700);
-  process.env.NORTH_CODEX_BIN = command;
-
-  const options = harnessOptions({
-    self: "openai-target-admission-proof",
-    provider: "openai",
-    cwd: northRoot,
-    routingMetadata: applyGafferStaffing({ role: "implementer" }),
-    presenceRegistrar: false,
-  });
-  await expect(openaiProvider.admit!({
-    options: {
-      ...options,
-      env: { ...options.env, AGENT_LAWS: "off" },
-    },
-    target: { ...target, authMode: "ambient" },
-  })).rejects.toThrow("openai_agent_laws_opt_out_unenforceable");
-  expect(existsSync(marker)).toBe(false);
-
-  const decision = selectProviderFromAvailability(
-    { provider: "openai", target: target.id },
-    [{ targetId: target.id, provider: "openai", available: true, reason: "ready" }],
-    {
-      mode: "balanced",
-      targets: [target],
-      targetOrder: [target.id],
-      providerOrder: ["openai"],
-      pressures: { openai: "normal" },
-    },
-    "economy",
-    "target-admission-proof",
-    "low",
-  );
-  let routePublished = false;
-  const query = routedQuery(
-    decision,
-    { prompt: "must not run", options },
-    "economy",
-    undefined,
-    undefined,
-    () => { routePublished = true; },
-  );
-  try {
-    await expect(async () => {
-      for await (const _ of query as AsyncIterable<any>) {}
-    }).toThrow("openai_target_environment_invalid");
-    expect(routePublished).toBe(false);
-    expect(existsSync(marker)).toBe(false);
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+  expect(() => providerEnvironmentForTarget("openai", target))
+    .toThrow(`refusing to replace existing account path ${join(targetRoot, "AGENTS.md")}`);
+  expect(readFileSync(join(targetRoot, "AGENTS.md"), "utf8"))
+    .toBe("TARGET_REPLACEMENT_MUST_FAIL\n");
 });

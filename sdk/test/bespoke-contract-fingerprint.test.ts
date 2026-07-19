@@ -30,10 +30,10 @@ const contract = {
 const semanticallyEquivalent = {
   responsibility: " \te\u0301vidence\r\ntrace \r",
   deliverable: "  sourced timeline\t",
-  capabilities: [" shell.readonly ", "filesystem.search", "filesystem.read", "filesystem.search"],
-  mayDecide: [" select source ", "follow trace", "follow trace"],
+  capabilities: [" shell.readonly ", "filesystem.search", "filesystem.read"],
+  mayDecide: [" select source ", "follow trace"],
   mustEscalate: ["missing authority", " destructive recovery "],
-  doneWhen: ["gaps named", "all transitions sourced", " gaps named "],
+  doneWhen: ["gaps named", "all transitions sourced"],
   report: " timeline and gaps ",
 };
 
@@ -66,6 +66,16 @@ test("bespoke fingerprint canonicalizes semantic sets with an explicit versioned
     .not.toBe(bespokeContractFingerprint(contract));
 });
 
+test("bespoke semantic sets reject duplicates instead of silently weakening the contract", () => {
+  for (const malformed of [
+    { ...contract, capabilities: [...contract.capabilities, "filesystem.search"] },
+    { ...contract, mayDecide: [...contract.mayDecide, "follow trace"] },
+    { ...contract, doneWhen: [...contract.doneWhen, "gaps named"] },
+  ]) {
+    expect(() => canonicalBespokeContract(malformed)).toThrow("must not contain duplicates");
+  }
+});
+
 test("routing and harness consume the same canonical contract and fingerprint", () => {
   const metadata = routing(semanticallyEquivalent);
   expect((metadata.composition as any).contract).toEqual(canonicalBespokeContract(contract));
@@ -84,6 +94,9 @@ test("routing and harness consume the same canonical contract and fingerprint", 
     model: "gpt-5.6-sol",
     provider: "openai",
     providerTarget: "codex-personal",
+    liveInput: "unsupported",
+    liveInputState: "frozen",
+    liveInputEpoch: "00000000-0000-4000-8000-000000000021",
     effort: "xhigh",
     compositionKind: composition.kind,
     compositionId: composition.id,

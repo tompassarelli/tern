@@ -9,9 +9,18 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { presetRequest } from "./routing-fixtures";
 
 let dir: string;
 let log: string;
+
+function readySubscription(stop: () => void = () => {}) {
+  return Object.assign(stop, {
+    ready: Promise.resolve(),
+    drain: async () => {},
+    isArmed: () => true,
+  });
+}
 
 // Every env key this test mutates — snapshot for exact restore (set-or-delete) in afterAll,
 // so a scrub here never leaks into sibling suites. Includes the INHERITED IDENTITY keys:
@@ -80,7 +89,7 @@ afterAll(() => {
 });
 
 test("a query that dies mid-stream -> partial return + agent_death notification", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
 
   // Fake SDK query: yields one assistant turn (simulating work-in-progress on a long gate),
   // then throws the exact exitError the real ProcessTransport raises on an OOM kill.
@@ -94,7 +103,8 @@ test("a query that dies mid-stream -> partial return + agent_death notification"
   let threw = false;
   try {
     result = await spawn({ prompt: "run a long gate", agentId: "test-dead-W3",
-      routingMetadata: { role: "integrator" }, queryFn: dyingQuery });
+      routingMetadata: presetRequest("integrator"), queryFn: dyingQuery,
+      feedSubscriber: () => readySubscription() });
   } catch {
     threw = true;
   }
@@ -118,8 +128,73 @@ test("a query that dies mid-stream -> partial return + agent_death notification"
   if (inheritedCoord) expect(logged).not.toContain(inheritedCoord);
 });
 
+test("ad-hoc spawn subscribes its exact lane and injects a child completion ping", async () => {
+  const { spawn } = await import("./support/spawn");
+  let subscribedAgent = "";
+  let deliver: ((message: string) => void) | undefined;
+  let stopCalls = 0;
+  let received = "";
+
+  const result = await spawn({
+    prompt: "coordinate one child",
+    agentId: "test-spawn-live-feed",
+    provider: "anthropic",
+    routingMetadata: presetRequest("integrator"),
+    feedSubscriber: (agentId, onMail) => {
+      subscribedAgent = agentId;
+      deliver = onMail;
+      return readySubscription(() => { stopCalls++; });
+    },
+    queryFn: ({ prompt }: any) => ({
+      async *[Symbol.asyncIterator]() {
+        const input = prompt[Symbol.asyncIterator]();
+        const initial = await input.next();
+        expect(initial.value.message.content).toBe("coordinate one child");
+        deliver?.("child lane settled with outcome ran");
+        const ping = await input.next();
+        received = ping.value.message.content;
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "reduced child result",
+          num_turns: 1,
+        };
+      },
+    }),
+  });
+
+  expect(result).toBe("reduced child result");
+  expect(subscribedAgent).toBe("test-spawn-live-feed");
+  expect(received).toContain("child lane settled");
+  expect(stopCalls).toBe(1);
+});
+
+test("OpenAI exec lanes never arm a live-input subscription", async () => {
+  const { spawn } = await import("./support/spawn");
+  let subscriptions = 0;
+  const result = await spawn({
+    prompt: "one-shot Codex run",
+    agentId: "test-openai-no-live-feed",
+    provider: "openai",
+    routingMetadata: presetRequest("integrator"),
+    feedSubscriber: () => {
+      subscriptions++;
+      return readySubscription();
+    },
+    queryFn: () => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "result", subtype: "success", result: "done", num_turns: 1 };
+      },
+    }),
+  });
+  expect(result).toBe("done");
+  expect(subscriptions).toBe(0);
+  expect(readFileSync(log, "utf8"))
+    .toContain("tell agent:test-openai-no-live-feed live_input unsupported");
+});
+
 test("public spawn mints one full-entropy ID across admission, harness, and identity", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   const policy = join(dir, "generated-id-policy.json");
   const accounting = join(dir, "generated-id-accounting.json");
   writeFileSync(policy, JSON.stringify({
@@ -137,7 +212,8 @@ test("public spawn mints one full-entropy ID across admission, harness, and iden
     process.env.NORTH_ENVELOPE_ACCOUNTING = accounting;
     const result = await spawn({
       prompt: "exercise generated identity",
-      routingMetadata: { role: "integrator" },
+      routingMetadata: presetRequest("integrator"),
+      feedSubscriber: () => readySubscription(),
       queryFn: ({ options }: any) => {
         harnessId = options.mcpServers.north.env.AGENT_ID;
         return (async function* () {
@@ -174,9 +250,9 @@ test("an exhausted run envelope rejects before an injected provider boundary is 
     process.env.NORTH_ROUTING_POLICY = policy;
     process.env.NORTH_ENVELOPE_ACCOUNTING = join(dir, "denied-accounting.json");
     let providerCalls = 0;
-    await expect((await import("../src/spawn")).spawn({
+    await expect((await import("./support/spawn")).spawn({
       prompt: "must not run", agentId: "denied-before-provider",
-      routingMetadata: { role: "integrator" },
+      routingMetadata: presetRequest("integrator"),
       queryFn: () => { providerCalls++; return { async *[Symbol.asyncIterator]() {} } as any; },
     })).rejects.toThrow("runs 0/0");
     expect(providerCalls).toBe(0);
@@ -201,9 +277,9 @@ test("Gaffer-derived frontier tier is hydrated before envelope admission", async
     process.env.NORTH_ROUTING_POLICY = policy;
     process.env.NORTH_ENVELOPE_ACCOUNTING = join(dir, "denied-frontier-accounting.json");
     let providerCalls = 0;
-    await expect((await import("../src/spawn")).spawn({
+    await expect((await import("./support/spawn")).spawn({
       prompt: "must not run", agentId: "gaffer-frontier-before-provider",
-      routingMetadata: { role: "designer" },
+      routingMetadata: presetRequest("designer"),
       queryFn: () => { providerCalls++; return { async *[Symbol.asyncIterator]() {} } as any; },
     })).rejects.toThrow("frontierRuns 0/0");
     expect(providerCalls).toBe(0);
@@ -212,4 +288,35 @@ test("Gaffer-derived frontier tier is hydrated before envelope admission", async
     if (originalAccounting === undefined) delete process.env.NORTH_ENVELOPE_ACCOUNTING;
     else process.env.NORTH_ENVELOPE_ACCOUNTING = originalAccounting;
   }
+});
+
+test("public spawn and dispatch reject hermetic runtime fields before invoking them", async () => {
+  let callbacks = 0;
+  const { spawn: publicSpawn } = await import("../src/spawn");
+  await expect(publicSpawn({
+    prompt: "must reject structural injection",
+    routingMetadata: presetRequest("integrator"),
+    queryFn: () => {
+      callbacks++;
+      return { async *[Symbol.asyncIterator]() {} } as any;
+    },
+    deliveryRuntime: {
+      reserve: () => { callbacks++; return {} as any; },
+      load: () => { callbacks++; return {} as any; },
+    },
+  } as any)).rejects.toThrow("managed North spawn request has unknown field queryFn");
+
+  const { dispatch: publicDispatch } = await import("../src/dispatch");
+  await expect(publicDispatch("must-not-read-thread", {
+    routingMetadata: presetRequest("integrator"),
+    loadThreadFacts: () => {
+      callbacks++;
+      return [];
+    },
+    claimDriver: () => {
+      callbacks++;
+      return { release() {} } as any;
+    },
+  } as any)).rejects.toThrow("managed North dispatch request has unknown field loadThreadFacts");
+  expect(callbacks).toBe(0);
 });

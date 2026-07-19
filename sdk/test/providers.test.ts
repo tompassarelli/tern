@@ -1,7 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import {
-  ProviderRetrySafeError, ProviderSelectionError, routedQuery, selectProvider, selectProviderFromAvailability,
+  compileProviderAuthoritySurface, ProviderRetrySafeError, ProviderSelectionError,
+  selectProvider, selectProviderFromAvailability,
 } from "../src/providers";
+import { routedQueryWithRegistry } from "../src/providers/internal-router";
 import { balancedAllocationEstimates } from "../src/provider-routing";
 import { RATE_LIMIT_WARNING_TTL_MS } from "../src/resource-policy";
 import { consumeExecutionAdmission, markExecutionAdmission } from "../src/execution-admission";
@@ -637,15 +639,31 @@ test("temporary Fable promotion is Anthropic-only at the semantic frontier", () 
   expect(() => resolveTier("anthropic", "frontier", undefined, "high"))
     .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
   expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
-  expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier", "fable", "xhigh")).toEqual({
+    tier: "frontier", model: "claude-fable-5", effort: "xhigh",
+  });
+  expect(() => resolveTier("anthropic", "frontier", "sonnet", "xhigh"))
+    .toThrow("model claude-sonnet-5 does not support reasoning xhigh");
+  expect(() => resolveTier("openai", "frontier", "luna", "xhigh"))
+    .toThrow("model gpt-5.6-luna does not support reasoning xhigh");
+  expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({
+    tier: "frontier", model: "claude-opus-4-8", effort: "xhigh",
+  });
   expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: "gpt-5.6-sol", effort: "xhigh" });
   process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+  expect(() => resolveTier("anthropic", "frontier", "fable", "xhigh"))
+    .toThrow("model claude-fable-5 does not support reasoning xhigh");
 });
 
 function fakeProvider(id: ProviderId, query: AgentProvider["query"]): AgentProvider {
-  return { id, probe: () => ({ provider: id, available: true, reason: "ready" }), query };
+  return {
+    id,
+    liveInput: id === "anthropic" ? "streaming" : "unsupported",
+    probe: () => ({ provider: id, available: true, reason: "ready" }),
+    query,
+  };
 }
 
 async function eventsOf(query: AsyncIterable<any>): Promise<any[]> {
@@ -669,7 +687,7 @@ test("routed provider admission runs once while direct adapter defense remains a
     openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {} })),
   };
 
-  await eventsOf(routedQuery(
+  await eventsOf(routedQueryWithRegistry(
     decision,
     { prompt: "managed", options: {} as any },
     "standard",
@@ -709,15 +727,20 @@ async function assertReadonlyCrossProviderFallback(
     presenceRegistrar: false,
   }) as any;
 
-  // The precompiled envelope is safe for either provider. Codex ignores the
-  // Claude SDK allowlist and independently constrains its native exec surface.
+  // The precompiled envelope is safe for either provider. A provider seal is
+  // intentionally not cross-usable until applyHarnessRoute rebinds it.
   expect(baseOptions.allowedTools).toContain(READONLY_SHELL_TOOL);
   expect(baseOptions.allowedTools).not.toContain("Bash");
   expect(baseOptions.disallowedTools).toContain("Bash");
   expect(baseOptions.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
-  expect(codexHarnessArguments(baseOptions)).toEqual(expect.arrayContaining([
-    "--sandbox", "read-only",
-  ]));
+  if (initial === "openai") {
+    expect(codexHarnessArguments(baseOptions)).toEqual(expect.arrayContaining([
+      "--sandbox", "read-only",
+    ]));
+  } else {
+    expect(() => codexHarnessArguments(baseOptions))
+      .toThrow("openai_harness_authority_seal_missing");
+  }
 
   const admissions: Record<ProviderId, number> = { anthropic: 0, openai: 0 };
   const duplicateAdmissions: Record<ProviderId, number> = { anthropic: 0, openai: 0 };
@@ -726,8 +749,8 @@ async function assertReadonlyCrossProviderFallback(
     provider: ProviderId;
     model?: string;
     evidence?: HarnessCompositionEvidence;
+    authorityProvider?: ProviderId;
   }> = [];
-  const adapter = { anthropic: anthropicProvider, openai: openaiProvider };
   const provider = (id: ProviderId): AgentProvider => ({
     ...fakeProvider(id, ({ options }) => {
       if (!consumeExecutionAdmission(id, options)) duplicateAdmissions[id]++;
@@ -742,34 +765,38 @@ async function assertReadonlyCrossProviderFallback(
     }),
     admit: async (args) => {
       admissions[id]++;
-      await adapter[id].admit!(args);
+      const authority = compileProviderAuthoritySurface(id, args.options);
+      expect(authority.provider).toBe(id);
     },
   });
 
-  expect(await eventsOf(routedQuery(
+  expect(await eventsOf(routedQueryWithRegistry(
     decision,
     { prompt: "inspect without writing", options: baseOptions },
     "frontier",
     { anthropic: provider("anthropic"), openai: provider("openai") },
     undefined,
-    (route, evidence) => routeEvidence.push({
+    (route, evidence, authority) => routeEvidence.push({
       provider: route.provider,
       model: route.resolvedModel,
       evidence,
+      authorityProvider: authority?.provider,
     }),
   ))).toEqual([{ type: "result", result: "ok" }]);
 
   expect(attempts.map(({ provider }) => provider)).toEqual([initial, fallback]);
   expect(attempts[0].options.model).toBe(initialRoute.model);
   expect(attempts[1].options.model).toBe(fallbackRoute.model);
-  for (const { options } of attempts) {
+  for (const { provider: attemptProvider, options } of attempts) {
     expect(options.allowedTools).toContain(READONLY_SHELL_TOOL);
     expect(options.allowedTools).not.toContain("Bash");
     expect(options.disallowedTools).toContain("Bash");
     expect(options.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
-    expect(codexHarnessArguments(options)).toEqual(expect.arrayContaining([
-      "--sandbox", "read-only",
-    ]));
+    if (attemptProvider === "openai") {
+      expect(codexHarnessArguments(options)).toEqual(expect.arrayContaining([
+        "--sandbox", "read-only",
+      ]));
+    }
   }
   expect(admissions).toEqual({ [initial]: 1, [fallback]: 1 });
   expect(duplicateAdmissions).toEqual({ anthropic: 0, openai: 0 });
@@ -777,6 +804,8 @@ async function assertReadonlyCrossProviderFallback(
     { provider: initial, model: initialRoute.model },
     { provider: fallback, model: fallbackRoute.model },
   ]);
+  expect(routeEvidence.map(({ authorityProvider }) => authorityProvider))
+    .toEqual([initial, fallback]);
   expect(routeEvidence[0].evidence?.modelDelta).toMatchObject({
     provider: initial, model: initialRoute.model,
   });
@@ -861,21 +890,34 @@ test("Anthropic managed admission rejects every omitted authority boundary befor
     presenceRegistrar: false,
   }) as any;
   const changed = (mutate: (options: any) => void) => {
-    const options = makeBase();
+    const sealed = makeBase();
+    const options = {
+      ...sealed,
+      env: { ...sealed.env },
+      mcpServers: { ...sealed.mcpServers },
+      tools: [...sealed.tools],
+      allowedTools: [...sealed.allowedTools],
+      disallowedTools: [...sealed.disallowedTools],
+      settingSources: [...sealed.settingSources],
+      northCapabilities: [...sealed.northCapabilities],
+    };
     mutate(options);
     return options;
   };
   const withoutServer = (name: string) => {
     return changed((options) => { delete options.mcpServers[name]; });
   };
-  const writableWithoutGuards = harnessOptions({
+  const writableWithCanonicalGuards = harnessOptions({
     self: "anthropic-unrestricted-shell-without-guards",
     provider: "anthropic",
     model: "claude-opus-4-8",
     routingMetadata: applyGafferStaffing({ role: "integrator" }),
     presenceRegistrar: false,
   }) as any;
-  writableWithoutGuards.hooks.PreToolUse = [];
+  const writableWithoutGuards = {
+    ...writableWithCanonicalGuards,
+    hooks: { ...writableWithCanonicalGuards.hooks, PreToolUse: [] },
+  };
   const cases: Array<[any, string]> = [
     [
       withoutServer("north"),
@@ -960,17 +1002,17 @@ test("Anthropic managed admission rejects every omitted authority boundary befor
       "anthropic_authoring_guard_contract_missing",
     ],
   ];
-  for (const [options, message] of cases) {
+  for (const [options] of cases) {
     let caught: unknown;
     try { await anthropicProvider.admit!({ options }); }
     catch (error) { caught = error; }
     expect(caught).toBeInstanceOf(ProviderRetrySafeError);
-    expect((caught as Error).message).toBe(message);
+    expect((caught as Error).message).toBe("anthropic_harness_authority_seal_missing");
   }
   await expect(eventsOf(anthropicProvider.query({
     prompt: "must not reach Claude",
     options: cases[0][0],
-  }) as AsyncIterable<any>)).rejects.toThrow("anthropic_managed_north_mcp_contract_missing");
+  }) as AsyncIterable<any>)).rejects.toThrow("anthropic_harness_authority_seal_missing");
   const base = makeBase();
   await expect(anthropicProvider.admit!({ options: base })).resolves.toBeUndefined();
 
@@ -982,7 +1024,7 @@ test("Anthropic managed admission rejects every omitted authority boundary befor
     (toolName: string) => toolName !== "Agent",
   );
   await expect(eventsOf(admitted as AsyncIterable<any>))
-    .rejects.toThrow("anthropic_adapter_did_not_enforce_absent_native_agent_capability");
+    .rejects.toThrow("anthropic_harness_authority_seal_missing");
 });
 
 test("unsafe Anthropic init is redacted and never manufactures retry-safe fallback", async () => {
@@ -1003,7 +1045,7 @@ test("unsafe Anthropic init is redacted and never manufactures retry-safe fallba
   };
 
   try {
-    await eventsOf(routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry));
+    await eventsOf(routedQueryWithRegistry(decision, { prompt: "x", options: {} as any }, "standard", registry));
     throw new Error("expected unsafe init rejection");
   } catch (error) {
     expect(error).not.toBeInstanceOf(ProviderRetrySafeError);
@@ -1035,7 +1077,7 @@ test("concurrent auto routes accept CLI-owned subscription init with honest iden
     }),
   };
 
-  const results = await Promise.all(decisions.map((decision, index) => eventsOf(routedQuery(
+  const results = await Promise.all(decisions.map((decision, index) => eventsOf(routedQueryWithRegistry(
     decision,
     { prompt: `task-${index}`, options: { model: "sonnet", effort: "medium" } as any },
     "standard",
@@ -1087,7 +1129,7 @@ test("an explicitly retry-safe synthetic Anthropic failure re-resolves the tier 
     }})),
   };
 
-  expect(await eventsOf(routedQuery(decision, {
+  expect(await eventsOf(routedQueryWithRegistry(decision, {
     prompt, options: { model: "fable", effort: "xhigh", systemPrompt: "keep system" } as any,
   }, "frontier", registry, undefined,
   (route) => activated.push(`${route.provider}/${route.resolvedModel}/${route.resolvedEffort}`))))
@@ -1132,7 +1174,7 @@ test("provider-pinned retry-safe failure advances to a sibling target only", asy
     }})),
     openai: fakeProvider("openai", () => { throw new Error("cross-provider fallback must remain filtered"); }),
   };
-  expect(await eventsOf(routedQuery(decision, { prompt: "x", options: { model: "opus", effort: "high" } as any },
+  expect(await eventsOf(routedQueryWithRegistry(decision, { prompt: "x", options: { model: "opus", effort: "high" } as any },
     "senior", registry, undefined, (route) => routes.push(`${route.target}/${route.provider}`))))
     .toEqual([{ type: "result", result: "ok" }]);
   expect(routes).toEqual(["claude-personal/anthropic", "claude-work/anthropic"]);
@@ -1154,7 +1196,7 @@ test("multiple retry-safe fallbacks append redacted structured provenance", asyn
     }})),
   };
 
-  expect(await eventsOf(routedQuery(decision, { prompt: "x", options: {} as any },
+  expect(await eventsOf(routedQueryWithRegistry(decision, { prompt: "x", options: {} as any },
     "standard", registry))).toEqual([{ type: "result", result: "ok" }]);
   expect(decision.selectionReason).toBe(selected);
   expect(decision.fallbackTargetPath).toEqual(["claude-personal", "claude-work", "codex-personal"]);
@@ -1180,7 +1222,7 @@ test("retry-safe execution failure on an exact target pin still does not fall ba
     }})),
     openai: fakeProvider("openai", () => { throw new Error("must not be called"); }),
   };
-  await expect(eventsOf(routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry)))
+  await expect(eventsOf(routedQueryWithRegistry(decision, { prompt: "x", options: {} as any }, "standard", registry)))
     .rejects.toThrow("target unavailable");
   expect(calls).toBe(1);
   expect(decision.fallbackCount).toBe(0);
@@ -1201,7 +1243,7 @@ test("automatic fallback re-resolves the provider while preserving requested rea
     }})),
   };
 
-  await eventsOf(routedQuery(decision, {
+  await eventsOf(routedQueryWithRegistry(decision, {
     prompt: "x", options: { model: "gpt-5.6-sol", effort: "high", systemPrompt: "system" } as any,
   }, "senior", registry));
   expect(fallbackArgs.options.model).toBe("claude-opus-4-8");
@@ -1221,7 +1263,7 @@ test("routed query preserves both live controls and records only successful chan
     })),
     openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {} })),
   };
-  const query = routedQuery(decision, {
+  const query = routedQueryWithRegistry(decision, {
     prompt: "x", options: { model: "opus", effort: "high" } as any,
   }, "senior", registry);
 
@@ -1245,7 +1287,7 @@ test("routed query leaves a resolved dial unchanged when its live control fails"
     })),
     openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {} })),
   };
-  const query = routedQuery(decision, {
+  const query = routedQueryWithRegistry(decision, {
     prompt: "x", options: { model: "opus", effort: "high" } as any,
   }, "senior", registry);
 
@@ -1267,7 +1309,7 @@ test("routed query preserves an applied model when the following effort control 
     })),
     openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {} })),
   };
-  const query = routedQuery(decision, {
+  const query = routedQueryWithRegistry(decision, {
     prompt: "x", options: { model: "opus", effort: "high" } as any,
   }, "senior", registry);
 
@@ -1300,7 +1342,7 @@ test("fallback replays a streaming prompt consumed by the failed provider", asyn
     yield { type: "user", message: { content: "same payload" } };
   }};
 
-  await eventsOf(routedQuery(decision, { prompt, options: {} as any }, "standard", registry));
+  await eventsOf(routedQueryWithRegistry(decision, { prompt, options: {} as any }, "standard", registry));
   expect(received).toEqual({ anthropic: ["same payload"], openai: ["same payload"] });
 });
 
@@ -1317,7 +1359,7 @@ test("automatic routing never retries after the first emitted event", async () =
 
   const seen: any[] = [];
   await expect(async () => {
-    for await (const event of routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry)) seen.push(event);
+    for await (const event of routedQueryWithRegistry(decision, { prompt: "x", options: {} as any }, "standard", registry)) seen.push(event);
   }).toThrow("capacity exhausted");
   expect(seen).toHaveLength(1);
   expect(fallbackCalls).toBe(0);
@@ -1334,7 +1376,7 @@ test("automatic routing never infers retry safety from matching error prose", as
     }})),
     openai: fakeProvider("openai", () => { fallbackCalls++; return { async *[Symbol.asyncIterator]() {} }; }),
   };
-  await expect(eventsOf(routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry)))
+  await expect(eventsOf(routedQueryWithRegistry(decision, { prompt: "x", options: {} as any }, "standard", registry)))
     .rejects.toThrow("authentication required");
   expect(fallbackCalls).toBe(0);
   expect(decision.fallbackCount).toBe(0);
@@ -1351,7 +1393,7 @@ test("an explicit provider never receives a fallback route", async () => {
   };
 
   expect(decision.fallbackProviders).toEqual([]);
-  await expect(eventsOf(routedQuery(decision, { prompt: "x", options: {} as any }, "standard", registry)))
+  await expect(eventsOf(routedQueryWithRegistry(decision, { prompt: "x", options: {} as any }, "standard", registry)))
     .rejects.toThrow("rate limit reached");
   expect(fallbackCalls).toBe(0);
   expect(decision.fallbackCount).toBe(0);
@@ -1367,7 +1409,7 @@ test("fallback admission runs before the fallback provider has side effects", as
     }})),
     openai: fakeProvider("openai", () => { fallbackCalls++; return { async *[Symbol.asyncIterator]() {} }; }),
   };
-  await expect(eventsOf(routedQuery(
+  await expect(eventsOf(routedQueryWithRegistry(
     decision, { prompt: "x", options: {} as any }, "standard", registry,
     async () => { throw new Error("resource envelope month:2026-07 exhausted: retries 1/1"); },
   ))).rejects.toThrow("retries 1/1");

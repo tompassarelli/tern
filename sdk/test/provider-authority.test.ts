@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
+  applyHarnessRoute,
   canonicalGlobalAgents,
   COORDINATION_TOOLS,
   GLOBAL_AGENTS_MAX_BYTES,
+  hasCanonicalHarnessAuthority,
+  hasCanonicalAuthoringHooks,
   harnessOptions,
   NORTH_MCP_TOOL_NAMES,
   PROJECT_AGENTS_MAX_BYTES,
@@ -16,18 +19,23 @@ import {
 } from "../src/harness";
 import { providerEnvironmentForTarget } from "../src/accounts";
 import { applyGafferStaffing } from "../src/gaffer-staffing";
+import { admitRoutingRequest } from "../src/routing-admission";
 import {
   MANAGED_NORTH_MCP_ENV_KEYS, validateManagedExecutionEnvelope,
 } from "../src/execution-admission";
 import {
   assertCodexGlobalAgentsForEnvironment, codexHarnessArguments,
 } from "../src/providers/openai";
+import {
+  compileProviderAuthoritySurface,
+} from "../src/providers/authority";
 
 const north = join(import.meta.dir, "../..");
 const temporary: string[] = [];
 const envKeys = [
   "HOME", "AGENT_LAWS", "NORTH_PORT", "FRAM_LOG", "FRAM_TELEMETRY_LOG",
-  "FRAM_THREADS", "UNRELATED_SECRET_CANARY",
+  "FRAM_THREADS", "UNRELATED_SECRET_CANARY", "GAFFER_HOME", "NORTH_MANAGED_LANE",
+  "NORTH_CODEX_BIN", "NORTH_MANAGED_CODEX_BIN",
 ] as const;
 const inheritedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
 
@@ -99,6 +107,100 @@ test("North MCP tool inventory and managed provider exposure stay exact", () => 
   }) as any;
   expect(() => codexHarnessArguments(director))
     .toThrow("openai_adapter_orchestrator_authority_unavailable");
+});
+
+test("route application rejects request laundering and authoring hooks are an exact frozen surface", () => {
+  const requestLaundered = designer("anthropic", "anthropic-request-laundering") as any;
+  requestLaundered.northRoutingRequest = admitRoutingRequest(
+    applyGafferStaffing({ role: "judge" }),
+  );
+  expect(() => applyHarnessRoute(
+    requestLaundered, "anthropic", "claude-opus-4-6", "xhigh",
+  )).toThrow("harness authority source mutated before route application");
+
+  const hookLaundered = designer("anthropic", "anthropic-hook-laundering") as any;
+  expect(Object.isFrozen(hookLaundered.hooks)).toBe(true);
+  expect(Object.isFrozen(hookLaundered.hooks.PreToolUse)).toBe(true);
+  expect(() => { hookLaundered.hooks.Stop = []; }).toThrow();
+  hookLaundered.hooks = {
+    ...hookLaundered.hooks,
+    Stop: [{ hooks: [async () => ({ continue: true })] }],
+  };
+  expect(hasCanonicalAuthoringHooks(hookLaundered)).toBe(false);
+  expect(() => applyHarnessRoute(
+    hookLaundered, "anthropic", "claude-opus-4-6", "xhigh",
+  )).toThrow("harness composition root mutated before route application");
+});
+
+test("provider authority surfaces are deeply frozen at every array boundary", () => {
+  for (const provider of ["anthropic", "openai"] as const) {
+    const surface = compileProviderAuthoritySurface(
+      provider,
+      designer(provider, `${provider}-deep-freeze`),
+    ) as any;
+    expect(Object.isFrozen(surface)).toBe(true);
+    const arrays = [
+      surface.capabilities,
+      surface.northEnabledTools,
+      ...(provider === "anthropic" ? [surface.builtins, surface.managedTools] : []),
+    ] as string[][];
+    for (const values of arrays) {
+      const before = [...values];
+      expect(Object.isFrozen(values)).toBe(true);
+      expect(() => values.push("authority-mutation")).toThrow();
+      expect(values).toEqual(before);
+    }
+    expect(() => { surface.liveInput = "forged"; }).toThrow();
+  }
+});
+
+test("managed authority rejects every unowned SDK option on initial and fallback routes", () => {
+  const hostile: Record<string, unknown> = {
+    additionalDirectories: ["/home/tom/code/client"],
+    plugins: [{ type: "local", path: "/tmp/hostile" }],
+    extraArgs: { "dangerously-skip-permissions": "" },
+    settings: "/tmp/hostile-settings.json",
+    managedSettings: "/tmp/hostile-managed-settings.json",
+    canUseTool: async () => ({ behavior: "allow" }),
+    toolAliases: { Bash: "unrestricted" },
+    allowDangerouslySkipPermissions: true,
+  };
+  for (const [field, value] of Object.entries(hostile)) {
+    const initial = designer("anthropic", `anthropic-extra-${field}`) as any;
+    initial[field] = value;
+    expect(hasCanonicalHarnessAuthority(initial, "anthropic")).toBe(false);
+
+    const source = designer("anthropic", `fallback-extra-${field}`) as any;
+    const fallback = applyHarnessRoute(
+      source, "openai", "gpt-5.6-terra", "high",
+    ).options as any;
+    fallback[field] = value;
+    expect(hasCanonicalHarnessAuthority(fallback, "openai")).toBe(false);
+  }
+
+  const spend = designer("anthropic", "anthropic-max-turns-tamper") as any;
+  spend.maxTurns = 1_000_000_000;
+  expect(hasCanonicalHarnessAuthority(spend, "anthropic")).toBe(false);
+});
+
+test("managed-lane marker is explicit, sealed, and never inherited or sent to North MCP", () => {
+  process.env.NORTH_MANAGED_LANE = "ambient-forgery";
+  process.env.NORTH_CODEX_BIN = "/tmp/ambient-codex-forgery";
+  process.env.NORTH_MANAGED_CODEX_BIN =
+    "/nix/store/00000000000000000000000000000000-codex-test/bin/codex";
+  const options = designer("openai", "openai-managed-marker");
+  expect(options.env.NORTH_MANAGED_LANE).toBe("1");
+  expect(options.env).not.toHaveProperty("NORTH_CODEX_BIN");
+  expect(options.env.NORTH_MANAGED_CODEX_BIN)
+    .toBe("/nix/store/00000000000000000000000000000000-codex-test/bin/codex");
+  expect(options.mcpServers.north.env).not.toHaveProperty("NORTH_MANAGED_LANE");
+  expect(options.mcpServers.north.env).not.toHaveProperty("NORTH_MANAGED_CODEX_BIN");
+  expect(Object.isFrozen(options.env)).toBe(true);
+  expect(() => { options.env.NORTH_MANAGED_LANE = "0"; }).toThrow();
+  expect(hasCanonicalHarnessAuthority(options, "openai")).toBe(true);
+
+  const laundered = { ...options, env: { ...options.env, NORTH_MANAGED_LANE: "0" } };
+  expect(hasCanonicalHarnessAuthority(laundered, "openai")).toBe(false);
 });
 
 test("both providers receive the exact custom North and Fram instance selectors without ambient secrets", () => {
@@ -388,7 +490,6 @@ test("native Codex loads global AGENTS exactly once while managed project discov
 });
 
 test("project AGENTS composition is bounded, root-to-cwd, override-aware, and provider-neutral", () => {
-  const managedOpenAI = designer("openai", "openai-native-project-doc-suppression");
   const home = mkdtempSync(join(tmpdir(), "north-project-agents-"));
   temporary.push(home);
   const project = join(home, "project");
@@ -403,6 +504,7 @@ test("project AGENTS composition is bounded, root-to-cwd, override-aware, and pr
   writeFileSync(join(nested, "AGENTS.override.md"), "OVERRIDE_PROJECT_CANARY\n");
   process.env.HOME = home;
   process.env.AGENT_LAWS = "on";
+  process.env.GAFFER_HOME = join(north, "../gaffer");
 
   const appendix = projectAgentsAppendix(nested);
   expect(appendix.indexOf("ROOT_PROJECT_CANARY")).toBeLessThan(appendix.indexOf("SRC_PROJECT_CANARY"));
@@ -422,10 +524,14 @@ test("project AGENTS composition is bounded, root-to-cwd, override-aware, and pr
   }
   expect(anthropic.systemPrompt).toContain("GLOBAL_AUTHORITY_CANARY");
   expect(openai.systemPrompt).not.toContain("GLOBAL_AUTHORITY_CANARY");
-  expect(codexHarnessArguments({
-    ...managedOpenAI,
+  const managedOpenAI = harnessOptions({
+    self: "openai-native-project-doc-suppression",
+    provider: "openai",
     cwd: nested,
-  })).toContain("project_doc_max_bytes=0");
+    presenceRegistrar: false,
+    routingMetadata: applyGafferStaffing({ role: "designer" }),
+  }) as any;
+  expect(codexHarnessArguments(managedOpenAI)).toContain("project_doc_max_bytes=0");
 
   writeFileSync(join(project, "AGENTS.md"), "x".repeat(PROJECT_AGENTS_MAX_BYTES));
   expect(() => projectAgentsAppendix(nested)).toThrow(

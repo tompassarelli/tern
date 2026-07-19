@@ -15,7 +15,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { codexConfigArguments, providerEnvironmentForTarget } from "../src/accounts";
+import {
+  bootstrapAccountConfig, codexConfigArguments, providerEnvironmentForTarget,
+} from "../src/accounts";
 
 const root = join(import.meta.dir, "..");
 const cli = join(root, "src/account-cli.ts");
@@ -123,6 +125,38 @@ test("add preserves routing fields, isolates roots, and links only allowlisted c
     join(claudeRoot, ".credentials.json"), join(claudeRoot, "sessions"),
     join(codexRoot, "auth.json"), join(codexRoot, "log"), join(codexRoot, "state.sqlite"),
   ]) expect(() => lstatSync(forbidden)).toThrow();
+});
+
+test("OpenAI bootstrap idempotently retires only North's legacy ambient hooks link", () => {
+  const { home } = fixture();
+  const ambientHooks = join(home, ".codex/hooks.json");
+  writeFileSync(ambientHooks, "{}\n");
+  const account = {
+    id: "codex-migrate",
+    provider: "openai" as const,
+    profile: "codex-migrate",
+    authMode: "isolated" as const,
+    root: join(home, ".local/state/north/accounts/openai/codex-migrate"),
+  };
+  bootstrapAccountConfig(account, { home });
+  writeFileSync(join(account.root, "auth.json"), "keep auth\n");
+  symlinkSync(ambientHooks, join(account.root, "hooks.json"));
+  const agentsLink = readlinkSync(join(account.root, "AGENTS.md"));
+  const configLink = readlinkSync(join(account.root, "config.toml"));
+
+  bootstrapAccountConfig(account, { home });
+  bootstrapAccountConfig(account, { home });
+
+  expect(() => lstatSync(join(account.root, "hooks.json"))).toThrow();
+  expect(readlinkSync(join(account.root, "AGENTS.md"))).toBe(agentsLink);
+  expect(readlinkSync(join(account.root, "config.toml"))).toBe(configLink);
+  expect(readFileSync(join(account.root, "auth.json"), "utf8")).toBe("keep auth\n");
+
+  const customHooks = join(home, "custom-hooks.json");
+  writeFileSync(customHooks, "{}\n");
+  symlinkSync(customHooks, join(account.root, "hooks.json"));
+  bootstrapAccountConfig(account, { home });
+  expect(readlinkSync(join(account.root, "hooks.json"))).toBe(customHooks);
 });
 
 test("the first account creates a balanced routing policy", () => {

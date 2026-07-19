@@ -94,13 +94,12 @@ describe("Gaffer routing metadata boundary", () => {
       ...request,
       composition: { ...request.composition, contract: { ...request.composition.contract, capabilities: [] } },
     } as any)).toThrow("capabilities must be a non-empty array");
-    const deduplicated = validateRoutingMetadata({
+    expect(() => validateRoutingMetadata({
       ...request,
       composition: { ...request.composition, contract: {
         ...request.composition.contract, capabilities: ["filesystem.read", "filesystem.read"],
       } },
-    } as any);
-    expect((deduplicated.composition as any).contract.capabilities).toEqual(["filesystem.read"]);
+    } as any)).toThrow("capabilities must not contain duplicates");
     expect(() => validateRoutingMetadata({
       ...request,
       composition: { ...request.composition, contract: {

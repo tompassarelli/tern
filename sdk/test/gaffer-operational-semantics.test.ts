@@ -3,13 +3,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  applyHarnessRoute, effectiveCapabilitySurface, formatEffectiveCapabilitySurface,
-  gafferAppendix, harnessCompositionEvidence, harnessOptions,
+  applyHarnessRoute, gafferAppendix, harnessCompositionEvidence, harnessOptions,
 } from "../src/harness";
 import { applyGafferStaffing } from "../src/gaffer-staffing";
 import type { RoutingMetadata } from "../src/routing-metadata";
 import { runFacts } from "../src/telemetry";
 import { codexGlobalArguments, codexHarnessArguments } from "../src/providers/openai";
+import {
+  compileProviderAuthoritySurface, formatProviderAuthoritySurface,
+} from "../src/providers";
+import { resolveTier } from "../src/providers/catalog";
 import { READONLY_SHELL_SERVER, READONLY_SHELL_TOOL } from "../src/readonly-shell";
 
 const north = resolve(import.meta.dir, "../..");
@@ -62,7 +65,8 @@ test("preset roles receive the exact canonical role contract and fail closed whe
   const empty = mkdtempSync(join(tmpdir(), "north-gaffer-missing-"));
   try {
     process.env.GAFFER_HOME = empty;
-    expect(() => gafferAppendix(preset("integrator"), north)).toThrow("Gaffer contract unavailable: role:integrator");
+    expect(() => gafferAppendix(preset("integrator"), north))
+      .toThrow("/providers/anthropic.json");
   } finally { rmSync(empty, { recursive: true, force: true }); }
 });
 
@@ -151,15 +155,18 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   ]));
   expect(designer.permissionMode).toBe("default");
   expect(designer.sandbox).toBeUndefined();
-  const loggedSurface = formatEffectiveCapabilitySurface(
-    effectiveCapabilitySurface(designer),
+  const loggedSurface = formatProviderAuthoritySurface(
+    compileProviderAuthoritySurface("anthropic", designer),
   );
   expect(loggedSurface).toBe(
-    "capabilities: filesystem.read, filesystem.search, shell.readonly; "
-    + "builtins: Read, Grep, Glob; managed: "
-    + "mcp__north-readonly-shell__run, mcp__north__capture, mcp__north__tell, "
-    + "mcp__north__evidence_record, mcp__north__show, mcp__north__ready, "
-    + "mcp__north__next, mcp__north__board, mcp__north__plate",
+    "provider=anthropic; capabilities=filesystem.read,filesystem.search,shell.readonly; "
+    + "native-multi-agent=disabled; "
+    + "authoring-hooks=harness-exact; "
+    + "north enabled_tools=capture,tell,evidence_record,show,ready,next,board,plate; "
+    + "web=disabled; sdk builtins=Read,Grep,Glob; "
+    + "mcp tools=mcp__north-readonly-shell__run,mcp__north__capture,mcp__north__tell,"
+    + "mcp__north__evidence_record,mcp__north__show,mcp__north__ready,mcp__north__next,"
+    + "mcp__north__board,mcp__north__plate",
   );
   expect(loggedSurface).not.toMatch(/\b(Edit|Write|Bash)\b/);
 
@@ -195,6 +202,30 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   ]));
 });
 
+test("managed capacity resolves from the complete request before the provider seal", () => {
+  process.env.AGENT_LAWS = "off";
+  const request = preset("designer");
+  for (const provider of ["openai", "anthropic"] as const) {
+    const resolved = resolveTier(provider, request.tier, undefined, request.reasoning);
+    const options = harnessOptions({
+      self: `${provider}-request-capacity`,
+      provider,
+      presenceRegistrar: false,
+      routingMetadata: request,
+    }) as any;
+    expect(options.model).toBe(resolved.model);
+    expect(options.effort).toBe(resolved.effort);
+    expect(compileProviderAuthoritySurface(provider, options).provider).toBe(provider);
+  }
+  expect(() => harnessOptions({
+    self: "mismatched-effort",
+    provider: "anthropic",
+    effort: "high",
+    presenceRegistrar: false,
+    routingMetadata: request,
+  })).toThrow("effort compatibility alias must equal routingMetadata.reasoning");
+});
+
 test("posture remains effective even when the retired praxis toggle is off", () => {
   process.env.AGENT_PRAXIS = "off";
   const composed = gafferAppendix({ posture: "preserve" }, north);
@@ -221,7 +252,7 @@ test("model calibration uses exact catalog keys and never applies stale alias de
     self: "delta-substring", provider: "anthropic", model: "custom-opus-lookalike",
     presenceRegistrar: false,
     routingMetadata: preset("integrator"),
-  })).toThrow("has no exact modelDeltas entry");
+  })).toThrow("provider anthropic does not declare model custom-opus-lookalike");
 
   const fable = harnessOptions({
     self: "delta-fable", provider: "anthropic", model: "fable",

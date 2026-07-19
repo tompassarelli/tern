@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { presetRequest } from "./routing-fixtures";
 
 const temporary: string[] = [];
 afterEach(() => {
@@ -25,7 +26,7 @@ exit 0
 `);
   chmodSync(fakeBun, 0o755);
   writeFileSync(fakeNorth, `#!/usr/bin/env bash
-printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":"integrator"},{"predicate":"goal","value":"contract probe"},{"predicate":"provider","value":"anthropic"},{"predicate":"provider_target","value":"claude-personal-tompas0x-gmail"},{"predicate":"model","value":"claude-opus-4-8"},{"predicate":"effort","value":"xhigh"},{"predicate":"composition_kind","value":"preset"},{"predicate":"composition_id","value":"integrator"},{"predicate":"composition_overrides","value":"[]"},{"predicate":"repo","value":"north"},{"predicate":"spawned_at","value":"2026-07-17T00:00:00Z"},{"predicate":"display_handle","value":"anthropic-claude-gmail-opus-xhigh-integrator-probe"},{"predicate":"display_name","value":"anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:integrator · contract probe"},{"predicate":"identity_manifest_sha256","value":"6accbefdabbad748a1bc37ba82db7171ed923930d498bcb8cfe47174f60cdb33"},{"predicate":"outcome","value":"ran"}]'
+printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":"integrator"},{"predicate":"goal","value":"contract probe"},{"predicate":"provider","value":"anthropic"},{"predicate":"provider_target","value":"claude-personal-tompas0x-gmail"},{"predicate":"live_input","value":"streaming"},{"predicate":"live_input_state","value":"frozen"},{"predicate":"live_input_epoch","value":"00000000-0000-4000-8000-000000000041"},{"predicate":"model","value":"claude-opus-4-8"},{"predicate":"effort","value":"xhigh"},{"predicate":"composition_kind","value":"preset"},{"predicate":"composition_id","value":"integrator"},{"predicate":"composition_overrides","value":"[]"},{"predicate":"repo","value":"north"},{"predicate":"spawned_at","value":"2026-07-17T00:00:00Z"},{"predicate":"display_handle","value":"anthropic-claude-gmail-opus-xhigh-integrator-probe"},{"predicate":"display_name","value":"anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:integrator · contract probe"},{"predicate":"identity_manifest_sha256","value":"c4d461959f641a1917174187051aded161dec0ebfd2eb11641e002f741ed39b8"},{"predicate":"outcome","value":"ran"}]'
 `);
   chmodSync(fakeNorth, 0o755);
 
@@ -47,8 +48,8 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
     NORTH_MCP_CAPTURE: capture,
     NORTH_SPAWN_STARTUP_TIMEOUT_MS: "1000",
     NO_COLOR: "1",
-    // Every ambient routing/proof axis below must be absent from the child;
-    // only request-owned AGENT_ROLE may be rebuilt.
+    // Every ambient routing/proof axis below must be absent from the child.
+    // The complete request-owned Gaffer contract is rebuilt below.
     AGENT_MODEL: "ambient-model",
     AGENT_PROVIDER: "openai",
     AGENT_TARGET: "ambient-account",
@@ -67,12 +68,12 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
   configure(home, env);
 
   const north = resolve(import.meta.dir, "../..");
+  const route = presetRequest("integrator");
   const request = `${JSON.stringify({
     jsonrpc: "2.0", id: 1, method: "tools/call",
     params: { name: "spawn", arguments: {
       prompt: "contract probe",
-      role: "integrator",
-      composition: { kind: "preset", id: "integrator", overrides: [] },
+      ...route,
     } },
   })}\n`;
   const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
@@ -92,14 +93,19 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
         return [line.slice(0, split), line.slice(split + 1)];
       }),
   );
-  expect(childEnv.AGENT_ROLE).toBe("integrator");
-  expect(childEnv.AGENT_COMPOSITION).toBe(
-    "{\"kind\":\"preset\",\"id\":\"integrator\",\"overrides\":[]}",
-  );
+  expect(childEnv).toMatchObject({
+    AGENT_ROLE: route.role,
+    AGENT_TASK_GRADE: route.taskGrade,
+    AGENT_DOMAIN_REQUIREMENTS: JSON.stringify(route.domainRequirements),
+    AGENT_TOPOLOGY: route.topology,
+    AGENT_TIER: route.tier,
+    AGENT_REASONING: route.reasoning,
+    AGENT_EFFORT: route.reasoning,
+    AGENT_POSTURE: route.posture,
+    AGENT_COMPOSITION: JSON.stringify(route.composition),
+  });
   for (const residue of [
-    "AGENT_MODEL", "AGENT_PROVIDER", "AGENT_TARGET", "AGENT_TIER",
-    "AGENT_REASONING", "AGENT_EFFORT", "AGENT_POSTURE",
-    "AGENT_TASK_GRADE", "AGENT_DOMAIN_REQUIREMENTS", "AGENT_TOPOLOGY",
+    "AGENT_MODEL", "AGENT_PROVIDER", "AGENT_TARGET",
     "NORTH_RUN_ID", "NORTH_THREAD_ID", "NORTH_RUN_CAPABILITY",
   ]) expect(childEnv).not.toHaveProperty(residue);
   return { home, childEnv };
@@ -155,7 +161,7 @@ case "$*" in
   *mcp-route-preflight.ts*) exit 0 ;;
 esac
 printf 'spawn:%s\n' "$AGENT_ID" >> "$NORTH_MCP_EVENTS"
-printf '%s|%s|%s|%s|%s\n' "$AGENT_TARGET" "$AGENT_PROVIDER" "$AGENT_ID" "$NORTH_DISPATCH_DRIVER_PRECLAIMED" "$*" > "$NORTH_MCP_CAPTURE"
+printf '%s|%s|%s|%s|%s|%s\n' "$AGENT_TARGET" "$AGENT_PROVIDER" "$AGENT_ID" "$NORTH_DISPATCH_DRIVER_PRECLAIMED" "$FRAM_LOG" "$*" > "$NORTH_MCP_CAPTURE"
 "$NORTH_MCP_BB" ignored 7977 release "@\${@: -1}" "$AGENT_ID"
 `);
   chmodSync(fakeBun, 0o755);
@@ -169,17 +175,17 @@ for _ in $(seq 1 200); do
   grep -q '^driver:release:' "$NORTH_MCP_EVENTS" 2>/dev/null && break
   sleep 0.01
 done
-printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":"integrator"},{"predicate":"goal","value":"contract probe"},{"predicate":"provider","value":"anthropic"},{"predicate":"provider_target","value":"claude-personal-tompas0x-gmail"},{"predicate":"model","value":"claude-opus-4-8"},{"predicate":"effort","value":"xhigh"},{"predicate":"composition_kind","value":"preset"},{"predicate":"composition_id","value":"integrator"},{"predicate":"composition_overrides","value":"[]"},{"predicate":"repo","value":"north"},{"predicate":"spawned_at","value":"2026-07-17T00:00:00Z"},{"predicate":"display_handle","value":"anthropic-claude-gmail-opus-xhigh-integrator-probe"},{"predicate":"display_name","value":"anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:integrator · contract probe"},{"predicate":"identity_manifest_sha256","value":"6accbefdabbad748a1bc37ba82db7171ed923930d498bcb8cfe47174f60cdb33"},{"predicate":"outcome","value":"ran"}]'
+printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":"integrator"},{"predicate":"goal","value":"contract probe"},{"predicate":"provider","value":"anthropic"},{"predicate":"provider_target","value":"claude-personal-tompas0x-gmail"},{"predicate":"live_input","value":"streaming"},{"predicate":"live_input_state","value":"frozen"},{"predicate":"live_input_epoch","value":"00000000-0000-4000-8000-000000000041"},{"predicate":"model","value":"claude-opus-4-8"},{"predicate":"effort","value":"xhigh"},{"predicate":"composition_kind","value":"preset"},{"predicate":"composition_id","value":"integrator"},{"predicate":"composition_overrides","value":"[]"},{"predicate":"repo","value":"north"},{"predicate":"spawned_at","value":"2026-07-17T00:00:00Z"},{"predicate":"display_handle","value":"anthropic-claude-gmail-opus-xhigh-integrator-probe"},{"predicate":"display_name","value":"anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:integrator · contract probe"},{"predicate":"identity_manifest_sha256","value":"c4d461959f641a1917174187051aded161dec0ebfd2eb11641e002f741ed39b8"},{"predicate":"outcome","value":"ran"}]'
 `);
   chmodSync(fakeNorth, 0o755);
 
   const north = resolve(import.meta.dir, "../..");
+  const exactFramLog = join(directory, "exact-coordination.log");
   const request = `${JSON.stringify({
     jsonrpc: "2.0", id: 1, method: "tools/call",
     params: { name: "dispatch", arguments: {
       id: "@019f6c5e-61d0-7880-98a0-f8999eac7b03",
-      role: "integrator",
-      composition: { kind: "preset", id: "integrator", overrides: [] },
+      ...presetRequest("integrator"),
       provider: "anthropic",
       target: "claude-personal-tompas0x-gmail",
     } },
@@ -194,6 +200,7 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
       NORTH_MCP_CAPTURE: capture,
       NORTH_MCP_EVENTS: events,
       NORTH_BIN: fakeNorth,
+      FRAM_LOG: exactFramLog,
     },
   });
   expect(result.status).toBe(0);
@@ -204,10 +211,12 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
   expect(response.result.content[0].text).toContain("target=claude-personal-tompas0x-gmail");
   expect(response.result.content[0].text).toContain("thread @019f6c5e-61d0-7880-98a0-f8999eac7b03");
   expect(response.result.content[0].text).not.toContain("@@019f6c5e-61d0-7880-98a0-f8999eac7b03");
-  const [target, provider, agentId, preclaimed, command] = readFileSync(capture, "utf8").trim().split("|");
+  const [target, provider, agentId, preclaimed, observedFramLog, command] =
+    readFileSync(capture, "utf8").trim().split("|");
   expect(target).toBe("claude-personal-tompas0x-gmail");
   expect(provider).toBe("anthropic");
   expect(preclaimed).toBe("1");
+  expect(observedFramLog).toBe(exactFramLog);
   expect(command).toContain("/dispatch.ts");
   expect(command).toContain("/dispatch.ts 019f6c5e-61d0-7880-98a0-f8999eac7b03");
   expect(command).not.toContain("@@019f6c5e-61d0-7880-98a0-f8999eac7b03");
@@ -232,7 +241,10 @@ test("MCP spawn reports pre-identity construction failure instead of fabricating
   const north = resolve(import.meta.dir, "../..");
   const request = `${JSON.stringify({
     jsonrpc: "2.0", id: 1, method: "tools/call",
-    params: { name: "spawn", arguments: { prompt: "construction failure probe", role: "verifier" } },
+    params: {
+      name: "spawn",
+      arguments: { prompt: "construction failure probe", ...presetRequest("verifier") },
+    },
   })}\n`;
   const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
     input: request,
@@ -277,8 +289,7 @@ exit 3
     input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
       params: { name: "dispatch", arguments: {
         id: thread,
-        role: "verifier",
-        composition: { kind: "preset", id: "verifier", overrides: [] },
+        ...presetRequest("verifier"),
       } } })}\n`,
     encoding: "utf8",
     env: { ...process.env, NORTH_MCP_BUN: fakeBun, NORTH_MCP_BB: fakeBb, NORTH_MCP_MARKER: marker },
@@ -309,11 +320,11 @@ test("raw MCP rejects non-contract Gaffer fields and verifier-as-topology before
     }, "dispatch id must be a safe North thread id (bare or single @ prefix)"],
     ["spawn", {}, "spawn prompt must be a non-empty string"],
     ["spawn", { prompt: "" }, "spawn prompt must be a non-empty string"],
-    ["spawn", { prompt: "probe" }, "managed spawn requires role selecting a canonical Gaffer preset or a complete bespoke composition"],
-    ["dispatch", { id: "019f6c5e-61d0-7880-98a0-f8999eac7b03" }, "managed dispatch requires role selecting a canonical Gaffer preset or a complete bespoke composition"],
-    ["spawn", { prompt: "probe", role: "verifier", model: 42 }, "model must be a non-empty string"],
-    ["spawn", { prompt: "probe", role: "verifier", coordinator: { raw: "value" } }, "coordinator must be a non-empty string"],
-    ["spawn", { prompt: "probe", role: "verifier", caveman: "extreme" }, "invalid caveman mode"],
+    ["spawn", { prompt: "probe" }, "managed spawn requires the complete eight-field Gaffer request; missing: role, taskGrade, domainRequirements, topology, tier, reasoning, posture, composition"],
+    ["dispatch", { id: "019f6c5e-61d0-7880-98a0-f8999eac7b03" }, "managed dispatch requires the complete eight-field Gaffer request; missing: role, taskGrade, domainRequirements, topology, tier, reasoning, posture, composition"],
+    ["spawn", { prompt: "probe", ...presetRequest("verifier"), model: 42 }, "model must be a non-empty string"],
+    ["spawn", { prompt: "probe", ...presetRequest("verifier"), coordinator: { raw: "value" } }, "coordinator must be a non-empty string"],
+    ["spawn", { prompt: "probe", ...presetRequest("verifier"), caveman: "extreme" }, "invalid caveman mode"],
   ] as const) {
     const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
       input: `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "tools/call",
@@ -346,7 +357,10 @@ test("raw MCP rejects non-contract Gaffer fields and verifier-as-topology before
 
   const topologyRequest = `${JSON.stringify({
     jsonrpc: "2.0", id: 2, method: "tools/call",
-    params: { name: "spawn", arguments: { prompt: "contract probe", role: "verifier", topology: "verifier" } },
+    params: {
+      name: "spawn",
+      arguments: { prompt: "contract probe", ...presetRequest("verifier"), topology: "verifier" },
+    },
   })}\n`;
   const topologyResult = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
     input: topologyRequest, encoding: "utf8", env: { ...process.env, NORTH_MCP_BUN: "/bin/false" },
@@ -356,11 +370,21 @@ test("raw MCP rejects non-contract Gaffer fields and verifier-as-topology before
   expect(topologyResponse.result.content[0].text).toBe("invalid topology");
 
   for (const [arguments_, expected] of [
-    [{ prompt: "probe", role: "special" }, "unknown role special requires complete bespoke composition"],
-    [{ prompt: "probe", role: "integrator", composition: { kind: "preset", id: "scout", overrides: [] } },
+    [{
+      prompt: "probe",
+      ...presetRequest("verifier"),
+      role: "special",
+      composition: { kind: "preset", id: "special", overrides: [] },
+    }, "unknown role special requires a bespoke composition"],
+    [{ prompt: "probe", ...presetRequest("integrator"),
+      composition: { kind: "preset", id: "scout", overrides: [] } },
       "known role integrator requires preset composition id integrator"],
-    [{ prompt: "probe", role: "researcher" }, "role researcher is retired because it was ambiguous"],
-    [{ prompt: "probe", role: "orchestrator" }, "orchestrator is a topology, not a role"],
+    [{ prompt: "probe", ...presetRequest("scout"), role: "researcher",
+      composition: { kind: "preset", id: "researcher", overrides: [] } },
+      "role researcher is retired because it was ambiguous"],
+    [{ prompt: "probe", ...presetRequest("director"), role: "orchestrator",
+      composition: { kind: "preset", id: "orchestrator", overrides: [] } },
+      "orchestrator is a topology, not a role"],
   ] as const) {
     const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
       input: `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call",
@@ -385,9 +409,9 @@ test("managed MCP launch depth stops at orchestrator to worker for every composi
     report: "integrated verdict",
   };
   const shapes = [
-    { role: "director" },
+    presetRequest("director"),
     {
-      role: "director",
+      ...presetRequest("director"),
       tier: "senior",
       composition: {
         kind: "preset", id: "director", overrides: ["tier"],

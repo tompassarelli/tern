@@ -1,12 +1,18 @@
 // Unit tests for the SDK worker authoring-guard bridge (authoring-guards.ts).
 // Hermetic: no real guard scripts, no coordinator — synthetic fixture scripts written
 // to a temp dir cover each rung of the guard-result protocol (deny-JSON, exit-2+stderr,
-// exit-0 allow, timeout allow, missing-script allow) plus the first-deny-wins chain.
+// exit-0 allow, timeout/missing unavailable, positive clock attestations, and
+// the first-deny-wins chain.
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import {
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runGuardScript, evaluateGuards } from "../src/authoring-guards";
+import {
+  runGuardScript, evaluateGuards, resolveManagedGuardChain,
+} from "../src/authoring-guards";
 
 let dir: string;
 const script = (name: string, body: string): string => {
@@ -45,6 +51,36 @@ const ECHO_STDIN = `#!/usr/bin/env bash
 cat > "$STDIN_CAP"   # capture what the harness fed on stdin
 exit 0
 `;
+const CLOCK_ATTEST = (verdict: "allow" | "not-applicable") => `#!/usr/bin/env bash
+cat >/dev/null
+[ "\${NORTH_CLOCK_GUARD_ATTEST:-}" = 1 ] || exit 0
+printf '%s' '{"northClockGuard":"${verdict}"}'
+`;
+const CLOCK_UNKNOWN = `#!/usr/bin/env bash
+cat >/dev/null
+printf '%s' '{"northClockGuard":"maybe"}'
+`;
+const CLOCK_EXTRA = `#!/usr/bin/env bash
+cat >/dev/null
+printf '%s' '{"northClockGuard":"allow","extra":true}'
+`;
+const CLOCK_DUPLICATE = `#!/usr/bin/env bash
+cat >/dev/null
+printf '%s' '{"northClockGuard":"not-applicable","northClockGuard":"allow"}'
+`;
+const OVERSIZED_OUTPUT = `#!/usr/bin/env bash
+cat >/dev/null
+head -c 70000 /dev/zero
+`;
+const FORKED_HELD_PIPE = `#!/usr/bin/env bash
+cat >/dev/null
+(
+  trap '' TERM
+  while :; do sleep 1; done
+) &
+printf '%s' "$!" > "$DESCENDANT_PID_FILE"
+sleep 5
+`;
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "guard-test-"));
@@ -78,15 +114,85 @@ describe("runGuardScript — result protocol", () => {
     expect(d.decision).toBe("allow");
   });
 
-  test("script that sleeps past the timeout -> allow (fail-open)", async () => {
+  test("script that sleeps past the timeout -> unavailable", async () => {
     const d = await runGuardScript(script("slow.sh", SLEEP_PAST), HOOK, 200);
-    expect(d.decision).toBe("allow");
+    expect(d.decision).toBe("unavailable");
   });
 
-  test("missing script -> allow (fail-open)", async () => {
+  test("missing script -> unavailable", async () => {
     const d = await runGuardScript(join(dir, "does-not-exist.sh"), HOOK);
-    expect(d.decision).toBe("allow");
+    expect(d.decision).toBe("unavailable");
   });
+
+  test("clock child alone receives attestation mode and preserves both positive verdicts", async () => {
+    for (const verdict of ["allow", "not-applicable"] as const) {
+      const d = await runGuardScript(
+        script("north-clock-guard.sh", CLOCK_ATTEST(verdict)),
+        HOOK,
+      );
+      expect(d).toEqual({ decision: "allow", northClockGuard: verdict });
+    }
+  });
+
+  test("clock attestation is an exact one-key, duplicate-free JSON object", async () => {
+    for (const [name, body] of [
+      ["extra", CLOCK_EXTRA],
+      ["duplicate", CLOCK_DUPLICATE],
+      ["unknown", CLOCK_UNKNOWN],
+    ] as const) {
+      mkdirSync(join(dir, `exact-${name}`));
+      const decision = await runGuardScript(
+        script(`exact-${name}/north-clock-guard.sh`, body),
+        HOOK,
+      );
+      expect(decision.decision).toBe("unavailable");
+    }
+  });
+
+  test("guard output is bounded and fails unavailable", async () => {
+    const decision = await runGuardScript(
+      script("oversized.sh", OVERSIZED_OUTPUT),
+      HOOK,
+      1_000,
+    );
+    expect(decision).toEqual({
+      decision: "unavailable",
+      reason: "guard process output exceeded bounded size",
+    });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "timeout terminates a forked descendant that holds inherited pipes",
+    async () => {
+      const pidFile = join(dir, "held-pipe-descendant.pid");
+      const decisionPromise = runGuardScript(
+        script("held-pipe.sh", FORKED_HELD_PIPE),
+        HOOK,
+        100,
+        { ...process.env, DESCENDANT_PID_FILE: pidFile },
+      );
+      const deadline = Date.now() + 1_000;
+      while (!existsSync(pidFile) && Date.now() < deadline) await Bun.sleep(10);
+      expect(existsSync(pidFile)).toBe(true);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
+      expect(await decisionPromise).toEqual({
+        decision: "unavailable",
+        reason: "guard process timed out",
+      });
+      let alive = true;
+      const goneBy = Date.now() + 1_000;
+      while (alive && Date.now() < goneBy) {
+        try {
+          process.kill(pid, 0);
+          await Bun.sleep(10);
+        } catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
+    },
+  );
 
   test("hook input is delivered on stdin as JSON the guards can parse", async () => {
     const cap = join(dir, "stdin.json");
@@ -118,5 +224,51 @@ describe("evaluateGuards — chain, first deny wins", () => {
 
   test("empty chain -> allow", async () => {
     expect((await evaluateGuards([], HOOK)).decision).toBe("allow");
+  });
+
+  test("the required clock guard accepts only an exact positive classification", async () => {
+    for (const verdict of ["allow", "not-applicable"] as const) {
+      const clock = script("north-clock-guard.sh", CLOCK_ATTEST(verdict));
+      expect(await evaluateGuards(
+        [clock], HOOK, 500, undefined, new Set([clock]),
+      )).toEqual({ decision: "allow" });
+    }
+    for (const [name, body] of [
+      ["empty", ALLOW_EXIT0],
+      ["unknown", CLOCK_UNKNOWN],
+      ["extra", CLOCK_EXTRA],
+      ["duplicate", CLOCK_DUPLICATE],
+      ["timeout", SLEEP_PAST],
+    ] as const) {
+      const clock = script("north-clock-guard.sh", body);
+      expect(await evaluateGuards(
+        [clock], HOOK, 100, undefined, new Set([clock]),
+      )).toEqual({ decision: "deny", reason: "billable_clock_guard_unavailable" });
+    }
+    const missing = join(dir, "missing", "north-clock-guard.sh");
+    expect(await evaluateGuards(
+      [missing], HOOK, 100, undefined, new Set([missing]),
+    )).toEqual({ decision: "deny", reason: "billable_clock_guard_unavailable" });
+
+    const nonExecutableDir = join(dir, "nonexec");
+    mkdirSync(nonExecutableDir);
+    const nonExecutable = join(nonExecutableDir, "north-clock-guard.sh");
+    writeFileSync(nonExecutable, CLOCK_ATTEST("allow"));
+    chmodSync(nonExecutable, 0o600);
+    expect(await evaluateGuards(
+      [nonExecutable], HOOK, 100, undefined, new Set([nonExecutable]),
+    )).toEqual({ decision: "deny", reason: "billable_clock_guard_unavailable" });
+  });
+
+  test("import-time chain construction never filters a missing clock guard", async () => {
+    const missingDir = join(dir, "absent-at-import");
+    const chain = resolveManagedGuardChain([
+      "optional.sh", "north-clock-guard.sh",
+    ], missingDir);
+    const clock = join(missingDir, "north-clock-guard.sh");
+    expect(chain).toEqual([clock]);
+    expect(await evaluateGuards(
+      chain, HOOK, 100, undefined, new Set([clock]),
+    )).toEqual({ decision: "deny", reason: "billable_clock_guard_unavailable" });
   });
 });

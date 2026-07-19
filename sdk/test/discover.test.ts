@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { discover, type DiscoverDependencies } from "../src/discover";
 import { ProviderSelectionError } from "../src/provider-routing";
 import { DispatchAlreadyActiveError } from "../src/dispatch-driver";
+import { presetRequest } from "./routing-fixtures";
 
 function dependencies(dispatch: DiscoverDependencies["dispatch"]) {
   const observations = { dispatches: 0, sleeps: [] as number[] };
@@ -23,14 +24,18 @@ test("subscription exhaustion backs off and terminates instead of hot-looping", 
       "no agent provider available: anthropic=ready/exhausted, openai=ready/exhausted");
   });
 
-  expect(await discover("test-discover", { role: "implementer", maxEmptyRounds: 3 }, value)).toEqual([]);
+  expect(await discover("test-discover", {
+    routingRequest: presetRequest("implementer"), maxEmptyRounds: 3,
+  }, value)).toEqual([]);
   expect(observations).toEqual({ dispatches: 3, sleeps: [2_000, 4_000, 8_000] });
 });
 
 test("repeated generic dispatch failures also consume maxEmptyRounds", async () => {
   const { value, observations } = dependencies(async () => { throw new Error("broken thread"); });
 
-  expect(await discover("test-discover", { role: "implementer", maxEmptyRounds: 2 }, value)).toEqual([]);
+  expect(await discover("test-discover", {
+    routingRequest: presetRequest("implementer"), maxEmptyRounds: 2,
+  }, value)).toEqual([]);
   expect(observations).toEqual({ dispatches: 2, sleeps: [2_000, 4_000] });
 });
 
@@ -50,14 +55,16 @@ test("driver contention falls through to the next ready thread without a second 
     random: () => 0.5,
   };
 
-  expect(await discover("test-discover", { role: "implementer", maxTasks: 1 }, value)).toEqual(["thread-free"]);
+  expect(await discover("test-discover", {
+    routingRequest: presetRequest("implementer"), maxTasks: 1,
+  }, value)).toEqual(["thread-free"]);
   expect(dispatched).toEqual(["thread-contended", "thread-free"]);
   expect(sleeps).toEqual([]);
 });
 
-test("discovery fails closed before polling when no Gaffer role is supplied", async () => {
+test("discovery fails closed before polling when the complete Gaffer request is absent", async () => {
   const { value, observations } = dependencies(async () => undefined);
   await expect(discover("test-discover", {} as any, value))
-    .rejects.toThrow("managed discovery requires an explicit Gaffer role");
+    .rejects.toThrow("complete eight-field Gaffer request");
   expect(observations.dispatches).toBe(0);
 });

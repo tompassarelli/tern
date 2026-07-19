@@ -78,6 +78,9 @@
       "goal": "Design semantic roster",
       "provider": "anthropic",
       "provider_target": "claude-personal-tompas0x-gmail",
+      "live_input": "streaming",
+      "live_input_state": "armed",
+      "live_input_epoch": "00000000-0000-4000-8000-000000000031",
       "model": "claude-opus-4-8",
       "effort": "xhigh",
       "composition_kind": "preset",
@@ -87,7 +90,7 @@
       "spawned_at": "2026-07-19T01:00:00Z",
       "display_handle": "openai-old-account-sol-high-gaffer-designer-a205e9ce",
       "display_name": "STALE openai route receipt says high effort and an old task",
-      "identity_manifest_sha256": "527ae34e2ca807296ef6087f757a358611256c5d8aa1fcfb198c68919aa2f205"
+      "identity_manifest_sha256": "4327abdf5e042242baf66944b30b71bae152f9543166a8b55d983ae88d828bea"
     },
     "expected": {
       "providerLabel": "anthropic:claude-personal-tompas0x-gmail",
@@ -108,6 +111,9 @@
       "goal": "Integrate provider seams",
       "provider": "openai",
       "provider_target": "codex-personal-tom-passarelli-proton",
+      "live_input": "unsupported",
+      "live_input_state": "frozen",
+      "live_input_epoch": "00000000-0000-4000-8000-000000000032",
       "model": "gpt-5.6-sol",
       "effort": "xhigh",
       "composition_kind": "preset",
@@ -118,7 +124,7 @@
       "spawned_at": "2026-07-19T01:01:00Z",
       "display_handle": "openai-codex-personal-tom-passarelli-proton-sol-xhigh-gaffer-integrator-override-tier-reasoning-fb3ba9b4",
       "display_name": "openai:codex-personal-tom-passarelli-proton · sol · xhigh · gaffer:integrator+override(tier,reasoning) · Integrate provider seams",
-      "identity_manifest_sha256": "44c579e1c07573722985c29e314209110b8b84939e73555fa13904809ea180eb"
+      "identity_manifest_sha256": "cf53f763efbae55ae28777467adbe890cf7b787d4d6dba8a528095a2cc7cd274"
     },
     "expected": {
       "providerLabel": "openai:codex-personal-tom-passarelli-proton",
@@ -139,6 +145,9 @@
       "goal": "Trace historical identity drift",
       "provider": "anthropic",
       "provider_target": "claude-personal-tom-passarelli-proton",
+      "live_input": "streaming",
+      "live_input_state": "armed",
+      "live_input_epoch": "00000000-0000-4000-8000-000000000033",
       "model": "claude-opus-4-8",
       "effort": "xhigh",
       "composition_kind": "bespoke",
@@ -153,7 +162,7 @@
       "spawned_at": "2026-07-19T01:02:00Z",
       "display_handle": "anthropic-claude-personal-tom-passarelli-proton-opus-xhigh-gaffer-bespoke-migration-forensics-6bcf1234",
       "display_name": "anthropic:claude-personal-tom-passarelli-proton · opus · xhigh · gaffer:bespoke:migration-forensics · Trace historical identity drift",
-      "identity_manifest_sha256": "74a17df989c7ff455de002dc3dbe8b85bce06c7507741916dad9858a09a7b29b"
+      "identity_manifest_sha256": "f1817a83cda42be331d8b7069f7a3a5b832904e2c80ab85ba9eca31159defbb2"
     },
     "expected": {
       "providerLabel": "anthropic:claude-personal-tom-passarelli-proton",

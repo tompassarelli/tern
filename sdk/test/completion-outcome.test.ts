@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { ProviderRetrySafeError } from "../src/providers";
 import { RUN_BAR_EVIDENCE_VERSION } from "../src/delivery-verification";
 import type { DeliveryRunContext } from "../src/delivery-evidence";
+import { presetRequest } from "./routing-fixtures";
+import { applyGafferStaffing } from "../src/gaffer-staffing";
 
 let dir: string;
 let log: string;
@@ -42,6 +44,18 @@ beforeAll(() => {
 printf '%s\\n' "$*" >> "${log}"
 case "$*" in
   *test-terminal-aux-budget*agent_death*) sleep 5 ;;
+  "clock start thread-sync-construction")
+    : > "${dir}/sync-clock-open"
+    printf 'clocked in on thread-sync-construction at now  (session s1, agent %s)\\n' "$NORTH_AGENT_ID" ;;
+  "clock status")
+    if [ "$NORTH_AGENT_ID" = "test-sync-construction-failure" ]; then
+      if [ -e "${dir}/sync-clock-open" ]; then
+        printf 'clocked in on thread-sync-construction  Sync construction  (agent %s)\\n' "$NORTH_AGENT_ID"
+      else
+        printf 'not clocked in (agent %s)\\n' "$NORTH_AGENT_ID"
+      fi
+    fi ;;
+  "clock orphan test-sync-construction-failure") rm -f "${dir}/sync-clock-open" ;;
 esac
 exit 0
 `);
@@ -99,7 +113,7 @@ afterAll(() => {
 });
 
 test("a clean-finishing lane records outcome=ran ON the lane entity (@agent:<id>)", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   let interrupts = 0;
 
   // Fake SDK query: one assistant turn, then a terminal `result` (subtype success) — the
@@ -113,7 +127,7 @@ test("a clean-finishing lane records outcome=ran ON the lane entity (@agent:<id>
   });
 
   const result = await spawn({
-    prompt: "do a bounded task", agentId: "test-done-ok", role: "integrator", queryFn: cleanQuery,
+    prompt: "do a bounded task", agentId: "test-done-ok", role: "integrator", routingMetadata: presetRequest("integrator"), queryFn: cleanQuery,
   });
   expect(result).toBe("task done");
   expect(interrupts).toBe(1);
@@ -133,7 +147,7 @@ test("a clean-finishing lane records outcome=ran ON the lane entity (@agent:<id>
 });
 
 test("a lane that dies mid-stream records outcome=died ON the lane entity (reported, not silent)", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
 
   // The SDK subprocess dies mid-turn (real exitError shape). The finally path runs, so this
   // is a REPORTED death: outcome=died on @agent:<id> alongside the agent_death fact. The
@@ -145,7 +159,7 @@ test("a lane that dies mid-stream records outcome=died ON the lane entity (repor
       throw new Error("Claude Code process terminated by signal 9");
     })();
 
-  await spawn({ prompt: "dies", agentId: "test-done-died", role: "integrator", queryFn: dyingQuery });
+  await spawn({ prompt: "dies", agentId: "test-done-died", role: "integrator", routingMetadata: presetRequest("integrator"), queryFn: dyingQuery });
 
   const logged = readFileSync(log, "utf8");
   expect(logged).toContain("tell agent:test-done-died outcome died");
@@ -155,13 +169,13 @@ test("a lane that dies mid-stream records outcome=died ON the lane entity (repor
 });
 
 test("a synchronous provider-construction failure closes lifecycle state and the billable clock", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
 
   const result = await spawn({
     prompt: "fail while constructing the provider query",
     agentId: "test-sync-construction-failure",
-    role: "integrator",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
     thread: "thread-sync-construction",
     queryFn: () => { throw new Error("synchronous adapter construction failure"); },
   });
@@ -175,7 +189,7 @@ test("a synchronous provider-construction failure closes lifecycle state and the
 });
 
 test("an Anthropic error terminal still records its authoritative usage", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const queryFn: any = () => (async function* () {
     yield {
@@ -187,7 +201,7 @@ test("an Anthropic error terminal still records its authoritative usage", async 
   })();
 
   await spawn({ prompt: "terminal error usage", agentId: "test-terminal-error",
-    role: "integrator", provider: "anthropic", queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn });
   await waitForLog("tell run-test-terminal-error-");
   await waitForLog("usage_total_status exact");
   const lines = readFileSync(log, "utf8").split("\n").filter((line) => line.includes("run-test-terminal-error-"));
@@ -196,7 +210,7 @@ test("an Anthropic error terminal still records its authoritative usage", async 
 });
 
 test("repeated Anthropic terminals record ambiguity without a selected or summed usage", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const queryFn: any = () => (async function* () {
     yield { type: "system", subtype: "task_started", task_id: "bg-1" };
@@ -210,7 +224,7 @@ test("repeated Anthropic terminals record ambiguity without a selected or summed
   })();
 
   await spawn({ prompt: "two terminal scopes", agentId: "test-repeated-terminals",
-    role: "integrator", provider: "anthropic", queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn });
   await waitForLog("usage_total_status unknown_repeated_terminal");
   const lines = readFileSync(log, "utf8").split("\n").filter((line) => line.includes("run-test-repeated-terminals-"));
   expect(lines.some((line) => line.endsWith(" usage_terminal_count 2"))).toBe(true);
@@ -218,12 +232,12 @@ test("repeated Anthropic terminals record ambiguity without a selected or summed
 });
 
 test("an empty spawn provider stream is a blocked provider error, never ran", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
 
   const result = await spawn({
     prompt: "provider stream closes without a terminal", agentId: "test-empty-spawn",
-    role: "integrator",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
     queryFn: () => (async function* () {})(),
   });
 
@@ -234,13 +248,13 @@ test("an empty spawn provider stream is a blocked provider error, never ran", as
 });
 
 test("an empty dispatch provider stream is a blocked provider error, never ran", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
   const boundaryIds: string[] = [];
 
   const result = await dispatch("@test-empty-dispatch", {
     agentId: "test-empty-dispatch-agent",
-    routingMetadata: { role: "integrator" },
+    routingMetadata: presetRequest("integrator"),
     claimDriver: ((threadId: string) => {
       boundaryIds.push(`driver:${threadId}`);
       return { release() {} };
@@ -276,7 +290,7 @@ test("an empty dispatch provider stream is a blocked provider error, never ran",
 });
 
 test("dispatch wakes its coordinator once, after every terminal publication settles", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   const scenarios = [
     {
       label: "ran",
@@ -355,7 +369,7 @@ test("dispatch wakes its coordinator once, after every terminal publication sett
     try {
       await dispatch(`thread-${agentId}`, {
         agentId,
-        routingMetadata: { role: "integrator" },
+        routingMetadata: presetRequest("integrator"),
         claimDriver: (() => ({ release() {} })) as any,
         queryFn: scenario.queryFn as any,
         loadThreadFacts: () => [
@@ -412,12 +426,12 @@ test("dispatch wakes its coordinator once, after every terminal publication sett
 }, 15_000);
 
 test("a failed dispatch completion wake-up never replaces the execution outcome", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
   const agentId = "test-dispatch-notify-failure";
   const result = await dispatch(`thread-${agentId}`, {
     agentId,
-    routingMetadata: { role: "integrator" },
+    routingMetadata: presetRequest("integrator"),
     claimDriver: (() => ({ release() {} })) as any,
     queryFn: () => (async function* () {
       yield {
@@ -448,14 +462,14 @@ test("a failed dispatch completion wake-up never replaces the execution outcome"
 });
 
 test("a blocked auxiliary terminal writer cannot stack beyond the shared publication budget", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   process.env.NORTH_TERMINAL_PUBLICATION_BUDGET_MS = "100";
   const runProbe = async (agentId: string) => {
     writeFileSync(log, "");
     const startedAt = performance.now();
     await dispatch(`thread-${agentId}`, {
       agentId,
-      routingMetadata: { role: "integrator" },
+      routingMetadata: presetRequest("integrator"),
       claimDriver: (() => ({ release() {} })) as any,
       queryFn: () => (async function* () {
         throw new Error("terminal auxiliary budget probe");
@@ -486,10 +500,11 @@ test("a blocked auxiliary terminal writer cannot stack beyond the shared publica
 });
 
 test("an MCP-preclaimed terminal thread verifies and safely releases before returning", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   const events: string[] = [];
   const dependencies = {
     agentId: "test-preclaimed-terminal-agent",
+    routingMetadata: presetRequest("integrator"),
     driverOptions: { preclaimed: true },
     loadThreadFacts: (threadId: string) => {
       events.push(`facts:${threadId}`);
@@ -527,6 +542,7 @@ test("an MCP-preclaimed terminal thread verifies and safely releases before retu
 
   let directClaims = 0;
   await dispatch("test-direct-terminal", {
+    routingMetadata: presetRequest("integrator"),
     loadThreadFacts: () => [
       { predicate: "title", value: "Direct terminal" },
       { predicate: "outcome", value: "done" },
@@ -541,6 +557,7 @@ test("an MCP-preclaimed terminal thread verifies and safely releases before retu
 
   await expect(dispatch("test-preclaimed-release-failure", {
     agentId: "test-preclaimed-release-failure-agent",
+    routingMetadata: presetRequest("integrator"),
     driverOptions: { preclaimed: true },
     loadThreadFacts: () => [
       { predicate: "title", value: "Terminal with unavailable release" },
@@ -557,7 +574,7 @@ test("an MCP-preclaimed terminal thread verifies and safely releases before retu
 });
 
 test("dispatch rejects malformed and injection-shaped ids before every read boundary", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   for (const invalid of [
     "", "@", "@@test-thread", " test-thread", "test-thread;touch-owned",
     "test-thread$(touch-owned)", "test-thread\nother",
@@ -581,7 +598,7 @@ test("dispatch rejects malformed and injection-shaped ids before every read boun
 });
 
 test("dispatch publishes newly observed done-bar evidence as reported, never self-verified", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
   const baseline = [
     { predicate: "title", value: "Proof-carrying delivery" },
@@ -593,7 +610,7 @@ test("dispatch publishes newly observed done-bar evidence as reported, never sel
   let reserved: DeliveryRunContext | undefined;
   await dispatch("test-reported-delivery", {
     agentId: "test-reported-delivery-agent",
-    routingMetadata: { role: "integrator" },
+    routingMetadata: presetRequest("integrator"),
     claimDriver: (() => ({ release() {} })) as any,
     loadChildren: () => [],
     loadThreadFacts: () => reads++ === 0
@@ -655,14 +672,14 @@ test("dispatch publishes newly observed done-bar evidence as reported, never sel
 });
 
 test("spawn reserves before provider execution and binds evidence plus telemetry to its exact thread", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const events: string[] = [];
   let reserved: DeliveryRunContext | undefined;
   const result = await spawn({
     prompt: "prove the bound task",
     agentId: "test-proof-bound-spawn",
-    role: "integrator",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
     thread: "test-proof-bound-thread",
     loadThreadFacts: () => {
       events.push("thread-read");
@@ -725,7 +742,7 @@ test("spawn reserves before provider execution and binds evidence plus telemetry
 });
 
 test("a spawn orchestrator gets a provider reduction turn after child settlement", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const settlements = [
     { kind: "live", children: ["@agent:child-a"], live: ["@agent:child-a"] },
@@ -763,6 +780,7 @@ test("a spawn orchestrator gets a provider reduction turn after child settlement
     prompt: "coordinate the child",
     agentId: "test-spawn-child-resolves",
     role: "director",
+          routingMetadata: presetRequest("director"),
     queryFn,
     childSettlementReader: () =>
       settlements[Math.min(settlementIndex++, settlements.length - 1)]!,
@@ -777,7 +795,7 @@ test("a spawn orchestrator gets a provider reduction turn after child settlement
 });
 
 test("a spawn orchestrator hits a bounded no-progress cap as incomplete, never ran", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const previousCap = process.env.NORTH_BG_MAX_CONTINUATIONS;
   process.env.NORTH_BG_MAX_CONTINUATIONS = "1";
@@ -801,6 +819,7 @@ test("a spawn orchestrator hits a bounded no-progress cap as incomplete, never r
       prompt: "coordinate a stuck child",
       agentId: "test-spawn-child-cap",
       role: "director",
+          routingMetadata: presetRequest("director"),
       coordinator: TEST_COORDINATOR,
       queryFn,
       childSettlementReader: () => ({
@@ -839,8 +858,8 @@ test("a spawn orchestrator hits a bounded no-progress cap as incomplete, never r
 });
 
 test("spawn and dispatch require reduction for first-seen and changed settled child sets", async () => {
-  const { spawn } = await import("../src/spawn");
-  const { dispatch } = await import("../src/dispatch");
+  const { spawn } = await import("./support/spawn");
+  const { dispatch } = await import("./support/dispatch");
   const scenarios = [
     {
       label: "already-settled",
@@ -892,13 +911,14 @@ test("spawn and dispatch require reduction for first-seen and changed settled ch
           prompt: "reduce settled child results",
           agentId,
           role: "director",
+          routingMetadata: presetRequest("director"),
           queryFn,
           childSettlementReader,
         });
       } else {
         await dispatch(`thread-${agentId}`, {
           agentId,
-          routingMetadata: { role: "director" },
+          routingMetadata: presetRequest("director"),
           claimDriver: (() => ({ release() {} })) as any,
           queryFn,
           loadThreadFacts: () => [
@@ -930,8 +950,8 @@ test("spawn and dispatch require reduction for first-seen and changed settled ch
 }, 15_000);
 
 test("spawn and dispatch block a previously live child disappearing from the graph", async () => {
-  const { spawn } = await import("../src/spawn");
-  const { dispatch } = await import("../src/dispatch");
+  const { spawn } = await import("./support/spawn");
+  const { dispatch } = await import("./support/dispatch");
 
   for (const surface of ["spawn", "dispatch"] as const) {
     writeFileSync(log, "");
@@ -969,13 +989,14 @@ test("spawn and dispatch block a previously live child disappearing from the gra
         prompt: "observe a live child before its graph edge disappears",
         agentId,
         role: "director",
+          routingMetadata: presetRequest("director"),
         queryFn,
         childSettlementReader,
       });
     } else {
       await dispatch(`thread-${agentId}`, {
         agentId,
-        routingMetadata: { role: "director" },
+        routingMetadata: presetRequest("director"),
         claimDriver: (() => ({ release() {} })) as any,
         queryFn,
         loadThreadFacts: () => [
@@ -1004,8 +1025,8 @@ test("spawn and dispatch block a previously live child disappearing from the gra
 });
 
 test("spawn and dispatch final gates reject a child disappearing after reduction", async () => {
-  const { spawn } = await import("../src/spawn");
-  const { dispatch } = await import("../src/dispatch");
+  const { spawn } = await import("./support/spawn");
+  const { dispatch } = await import("./support/dispatch");
 
   for (const surface of ["spawn", "dispatch"] as const) {
     writeFileSync(log, "");
@@ -1041,13 +1062,14 @@ test("spawn and dispatch final gates reject a child disappearing after reduction
         prompt: "reduce a child before its graph edge disappears",
         agentId,
         role: "director",
+          routingMetadata: presetRequest("director"),
         queryFn,
         childSettlementReader,
       });
     } else {
       await dispatch(`thread-${agentId}`, {
         agentId,
-        routingMetadata: { role: "director" },
+        routingMetadata: presetRequest("director"),
         claimDriver: (() => ({ release() {} })) as any,
         queryFn,
         loadThreadFacts: () => [
@@ -1077,8 +1099,8 @@ test("spawn and dispatch final gates reject a child disappearing after reduction
 });
 
 test("spawn and dispatch final gates reject late live, unavailable, or unreduced settled state", async () => {
-  const { spawn } = await import("../src/spawn");
-  const { dispatch } = await import("../src/dispatch");
+  const { spawn } = await import("./support/spawn");
+  const { dispatch } = await import("./support/dispatch");
   const terminalStates = [
     {
       label: "live",
@@ -1133,13 +1155,14 @@ test("spawn and dispatch final gates reject late live, unavailable, or unreduced
           prompt: "exercise the final child gate",
           agentId,
           role: "director",
+          routingMetadata: presetRequest("director"),
           queryFn: oneTerminalQuery,
           childSettlementReader,
         });
       } else {
         await dispatch(`thread-${agentId}`, {
           agentId,
-          routingMetadata: { role: "director" },
+          routingMetadata: presetRequest("director"),
           claimDriver: (() => ({ release() {} })) as any,
           queryFn: oneTerminalQuery,
           loadThreadFacts: () => [
@@ -1172,13 +1195,13 @@ test("spawn and dispatch final gates reject late live, unavailable, or unreduced
 }, 15_000);
 
 test("dispatch abandons a failed reservation subject and publishes unverified telemetry on a fresh run", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
   let abandonedRunId: string | undefined;
   let loadCalled = false;
   await dispatch("test-dispatch-reservation-rotation", {
     agentId: "test-dispatch-reservation-rotation-agent",
-    routingMetadata: { role: "integrator" },
+    routingMetadata: presetRequest("integrator"),
     claimDriver: (() => ({ release() {} })) as any,
     loadChildren: () => [],
     loadThreadFacts: () => [
@@ -1218,14 +1241,14 @@ test("dispatch abandons a failed reservation subject and publishes unverified te
 });
 
 test("spawn abandons a failed reservation subject and publishes unverified telemetry on a fresh run", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   let abandonedRunId: string | undefined;
   let loadCalled = false;
   await spawn({
     prompt: "recover from a partial reservation",
     agentId: "test-spawn-reservation-rotation",
-    role: "integrator",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
     thread: "thread-spawn-reservation-rotation",
     deliveryRuntime: {
       reserve(context) {
@@ -1255,12 +1278,12 @@ test("spawn abandons a failed reservation subject and publishes unverified telem
 });
 
 test("dispatch rotates away from a reservation that is invalid at finalization", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
   let reservedRunId: string | undefined;
   await dispatch("test-dispatch-finalize-rotation", {
     agentId: "test-dispatch-finalize-rotation-agent",
-    routingMetadata: { role: "integrator" },
+    routingMetadata: presetRequest("integrator"),
     claimDriver: (() => ({ release() {} })) as any,
     loadChildren: () => [],
     loadThreadFacts: () => [
@@ -1300,13 +1323,13 @@ test("dispatch rotates away from a reservation that is invalid at finalization",
 });
 
 test("spawn rotates away from a reservation that is invalid at finalization", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   let reservedRunId: string | undefined;
   await spawn({
     prompt: "recover at finalization",
     agentId: "test-spawn-finalize-rotation",
-    role: "integrator",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
     thread: "thread-spawn-finalize-rotation",
     deliveryRuntime: {
       reserve(context) {
@@ -1336,7 +1359,7 @@ test("spawn rotates away from a reservation that is invalid at finalization", as
 });
 
 test("spawn keeps omitted, reported-zero, and preflight-zero turn evidence distinct", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
 
   const terminal = (numTurns?: number) => () => (async function* () {
@@ -1348,21 +1371,21 @@ test("spawn keeps omitted, reported-zero, and preflight-zero turn evidence disti
 
   await spawn({
     prompt: "provider omits turn count", agentId: "test-turns-omitted",
-    role: "integrator", queryFn: terminal(),
+    role: "integrator", routingMetadata: presetRequest("integrator"), queryFn: terminal(),
   });
   const omitted = await settledRunLines("test-turns-omitted");
   expect(omitted.some((line) => line.includes(" num_turns "))).toBe(false);
 
   await spawn({
     prompt: "provider reports zero turns", agentId: "test-turns-reported-zero",
-    role: "integrator", queryFn: terminal(0),
+    role: "integrator", routingMetadata: presetRequest("integrator"), queryFn: terminal(0),
   });
   const reportedZero = await settledRunLines("test-turns-reported-zero");
   expect(reportedZero.some((line) => line.endsWith(" num_turns 0"))).toBe(true);
 
   await spawn({
     prompt: "preflight blocks before provider acceptance", agentId: "test-turns-preflight-zero",
-    role: "integrator",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
     queryFn: () => { throw new ProviderRetrySafeError("test_retry_safe_preflight"); },
   });
   const preflightZero = await settledRunLines("test-turns-preflight-zero");
@@ -1371,7 +1394,7 @@ test("spawn keeps omitted, reported-zero, and preflight-zero turn evidence disti
 });
 
 test("dispatch keeps omitted, reported-zero, and preflight-zero turn evidence distinct", async () => {
-  const { dispatch } = await import("../src/dispatch");
+  const { dispatch } = await import("./support/dispatch");
   writeFileSync(log, "");
 
   const terminal = (numTurns?: number) => () => (async function* () {
@@ -1382,7 +1405,7 @@ test("dispatch keeps omitted, reported-zero, and preflight-zero turn evidence di
   })();
   const dependencies = (agentId: string, queryFn: any) => ({
     agentId,
-    routingMetadata: { role: "integrator" },
+    routingMetadata: presetRequest("integrator"),
     claimDriver: (() => ({ release() {} })) as any,
     queryFn,
     loadThreadFacts: () => [
@@ -1452,7 +1475,7 @@ async function settledRunLines(agent: string, requiredSuffix = "error_count 0"):
 }
 
 test("public spawn composes justified explicit axes before Gaffer hydration", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   let queryOptions: any;
@@ -1466,12 +1489,12 @@ test("public spawn composes justified explicit axes before Gaffer hydration", as
   await spawn({
     prompt: "exercise the real composition boundary", agentId: "test-composed-director",
     role: "director", tier: "economy", effort: "low", posture: "preserve",
-    routingMetadata: {
-      role: "director", topology: "orchestrator",
+    routingMetadata: applyGafferStaffing({
+      role: "director", tier: "economy", reasoning: "low", posture: "preserve",
       composition: { kind: "preset", id: "director",
         overrides: ["tier", "reasoning", "posture"],
         overrideReason: "exercise the explicit public-dial composition boundary" },
-    }, provider: "anthropic", queryFn,
+    }), provider: "anthropic", queryFn,
   });
 
   expect(queryOptions.model).toBe("claude-sonnet-5");
@@ -1484,7 +1507,7 @@ test("public spawn composes justified explicit axes before Gaffer hydration", as
 });
 
 test("public role-only integrator spawn hydrates the complete Gaffer preset", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   let queryOptions: any;
@@ -1497,7 +1520,7 @@ test("public role-only integrator spawn hydrates the complete Gaffer preset", as
 
   await spawn({
     prompt: "hydrate a role-only request", agentId: "test-role-only-integrator",
-    role: "integrator", provider: "anthropic", queryFn,
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn,
   });
 
   expect(queryOptions.model).toBe("claude-opus-4-8");
@@ -1519,7 +1542,7 @@ test("public role-only integrator spawn hydrates the complete Gaffer preset", as
 });
 
 test("tier-routed OpenAI identity records the resolved Sol route, not requested blanks", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   let queryOptions: any;
   const queryFn: any = (args: any) => {
@@ -1530,7 +1553,7 @@ test("tier-routed OpenAI identity records the resolved Sol route, not requested 
   };
 
   await spawn({ prompt: "route with OpenAI", agentId: "test-openai-designer",
-    role: "designer", provider: "openai", queryFn });
+    role: "designer", routingMetadata: presetRequest("designer"), provider: "openai", queryFn });
 
   expect(queryOptions.model).toBe("gpt-5.6-sol");
   expect(queryOptions.effort).toBe("xhigh");
@@ -1545,7 +1568,7 @@ test("tier-routed OpenAI identity records the resolved Sol route, not requested 
 });
 
 test("public SpawnOptions target and Gaffer role land on exact account identity", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const policyPath = process.env.NORTH_ROUTING_POLICY!;
   writeFileSync(policyPath, JSON.stringify({
@@ -1560,7 +1583,7 @@ test("public SpawnOptions target and Gaffer role land on exact account identity"
   try {
     await spawn({
       prompt: "design on the work account", agentId: "test-target-designer",
-      role: "designer", provider: "anthropic", target: "claude-work",
+      role: "designer", routingMetadata: presetRequest("designer"), provider: "anthropic", target: "claude-work",
       queryFn: () => (async function* () {
         yield { type: "result", subtype: "success", result: "designed", duration_ms: 1, num_turns: 1 };
       })(),
@@ -1577,7 +1600,7 @@ test("public SpawnOptions target and Gaffer role land on exact account identity"
 });
 
 test("in-flight escalation refreshes model, effort, and semantic handle without resetting identity", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const models: string[] = [];
   const queryFn: any = () => ({
@@ -1593,7 +1616,7 @@ test("in-flight escalation refreshes model, effort, and semantic handle without 
   });
 
   await spawn({ prompt: "recover from errors", agentId: "test-escalated-integrator",
-    role: "integrator", provider: "anthropic", escalate: true, queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", escalate: true, queryFn });
 
   expect(models.length).toBeGreaterThan(0);
   const logged = readFileSync(log, "utf8");
@@ -1603,7 +1626,7 @@ test("in-flight escalation refreshes model, effort, and semantic handle without 
 });
 
 test("unsupported in-flight escalation is explicit and does not fabricate a higher route", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   let interrupts = 0;
   const queryFn: any = () => ({
@@ -1618,7 +1641,7 @@ test("unsupported in-flight escalation is explicit and does not fabricate a high
   });
 
   await spawn({ prompt: "unsupported escalation", agentId: "test-escalation-unsupported",
-    role: "integrator", provider: "openai", escalate: true, queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "openai", escalate: true, queryFn });
 
   const logged = readFileSync(log, "utf8");
   expect(logged).toContain("tell agent:test-escalation-unsupported outcome provider_escalation_unsupported");
@@ -1632,7 +1655,7 @@ test("unsupported in-flight escalation is explicit and does not fabricate a high
 });
 
 test("a failed effort escalation records the applied model and interrupts before death", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   const effortFailure = new Error("effort control rejected");
   let interrupts = 0;
@@ -1650,7 +1673,7 @@ test("a failed effort escalation records the applied model and interrupts before
   });
 
   await spawn({ prompt: "partial escalation", agentId: "test-escalation-partial",
-    role: "integrator", provider: "anthropic", escalate: true, queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", escalate: true, queryFn });
 
   const logged = readFileSync(log, "utf8");
   expect(interrupts).toBe(1);
@@ -1662,7 +1685,7 @@ test("a failed effort escalation records the applied model and interrupts before
 });
 
 test("the escalation ceiling interrupts the active child before reporting completion", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
   let interrupts = 0;
@@ -1681,7 +1704,7 @@ test("the escalation ceiling interrupts the active child before reporting comple
   });
 
   await spawn({ prompt: "reach escalation ceiling", agentId: "test-escalation-ceiling",
-    role: "integrator", provider: "anthropic", escalate: true, queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", escalate: true, queryFn });
 
   const logged = readFileSync(log, "utf8");
   expect(models).toEqual(["claude-opus-4-8"]);
@@ -1692,7 +1715,7 @@ test("the escalation ceiling interrupts the active child before reporting comple
 });
 
 test("preset-hydrated Anthropic frontier promotes to Fable without losing requested reasoning", async () => {
-  const { spawn } = await import("../src/spawn");
+  const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
   process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
   let queryOptions: any;
@@ -1705,7 +1728,7 @@ test("preset-hydrated Anthropic frontier promotes to Fable without losing reques
 
   await spawn({
     prompt: "frontier preset", agentId: "test-fable-designer",
-    role: "designer", provider: "anthropic", queryFn,
+    role: "designer", routingMetadata: presetRequest("designer"), provider: "anthropic", queryFn,
   });
 
   expect(queryOptions.model).toBe("claude-fable-5");
