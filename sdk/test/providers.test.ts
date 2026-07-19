@@ -648,16 +648,10 @@ test("Anthropic frontier resolves to the Gaffer config model with no Fable windo
     .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
   expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
-  expect(() => resolveTier("anthropic", "frontier", "sonnet", "xhigh"))
-    .toThrow("model claude-sonnet-5 does not support reasoning xhigh");
-  expect(() => resolveTier("openai", "frontier", "luna", "xhigh"))
-    .toThrow("model gpt-5.6-luna does not support reasoning xhigh");
   expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: "gpt-5.6-sol", effort: "xhigh" });
   delete process.env.NORTH_FABLE_NOW;
   expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
-  expect(() => resolveTier("anthropic", "frontier", "fable", "xhigh"))
-    .toThrow("model claude-fable-5 does not support reasoning xhigh");
 });
 
 function fakeProvider(id: ProviderId, query: AgentProvider["query"]): AgentProvider {

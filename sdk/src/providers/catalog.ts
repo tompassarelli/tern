@@ -112,39 +112,6 @@ export function supportedReasoning(provider: ProviderId, tier: SemanticTier): re
   return entry.efforts ?? entry.reasoning ?? [];
 }
 
-function supportedReasoningForModel(
-  provider: ProviderId,
-  model: string,
-): readonly Effort[] {
-  const catalog = providerCatalog(provider);
-  const levels = new Set<Effort>();
-  for (const tier of SEMANTIC_TIER_ORDER) {
-    const entry = catalog.tiers[tier];
-    if (!entry) continue;
-    const concrete = catalog.modelAliases[entry.model] ?? entry.model;
-    if (concrete !== model) continue;
-    for (const effort of entry.efforts ?? entry.reasoning ?? [])
-      levels.add(effort);
-  }
-  return [...levels];
-}
-
-function assertModelEffortPair(
-  provider: ProviderId,
-  model: string | undefined,
-  effort: Effort | undefined,
-  tier?: SemanticTier,
-): void {
-  if (!model || !effort) return;
-  const supported = supportedReasoningForModel(provider, model).includes(effort);
-  if (!supported) {
-    throw new Error(
-      `provider ${provider} model ${model} does not support reasoning ${effort}`
-      + (tier ? ` at semantic tier ${tier}` : ""),
-    );
-  }
-}
-
 export function providerSupportsRoute(provider: ProviderId, tier?: SemanticTier, reasoning?: Effort): boolean {
   return !tier || !reasoning || supportedReasoning(provider, tier).includes(reasoning);
 }
@@ -152,11 +119,7 @@ export function providerSupportsRoute(provider: ProviderId, tier?: SemanticTier,
 export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: string, effort?: Effort): ResolvedTier {
   if (model && !providerSupportsModel(provider, model))
     throw new Error(`provider ${provider} does not declare model ${model}`);
-  if (!tier) {
-    const resolvedModel = resolveModelAlias(provider, model);
-    assertModelEffortPair(provider, resolvedModel, effort);
-    return { model: resolvedModel, effort };
-  }
+  if (!tier) return { model: resolveModelAlias(provider, model), effort };
   const entry = tierEntry(provider, tier);
   const levels = entry.efforts ?? entry.reasoning ?? [];
   if (effort && !levels.includes(effort)) {
@@ -172,11 +135,5 @@ export function resolveTier(provider: ProviderId, tier?: SemanticTier, model?: s
   // defaults to the tier's declared default.
   const resolvedModel = resolveModelAlias(provider, model ?? (entry.model === "auto" ? undefined : entry.model));
   const resolvedEffort = effort ?? entry.defaultEffort ?? entry.defaultReasoning;
-  assertModelEffortPair(
-    provider,
-    resolvedModel,
-    resolvedEffort,
-    tier,
-  );
   return { tier, model: resolvedModel, effort: resolvedEffort };
 }
