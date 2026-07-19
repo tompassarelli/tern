@@ -906,6 +906,83 @@ test("the executable Codex adapter rejects orchestrator authority before startin
   expect(existsSync(marker)).toBe(false);
 });
 
+test("managed executable resolution fails retry-safe before onRoute or query construction", async () => {
+  const home = mkdtempSync(join(tmpdir(), "north-openai-command-preflight-"));
+  temporary.push(home);
+  process.env.HOME = home;
+  process.env.AGENT_LAWS = "on";
+  process.env.GAFFER_HOME = realpathSync(savedGaffer ?? join(northRoot, "../gaffer"));
+  process.env.NORTH_PORT = "65534";
+  const coordinatorLogPath = join(home, "must-not-reach-coordinator.log");
+  process.env.FRAM_LOG = coordinatorLogPath;
+  const codexHome = join(home, ".codex");
+  mkdirSync(codexHome);
+  writeFileSync(join(codexHome, "AGENTS.md"), "COMMAND_PREFLIGHT_CANONICAL\n");
+
+  const target = {
+    id: "codex-command-preflight",
+    provider: "openai" as const,
+    authMode: "isolated" as const,
+    profile: "command-preflight",
+  };
+  const options = harnessOptions({
+    self: "openai-command-preflight-proof",
+    provider: "openai",
+    cwd: northRoot,
+    routingMetadata: applyGafferStaffing({ role: "executor" }),
+    presenceRegistrar: false,
+  });
+  const decision = selectProviderFromAvailability(
+    { provider: "openai", target: target.id },
+    [{ targetId: target.id, provider: "openai", available: true, reason: "ready" }],
+    {
+      mode: "balanced",
+      targets: [target],
+      targetOrder: [target.id],
+      providerOrder: ["openai"],
+      pressures: { openai: "normal" },
+    },
+    "economy",
+    "command-preflight-proof",
+    "low",
+  );
+  let resolverCalls = 0;
+  let queryConstructed = false;
+  let routePublished = false;
+  const provider = internalOpenAIProviderWithManagedHooksProbeForTest(
+    () => {},
+    {
+      resolveManagedCommand: () => {
+        resolverCalls++;
+        throw new Error("trusted resolver unavailable");
+      },
+      onQueryConstruction: () => { queryConstructed = true; },
+    },
+  );
+  const query = routedQueryWithRegistry(
+    decision,
+    { prompt: "must not run", options },
+    "economy",
+    Object.freeze({ anthropic: anthropicProvider, openai: Object.freeze(provider) }),
+    undefined,
+    () => { routePublished = true; },
+  );
+
+  let caught: unknown;
+  try {
+    for await (const _ of query as AsyncIterable<any>) {}
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(ProviderRetrySafeError);
+  expect((caught as Error).message)
+    .toBe("openai_provider_executable_unavailable_before_acceptance");
+  expect(resolverCalls).toBe(1);
+  expect(queryConstructed).toBe(false);
+  expect(routePublished).toBe(false);
+  expect(existsSync(coordinatorLogPath)).toBe(false);
+});
+
 gatedTest("loopback-bind", "selected Codex account bootstrap fails during admission before onRoute or provider spawn", async () => {
   let coordinatorLog = "";
   const server = createServer((socket) => {
@@ -989,7 +1066,10 @@ gatedTest("loopback-bind", "selected Codex account bootstrap fails during admiss
     Object.freeze({
       anthropic: anthropicProvider,
       openai: Object.freeze(
-        internalOpenAIProviderWithManagedHooksProbeForTest(() => {}),
+        internalOpenAIProviderWithManagedHooksProbeForTest(
+          () => {},
+          { resolveManagedCommand: () => "/nix/store/codex-test/bin/codex" },
+        ),
       ),
     }),
     undefined,
