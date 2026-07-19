@@ -68,6 +68,12 @@ export interface RunRecord {
   numTurns?: number; // SDKResultMessage.num_turns (was dropped before)
   compactions?: number; // count of SDK compact_boundary events observed this run (audit fix 4)
   errorCount?: number; // tool_result errors this run
+  // Harness-observed struggle sensors that fired this run (escalation-arch D2/D5):
+  // consecutive_errors | tool_loop | no_progress. Multi-valued execution-axis evidence.
+  struggleTriggers?: string[];
+  // Legacy in-flight escalation fields — the machinery is retired; these stay so
+  // historical @run rows (escalation_* facts, routing-report escalated column) keep
+  // reading. No current producer sets them.
   escalationTier?: number; // final ladder tier (omit / <0 = escalation off)
   escalations?: Array<{ from: string; to: string; reason: string }>;
   // Spend guard (build-order step 2). Present only on an API-billed run that
@@ -225,6 +231,7 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (rec.numTurns != null) facts.push(["num_turns", String(rec.numTurns)]);
   if (rec.compactions) facts.push(["compactions", String(rec.compactions)]);
   if (rec.errorCount != null) facts.push(["error_count", String(rec.errorCount)]);
+  for (const reason of rec.struggleTriggers ?? []) facts.push(["struggle", reason]);
   if (rec.escalationTier != null && rec.escalationTier >= 0)
     facts.push(["escalation_tier", String(rec.escalationTier)]);
   if (rec.escalations && rec.escalations.length) {

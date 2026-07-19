@@ -260,7 +260,7 @@
                 (not on-roster)
                 (red "F4 — not on any roster: a zombie fork, a bad id, or an unmanaged actor. Confirm via git author vs `north agents`.")
                 (= terminal-kind :died)
-                (str (red "F1 — API-death mid-lane.") " agent_death recorded. Remedy: re-dispatch the thread (idempotent); enable AGENT_ESCALATE=1 for chronic deaths; read the partial result first.")
+                (str (red "F1 — API-death mid-lane.") " agent_death recorded. Remedy: re-dispatch the thread (idempotent); for chronic deaths re-dispatch at the next tier per the D2 execution-axis move; read the partial result first.")
                 (= terminal-kind :died-unreported)
                 (str (red "F3 — died with no self-reported signal; reactor reaped it (outcome=died-unreported).") " The lease/telemetry missed the death; trust the reactor verdict.")
                 (and (seq deaths) (not terminal?))

@@ -232,10 +232,10 @@
                              "composition_overrides" "[]"
                              "display_handle" "openai-sol-high-designer-a205e9ce"}))))
 
-(check "CLI Fable window matches the canonical Eastern-time exclusive boundary"
-       (and (= (java.time.Instant/parse "2026-07-20T04:00:00Z") FABLE-WINDOW-END)
-            (fable-window-open? (java.time.Instant/parse "2026-07-20T03:59:59.999Z"))
-            (not (fable-window-open? (java.time.Instant/parse "2026-07-20T04:00:00Z")))))
+(check "dry-run route: Anthropic frontier resolves to the Gaffer config model, no Fable window swap"
+       (let [route (dry-resolved-route "anthropic" "frontier" nil nil)]
+         (and (= "anthropic" (:provider route))
+              (not= "fable" (:model route)))))
 
 (let [bulk [(str root "/bin/north") "json" "agents"]
       show [(str root "/bin/north") "json" "show" "agent:sdk-recovered"]
@@ -350,20 +350,14 @@
               (re-find #"control: lane-[0-9a-z]+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}" (:out dry))
               (not (str/includes? (:out dry) "agent-id would be")))))
 
-(let [open (proc/shell {:out :string :err :string :continue true
-                        :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"
-                                    "NORTH_FABLE_NOW" "2026-07-20T03:59:59.999Z"}}
-                       "bb" (str root "/cli/agents-cli.clj") "spawn" "designer" "probe"
-                       "--provider" "anthropic" "--dry-run")
-      closed (proc/shell {:out :string :err :string :continue true
+(let [closed (proc/shell {:out :string :err :string :continue true
                           :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"
-                                      "NORTH_FABLE_NOW" "2026-07-20T04:00:00Z"}}
+                                      ;; even forcing the OLD in-window instant, the retired
+                                      ;; Fable promotion must never resolve to fable.
+                                      "NORTH_FABLE_NOW" "2026-07-19T00:00:00Z"}}
                          "bb" (str root "/cli/agents-cli.clj") "spawn" "designer" "probe"
                          "--provider" "anthropic" "--dry-run")]
-  (check "CLI dry route uses fable/xhigh immediately before the cutoff"
-         (and (zero? (:exit open))
-              (re-find #"anthropic-ambient-fable-xhigh-gaffer-designer-[a-z0-9]+" (:out open))))
-  (check "CLI dry route falls back to opus/xhigh exactly at the cutoff"
+  (check "CLI dry route resolves anthropic frontier to opus/xhigh with no retired Fable window swap"
          (and (zero? (:exit closed))
               (re-find #"anthropic-ambient-opus-xhigh-gaffer-designer-[a-z0-9]+" (:out closed))
               (not (str/includes? (:out closed) "anthropic-fable")))))

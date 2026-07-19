@@ -398,7 +398,9 @@ test("warning floors expire and do not absorb unlike provider windows", () => {
 });
 
 test("model-scoped exhaustion constrains only the matching Anthropic route", () => {
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
+  // The fable-model route is now reached by an explicit model pin (the D1 gate),
+  // not the retired window auto-promotion; the claude:model:fable pool window still
+  // constrains only that route, never the opus/sonnet tiers.
   const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
   const scoped = accountPolicy({
     targetPressures: { "claude-personal": "exhausted", "claude-work": "unknown", "codex-personal": "unknown" },
@@ -417,7 +419,7 @@ test("model-scoped exhaustion constrains only the matching Anthropic route", () 
   );
   expect(senior.entitlementPressure).toBe("plenty");
   expect(() => selectProviderFromAvailability(
-    { target: "claude-personal" }, target, scoped, "frontier", "frontier", "xhigh",
+    { target: "claude-personal" }, target, scoped, "frontier", "frontier", "xhigh", "fable",
   )).toThrow("routing target claude-personal entitlement exhausted");
 });
 
@@ -474,7 +476,9 @@ test("explicit models constrain provider compatibility before observed-window pr
 });
 
 test("fresh telemetry failure neither rewards stale headroom nor revives model-scoped exhaustion", () => {
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
+  // Fable route is reached by explicit model pin now (window retired); the pinned
+  // fable route stays exhausted under the model-scoped window even when a fresh
+  // generic probe failed, while the unpinned standard route falls to unknown.
   const observedAt = new Date().toISOString();
   const target = accountAvailability.filter(({ targetId }) => targetId === "claude-personal");
   const failed = accountPolicy({
@@ -491,10 +495,10 @@ test("fresh telemetry failure neither rewards stale headroom nor revives model-s
 
   const standard = balancedAllocationEstimates(target, failed, "standard", "medium")[0];
   expect(standard).toMatchObject({ eligible: true, pressure: "unknown", effectiveWeight: 0.5 });
-  const frontier = balancedAllocationEstimates(target, failed, "frontier", "xhigh")[0];
+  const frontier = balancedAllocationEstimates(target, failed, "frontier", "xhigh", "fable")[0];
   expect(frontier).toMatchObject({ eligible: false, pressure: "exhausted", effectiveWeight: 0 });
   expect(() => selectProviderFromAvailability(
-    { target: "claude-personal" }, target, failed, "frontier", "failed-frontier", "xhigh",
+    { target: "claude-personal" }, target, failed, "frontier", "failed-frontier", "xhigh", "fable",
   )).toThrow("routing target claude-personal entitlement exhausted");
 });
 
@@ -619,16 +623,19 @@ test("provider selection filters unenforceable capability shapes before side eff
   }
 });
 
-test("temporary Fable promotion is Anthropic-only at the semantic frontier", () => {
-  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z";
-  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
+test("Anthropic frontier resolves to the Gaffer config model with no Fable window swap", () => {
+  // The temporary Fable promotion window is retired (escalation-arch D1/D5): frontier
+  // resolves per provider config regardless of clock, and NORTH_FABLE_NOW no longer
+  // influences resolution. No hidden model swap; an explicit model still wins.
+  process.env.NORTH_FABLE_NOW = "2026-07-19T00:00:00Z"; // inside the old window — must NOT promote
+  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", undefined, "high"))
     .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
-  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
   expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: "gpt-5.6-sol", effort: "xhigh" });
-  process.env.NORTH_FABLE_NOW = "2026-07-20T04:00:00Z";
+  delete process.env.NORTH_FABLE_NOW;
   expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
 });
 

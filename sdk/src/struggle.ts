@@ -1,9 +1,10 @@
-// Struggle detection for escalate-not-kill (thread 019f1194-ca57). Scores a LIVE
-// run off its SDK message stream so a stuck agent can be ESCALATED to a smarter
-// tier instead of guillotined at a turn cap. Three signals, all derived inside the
-// spawn for-await loop (no extra I/O): an error STREAK, a tool LOOP, a no-PROGRESS
-// stall. Thresholds are env-tunable (initial values are estimates — calibrate off
-// @run telemetry once escalation has run in anger).
+// Struggle sensors (escalation-arch D2/D5). Harness-OBSERVED execution-axis
+// signals scored off a live run's SDK message stream inside the spawn for-await
+// loop (no extra I/O): an error STREAK, a tool LOOP, a no-PROGRESS stall. In-flight
+// escalation is retired; a fired sensor now leaves a stderr breadcrumb and a
+// terminal `struggle <reason>` run fact so the D2 signal table has execution-axis
+// evidence that does not rely on lane self-report. Thresholds stay env-tunable
+// (initial values are estimates — calibrate off @run telemetry).
 const ERROR_STREAK = Number(process.env.STRUGGLE_ERROR_STREAK) || 3;
 const LOOP_REPEAT = Number(process.env.STRUGGLE_LOOP_REPEAT) || 3;
 const LOOP_WINDOW = Number(process.env.STRUGGLE_LOOP_WINDOW) || 20;
@@ -76,12 +77,4 @@ export function checkStruggle(st: StruggleState): StruggleTrigger | null {
   }
   if (st.turn - st.lastProgressTurn >= STALL_TURNS) return "no_progress";
   return null;
-}
-
-// After an escalation: clear the transient signals so the smarter tier starts fresh
-// (else it would re-trigger immediately on the same accumulated evidence).
-export function resetStruggle(st: StruggleState): void {
-  st.consecutiveErrors = 0;
-  st.fingerprints = [];
-  st.lastProgressTurn = st.turn;
 }

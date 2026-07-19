@@ -367,3 +367,19 @@ invoking Fram's coordinator protocol directly, opening North's sockets, or
 editing user-owned state. Those are unsupported integrity violations and may be
 detected by audit/validation; North does not claim to make them impossible.
 Hostile-code isolation requires an OS/container boundary outside this harness.
+
+## Dispatch judgment grade
+
+`north dispatch` warns (teach, never block) when a committed thread carries no
+`judgment_grade` fact. The grade is the DISPATCHER's coarse S/M/L estimate of
+judgment saturation — how many independent decision points the work is expected
+to cross — set with `north tell @<thread> judgment_grade s|m|l`. Bands:
+
+- **S** — ≤3 expected decision points
+- **M** — 4–11 expected decision points
+- **L** — ≥12 expected decision points
+
+The threshold detector (build-order step 5) trips when observed judgment events
+exceed `k × ceiling(grade)`, with **k = 1.5** default. Bands and `k` are v1
+constants, env-overridable later; the trip check itself is not built yet.
+`judgment_grade` is a single-valued coordination-log predicate (re-tell replaces).

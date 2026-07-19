@@ -145,7 +145,7 @@
 (def audited-run-multi
   #{"allocation_evidence" "applied_capability" "applied_domain_requirement"
     "applied_preset_override" "composition_override" "domain_requirement"
-    "envelope_advisory" "envelope_scope" "fallback_reason"})
+    "envelope_advisory" "envelope_scope" "fallback_reason" "struggle"})
 (def audited-run-single
   #{"agent" "allocation_mode" "applied_bespoke_contract_sha256"
     "applied_bespoke_contract_fingerprint_domain"

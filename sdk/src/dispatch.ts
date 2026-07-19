@@ -125,6 +125,14 @@ async function runDispatch(
     console.log(`[dispatch] ⚠ @${threadId} committed but has NO done_when — worker will define its own done bar as first act`);
   }
 
+  // Judgment grade (escalation-arch step 3): S/M/L estimate of judgment saturation is the
+  // DISPATCHER's call, not the worker's — it feeds the threshold detector, fable gate, and
+  // calibration report. Warn (teach, never block or inject) when a committed thread lacks it,
+  // mirroring the done_when warn above. Bands live in docs/provider-architecture.md.
+  if (posture.committed && !facts.some((f) => f.predicate === "judgment_grade")) {
+    console.log(`[dispatch] ⚠ @${threadId} committed but has NO judgment_grade — set s|m|l (S≤3 / M 4-11 / L≥12 expected decision points) so the detector can calibrate`);
+  }
+
   if (posture.hasOutcome) {
     return { threadId, posture: "atomic", result: "already done" };
   }

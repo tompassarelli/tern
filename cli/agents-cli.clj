@@ -106,36 +106,19 @@
           (println (dim (str "  capabilities " (str/join " " capabilities))))
           (when verbose? (println (str "  " description))))))))
 
-(declare fable-window-open?)
-
+;; Dry-run route preview. Anthropic frontier resolves per Gaffer provider config
+;; with NO hidden model swap — the temporary Fable promotion window expired
+;; 2026-07-20T04:00Z and its machinery is retired (twin of sdk/src/providers/catalog.ts).
 (defn dry-resolved-route [provider tier explicit-model reasoning]
   (when (and provider (not= provider "auto"))
     (try
       (let [entry (get-in (json/parse-string
                            (slurp (io/file GAFFER "providers" (str provider ".json"))) true)
-                          [:tiers (keyword tier)])
-            temporary-fable (and (= provider "anthropic") (= tier "frontier")
-                                 (nil? explicit-model) (not= reasoning "max")
-                                 (fable-window-open?))]
+                          [:tiers (keyword tier)])]
         {:provider provider
-         :model (cond temporary-fable "fable" explicit-model explicit-model :else (:model entry))
-         :effort (if temporary-fable (or reasoning "xhigh")
-                   (or reasoning (:defaultEffort entry) (:defaultReasoning entry)))})
+         :model (or explicit-model (:model entry))
+         :effort (or reasoning (:defaultEffort entry) (:defaultReasoning entry))})
       (catch Exception _ {:provider provider :model explicit-model :effort reasoning}))))
-
-;; ---- Fable window — mechanical, owner-ordered, auto-expiring (routing-overhaul PART 3)
-;; Promotion runs through Sunday 2026-07-19 23:59:59 US Eastern (EDT, UTC-4);
-;; the clean exclusive cutoff is 2026-07-20T04:00:00Z
-;; (= 2026-07-20 12:00 Asia/Taipei). The Clojure
-;; twin of sdk/src/fable-window.ts; NORTH_FABLE_NOW (ISO-8601 instant) overrides "now" so
-;; the gate is testable without touching the system clock. After the cutoff this flips
-;; with zero code change: orchestrator dials fall back to opus/xhigh.
-(def FABLE-WINDOW-END (java.time.Instant/parse "2026-07-20T04:00:00Z"))
-(defn fable-window-open?
-  ([] (fable-window-open?
-       (or (some-> (System/getenv "NORTH_FABLE_NOW") java.time.Instant/parse)
-           (java.time.Instant/now))))
-  ([now] (.isBefore now FABLE-WINDOW-END)))
 
 ;; ---- agent identity facts (one log scan; single-valued predicates) ----------
 (defn- bulk-agent-facts []
