@@ -1,15 +1,31 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { probeAnthropic, probeOpenAI } from "../src/provider-routing";
+import { authCacheKey, readAuthState, writeAuthState, type CachedAuthState } from "../src/provider-auth-cache";
 
-const saved = { claude: process.env.NORTH_CLAUDE_BIN, codex: process.env.NORTH_CODEX_BIN, home: process.env.HOME };
+const saved = {
+  claude: process.env.NORTH_CLAUDE_BIN,
+  codex: process.env.NORTH_CODEX_BIN,
+  home: process.env.HOME,
+  authCache: process.env.NORTH_AUTH_STATE_CACHE,
+};
 const temporary: string[] = [];
+let authCachePath = "";
+beforeEach(() => {
+  // Isolate the cross-process auth-state cache per test so a definitive verdict
+  // from one case never coalesces into the next (and never touches real state).
+  const directory = mkdtempSync(join(tmpdir(), "north-auth-cache-"));
+  temporary.push(directory);
+  authCachePath = join(directory, "auth-state.json");
+  process.env.NORTH_AUTH_STATE_CACHE = authCachePath;
+});
 afterEach(() => {
   if (saved.claude === undefined) delete process.env.NORTH_CLAUDE_BIN; else process.env.NORTH_CLAUDE_BIN = saved.claude;
   if (saved.codex === undefined) delete process.env.NORTH_CODEX_BIN; else process.env.NORTH_CODEX_BIN = saved.codex;
   if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
+  if (saved.authCache === undefined) delete process.env.NORTH_AUTH_STATE_CACHE; else process.env.NORTH_AUTH_STATE_CACHE = saved.authCache;
   delete process.env.NORTH_DISABLE_ANTHROPIC;
   delete process.env.NORTH_DISABLE_OPENAI;
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
@@ -180,6 +196,60 @@ exit 2`);
     expect(args).toContain('model_provider="openai"');
     expect(args).toContain(`sqlite_home="${join(root, "sqlite")}"`);
   }
+});
+
+const readyState = (provider: "anthropic" | "openai", at: number): CachedAuthState =>
+  ({ provider, installed: true, authenticated: true, available: true, reason: "ready", at });
+
+// version prints, auth/login is killed by a signal: the classic contended-probe
+// shape (spawn could not complete), distinct from the CLI reporting a verdict.
+const killedAuthClaude = () => command("claude", `
+if [ "$1" = "--version" ]; then echo 'claude 1'; exit 0; fi
+if [ "$1 $2 $3" = "auth status --json" ]; then kill -KILL $$; fi
+exit 2`);
+const killedAuthCodex = () => command("codex", `
+if [ "$1" = "--version" ]; then echo 'codex 1'; exit 0; fi
+if [ "$1 $2" = "login status" ]; then kill -KILL $$; fi
+exit 2`);
+
+test("an incomplete auth probe retains the last authenticated verdict instead of flapping to missing", () => {
+  // Older than the coalesce window so the probe actually runs, within retention.
+  writeAuthState(authCachePath, authCacheKey("anthropic", undefined), readyState("anthropic", Date.now() - 60_000));
+  process.env.NORTH_CLAUDE_BIN = killedAuthClaude();
+  expect(probeAnthropic()).toMatchObject({ authenticated: true, available: true, reason: "ready" });
+});
+
+test("a fresh authenticated verdict coalesces: a burst reuses it without spawning", () => {
+  writeAuthState(authCachePath, authCacheKey("openai", undefined), readyState("openai", Date.now()));
+  // Any invocation would fail --version and classify command_missing; reuse proves no spawn.
+  process.env.NORTH_CODEX_BIN = command("codex", "exit 3");
+  expect(probeOpenAI()).toMatchObject({ installed: true, authenticated: true, available: true, reason: "ready" });
+});
+
+test("an incomplete probe with no prior verdict is unknown, never authentication_missing", () => {
+  process.env.NORTH_CODEX_BIN = killedAuthCodex();
+  const result = probeOpenAI();
+  expect(result).toMatchObject({ authenticated: false, available: false, reason: "unknown" });
+  expect(result.reason).not.toBe("authentication_missing");
+});
+
+test("a definitive logged-out verdict is persisted and preserved across a later incomplete probe", () => {
+  // First, the CLI genuinely reports logged out (revoked-equivalent): definitive.
+  process.env.NORTH_CODEX_BIN = command("codex", `
+if [ "$1" = "--version" ]; then echo 'codex 1'; exit 0; fi
+if [ "$1 $2" = "login status" ]; then echo 'Not logged in'; exit 1; fi
+exit 2`);
+  expect(probeOpenAI()).toMatchObject({ authenticated: false, reason: "authentication_missing" });
+  expect(readAuthState(authCachePath, authCacheKey("openai", undefined)))
+    .toMatchObject({ reason: "authentication_missing", authenticated: false });
+
+  // A subsequent contended probe must not upgrade a known-revoked account to ready.
+  writeAuthState(authCachePath, authCacheKey("openai", undefined), {
+    provider: "openai", installed: true, authenticated: false, available: false,
+    reason: "authentication_missing", at: Date.now() - 60_000,
+  });
+  process.env.NORTH_CODEX_BIN = killedAuthCodex();
+  expect(probeOpenAI()).toMatchObject({ authenticated: false, available: false, reason: "authentication_missing" });
 });
 
 test("disabled is routing policy and preserves independent installation/authentication facts", () => {

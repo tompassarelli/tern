@@ -46,8 +46,97 @@ import {
   providerSupportsCapabilities, type GafferCapability,
 } from "./gaffer-capabilities";
 import { spendGuardEligible } from "./spend-guard";
+import {
+  authCacheKey,
+  authStateCachePath,
+  readAuthState,
+  writeAuthState,
+  type AuthVerdictReason,
+  type CachedAuthState,
+} from "./provider-auth-cache";
 
 const PROVIDERS: ProviderId[] = ["anthropic", "openai"];
+
+/** Reuse a definitive authenticated verdict younger than this without spawning. */
+const AUTH_PROBE_COALESCE_TTL_MS = 10_000;
+/** Retain the last definitive verdict this long when a fresh probe cannot complete. */
+const AUTH_STATE_RETENTION_MS = 15 * 60 * 1000;
+
+interface SpawnResultShape {
+  error?: Error;
+  signal?: NodeJS.Signals | null;
+  status: number | null;
+}
+
+/** ENOENT is the CLI genuinely being absent, distinct from a failed spawn. */
+function spawnCommandMissing(result: SpawnResultShape): boolean {
+  return (result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/**
+ * A probe "ran" only when the process exited with a status code. A set `error`
+ * (timeout/ENOMEM/EAGAIN) or a kill `signal` (e.g. the timeout SIGTERM) means it
+ * could not complete — absence of evidence, never a logged-out verdict.
+ */
+function spawnRanToCompletion(result: SpawnResultShape): boolean {
+  return !result.error && result.signal == null && result.status !== null;
+}
+
+function availabilityOf(state: CachedAuthState, disabled: boolean, targetId?: string): ProviderAvailability {
+  return {
+    ...(targetId ? { targetId } : {}),
+    provider: state.provider,
+    installed: state.installed,
+    authenticated: state.authenticated,
+    available: disabled ? false : state.available,
+    reason: disabled ? "disabled" : state.reason,
+  };
+}
+
+function persistAuthVerdict(
+  cachePath: string,
+  key: string,
+  provider: ProviderId,
+  installed: boolean,
+  reason: AuthVerdictReason,
+): CachedAuthState {
+  const state: CachedAuthState = {
+    provider, installed,
+    authenticated: reason === "ready",
+    available: reason === "ready",
+    reason,
+    at: Date.now(),
+  };
+  writeAuthState(cachePath, key, state);
+  return state;
+}
+
+/**
+ * A probe could not complete. Retain the last definitive verdict (single source
+ * of authentication truth), whether that was ready or logged-out, rather than
+ * fabricating either. With no retained verdict the honest state is "unknown":
+ * unavailable for routing but explicitly not `authentication_missing`.
+ */
+function unverifiableAuth(
+  cachePath: string,
+  key: string,
+  provider: ProviderId,
+  installed: boolean,
+  disabled: boolean,
+  targetId: string | undefined,
+  now: number,
+): ProviderAvailability {
+  const retained = readAuthState(cachePath, key);
+  if (retained && now - retained.at <= AUTH_STATE_RETENTION_MS)
+    return availabilityOf(retained, disabled, targetId);
+  return {
+    ...(targetId ? { targetId } : {}),
+    provider, installed,
+    authenticated: false,
+    available: false,
+    reason: disabled ? "disabled" : "unknown",
+  };
+}
 
 export type ProviderSelectionFailure =
   | "provider_unavailable"
@@ -192,52 +281,61 @@ export function resourcePolicyFromEnv(
 export function probeAnthropic(target?: RoutingTarget): ProviderAvailability {
   const env = providerEnvironmentForTarget("anthropic", target);
   const disabled = env.NORTH_DISABLE_ANTHROPIC === "1";
+  const cachePath = authStateCachePath();
+  const key = authCacheKey("anthropic", target?.id);
+  const now = Date.now();
+
+  // Coalesce: a recent authenticated verdict is reused without spawning, so a
+  // burst of callers collapses to a single probe instead of a fork stampede.
+  const cached = readAuthState(cachePath, key);
+  if (cached?.reason === "ready" && now - cached.at <= AUTH_PROBE_COALESCE_TTL_MS)
+    return availabilityOf(cached, disabled, target?.id);
+
   const command = env.NORTH_CLAUDE_BIN ?? "claude";
   const version = spawnSync(command, ["--version"], { env, encoding: "utf8", timeout: 3000 });
-  if (version.error || version.status !== 0) return {
-    ...(target ? { targetId: target.id } : {}),
-    provider: "anthropic", installed: false, authenticated: false, available: false,
-    reason: disabled ? "disabled" : "command_missing",
-  };
+  if (spawnCommandMissing(version) || (spawnRanToCompletion(version) && version.status !== 0))
+    return availabilityOf(persistAuthVerdict(cachePath, key, "anthropic", false, "command_missing"), disabled, target?.id);
+  if (!spawnRanToCompletion(version))
+    return unverifiableAuth(cachePath, key, "anthropic", false, disabled, target?.id, now);
+
   const auth = spawnSync(command, ["auth", "status", "--json"], { env, encoding: "utf8", timeout: 3000 });
+  if (!spawnRanToCompletion(auth))
+    return unverifiableAuth(cachePath, key, "anthropic", true, disabled, target?.id, now);
   let loggedIn = false;
   try {
     const status = JSON.parse(auth.stdout || "{}");
     loggedIn = isClaudeSubscriptionStatus(status);
   } catch { /* malformed output is not authenticated */ }
-  if (auth.error || auth.status !== 0 || !loggedIn) return {
-    ...(target ? { targetId: target.id } : {}),
-    provider: "anthropic", installed: true, authenticated: false, available: false,
-    reason: disabled ? "disabled" : "authentication_missing",
-  };
-  return { ...(target ? { targetId: target.id } : {}), provider: "anthropic", installed: true, authenticated: true, available: !disabled,
-    reason: disabled ? "disabled" : "ready" };
+  const reason: AuthVerdictReason = auth.status !== 0 || !loggedIn ? "authentication_missing" : "ready";
+  return availabilityOf(persistAuthVerdict(cachePath, key, "anthropic", true, reason), disabled, target?.id);
 }
 
 export function probeOpenAI(target?: RoutingTarget): ProviderAvailability {
   const env = providerEnvironmentForTarget("openai", target);
   const disabled = env.NORTH_DISABLE_OPENAI === "1";
+  const cachePath = authStateCachePath();
+  const key = authCacheKey("openai", target?.id);
+  const now = Date.now();
+
+  // Coalesce: reuse a recent authenticated verdict rather than re-forking.
+  const cached = readAuthState(cachePath, key);
+  if (cached?.reason === "ready" && now - cached.at <= AUTH_PROBE_COALESCE_TTL_MS)
+    return availabilityOf(cached, disabled, target?.id);
+
   const command = env.NORTH_CODEX_BIN ?? "codex";
   const result = spawnSync(command, ["--version"], { env, encoding: "utf8", timeout: 3000 });
-  if (result.error || result.status !== 0)
-    return {
-      ...(target ? { targetId: target.id } : {}),
-      provider: "openai",
-      installed: false,
-      authenticated: false,
-      available: false,
-      reason: disabled ? "disabled" : "command_missing",
-  };
+  if (spawnCommandMissing(result) || (spawnRanToCompletion(result) && result.status !== 0))
+    return availabilityOf(persistAuthVerdict(cachePath, key, "openai", false, "command_missing"), disabled, target?.id);
+  if (!spawnRanToCompletion(result))
+    return unverifiableAuth(cachePath, key, "openai", false, disabled, target?.id, now);
+
   const auth = spawnSync(command, ["login", "status", ...codexConfigArguments(env)], { env, encoding: "utf8", timeout: 3000 });
+  if (!spawnRanToCompletion(auth))
+    return unverifiableAuth(cachePath, key, "openai", true, disabled, target?.id, now);
   const authLines = `${auth.stdout}\n${auth.stderr}`.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const loggedIn = auth.status === 0 && authLines.includes("Logged in using ChatGPT");
-  if (auth.error || !loggedIn) return {
-    ...(target ? { targetId: target.id } : {}),
-    provider: "openai", installed: true, authenticated: false, available: false,
-    reason: disabled ? "disabled" : "authentication_missing",
-  };
-  return { ...(target ? { targetId: target.id } : {}), provider: "openai", installed: true, authenticated: true, available: !disabled,
-    reason: disabled ? "disabled" : "ready" };
+  const reason: AuthVerdictReason = loggedIn ? "ready" : "authentication_missing";
+  return availabilityOf(persistAuthVerdict(cachePath, key, "openai", true, reason), disabled, target?.id);
 }
 
 function stableUnit(value: string): number {
