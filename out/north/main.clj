@@ -152,6 +152,43 @@
    c (add-fact c te "committed" today)]
   c))
 
+(defrecord CaptureReceipt [id thread title path expected committed complete reason])
+
+(defn capturereceipt-id [r] (:id r))
+
+(defn capturereceipt-thread [r] (:thread r))
+
+(defn capturereceipt-title [r] (:title r))
+
+(defn capturereceipt-path [r] (:path r))
+
+(defn capturereceipt-expected [r] (:expected r))
+
+(defn capturereceipt-committed [r] (:committed r))
+
+(defn capturereceipt-complete [r] (:complete r))
+
+(defn capturereceipt-reason [r] (:reason r))
+
+(defn- ^Boolean structured-capture? []
+  (= "1" (fram.rt/getenv-or "NORTH_CAPTURE_STRUCTURED" "")))
+
+(defn- print-capture-receipt [^String id ^String te ^String title ^String path expected committed ^Boolean complete ^String reason]
+  (println (fram.rt/to-json (->CaptureReceipt id te title path expected committed complete reason))))
+
+(defn- ^Boolean retract-committed-capture-facts [port ^String log facts results i]
+  (if (>= i (count facts)) true (let [fact (nth facts i)
+   result (nth results i)
+   current-ok (if (str/starts-with? result "ok:") (str/starts-with? (tell-retry port log "retract" (:l fact) (:p fact) (:r fact) 5) "ok:") true)
+   remaining-ok (retract-committed-capture-facts port log facts results (+ i 1))]
+  (and current-ok remaining-ok))))
+
+(defn- ^Boolean cleanup-partial-capture [port ^String log ^String te ^String path facts results]
+  (let [retracted (retract-committed-capture-facts port log facts results 0)
+   _ (fram.rt/delete-file path)
+   remaining (filterv (fn [fact] (= te (:l fact))) (fram.rt/coord-live-facts port log))]
+  (and retracted (empty? remaining) (not (fram.rt/file-exists path)))))
+
 (defn cmd-capture [^String threads-dir ^String log ^String title ^String owner]
   (let [source (fram.rt/getenv-or "NORTH_SOURCE" "self")
    author (fram.rt/getenv-or "NORTH_AUTHOR" "you")
@@ -171,12 +208,13 @@
    path (str threads-dir "/" id "-" slug ".md")
    port (fram.rt/coord-port)
    coord-v (fram.rt/coord-version-for-log port log)]
-  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "capture was not recorded")) (let [facts (capture-facts te title owner source author lead proposed created-at today)
+  (if (< coord-v 0) (if (structured-capture?) (print-capture-receipt id te title path 0 0 false "coordinator-unavailable") (println (coordinator-failure-message coord-v port log "capture was not recorded"))) (let [facts (capture-facts te title owner source author lead proposed created-at today)
    results (mapv (fn [c] (tell-retry port log "assert" (:l c) (:p c) (:r c) 5)) facts)
    oks (count (filterv (fn [r] (str/starts-with? r "ok:")) results))]
   (if (= oks (count facts)) (do
   (fram.rt/spit-file path (exp/thread-md (:facts (fold/fold (fram.rt/read-log log))) te))
-  (println (str "captured -> " te "  " title "  [owner: " owner "]\n" "  file:      " path "\n" "  committed: " oks " facts via coordinator. Next: north tell " id " <pred> <value>"))) (println (str "capture PARTIAL: only " oks "/" (count facts) " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files."))))))))))
+  (if (structured-capture?) (print-capture-receipt id te title path (count facts) oks true "captured") (println (str "captured -> " te "  " title "  [owner: " owner "]\n" "  file:      " path "\n" "  committed: " oks " facts via coordinator. Next: north tell " id " <pred> <value>")))) (if (structured-capture?) (let [cleaned (cleanup-partial-capture port log te path facts results)]
+  (print-capture-receipt id te title path (count facts) oks false (if cleaned "partial-cleaned" "partial-cleanup-failed"))) (println (str "capture PARTIAL: only " oks "/" (count facts) " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files.")))))))))))
 
 (defn- ^Boolean id-like? [^String bare]
   (and (not (str/blank? bare)) (str/blank? (str/replace bare #"[0-9a-f-]" "")) (or (str/includes? bare "-") (>= (count bare) 8))))
@@ -1079,7 +1117,7 @@
 (defn run [args ^String threads-dir ^String log]
   (let [cmd (if (empty? args) "" (first args))]
   (cond
-  (= cmd "capture") (if (>= (count args) 2) (cmd-capture threads-dir log (nth args 1) (if (>= (count args) 3) (nth args 2) "personal")) (println "usage: capture <title> [owner]"))
+  (= cmd "capture") (if (and (>= (count args) 2) (or (= (nth args 1) "--help") (= (nth args 1) "-h"))) (println "usage: capture <title> [owner]") (if (>= (count args) 2) (cmd-capture threads-dir log (nth args 1) (if (>= (count args) 3) (nth args 2) "personal")) (println "usage: capture <title> [owner]")))
   (= cmd "ready") (cmd-ready log (has-flag? args "--all"))
   (= cmd "blocked") (cmd-blocked log)
   (= cmd "leverage") (cmd-leverage log)

@@ -279,10 +279,43 @@
 ;;      the immediate parent, not a leaked top-of-tree pin;
 ;;   3. NORTH_AGENT_ID — a pinned session id (last, so an inherited pin never beats #2).
 ;; Captured from `env` BEFORE cmd-env reassigns AGENT_ID to the new lane.
+(defn canonical-default-path [home & segments]
+  (.getCanonicalPath (apply io/file home segments)))
+
+(defn materialize-instance-env
+  "Compile the MCP server's captured process environment into the exact North
+  instance selectors a managed child receives. Explicit instance pins win;
+  otherwise this mirrors bin/north's facts.log default and seeded split switch."
+  ([source]
+   (materialize-instance-env source #(.isFile (io/file %))))
+  ([source regular-file?]
+   (let [home (or (not-empty (get source "HOME"))
+                  (System/getProperty "user.home"))
+         explicit-log (not-empty (get source "FRAM_LOG"))
+         explicit-telemetry (not-empty (get source "FRAM_TELEMETRY_LOG"))
+         default-log (canonical-default-path home ".local" "state" "north" "facts.log")
+         initial-log (or explicit-log default-log)
+         log-parent (or (.getParent (io/file initial-log)) ".")
+         split-log (.getCanonicalPath (io/file log-parent "coordination.log"))
+         split? (and (nil? explicit-log)
+                     (nil? explicit-telemetry)
+                     (regular-file? split-log))
+         selected-log (if split? split-log initial-log)
+         threads (or (not-empty (get source "FRAM_THREADS"))
+                     (canonical-default-path home ".local" "state" "north" "threads"))
+         port (or (not-empty (get source "NORTH_PORT")) "7977")]
+     (cond-> (assoc source
+                    "HOME" home
+                    "FRAM_LOG" selected-log
+                    "FRAM_THREADS" threads
+                    "NORTH_PORT" port)
+       split? (assoc "FRAM_TELEMETRY_LOG"
+                     (.getCanonicalPath (io/file log-parent "telemetry.log")))))))
+
 (defn resolve-coordinator [env args]
   (or (not-empty (get args "coordinator"))
       (not-empty (get env "AGENT_ID"))
-      (not-empty (System/getenv "NORTH_AGENT_ID"))))
+      (not-empty (get env "NORTH_AGENT_ID"))))
 
 ;; A child request owns every managed routing axis. Starting from the parent
 ;; process environment without removing these lets a director's composition or
@@ -578,7 +611,7 @@
     {:content [{:type "text" :text problem}] :isError true}
     (if-let [problem (preflight-exact-target args)]
       {:content [{:type "text" :text problem}] :isError true}
-      (let [parent-env (into {} (System/getenv))
+      (let [parent-env (materialize-instance-env (into {} (System/getenv)))
             coordinator (resolve-coordinator parent-env args)
             env (north.managed-child-env/scrub parent-env)]
         (case nm
@@ -616,7 +649,7 @@
         (if-let [problem (claim-driver-problem id agent-id)]
           {:content [{:type "text" :text problem}] :isError true}
           (try
-            (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))
+            (let [log (io/file (str (get parent-env "HOME") "/.local/state/north/agents/" agent-id ".log"))
                   process (launch-sdk! [bun "run" (str sdk-dir "/dispatch.ts") id] cmd-env log)
                   _ (watch-driver-release! process id agent-id)
                   startup (await-sdk-startup process agent-id log)
@@ -670,7 +703,7 @@
                       caveman     (assoc "AGENT_CAVEMAN" caveman)
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (try
-          (let [log (io/file (str (System/getenv "HOME") "/.local/state/north/agents/" agent-id ".log"))
+          (let [log (io/file (str (get parent-env "HOME") "/.local/state/north/agents/" agent-id ".log"))
                 process (launch-sdk! [bun "run" (str sdk-dir "/spawn.ts") prompt] cmd-env log)
                 startup (await-sdk-startup process agent-id log)
                 suffix (str (when model (str " model=" model))

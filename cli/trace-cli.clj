@@ -115,6 +115,60 @@
              :else nil)
      :death-notifications (count deaths)}))
 
+(defn terminal-delivery-state
+  "Expose delivery only from the same committed lane terminal that established
+  process truth. A compatibility run fallback has no lane delivery projection."
+  [facts terminal-state]
+  (when (and (:terminal? terminal-state)
+             (= :agent (:source terminal-state)))
+    {:outcome (or (north.terminal-projection/singleton-value
+                   facts "delivery_outcome")
+                  "unrecorded")
+     :reason (north.terminal-projection/singleton-value
+              facts "delivery_reason")}))
+
+(defn terminal-summary [terminal-state delivery-state]
+  (str "process=" (:outcome terminal-state)
+       " · delivery=" (or (:outcome delivery-state) "unrecorded")
+       (when-let [reason (:reason delivery-state)]
+         (str " (" reason ")"))))
+
+(defn trace-verdict
+  [{:keys [id on-roster terminal-state delivery-state online lease lineage
+           identity-complete deaths]}]
+  (let [terminal? (:terminal? terminal-state)
+        terminal-kind (:kind terminal-state)
+        summary (terminal-summary terminal-state delivery-state)]
+    (cond
+      (not on-roster)
+      (red "F4 — not on any roster: a zombie fork, a bad id, or an unmanaged actor. Confirm via git author vs `north agents`.")
+      (= terminal-kind :died)
+      (str (red (str "F1 — API-death mid-lane; " summary "."))
+           " agent_death recorded. Remedy: re-dispatch the thread (idempotent); enable AGENT_ESCALATE=1 for chronic deaths; read the partial result first.")
+      (= terminal-kind :died-unreported)
+      (str (red (str "F3 — silent death; " summary "."))
+           " The lease/telemetry missed the death; trust the reactor verdict.")
+      (= terminal-kind :stopped)
+      (str (red (str "terminal execution did not succeed; " summary "."))
+           (when online " The still-live lease is stale presence, not evidence of healthy execution."))
+      (and (seq deaths) (not terminal?))
+      (str (red "F1/F3 — death notification received but execution remains unresolved.")
+           " A notification is diagnostic only; require a committed lane terminal or committed run before treating the lane as finished.")
+      (and on-roster (not terminal?) (not online))
+      (str (red "F2/F3 — offline with NO completion signal.")
+           (if lease " Lease lapsed but still present:" " Lease gone entirely (expired + reaped, or never leased):")
+           " if the transcript moved after the lease expiry → F2 (lapsed-but-alive): trust the transcript. Else it died silently — the reactor reaps it as died-unreported within 30min (confirm: `north show @agent:"
+           id "` for outcome=died-unreported).")
+      (and (= lineage :sdk-lane) (not identity-complete))
+      (red "F6 — SDK-lane missing identity facts: possible id-collision/aliasing, or writeAgentFacts failed. Check `north show @agent:<id>` for contradictory repos/goals.")
+      (and (= terminal-kind :ran) online)
+      (grn (str "healthy — " summary "; lease remains online. No failure."))
+      (= terminal-kind :ran)
+      (grn (str "healthy — " summary "; lease lapsed as expected. No failure."))
+      online
+      (grn "healthy — online and advancing (no terminal signal yet). No failure.")
+      :else (dim "no failing stage detected."))))
+
 ;; ---- render one stage line ---------------------------------------------------
 (defn stage [n mark label detail cmd]
   (let [g (case mark :ok (grn "✓") :na (dim "·") :fail (red "✗"))]
@@ -160,7 +214,7 @@
             terminal-state (execution-terminal-state facts last-run deaths)
             terminal? (:terminal? terminal-state)
             terminal-kind (:kind terminal-state)
-            execution-outcome (:outcome terminal-state)
+            delivery-state (terminal-delivery-state facts terminal-state)
             inbox (inbox-to id)]
         ;; header
         (println (str (bold "north trace ") (bold id) "  ·  :" PORT))
@@ -231,12 +285,15 @@
                          online :na
                          :else :fail)
               detail (case terminal-kind
-                       :ran (str (grn "outcome=ran") (when last-run (str " " (ago (- NOW (:ms last-run))) " ago")))
-                       :died (str (red "outcome=died")
+                       :ran (str (grn (terminal-summary terminal-state delivery-state))
+                                 (when last-run (str " " (ago (- NOW (:ms last-run))) " ago")))
+                       :died (str (red (terminal-summary terminal-state delivery-state))
                                   (when death-notification
                                     (str " · notification: \"" (:reason death-notification) "\"")))
-                       :died-unreported (red "outcome=died-unreported (reactor-reaped silent death)")
-                       :stopped (str (ylw (str "outcome=" execution-outcome)))
+                       :died-unreported
+                       (red (str (terminal-summary terminal-state delivery-state)
+                                 " (reactor-reaped silent death)"))
+                       :stopped (ylw (terminal-summary terminal-state delivery-state))
                        (cond
                          death-notification
                          (str (red "agent_death notification without committed terminal")
@@ -256,29 +313,10 @@
         (println)
         ;; ---- verdict (first genuine failure + F-mode) ----
         (let [verdict
-              (cond
-                (not on-roster)
-                (red "F4 — not on any roster: a zombie fork, a bad id, or an unmanaged actor. Confirm via git author vs `north agents`.")
-                (= terminal-kind :died)
-                (str (red "F1 — API-death mid-lane.") " agent_death recorded. Remedy: re-dispatch the thread (idempotent); enable AGENT_ESCALATE=1 for chronic deaths; read the partial result first.")
-                (= terminal-kind :died-unreported)
-                (str (red "F3 — died with no self-reported signal; reactor reaped it (outcome=died-unreported).") " The lease/telemetry missed the death; trust the reactor verdict.")
-                (and (seq deaths) (not terminal?))
-                (str (red "F1/F3 — death notification received but execution remains unresolved.")
-                     " A notification is diagnostic only; require a committed lane terminal or committed run before treating the lane as finished.")
-                (and on-roster (not terminal?) (not online))
-                (str (red "F2/F3 — offline with NO completion signal.")
-                     (if l " Lease lapsed but still present:" " Lease gone entirely (expired + reaped, or never leased):")
-                     " if the transcript moved after the lease expiry → F2 (lapsed-but-alive): trust the transcript. Else it died silently — the reactor reaps it as died-unreported within 30min (confirm: `north show @agent:" id "` for outcome=died-unreported).")
-                (and (= lineage :sdk-lane) (not idfull))
-                (red "F6 — SDK-lane missing identity facts: possible id-collision/aliasing, or writeAgentFacts failed. Check `north show @agent:<id>` for contradictory repos/goals.")
-                (and (= terminal-kind :ran) online)
-                (grn "healthy — online; a completed run is recorded (outcome=ran). No failure.")
-                (= terminal-kind :ran)
-                (grn "healthy — completed cleanly (outcome=ran), lease lapsed as expected. No failure.")
-                online
-                (grn "healthy — online and advancing (no terminal signal yet). No failure.")
-                :else (dim "no failing stage detected."))]
+              (trace-verdict
+               {:id id :on-roster on-roster :terminal-state terminal-state
+                :delivery-state delivery-state :online online :lease l
+                :lineage lineage :identity-complete idfull :deaths deaths})]
           (println (str (bold "verdict: ") verdict)))))
     (System/exit 0)))
 

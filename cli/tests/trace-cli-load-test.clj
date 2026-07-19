@@ -49,6 +49,24 @@
       conflict (north.agent-provenance/fold-fact folded "process_outcome" "died")
       corrupt-marker (north.agent-provenance/fold-fact
                       folded "terminal_manifest_sha256" "corrupt")
+      blocked-terminal {"outcome" "blocked_preflight"
+                        "process_outcome" "blocked_preflight"
+                        "delivery_outcome" "blocked"
+                        "delivery_reason" "execution_preflight_blocked"}
+      blocked-modern
+      (assoc blocked-terminal "terminal_manifest_sha256"
+             (north.terminal-projection/terminal-manifest-sha256
+              blocked-terminal))
+      blocked-folded
+      (reduce-kv north.agent-provenance/fold-fact {} blocked-modern)
+      blocked-state (execution-terminal-state blocked-folded nil [])
+      blocked-delivery (terminal-delivery-state blocked-folded blocked-state)
+      blocked-verdict
+      (trace-verdict
+       {:id "blocked-agent" :on-roster true
+        :terminal-state blocked-state :delivery-state blocked-delivery
+        :online true :lease {:exp (+ NOW 60000)}
+        :lineage :sdk-lane :identity-complete true :deaths []})
       run {:outcome "ran" :ms 0}
       death [{:reason "transport exited" :ms 0}]]
   (check "true legacy singleton outcome remains terminal"
@@ -67,6 +85,20 @@
          (= {:outcome "ran" :source :run :terminal? true :kind :ran
              :death-notifications 0}
             (execution-terminal-state {} run [])))
+  (check "blocked_preflight is a stopped terminal even with a live lease"
+         (= {:outcome "blocked_preflight" :source :agent :terminal? true
+             :kind :stopped :death-notifications 0}
+            blocked-state))
+  (check "completion rendering separates process from delivery"
+         (= (str "process=blocked_preflight · delivery=blocked "
+                 "(execution_preflight_blocked)")
+            (terminal-summary blocked-state blocked-delivery)))
+  (check "terminal blocked_preflight dominates live presence in the verdict"
+         (and (str/includes? blocked-verdict
+                             "terminal execution did not succeed")
+              (str/includes? blocked-verdict "process=blocked_preflight")
+              (str/includes? blocked-verdict "delivery=blocked")
+              (not (str/includes? blocked-verdict "healthy —"))))
   (check "death notification alone is diagnostic and never terminal"
          (= {:outcome nil :source nil :terminal? false :kind nil
              :death-notifications 1}

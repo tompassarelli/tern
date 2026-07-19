@@ -651,6 +651,11 @@ One binary. Run it via the north wrapper: **`~/code/north/bin/north`**.
 The wrapper aims the Fram engine (`~/code/fram`) at north's private data
 (`FRAM_THREADS`/`FRAM_LOG` under `~/.local/state/north/`, projected from the
 canonical `north-data/facts.log`) and sets capture provenance defaults.
+`~/code/north/bin/north-mcp` materializes the same instance selectors once from
+its captured parent environment before launching children: explicit selectors
+win; otherwise it supplies canonical `FRAM_LOG`, `FRAM_THREADS`, and
+`NORTH_PORT` defaults. It selects the split coordination/telemetry logs only
+when no log is pinned and the seeded coordination log already exists.
 
 `los` is **gone entirely** — `los thread`/`los validate` retired (use `north`),
 and time tracking is now **`north clock`** (fact-native; see Clock management).
@@ -815,12 +820,36 @@ verb to exactly one mechanical form:
 ```sh
 north delegate "<task>" --role <worker-role> [spawn options]  # atomic
 north delegate "<task>" --composite [spawn options]           # 2+ independent pieces
+north delegate "<task>" --thread <id> ...                     # bind an existing thread
 ```
 
 There is no unclassified default. Atomic handoff forwards every normal spawn
 axis and bespoke-composition option, so it starts exactly one selected terminal
 worker. Composite handoff alone hydrates the director, which then owns fan-out
 and reduction. Context carriage remains orthogonal via `--context <file>`.
+
+Every executed delegation has one durable, exact thread before a provider is
+invoked. `--thread` wins and must resolve to a title-bearing thread. Without it,
+North inherits a managed parent thread only when the ambient run reservation,
+reporter, and capability all verify; stray or stale environment variables never
+count as proof. Otherwise North mechanically captures one committed thread. Its
+title is a deterministic, bounded label derived from the first meaningful task
+line; the complete task remains in the spawn brief. Structured capture is
+transaction-like at this boundary: a partial write is retracted and absence is
+proved, or delegation fails closed before provider execution.
+
+The dedicated delegate-thread environment binding is adapter input, not
+heritable authority: the SDK consumes it once, while managed child environments
+scrub it along with parent run credentials. A composite thread records only the
+aggregate reduction/checkpoint contract. Each child receives its own
+title-bearing thread linked with `part_of`, its own run reservation, and its own
+evidence. A successful orchestrator terminal additionally requires an explicit
+child reconciliation result. Live children cause a bounded continuation (real
+state progress resets the bound); an unavailable reconciliation source or a
+no-progress cap records a blocked, never-ran terminal. North repeats the
+reconciliation gate immediately before publication to narrow the late-child
+race window to that publication seam. Terminal workers retain the loud
+early-exit notification behavior.
 
 **Ownership rule** (2026-07-09): a cockpit verb earns its place ONLY when it
 COMPOSES multiple tools (`dashboard`, `doctor`, `profile`, `spawn` = gaffer dials

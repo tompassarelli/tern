@@ -42,6 +42,8 @@
 (declare-extern fram.rt/time-dir [-> String])
 (declare-extern fram.rt/ensure-dir [String -> Nil])
 (declare-extern fram.rt/spit-file [String String -> Nil])
+(declare-extern fram.rt/file-exists [String -> Bool])
+(declare-extern fram.rt/delete-file [String -> Nil])
 (declare-extern fram.rt/slugify [String -> String])
 (declare-extern fram.rt/getenv-or [String String -> String])
 (declare-extern fram.rt/coord-version-for-log [Int String -> Int])
@@ -291,8 +293,8 @@
   (if (str/blank? v) "" (str "@" v)))
 
 (defn- capture-facts [te :- String title :- String owner :- String source :- String
-                       author :- String lead :- String proposed :- String
-                       created-at :- String today :- String] :- (Vec k/Fact)
+                      author :- String lead :- String proposed :- String
+                      created-at :- String today :- String] :- (Vec k/Fact)
   ;; NO `driver` at birth (operating-manual): making a thread active is a deliberate
   ;; pickup (`tell <id> driver @x`), never a capture default — a driver cell here is
   ;; exactly the "stray driver" pollution the-model warns about.
@@ -316,6 +318,65 @@
         c (add-fact c te "updated_at" today)
         c (add-fact c te "committed" today)]
     c))
+
+(defrecord CaptureReceipt
+  [id :- String
+   thread :- String
+   title :- String
+   path :- String
+   expected :- Int
+   committed :- Int
+   complete :- Bool
+   reason :- String])
+
+(defn- structured-capture? [] :- Bool
+  ;; Internal machine boundary for adapters that must bind the exact minted
+  ;; thread without scraping human prose. Environment control keeps the mode
+  ;; impossible to trigger accidentally through a title or owner argument.
+  (= "1" (fram.rt/getenv-or "NORTH_CAPTURE_STRUCTURED" "")))
+
+(defn- print-capture-receipt
+  [id :- String te :- String title :- String path :- String expected :- Int
+   committed :- Int complete :- Bool reason :- String] :- Nil
+  (println
+   (fram.rt/to-json
+    (->CaptureReceipt id te title path expected committed complete reason))))
+
+(defn- retract-committed-capture-facts
+  [port :- Int log :- String facts :- (Vec k/Fact) results :- (Vec String)
+   i :- Int] :- Bool
+  (if (>= i (count facts))
+    true
+    (let [fact (nth facts i)
+          result (nth results i)
+          current-ok
+          (if (str/starts-with? result "ok:")
+            (str/starts-with?
+             (tell-retry port log "retract" (:l fact) (:p fact) (:r fact) 5)
+             "ok:")
+            true)
+          remaining-ok
+          (retract-committed-capture-facts
+           port log facts results (+ i 1))]
+      ;; Always attempt every acknowledged write. A failed early retraction
+      ;; must not prevent later facts from being compensated.
+      (and current-ok remaining-ok))))
+
+(defn- cleanup-partial-capture
+  [port :- Int log :- String te :- String path :- String
+   facts :- (Vec k/Fact) results :- (Vec String)] :- Bool
+  ;; Structured capture owns this freshly minted UUID, so it can compensate
+  ;; exactly the facts acknowledged by this attempt. Prove both graph and view
+  ;; absence before describing the rollback as clean.
+  (let [retracted
+        (retract-committed-capture-facts port log facts results 0)
+        _ (fram.rt/delete-file path)
+        remaining
+        (filterv (fn [fact :- k/Fact] :- Bool (= te (:l fact)))
+                 (fram.rt/coord-live-facts port log))]
+    (and retracted
+         (empty? remaining)
+         (not (fram.rt/file-exists path)))))
 
 (defn cmd-capture [threads-dir :- String log :- String title :- String owner :- String] :- Nil
   (let [source (fram.rt/getenv-or "NORTH_SOURCE" "self")
@@ -349,8 +410,11 @@
          ;; UUIDv7 is collision-proof, so capture no longer reserves a file-lock id
          ;; (the old now-id/reserve-id dance guarded same-second timestamp clashes).
          (if (< coord-v 0)
-           (println (coordinator-failure-message
-                     coord-v port log "capture was not recorded"))
+           (if (structured-capture?)
+             (print-capture-receipt
+              id te title path 0 0 false "coordinator-unavailable")
+             (println (coordinator-failure-message
+                       coord-v port log "capture was not recorded")))
            (let [facts (capture-facts te title owner source author lead proposed created-at today)
                  results (mapv (fn [c :- k/Fact] :- String
                                  (tell-retry port log "assert" (:l c) (:p c) (:r c) 5))
@@ -359,11 +423,22 @@
              (if (= oks (count facts))
                (do
                  (fram.rt/spit-file path (exp/thread-md (:facts (fold/fold (fram.rt/read-log log))) te))
-                 (println (str "captured -> " te "  " title "  [owner: " owner "]\n"
-                               "  file:      " path "\n"
-                               "  committed: " oks " facts via coordinator. Next: north tell " id " <pred> <value>")))
-               (println (str "capture PARTIAL: only " oks "/" (count facts)
-                             " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files.")))))))])))
+                 (if (structured-capture?)
+                   (print-capture-receipt
+                    id te title path (count facts) oks true "captured")
+                   (println (str "captured -> " te "  " title "  [owner: " owner "]\n"
+                                 "  file:      " path "\n"
+                                 "  committed: " oks " facts via coordinator. Next: north tell " id " <pred> <value>"))))
+               (if (structured-capture?)
+                 (let [cleaned
+                       (cleanup-partial-capture
+                        port log te path facts results)]
+                   (print-capture-receipt
+                    id te title path (count facts) oks false
+                    (if cleaned "partial-cleaned"
+                        "partial-cleanup-failed")))
+                 (println (str "capture PARTIAL: only " oks "/" (count facts)
+                               " fact(s) committed (write conflict / no daemon?). Re-run — nothing is stranded in files."))))))))])))
 
 ;; Resolve a thread ref (@id OR @handle) to its canonical @id and print it. The
 ;; bin/north wrapper calls this before routing tell/untell to fram, so a
@@ -1648,9 +1723,12 @@
   (let [cmd (if (empty? args) "" (first args))]
     (cond
       [(= cmd "capture")
-       (if (>= (count args) 2)
-         (cmd-capture threads-dir log (nth args 1) (if (>= (count args) 3) (nth args 2) "personal"))
-         (println "usage: capture <title> [owner]"))]
+       (if (and (>= (count args) 2)
+                (or (= (nth args 1) "--help") (= (nth args 1) "-h")))
+         (println "usage: capture <title> [owner]")
+         (if (>= (count args) 2)
+           (cmd-capture threads-dir log (nth args 1) (if (>= (count args) 3) (nth args 2) "personal"))
+           (println "usage: capture <title> [owner]")))]
       [(= cmd "ready")    (cmd-ready log (has-flag? args "--all"))]
       [(= cmd "blocked")  (cmd-blocked log)]
       [(= cmd "leverage") (cmd-leverage log)]

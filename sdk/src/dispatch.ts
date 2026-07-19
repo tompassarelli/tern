@@ -12,7 +12,10 @@ import { newRunId, recordRun } from "./telemetry";
 import { notifyDeath } from "./death";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
-import { liveChildren, notifyEarlyExitChildren } from "./children";
+import {
+  childContinuationMessage, decideChildTurnEnd, initialChildContinuationState,
+  notifyEarlyExitChildren, reconcileChildren, type ChildReconciliation,
+} from "./children";
 import {
   bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute,
   userAnchoredPath,
@@ -76,6 +79,8 @@ export interface DispatchDependencies {
     reserve: (context: DeliveryRunContext) => DeliveryReservation;
     load: (runId: string) => DeliveryRunState;
   };
+  /** Hermetic graph seam for orchestrator child reconciliation. */
+  childReconciler?: (agentId: string) => ChildReconciliation;
 }
 
 export function createDispatchAgentId(threadId: string, now = Date.now(), uuid = randomUUID()): string {
@@ -105,6 +110,7 @@ async function runDispatch(
   hydratedChildren?: ReturnType<typeof getChildren>,
   loadTerminalFacts: typeof getThreadFacts = getThreadFacts,
   deliveryRuntime?: DispatchDependencies["deliveryRuntime"],
+  childReconciler: (agentId: string) => ChildReconciliation = reconcileChildren,
 ): Promise<DispatchResult> {
   const runStartedAt = process.hrtime.bigint();
   const routingMetadata = hydratedMetadata ?? validateRoutingMetadata(applyGafferStaffing(routingMetadataFromEnv()));
@@ -237,6 +243,8 @@ async function runDispatch(
   // `result` while a harness-tracked background task is live — see bgtasks.ts.
   const bgTracker = makeBgTracker();
   let bgContinuations = 0;
+  const orchestrator = routingMetadata.topology === "orchestrator";
+  let childContinuation = initialChildContinuationState();
   let q: AgentQuery | undefined;
   let compositionEvidence: HarnessCompositionEvidence | undefined;
   let queryInterrupted = false;
@@ -339,6 +347,30 @@ async function runDispatch(
           if (bgTracker.size() > 0) {
             console.error(`[harness] @agent:${agentId} continuation cap (${maxBgContinuations()}) reached with ${bgTracker.size()} task(s) still live — finalizing anyway`);
           }
+          if (orchestrator) {
+            const decision = decideChildTurnEnd(
+              childContinuation,
+              childReconciler(agentId),
+              maxBgContinuations(),
+            );
+            childContinuation = decision.state;
+            if (decision.action === "continue") {
+              console.error(
+                `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
+              );
+              ch.push(childContinuationMessage(decision.live));
+              continue;
+            }
+            if (decision.action === "block") {
+              outcome = decision.reason === "child_reconciliation_unavailable"
+                ? "child_reconciliation_unavailable"
+                : "orchestrator_children_incomplete";
+              console.error(
+                `[harness] @agent:${agentId} orchestrator completion blocked: ${decision.reason}${decision.live?.length ? ` (${decision.live.join(", ")})` : ""}`,
+              );
+              break;
+            }
+          }
           break; // task done + no pending peer ping -> finish
         }
       }
@@ -384,12 +416,21 @@ async function runDispatch(
     await interruptQuery();
   }
 
-  // Early exit with live children (thread 019f4ed2, half b): flag orphaned spawned
-  // agents loudly at finalize instead of waiting for the reactor's 30min sweep.
-  try {
-    const orphans = liveChildren(agentId);
-    if (orphans.length) notifyEarlyExitChildren(agentId, orphans, { coordinator: coordHandle });
-  } catch { /* never block finalize */ }
+  // Final child gate is deliberately adjacent to terminal publication. It
+  // catches a child appearing after the last provider result and treats graph
+  // unavailability as unknown, never as an empty child set.
+  const finalChildren = childReconciler(agentId);
+  if (orchestrator && outcome === "ran") {
+    if (finalChildren.kind === "live") outcome = "orchestrator_children_incomplete";
+    if (finalChildren.kind === "unavailable") outcome = "child_reconciliation_unavailable";
+  }
+  if (finalChildren.kind === "live") {
+    notifyEarlyExitChildren(agentId, finalChildren.live, { coordinator: coordHandle });
+  } else if (orchestrator && finalChildren.kind === "unavailable") {
+    console.error(
+      `[harness] @agent:${agentId} CHILD RECONCILIATION UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
+    );
+  }
 
   // Close the auto-clock: a crash (died/stalled) orphan-closes (end_time + flag);
   // any other terminal (clean or provider-capped) stops the session normally.
@@ -540,6 +581,7 @@ export async function dispatch(
       threadId, admission, routingMetadata, workingDirectory, agentId, dependencies.queryFn,
       facts, children, dependencies.loadThreadFacts ?? getThreadFacts,
       dependencies.deliveryRuntime,
+      dependencies.childReconciler,
     );
   } finally {
     try { await completeResourceEnvelope(admission); }

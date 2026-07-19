@@ -23,6 +23,8 @@ const BLOCKED_REASON: Record<string, string> = {
   resource_envelope_exceeded: "resource_envelope_exceeded",
   provider_escalation_unsupported: "provider_escalation_unsupported",
   max_tier: "escalation_ladder_exhausted",
+  orchestrator_children_incomplete: "orchestrator_children_live_at_terminal",
+  child_reconciliation_unavailable: "orchestrator_child_reconciliation_unavailable",
 };
 
 /**

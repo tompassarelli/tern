@@ -24,6 +24,7 @@ const MANAGED_ENV = [
   "AGENT_TIER", "AGENT_REASONING", "AGENT_POSTURE", "AGENT_TOPOLOGY", "AGENT_TASK_GRADE",
   "AGENT_DOMAIN_REQUIREMENTS", "AGENT_COMPOSITION", "NORTH_FABLE_NOW",
   "NORTH_ROUTING_POLICY", "NORTH_ENVELOPE_ACCOUNTING",
+  "NORTH_BG_MAX_CONTINUATIONS",
   "NORTH_PROVIDER_OBSERVATIONS", "NORTH_ALLOCATION_MODE", "NORTH_PROVIDER_ORDER",
   "NORTH_PROVIDER_WEIGHTS", "NORTH_RESERVED_FRONTIER_PROVIDER",
   "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
@@ -50,6 +51,7 @@ beforeAll(() => {
   process.env.NORTH_ROUTING_POLICY = join(dir, "absent-routing-policy.json");
   process.env.NORTH_PROVIDER_OBSERVATIONS = join(dir, "absent-provider-observations.json");
   delete process.env.NORTH_ALLOCATION_MODE;
+  delete process.env.NORTH_BG_MAX_CONTINUATIONS;
   delete process.env.NORTH_PROVIDER_ORDER;
   delete process.env.NORTH_PROVIDER_WEIGHTS;
   delete process.env.NORTH_RESERVED_FRONTIER_PROVIDER;
@@ -110,6 +112,8 @@ test("a clean-finishing lane records outcome=ran ON the lane entity (@agent:<id>
   expect(logged).toContain(
     "tell agent:test-done-ok delivery_reason provider_terminal_success_without_external_verification",
   );
+  const runLines = await settledRunLines("test-done-ok");
+  expect(runLines.some((line) => line.endsWith(" thread (ad-hoc)"))).toBe(true);
 });
 
 test("a lane that dies mid-stream records outcome=died ON the lane entity (reported, not silent)", async () => {
@@ -422,6 +426,247 @@ test("dispatch publishes newly observed done-bar evidence as reported, never sel
   );
   expect(lines.some((line) => line.endsWith(" delivery_outcome reported"))).toBe(true);
   expect(lines.some((line) => line.includes(" delivery_evidence "))).toBe(true);
+});
+
+test("spawn reserves before provider execution and binds evidence plus telemetry to its exact thread", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+  const events: string[] = [];
+  let reserved: DeliveryRunContext | undefined;
+  const result = await spawn({
+    prompt: "prove the bound task",
+    agentId: "test-proof-bound-spawn",
+    role: "integrator",
+    thread: "test-proof-bound-thread",
+    loadThreadFacts: () => {
+      events.push("thread-read");
+      return [
+        { predicate: "title", value: "Proof-bound task" },
+        { predicate: "done_when", value: "focused tests pass" },
+      ];
+    },
+    deliveryRuntime: {
+      reserve(context) {
+        events.push("reserve");
+        reserved = context;
+        return {
+          contractOrigin: "accepted",
+          baselineDoneWhen: ["focused tests pass"],
+        };
+      },
+      load(runId) {
+        events.push("evidence-load");
+        if (!reserved || runId !== reserved.runId) {
+          return { reservationValid: false, evidence: [] };
+        }
+        return {
+          reservationValid: true,
+          evidence: [{
+            version: RUN_BAR_EVIDENCE_VERSION,
+            run: `@${runId}`,
+            thread: "@test-proof-bound-thread",
+            reporter: "@agent:test-proof-bound-spawn",
+            bar: "focused tests pass",
+            observed: "28/28 pass",
+            recordedAt: "2026-07-19T01:00:00Z",
+          }],
+        };
+      },
+    },
+    queryFn: () => {
+      events.push("provider");
+      expect(reserved?.threadId).toBe("test-proof-bound-thread");
+      return (async function* () {
+        yield {
+          type: "result", subtype: "success", result: "evidence recorded",
+          duration_ms: 1, num_turns: 1,
+        };
+      })();
+    },
+  });
+  expect(result).toBe("evidence recorded");
+  expect(events.slice(0, 2)).toEqual(["reserve", "provider"]);
+  const logged = await waitForLog(
+    "tell agent:test-proof-bound-spawn delivery_outcome reported",
+  );
+  expect(logged).toContain(
+    "tell agent:test-proof-bound-spawn delivery_reason complete_run_scoped_done_bar_evidence_self_reported",
+  );
+  const lines = await settledRunLines("test-proof-bound-spawn");
+  expect(lines.some((line) => line.endsWith(" thread test-proof-bound-thread"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" thread (ad-hoc)"))).toBe(false);
+  expect(lines.some((line) => line.endsWith(" delivery_outcome reported"))).toBe(true);
+});
+
+test("a spawn orchestrator continues while a child is live and publishes ran only after reconciliation", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+  const reconciliations = [
+    { kind: "live", children: ["@agent:child-a"], live: ["@agent:child-a"] },
+    { kind: "reconciled", children: ["@agent:child-a"] },
+    { kind: "reconciled", children: ["@agent:child-a"] },
+  ] as const;
+  let reconcileIndex = 0;
+  const seenInputs: string[] = [];
+  const queryFn: any = ({ prompt }: any) => ({
+    async *[Symbol.asyncIterator]() {
+      const input = prompt[Symbol.asyncIterator]();
+      const initial = await input.next();
+      seenInputs.push(initial.value.message.content);
+      yield {
+        type: "result", subtype: "success", result: "premature",
+        duration_ms: 1, num_turns: 1,
+      };
+      const continuation = await input.next();
+      seenInputs.push(continuation.value.message.content);
+      yield {
+        type: "result", subtype: "success", result: "reconciled",
+        duration_ms: 2, num_turns: 2,
+      };
+    },
+  });
+
+  const result = await spawn({
+    prompt: "coordinate the child",
+    agentId: "test-spawn-child-resolves",
+    role: "director",
+    queryFn,
+    childReconciler: () =>
+      reconciliations[Math.min(reconcileIndex++, reconciliations.length - 1)]!,
+  });
+  expect(result).toBe("reconciled");
+  expect(seenInputs[1]).toContain("North refuses orchestrator turn-end");
+  expect(reconcileIndex).toBe(3);
+  const lines = await settledRunLines("test-spawn-child-resolves");
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(true);
+});
+
+test("a spawn orchestrator hits a bounded no-progress cap as incomplete, never ran", async () => {
+  const { spawn } = await import("../src/spawn");
+  writeFileSync(log, "");
+  const previousCap = process.env.NORTH_BG_MAX_CONTINUATIONS;
+  process.env.NORTH_BG_MAX_CONTINUATIONS = "1";
+  try {
+    const queryFn: any = ({ prompt }: any) => ({
+      async *[Symbol.asyncIterator]() {
+        const input = prompt[Symbol.asyncIterator]();
+        await input.next();
+        yield {
+          type: "result", subtype: "success", result: "first early exit",
+          duration_ms: 1, num_turns: 1,
+        };
+        await input.next();
+        yield {
+          type: "result", subtype: "success", result: "second early exit",
+          duration_ms: 2, num_turns: 2,
+        };
+      },
+    });
+    await spawn({
+      prompt: "coordinate a stuck child",
+      agentId: "test-spawn-child-cap",
+      role: "director",
+      queryFn,
+      childReconciler: () => ({
+        kind: "live", children: ["@agent:stuck-child"], live: ["@agent:stuck-child"],
+      }),
+    });
+    const lines = await settledRunLines("test-spawn-child-cap");
+    expect(lines.some((line) =>
+      line.endsWith(" process_outcome orchestrator_children_incomplete"),
+    )).toBe(true);
+    expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+  } finally {
+    if (previousCap === undefined) delete process.env.NORTH_BG_MAX_CONTINUATIONS;
+    else process.env.NORTH_BG_MAX_CONTINUATIONS = previousCap;
+  }
+});
+
+test("spawn and dispatch final gates reject late live or unavailable child state", async () => {
+  const { spawn } = await import("../src/spawn");
+  const { dispatch } = await import("../src/dispatch");
+  const terminalStates = [
+    {
+      label: "live",
+      state: {
+        kind: "live" as const,
+        children: ["@agent:late-child"],
+        live: ["@agent:late-child"],
+      },
+      outcome: "orchestrator_children_incomplete",
+    },
+    {
+      label: "unavailable",
+      state: {
+        kind: "unavailable" as const,
+        reason: "injected graph outage",
+      },
+      outcome: "child_reconciliation_unavailable",
+    },
+  ];
+  const oneTerminalQuery: any = ({ prompt }: any) => ({
+    async *[Symbol.asyncIterator]() {
+      const input = prompt[Symbol.asyncIterator]();
+      await input.next();
+      yield {
+        type: "result", subtype: "success", result: "provider said done",
+        duration_ms: 1, num_turns: 1,
+      };
+    },
+  });
+
+  for (const surface of ["spawn", "dispatch"] as const) {
+    for (const terminalState of terminalStates) {
+      writeFileSync(log, "");
+      const agentId = `test-${surface}-late-${terminalState.label}`;
+      let calls = 0;
+      const childReconciler = () => {
+        calls++;
+        return calls === 1
+          ? { kind: "reconciled" as const, children: [] }
+          : terminalState.state;
+      };
+      if (surface === "spawn") {
+        await spawn({
+          prompt: "exercise the final child gate",
+          agentId,
+          role: "director",
+          queryFn: oneTerminalQuery,
+          childReconciler,
+        });
+      } else {
+        await dispatch(`thread-${agentId}`, {
+          agentId,
+          routingMetadata: { role: "director" },
+          claimDriver: (() => ({ release() {} })) as any,
+          queryFn: oneTerminalQuery,
+          loadThreadFacts: () => [
+            { predicate: "title", value: "Exercise dispatch child gate" },
+            { predicate: "planned", value: "true" },
+            { predicate: "atomic", value: "true" },
+          ],
+          loadChildren: () => [],
+          childReconciler,
+        });
+      }
+      expect(calls).toBe(2);
+      const lines = await settledRunLines(
+        agentId,
+        surface === "dispatch" ? "applied_domain_requirement_count 0" : "error_count 0",
+      );
+      expect(lines.some((line) =>
+        line.endsWith(` process_outcome ${terminalState.outcome}`),
+      )).toBe(true);
+      expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+      const logged = readFileSync(log, "utf8");
+      expect(logged).toContain(
+        `tell agent:${agentId} delivery_outcome blocked`,
+      );
+      if (terminalState.label === "live") {
+        expect(logged).toContain(`tell agent:${agentId} early_exit_children`);
+      }
+    }
+  }
 });
 
 test("dispatch abandons a failed reservation subject and publishes unverified telemetry on a fresh run", async () => {

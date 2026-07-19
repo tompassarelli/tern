@@ -3,8 +3,10 @@
 // coordinator. The impure graph query remains covered by the E2E probe.
 import { test, expect, describe } from "bun:test";
 import {
+  decideChildTurnEnd,
   earlyExitCommands,
-  gatherLiveChildren,
+  gatherChildReconciliation,
+  initialChildContinuationState,
   resolveChildLifecycle,
 } from "../src/children";
 import {
@@ -62,17 +64,42 @@ describe("committed child lifecycle evidence", () => {
     expect(laneResolvedByFacts([], [committedRun])).toBe(true);
   });
 
-  test("a graph read failure fails open without orphan claims", () => {
-    expect(gatherLiveChildren(
+  test("no children and all resolved children are explicit reconciled states", () => {
+    expect(gatherChildReconciliation(
+      "director",
+      () => [],
+      () => false,
+    )).toEqual({ kind: "reconciled", children: [] });
+    expect(gatherChildReconciliation(
+      "director",
+      () => ["@agent:one", "@agent:two"],
+      () => true,
+    )).toEqual({
+      kind: "reconciled",
+      children: ["@agent:one", "@agent:two"],
+    });
+  });
+
+  test("live children and read failures can never collapse to the same state", () => {
+    expect(gatherChildReconciliation(
+      "director",
+      () => ["@agent:done", "@agent:live"],
+      (child) => child.endsWith("done"),
+    )).toEqual({
+      kind: "live",
+      children: ["@agent:done", "@agent:live"],
+      live: ["@agent:live"],
+    });
+    expect(gatherChildReconciliation(
       "director",
       () => { throw new Error("coordinator unavailable"); },
       () => false,
-    )).toEqual([]);
-    expect(gatherLiveChildren(
+    )).toEqual({ kind: "unavailable", reason: "coordinator unavailable" });
+    expect(gatherChildReconciliation(
       "director",
       () => ["@agent:child"],
       () => { throw new Error("terminal read failed"); },
-    )).toEqual([]);
+    )).toEqual({ kind: "unavailable", reason: "terminal read failed" });
     // A committed lane terminal short-circuits the secondary run read entirely.
     let runRead = false;
     expect(resolveChildLifecycle(markedLane, () => {
@@ -80,6 +107,53 @@ describe("committed child lifecycle evidence", () => {
       throw new Error("run query unavailable");
     })).toBe(true);
     expect(runRead).toBe(false);
+  });
+});
+
+describe("orchestrator child continuation state", () => {
+  test("live children resolve on a later provider terminal", () => {
+    const first = decideChildTurnEnd(initialChildContinuationState(), {
+      kind: "live", children: ["@agent:a"], live: ["@agent:a"],
+    }, 2);
+    expect(first).toMatchObject({ action: "continue", attempt: 1, cap: 2 });
+    const settled = decideChildTurnEnd(first.state, {
+      kind: "reconciled", children: ["@agent:a"],
+    }, 2);
+    expect(settled).toEqual({ action: "finish", state: { noProgress: 0 } });
+  });
+
+  test("state advance resets consecutive no-progress while an unchanged set hits the cap", () => {
+    const one = decideChildTurnEnd(initialChildContinuationState(), {
+      kind: "live", children: ["a", "b"], live: ["a", "b"],
+    }, 2);
+    const two = decideChildTurnEnd(one.state, {
+      kind: "live", children: ["a", "b"], live: ["a", "b"],
+    }, 2);
+    expect(two).toMatchObject({ action: "continue", attempt: 2 });
+    const advanced = decideChildTurnEnd(two.state, {
+      kind: "live", children: ["b"], live: ["b"],
+    }, 2);
+    expect(advanced).toMatchObject({ action: "continue", attempt: 1 });
+    const unchanged = decideChildTurnEnd(advanced.state, {
+      kind: "live", children: ["b"], live: ["b"],
+    }, 2);
+    const capped = decideChildTurnEnd(unchanged.state, {
+      kind: "live", children: ["b"], live: ["b"],
+    }, 2);
+    expect(capped).toMatchObject({
+      action: "block",
+      reason: "children_live_at_continuation_cap",
+      live: ["b"],
+    });
+  });
+
+  test("an unavailable reconciliation blocks immediately", () => {
+    expect(decideChildTurnEnd(initialChildContinuationState(), {
+      kind: "unavailable", reason: "graph offline",
+    }, 5)).toMatchObject({
+      action: "block",
+      reason: "child_reconciliation_unavailable",
+    });
   });
 });
 

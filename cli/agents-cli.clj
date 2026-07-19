@@ -15,6 +15,7 @@
 (def HOME (System/getenv "HOME"))
 (def NORTH (or (System/getenv "NORTH_HOME")
                (some-> *file* io/file .getCanonicalFile .getParentFile .getParentFile str)))
+(def NORTH-CLI (or (System/getenv "NORTH_BIN") (str NORTH "/bin/north")))
 (def GAFFER (or (System/getenv "GAFFER_HOME") (str HOME "/code/gaffer")))
 (def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
 (def GAFFER-STAFFING (or (System/getenv "GAFFER_STAFFING_CATALOG")
@@ -36,9 +37,11 @@
 (defn ylw [s]  (c "33" s))
 (defn cyn [s]  (c "36" s))
 
-(defn run [argv & {:keys [timeout in] :or {timeout 4000}}]
+(defn run [argv & {:keys [timeout in env] :or {timeout 4000}}]
   (try
-    (let [proc (p/process argv (cond-> {:out :string :err :string} in (assoc :in in)))
+    (let [proc (p/process argv (cond-> {:out :string :err :string}
+                                in (assoc :in in)
+                                env (assoc :env env)))
           res  (deref proc timeout ::timeout)]
       (if (= res ::timeout)
         (do (p/destroy-tree proc) {:timeout true :ok false})
@@ -520,6 +523,9 @@
       "worker topology forbids coordination capability"
       :else nil)))
 
+(def ^:dynamic *delegate-request* nil)
+(declare resolve-delegate-thread! delegate-brief)
+
 (defn cmd-spawn [args]
   (north.topology-authority/require-coordination! "spawn")
   (let [{:keys [dry? notify provider target taskGrade domains topology tier reasoning posture composition
@@ -683,6 +689,11 @@
       :else
       (let [model (:model base) synthetic-effort (:effort base) synthetic-reasoning (:reasoning base)
             gaffer-preset (:gaffer-preset base) semantic (:semantic base)
+            delegate-binding (when *delegate-request*
+                               (resolve-delegate-thread! *delegate-request* dry?))
+            effective-prompt (if delegate-binding
+                               (delegate-brief *delegate-request* delegate-binding)
+                               prompt)
             canonical-contract (when bespoke?
                                  (canonical-bespoke-contract (:contract selected-composition)))
             contract-sha256 (when canonical-contract
@@ -704,7 +715,8 @@
                   selected-reasoning (assoc "AGENT_REASONING" selected-reasoning "AGENT_EFFORT" selected-reasoning)
                   provider (assoc "AGENT_PROVIDER" provider)
                   target (assoc "AGENT_TARGET" target)
-                  notify (assoc "AGENT_COORDINATOR" notify))
+                  notify (assoc "AGENT_COORDINATOR" notify)
+                  delegate-binding (assoc "NORTH_DELEGATE_THREAD_ID" (:id delegate-binding)))
             immediate-coordinator (or notify (System/getenv "AGENT_ID")
                                       (System/getenv "NORTH_AGENT_ID"))
             child-env (north.managed-child-env/child
@@ -740,7 +752,7 @@
                                             ;; A dry run has no coordinator publication, but its visible
                                             ;; identity must pass the same exact validator. These values are
                                             ;; explicit synthetic evidence, never persisted.
-                                            "repo" (current-repo) "goal" prompt
+                                            "repo" (current-repo) "goal" effective-prompt
                                             "spawned_at" (str (java.time.Instant/now))
                                             "display_handle" "dry-run" "display_name" "dry-run"}))
             fallback-facts (assoc fallback-base "identity_manifest_sha256"
@@ -762,7 +774,7 @@
                         " sha256=" contract-sha256
                         " capabilities=" (str/join "," (:capabilities canonical-contract))
                         " reason=recorded")))
-        (echo-cmd envs "bun run" spawn-ts (str "\"" prompt "\""))
+        (echo-cmd envs "bun run" spawn-ts (str "\"" effective-prompt "\""))
         (if dry?
           (do
             (println (ylw "[dry-run]") "not executed. semantic handle would be"
@@ -773,7 +785,7 @@
           (let [log (io/file AGENT-LOGDIR (str aid ".log"))]
             (.mkdirs (.getParentFile log))
             (let [process (north.spawn-process/launch-detached!
-                           ["bun" "run" spawn-ts prompt] child-env log)
+                           ["bun" "run" spawn-ts effective-prompt] child-env log)
                   startup (north.spawn-process/await-startup
                            process aid log agent-facts-one agent-online?)]
               (case (:status startup)
@@ -801,12 +813,186 @@
 ;; never charges a director+worker pair for an atomic handoff. All ordinary spawn
 ;; axes and bespoke-composition flags pass through to cmd-spawn unchanged.
 (def delegate-usage
-  "north delegate \"<task>\" (--role <worker-role> | --composite) [--context <file>] [spawn options]")
+  "north delegate \"<task>\" (--role <worker-role> | --composite) [--thread <id>] [--context <file>] [spawn options]")
 
 (defn- delegate-die [message]
   (println (red message))
   (println (red "usage:") delegate-usage)
   (System/exit 1))
+
+(def delegate-thread-id-pattern #"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+(def delegate-thread-title-max-utf8-bytes 160)
+(def capture-receipt-keys
+  #{:id :thread :title :path :expected :committed :complete :reason})
+
+(defn- canonical-delegate-thread [raw]
+  (let [value (some-> raw str)
+        bare (when value (str/replace-first value #"^@" ""))]
+    (when (and value
+               (= value (str/trim value))
+               (not (str/starts-with? bare "@"))
+               (<= (count bare) 512)
+               (re-matches delegate-thread-id-pattern bare))
+      bare)))
+
+(defn- normalize-delegate-thread [raw]
+  (or (canonical-delegate-thread raw)
+      (delegate-die "--thread must be a bare or single-@ ASCII North thread id")))
+
+(defn- parse-structured-facts [raw]
+  (try
+    (let [facts (json/parse-string (str/trim raw) true)]
+      (when (and (sequential? facts)
+                 (every? #(and (map? %)
+                               (= #{:predicate :value} (set (keys %)))
+                               (string? (:predicate %))
+                               (string? (:value %)))
+                         facts))
+        facts))
+    (catch Exception _ nil)))
+
+(defn- parse-structured-facts! [label raw]
+  (or (parse-structured-facts raw)
+      (delegate-die (str label " returned an invalid structured fact projection"))))
+
+(defn- parse-thread-facts! [id raw]
+  (let [facts (parse-structured-facts! (str "thread @" id) raw)]
+    (let [titles (mapv :value (filter #(= "title" (:predicate %)) facts))]
+      (when-not (and (= 1 (count titles)) (not (str/blank? (first titles))))
+        (delegate-die (str "thread @" id " is not a title-bearing North thread")))
+      {:id id
+       :title (first titles)
+       :facts facts
+       :committed? (boolean (some #(= "committed" (:predicate %)) facts))
+       :done-when (mapv :value (filter #(= "done_when" (:predicate %)) facts))})))
+
+(defn- read-delegate-thread! [raw]
+  (let [id (normalize-delegate-thread raw)
+        result (run [NORTH-CLI "json" "show" id] :timeout 10000)]
+    (when-not (:ok result)
+      (delegate-die (str "cannot prove delegate thread @" id " through North's structured read boundary")))
+    (parse-thread-facts! id (:out result))))
+
+(defn- fact-set [facts]
+  (reduce (fn [acc {:keys [predicate value]}]
+            (update acc predicate (fnil conj #{}) value))
+          {}
+          facts))
+
+(defn- utf8-byte-count [value]
+  (alength (.getBytes (str value) java.nio.charset.StandardCharsets/UTF_8)))
+
+(defn- utf8-prefix [value max-bytes]
+  (loop [end 0]
+    (if (>= end (.length value))
+      value
+      (let [next (+ end (Character/charCount (.codePointAt value end)))]
+        (if (> (utf8-byte-count (subs value 0 next)) max-bytes)
+          (subs value 0 end)
+          (recur next))))))
+
+(defn delegate-thread-title [task]
+  ;; A durable title is a label, not the worker payload. Keep the full task in
+  ;; the delegate brief while projecting one deterministic line that satisfies
+  ;; canonical capture's stricter single-line boundary.
+  (let [lines (str/split (str task) #"\R" -1)
+        line (or (first (remove str/blank? (map str/trim lines))) "Delegated task")
+        collapsed (-> line
+                      (str/replace #"[\p{javaWhitespace}\p{Z}]+" " ")
+                      str/trim)]
+    (utf8-prefix collapsed delegate-thread-title-max-utf8-bytes)))
+
+(defn- managed-thread-binding []
+  (let [ambient-run (System/getenv "NORTH_RUN_ID")
+        thread (System/getenv "NORTH_THREAD_ID")
+        capability (System/getenv "NORTH_RUN_CAPABILITY")
+        agent (System/getenv "AGENT_ID")
+        values [ambient-run thread capability agent]
+        present (mapv #(boolean (known %)) values)]
+    (if-not (every? true? present)
+      {:kind :none :residue? (some true? present)}
+      (try
+        (let [run-id (canonical-delegate-thread ambient-run)
+              thread-id (canonical-delegate-thread thread)
+              result (when (and run-id thread-id)
+                       (run [NORTH-CLI "json" "show" run-id] :timeout 10000))
+              facts (when (:ok result)
+                      (fact-set
+                       (parse-structured-facts (:out result))))
+              reporter (str "@agent:" (str/replace-first agent #"^@?agent:" ""))]
+          (if (and run-id
+                   thread-id
+                   facts
+                   (north.terminal-projection/run-reservation-valid? facts)
+                   (= #{(str "@" thread-id)}
+                      (get facts "run_reservation_thread"))
+                   (= #{reporter}
+                      (get facts "run_reservation_agent"))
+                   (= #{(north.terminal-projection/sha256 capability)}
+                      (get facts "run_capability_sha256")))
+            {:kind :complete :thread thread-id}
+            {:kind :none :residue? true}))
+        (catch Exception _
+          {:kind :none :residue? true})))))
+
+(defn- capture-delegate-thread! [task]
+  (let [title (delegate-thread-title task)
+        capture-env (assoc (into {} (System/getenv))
+                           "NORTH_CAPTURE_STRUCTURED" "1")
+        result (run [NORTH-CLI "capture" title] :timeout 15000 :env capture-env)]
+    (when-not (:ok result)
+      (delegate-die "North could not capture a durable delegate thread"))
+    (let [receipt (try (json/parse-string (str/trim (:out result)) true)
+                       (catch Exception _
+                         (delegate-die "North capture did not return its exact structured receipt")))]
+      (when-not (and (map? receipt)
+                     (= capture-receipt-keys (set (keys receipt)))
+                     (string? (:id receipt))
+                     (string? (:thread receipt))
+                     (string? (:title receipt))
+                     (string? (:path receipt))
+                     (integer? (:expected receipt))
+                     (integer? (:committed receipt))
+                     (boolean? (:complete receipt))
+                     (string? (:reason receipt)))
+        (delegate-die "North capture returned a malformed structured receipt"))
+      (let [id (normalize-delegate-thread (:id receipt))]
+        (when-not (and (:complete receipt)
+                       (= "captured" (:reason receipt))
+                       (= (str "@" id) (:thread receipt))
+                       (= title (:title receipt))
+                       (pos? (:expected receipt))
+                       (= (:expected receipt) (:committed receipt)))
+          (delegate-die "North capture was partial; delegate spawn refused before provider execution"))
+        (let [thread (read-delegate-thread! id)]
+          (when-not (and (= title (:title thread)) (:committed? thread))
+            (delegate-die "captured delegate thread failed exact title/commit readback"))
+          (assoc thread :source :captured))))))
+
+(defn resolve-delegate-thread!
+  [{:keys [task explicit-thread]} dry?]
+  (cond
+    explicit-thread
+    (assoc (read-delegate-thread! explicit-thread) :source :explicit)
+
+    :else
+    (let [{:keys [kind thread residue?]} (managed-thread-binding)]
+      (case kind
+        :complete (assoc (read-delegate-thread! thread) :source :inherited)
+        :none (do
+                (when residue?
+                  (binding [*out* *err*]
+                    (println
+                     (ylw "ignoring unverified ambient North run/thread residue; a fresh delegate thread is required"))))
+                (if dry?
+                  {:id "capture-on-execution"
+                   :title task
+                   :facts [{:predicate "title" :value task}
+                           {:predicate "committed" :value "dry-run"}]
+                   :committed? true
+                   :done-when []
+                   :source :dry-capture}
+                  (capture-delegate-thread! task)))))))
 
 (defn- parse-delegate-args [args]
   (let [task (first args)]
@@ -835,12 +1021,56 @@
               (delegate-die "--context requires a brief file"))
             (recur (nnext xs) (assoc parsed :context path)))
 
+          "--thread"
+          (let [thread (second xs)]
+            (when (or (nil? thread) (str/starts-with? thread "--"))
+              (delegate-die "--thread requires a North thread id"))
+            (when (:thread parsed)
+              (delegate-die "delegate accepts exactly one --thread"))
+            (recur (nnext xs) (assoc parsed :thread thread)))
+
           (recur (rest xs) (update parsed :forward conj x)))
         parsed))))
 
+(defn delegate-brief
+  [{:keys [task mode context]} {:keys [id committed? done-when]}]
+  (let [context-block (when context (str "CONTEXT BRIEF:\n" context "\n\n"))
+        proof-block
+        (cond
+          (seq done-when)
+          (str "North has prebound this lane and its immutable starting done_when set to @"
+               id ". Run each exact bar, then record its observation with "
+               "`north evidence record \"<exact bar>\" \"<observed result>\"`; "
+               "provider success without those records is not delivery evidence.")
+
+          committed?
+          (str "North has prebound this accepted, currently barless thread to @" id
+               ". FIRST ACT: define exact probe + expected-result criteria with "
+               "`north tell " id " done_when \"<probe + expected result>\"`. "
+               "After each probe, use `north evidence record \"<exact bar>\" "
+               "\"<observed result>\"`; provider success alone is not delivery evidence.")
+
+          :else
+          (str "North has prebound this title-bearing thread to @" id
+               ". Record exact done_when criteria before claiming completion, then use "
+               "`north evidence record \"<exact bar>\" \"<observed result>\"` after each probe."))]
+    (str context-block
+         "DELEGATE TASK: " task "\n\n"
+         "NORTH DELIVERY CONTRACT: " proof-block "\n\n"
+         (if (= mode :composite)
+           (str "COMPOSITE INTAKE: @" id
+                " is the aggregate reduction/checkpoint thread. Create a distinct "
+                "title-bearing child thread linked `part_of @" id
+                "` for every terminal piece, and bind each child run to its own thread; "
+                "never make workers prove the aggregate bar set. Keep the North listener/"
+                "continuation live, checkpoint each result as it arrives, and reconcile "
+                "every child before publishing the aggregate outcome.")
+           (str "ATOMIC INTAKE: use @" id
+                " as the single durable work/evidence thread and return one evidence-backed result.")))))
+
 (defn cmd-delegate [args]
   (north.topology-authority/require-coordination! "delegate")
-  (let [{:keys [task mode role context forward]} (parse-delegate-args args)
+  (let [{:keys [task mode role context thread forward]} (parse-delegate-args args)
         _ (when-not mode
             (delegate-die "delegate needs an explicit intake decision: --role for atomic work or --composite"))
         canonical (when role (get (gaffer-routing) role))
@@ -857,52 +1087,13 @@
                 (when-not (.exists f)
                   (delegate-die (str "context file not found: " ctx-file)))
                 (str/trim (slurp f))))
-        director-contract (str (if ctx "You carry the coordinator's context (above) — continue the work; "
-                                       "You are a fresh managed lane — take the task forward. ")
-                      (when ctx "do not re-discover what the brief already states. ")
-                      "You are the DIRECTOR. Decide worker tiers independently from each local task. "
-                      "This intake was classified COMPOSITE (at least two independent subtasks): fan out "
-                      "one sub-spawn per subtask, in parallel, THIS turn, at the right gaffer dials; "
-                      "do NOT execute subtasks yourself (read/analyze, spawn, steer, verify, "
-                      "integrate); own the seams and verify workers' load-bearing claims. "
-                      "CHECKPOINT DISCIPLINE (a silent reduce phase is how orchestrators wedge): "
-                      "your FIRST act is a North coordination thread with a progress/reduction "
-                      "skeleton plus the fan-out, both within your first 3 turns; keep turns SHORT "
-                      "thereafter, recording each worker result as a thread fact/message AS it "
-                      "returns — so partial state is durable and a stall is caught early. "
-                      "Decompose by the STOP-RULE: split only while further subdivision buys "
-                      "independence, certainty, or verifiability more than it costs integration; "
-                      "a subtask is TERMINAL (stop) when it has clear objective, bounded scope, "
-                      "known inputs/outputs, and a verification path — give each sub-spawn that "
-                      "LOCAL contract. YOU own the REDUCTION: child outputs return to and "
-                      "reconcile in you, never flat fan-in; over-parallelize exploration, "
-                      "converge execution; width and sequential waves are open, depth stays two. "
-                      "A director never executes a worker subtask itself. Workers do NOT "
-                      "sub-delegate or spawn any agent; verification is a sibling lane that "
-                      "you, the director, own. "
-                      "Escalation is wired (struggling workers climb "
-                      "the ladder). Strictly synchronous — and STAY ALIVE: ending a turn = "
-                      "process EXIT; NEVER end a turn while your workers still run or to "
-                      "'await pings' (a real orchestrator died this way) — hold the turn, "
-                      "poll with short sleeps, reconcile every child before moving on. "
-                      "You are read-only by contract: workers own source edits and commits. "
-                      "Record reduction checkpoints and the final outcome on the North thread; "
-                      "never write a markdown report or commit source yourself.")
-        atomic-contract (str (if ctx "Use the supplied context without re-discovering settled facts. "
-                                     "This is a fresh, bounded handoff. ")
-                             "This intake was classified ATOMIC. Execute the task directly under "
-                             "your selected Gaffer role and return one verified result. Do not "
-                             "spawn, delegate, or command another agent; topology enforcement is "
-                             "part of the contract.")
-        brief (str (when ctx (str "CONTEXT BRIEF:\n" ctx "\n\n"))
-                   "DELEGATE TASK: " task
-                   "\n\nOPERATING CONTRACT: "
-                   (if (= mode :composite) director-contract atomic-contract))
         spawn-role (if (= mode :composite) "director" role)
         inherited-notify (and (not (some #{"--notify"} forward))
                               (System/getenv "NORTH_NOTIFY"))]
-    (cmd-spawn (cond-> (into [spawn-role brief] forward)
-                 inherited-notify (into ["--notify" inherited-notify])))))
+    (binding [*delegate-request* {:task task :mode mode :context ctx
+                                  :explicit-thread thread}]
+      (cmd-spawn (cond-> (into [spawn-role task] forward)
+                   inherited-notify (into ["--notify" inherited-notify]))))))
 
 (defn cmd-watch [[id & _]]
   (if (nil? id)

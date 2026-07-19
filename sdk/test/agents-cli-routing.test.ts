@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION, bespokeContractFingerprint,
 } from "../src/bespoke-contract";
@@ -119,7 +120,9 @@ test("composite delegate alone hydrates the canonical director preset", () => {
   expect(result.stdout).toContain("# gaffer dials for role director");
   expect(result.stdout).toContain("AGENT_ROLE=director");
   expect(result.stdout).toContain("AGENT_TOPOLOGY=orchestrator");
-  expect(result.stdout).toContain("classified COMPOSITE");
+  expect(result.stdout).toContain("COMPOSITE INTAKE");
+  expect(result.stdout).toContain("NORTH_DELEGATE_THREAD_ID=capture-on-execution");
+  expect(result.stdout).toContain("child thread linked `part_of @capture-on-execution`");
 });
 
 test("atomic delegate starts exactly the selected terminal worker and forwards route overrides", () => {
@@ -133,7 +136,8 @@ test("atomic delegate starts exactly the selected terminal worker and forwards r
   expect(result.stdout).toContain("AGENT_ROLE=integrator");
   expect(result.stdout).toContain("AGENT_TOPOLOGY=worker");
   expect(result.stdout).toContain("AGENT_TIER=standard");
-  expect(result.stdout).toContain("classified ATOMIC");
+  expect(result.stdout).toContain("ATOMIC INTAKE");
+  expect(result.stdout).toContain("return one evidence-backed result");
   expect(result.stdout).not.toContain("You are the DIRECTOR");
 });
 
@@ -159,6 +163,290 @@ test("delegate context remains an orthogonal handoff payload", () => {
   expect(result.status).toBe(0);
   expect(result.stdout).toContain("CONTEXT BRIEF:");
   expect(result.stdout).toContain("settled fact: use the canonical parser");
+});
+
+test("delegate prompt keeps North deltas and does not duplicate canonical Gaffer law", () => {
+  const result = delegate("coordinate this", "--composite", "--dry-run");
+  expect(result.status).toBe(0);
+  for (const duplicate of [
+    "STOP-RULE",
+    "A director never executes",
+    "Decide worker tiers independently",
+    "You are read-only by contract",
+    "verification is a sibling lane",
+  ]) {
+    expect(result.stdout).not.toContain(duplicate);
+  }
+  for (const northDelta of [
+    "aggregate reduction/checkpoint thread",
+    "North listener/continuation",
+    "reconcile every child",
+    "north evidence record",
+  ]) {
+    expect(result.stdout).toContain(northDelta);
+  }
+});
+
+function writeThreadFake(
+  directory: string,
+  receipt: Record<string, unknown>,
+  title: string,
+  runFacts?: Array<{ predicate: string; value: string }>,
+): { command: string; calls: string } {
+  const command = join(directory, "north-fake");
+  const calls = join(directory, "calls.log");
+  writeFileSync(command, `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(calls)}
+if [ "$1" = "capture" ]; then
+  printf '%s\\n' ${JSON.stringify(JSON.stringify(receipt))}
+  exit 0
+fi
+if [ "$1" = "json" ] && [ "$2" = "show" ]; then
+  if [ "$3" = "run-parent" ] && [ -n ${JSON.stringify(runFacts ? "yes" : "")} ]; then
+    printf '%s\\n' ${JSON.stringify(JSON.stringify(runFacts ?? []))}
+    exit 0
+  fi
+  printf '%s\\n' ${JSON.stringify(JSON.stringify([
+    { predicate: "title", value: title },
+    { predicate: "kind", value: "thread" },
+    { predicate: "committed", value: "2026-07-19" },
+  ]))}
+  exit 0
+fi
+exit 1
+`);
+  chmodSync(command, 0o755);
+  return { command, calls };
+}
+
+function reservationFacts(
+  thread: string,
+  agent: string,
+  capability: string,
+): Array<{ predicate: string; value: string }> {
+  const projection: Record<string, string> = {
+    run_capability_sha256: createHash("sha256").update(capability).digest("hex"),
+    run_reservation_agent: `@agent:${agent}`,
+    run_reservation_contract_origin: "worker-defined",
+    run_reservation_done_when: "[]",
+    run_reservation_thread: `@${thread}`,
+    run_reservation_version: "north:run-reservation:v1",
+    run_reserved_at: "2026-07-19T00:00:00.000Z",
+  };
+  const canonical = Object.entries(projection)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([predicate, value]) => `${predicate}\0${value}\n`)
+    .join("");
+  return [
+    ...Object.entries(projection).map(([predicate, value]) => ({ predicate, value })),
+    {
+      predicate: "run_reservation_manifest_sha256",
+      value: createHash("sha256").update(canonical).digest("hex"),
+    },
+  ];
+}
+
+function resolveDelegateThread(
+  request: { task: string; explicit?: string },
+  env: Record<string, string>,
+) {
+  const expression = [
+    `(System/setProperty "north.agents.lib" "1")`,
+    `(load-file ${JSON.stringify(cli)})`,
+    `(println (json/generate-string (resolve-delegate-thread! {:task ${JSON.stringify(request.task)} :explicit-thread ${request.explicit ? JSON.stringify(request.explicit) : "nil"}} false)))`,
+  ].join(" ");
+  return spawnSync("bb", ["-e", expression], {
+    encoding: "utf8",
+    cwd: north,
+    env: {
+      ...process.env,
+      NORTH_AGENTS_LIB: "1",
+      NO_COLOR: "1",
+      ...env,
+    },
+  });
+}
+
+test("delegate captures exactly one thread when no explicit or managed binding exists", () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-delegate-capture-"));
+  try {
+    const task = "proof-bound task";
+    const receipt = {
+      id: "captured-thread",
+      thread: "@captured-thread",
+      title: task,
+      path: "/tmp/captured-thread.md",
+      expected: 7,
+      committed: 7,
+      complete: true,
+      reason: "captured",
+    };
+    const fake = writeThreadFake(directory, receipt, task);
+    const result = resolveDelegateThread({ task }, {
+      NORTH_BIN: fake.command,
+      NORTH_RUN_ID: "",
+      NORTH_THREAD_ID: "",
+      NORTH_RUN_CAPABILITY: "",
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({
+      id: "captured-thread",
+      source: "captured",
+    });
+    const calls = readFileSync(fake.calls, "utf8").trim().split("\n");
+    expect(calls.filter((line) => line.startsWith("capture "))).toEqual([`capture ${task}`]);
+    expect(calls.filter((line) => line === "json show captured-thread")).toHaveLength(1);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("delegate derives a bounded single-line capture title without truncating the worker task", () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-delegate-title-"));
+  try {
+    const meaningfulLine = `  Design\t  ${"界".repeat(80)} trailing detail  `;
+    const task = `\r\n${meaningfulLine}\u2028Second line must remain in the worker prompt.`;
+    const collapsed = meaningfulLine.trim().replace(/\s+/g, " ");
+    let title = "";
+    for (const point of collapsed) {
+      if (Buffer.byteLength(title + point, "utf8") > 160) break;
+      title += point;
+    }
+    const receipt = {
+      id: "bounded-title-thread",
+      thread: "@bounded-title-thread",
+      title,
+      path: "/tmp/bounded-title-thread.md",
+      expected: 7,
+      committed: 7,
+      complete: true,
+      reason: "captured",
+    };
+    const fake = writeThreadFake(directory, receipt, title);
+    const result = resolveDelegateThread({ task }, {
+      NORTH_BIN: fake.command,
+      NORTH_RUN_ID: "",
+      NORTH_THREAD_ID: "",
+      NORTH_RUN_CAPABILITY: "",
+    });
+    expect(result.status).toBe(0);
+    expect(Buffer.byteLength(title, "utf8")).toBeLessThanOrEqual(160);
+    expect(title).not.toContain("\n");
+    expect(title).not.toContain("\u2028");
+    expect(readFileSync(fake.calls, "utf8")).toContain(`capture ${title}\n`);
+
+    const briefExpression = [
+      `(System/setProperty "north.agents.lib" "1")`,
+      `(load-file ${JSON.stringify(cli)})`,
+      `(print (delegate-brief {:task ${JSON.stringify(task)} :mode :atomic}`,
+      `{:id "bounded-title-thread" :committed? true :done-when []}))`,
+    ].join(" ");
+    const brief = spawnSync("bb", ["-e", briefExpression], {
+      encoding: "utf8",
+      cwd: north,
+      env: { ...process.env, NORTH_AGENTS_LIB: "1", NO_COLOR: "1" },
+    });
+    expect(brief.status).toBe(0);
+    expect(brief.stdout).toContain(task);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("delegate explicit and complete managed bindings reuse one proven title-bearing thread", () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-delegate-reuse-"));
+  try {
+    const fake = writeThreadFake(
+      directory,
+      {},
+      "existing work",
+      reservationFacts("existing-thread", "parent-agent", "capability"),
+    );
+    const explicit = resolveDelegateThread({ task: "child task", explicit: "@existing-thread" }, {
+      NORTH_BIN: fake.command,
+      NORTH_RUN_ID: "",
+      NORTH_THREAD_ID: "",
+      NORTH_RUN_CAPABILITY: "",
+    });
+    expect(explicit.status).toBe(0);
+    expect(JSON.parse(explicit.stdout.trim())).toMatchObject({
+      id: "existing-thread",
+      source: "explicit",
+    });
+    const dryCli = spawnSync("bb", [
+      cli, "delegate", "child task", "--role", "integrator",
+      "--thread", "@existing-thread", "--dry-run",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        NORTH_BIN: fake.command,
+        NO_COLOR: "1",
+        GAFFER_HOME: gaffer,
+        GAFFER_STAFFING_CATALOG: resolve(gaffer, "staffing/catalog.json"),
+      },
+    });
+    expect(dryCli.status).toBe(0);
+    expect(dryCli.stdout).toContain("NORTH_DELEGATE_THREAD_ID=existing-thread");
+    expect(dryCli.stdout).toContain("prebound this accepted, currently barless thread to @existing-thread");
+    const inherited = resolveDelegateThread({ task: "child task" }, {
+      NORTH_BIN: fake.command,
+      NORTH_RUN_ID: "run-parent",
+      NORTH_THREAD_ID: "existing-thread",
+      NORTH_RUN_CAPABILITY: "capability",
+      AGENT_ID: "parent-agent",
+    });
+    expect(inherited.status).toBe(0);
+    expect(JSON.parse(inherited.stdout.trim())).toMatchObject({
+      id: "existing-thread",
+      source: "inherited",
+    });
+    expect(readFileSync(fake.calls, "utf8")).not.toContain("capture ");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a partial structured capture fails closed before any provider process starts", () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-delegate-partial-"));
+  try {
+    const task = "must not spawn";
+    const fake = writeThreadFake(directory, {
+      id: "partial-thread",
+      thread: "@partial-thread",
+      title: task,
+      path: "/tmp/partial-thread.md",
+      expected: 7,
+      committed: 3,
+      complete: false,
+      reason: "partial-cleaned",
+    }, task);
+    const bunLog = join(directory, "bun.log");
+    const fakeBun = join(directory, "bun");
+    writeFileSync(fakeBun, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(bunLog)}\nexit 0\n`);
+    chmodSync(fakeBun, 0o755);
+    const result = spawnSync("bb", [
+      cli, "delegate", task, "--role", "integrator",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${directory}:${process.env.PATH}`,
+        NORTH_BIN: fake.command,
+        NORTH_RUN_ID: "",
+        NORTH_THREAD_ID: "",
+        NORTH_RUN_CAPABILITY: "",
+        NO_COLOR: "1",
+        GAFFER_HOME: gaffer,
+        GAFFER_STAFFING_CATALOG: resolve(gaffer, "staffing/catalog.json"),
+      },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("capture was partial");
+    expect(() => readFileSync(bunLog, "utf8")).toThrow();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("legacy unclassified delegate no longer silently buys a director", () => {

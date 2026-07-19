@@ -22,7 +22,10 @@ import {
 } from "./ladder";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
-import { liveChildren, notifyEarlyExitChildren } from "./children";
+import {
+  childContinuationMessage, decideChildTurnEnd, initialChildContinuationState,
+  notifyEarlyExitChildren, reconcileChildren, type ChildReconciliation,
+} from "./children";
 import { clockStart, clockFinalize } from "./clock";
 import {
   routedQuery, selectProvider, ProviderEscalationUnsupportedError, ProviderRetrySafeError,
@@ -46,7 +49,7 @@ import {
 import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal } from "./execution-outcome";
 import { assessThreadDelivery, type DeliveryAssessment } from "./delivery-verification";
-import { getThreadFacts } from "./north-client";
+import { getThreadFacts, normalizeNorthEntityId } from "./north-client";
 import {
   loadDeliveryRunState, newDeliveryRunContext, reserveDeliveryRun,
   type DeliveryReservation, type DeliveryRunContext, type DeliveryRunState,
@@ -63,7 +66,7 @@ export interface SpawnOptions {
   escalate?: boolean; // escalate-not-kill: climb the ladder on struggle instead of stopping
   role: string;
   posture?: string;
-  thread?: string; // billable thread — when set, auto-clock this spawn like dispatch (bare id); ad-hoc spawns (no thread) never clock
+  thread?: string; // exact work/evidence thread; also auto-clock like dispatch. Raw ad-hoc spawns omit it.
   caveman?: "off" | "lite" | "full"; // per-spawn terse-output dial; overrides ambient AGENT_CAVEMAN
   coordinator?: string; // spawning coordinator handle -> gets a direct peer ping on death
   provider?: ProviderPreference;
@@ -78,6 +81,10 @@ export interface SpawnOptions {
     reserve: (context: DeliveryRunContext) => DeliveryReservation;
     load: (runId: string) => DeliveryRunState;
   };
+  /** Hermetic terminal thread read for delivery assessment. */
+  loadThreadFacts?: typeof getThreadFacts;
+  /** Hermetic graph seam for orchestrator child reconciliation. */
+  childReconciler?: (agentId: string) => ChildReconciliation;
 }
 
 export function createSpawnAgentId(now = Date.now(), uuid = randomUUID()): string {
@@ -266,6 +273,9 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
   // counts CONSECUTIVE no-progress refusals (reset on settlement) for the stuck-lane cap.
   const bgTracker = makeBgTracker();
   let bgContinuations = 0;
+  const orchestrator = routingMetadata.topology === "orchestrator";
+  const reconcile = opts.childReconciler ?? reconcileChildren;
+  let childContinuation = initialChildContinuationState();
   try {
   // Reserve only at the last pre-provider seam. Earlier routing/admission
   // failures must not strand undiscoverable reservation-only subjects.
@@ -410,6 +420,31 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
         if (bgTracker.size() > 0) {
           console.error(`[harness] @agent:${agentId} continuation cap (${maxBgContinuations()}) reached with ${bgTracker.size()} task(s) still live — finalizing anyway`);
         }
+        if (orchestrator) {
+          const decision = decideChildTurnEnd(
+            childContinuation,
+            reconcile(agentId),
+            maxBgContinuations(),
+          );
+          childContinuation = decision.state;
+          if (decision.action === "continue") {
+            console.error(
+              `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
+            );
+            ch.push(childContinuationMessage(decision.live));
+            continue;
+          }
+          if (decision.action === "block") {
+            const blockedOutcome = decision.reason === "child_reconciliation_unavailable"
+              ? "child_reconciliation_unavailable"
+              : "orchestrator_children_incomplete";
+            console.error(
+              `[harness] @agent:${agentId} orchestrator completion blocked: ${decision.reason}${decision.live?.length ? ` (${decision.live.join(", ")})` : ""}`,
+            );
+            end(blockedOutcome);
+            break;
+          }
+        }
         end("ran");
         break; // MUST end the channel or the query hangs
       }
@@ -448,15 +483,22 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     await interruptQuery();
   }
 
-  // Early exit with live children (thread 019f4ed2, half b): on TRUE finalize (any
-  // terminal path), if this lane spawned agents without committed terminal evidence,
-  // make the orphaning loud NOW instead of waiting up to 30min for the reactor's sweep —
-  // a loud lane-log line + coordinator ping + a durable early_exit_children fact.
-  // Fail-open: a graph hiccup here must never break the finalize.
-  try {
-    const orphans = liveChildren(agentId);
-    if (orphans.length) notifyEarlyExitChildren(agentId, orphans, { coordinator: coordHandle });
-  } catch { /* never block finalize */ }
+  // Belt-and-suspenders terminal gate. A child may appear after the last
+  // provider result, and an unavailable graph is not evidence of zero children.
+  // Workers keep historical best-effort notification semantics; only a
+  // successful orchestrator is prevented from publishing process=ran.
+  const finalChildren = reconcile(agentId);
+  if (orchestrator && outcome === "ran") {
+    if (finalChildren.kind === "live") outcome = "orchestrator_children_incomplete";
+    if (finalChildren.kind === "unavailable") outcome = "child_reconciliation_unavailable";
+  }
+  if (finalChildren.kind === "live") {
+    notifyEarlyExitChildren(agentId, finalChildren.live, { coordinator: coordHandle });
+  } else if (orchestrator && finalChildren.kind === "unavailable") {
+    console.error(
+      `[harness] @agent:${agentId} CHILD RECONCILIATION UNAVAILABLE: ${finalChildren.reason}; terminal cannot be process=ran`,
+    );
+  }
 
   // Close the auto-clock (only if this spawn opened one): crash -> orphan-close, else stop.
   if (opts.thread) clockFinalize(agentId, outcome);
@@ -494,7 +536,7 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
           delivery = assessThreadDelivery(
             opts.thread,
             agentId,
-            getThreadFacts(opts.thread),
+            (opts.loadThreadFacts ?? getThreadFacts)(opts.thread),
             deliveryReservation.baselineDoneWhen.map(
               (value) => ({ predicate: "done_when", value }),
             ),
@@ -625,6 +667,17 @@ if (import.meta.main) {
     );
     process.exit(1);
   }
+  const rawDelegateThread = process.env.NORTH_DELEGATE_THREAD_ID;
+  delete process.env.NORTH_DELEGATE_THREAD_ID;
+  let delegateThread: string | undefined;
+  if (rawDelegateThread !== undefined) {
+    try {
+      delegateThread = normalizeNorthEntityId(rawDelegateThread);
+    } catch {
+      console.error("managed delegate bootstrap received an invalid exact North thread id");
+      process.exit(1);
+    }
+  }
 
   spawn({
     prompt,
@@ -635,6 +688,7 @@ if (import.meta.main) {
     target: process.env.AGENT_TARGET,
     tier: process.env.AGENT_TIER as SemanticTier | undefined,
     role,
+    thread: delegateThread,
     coordinator: process.env.AGENT_COORDINATOR,
     routingMetadata: routingMetadataFromEnv(),
   })

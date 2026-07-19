@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,6 +7,139 @@ import { spawnSync } from "node:child_process";
 const temporary: string[] = [];
 afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+function mcpSpawnEnvironment(
+  configure: (home: string, env: Record<string, string>) => void,
+): { home: string; childEnv: Record<string, string> } {
+  const directory = mkdtempSync(join(tmpdir(), "north-mcp-instance-env-"));
+  temporary.push(directory);
+  const home = join(directory, "home");
+  mkdirSync(home, { recursive: true });
+  const capture = join(directory, "sdk-env");
+  const fakeBun = join(directory, "bun");
+  const fakeNorth = join(directory, "north");
+  writeFileSync(fakeBun, `#!/usr/bin/env bash
+env > "$NORTH_MCP_CAPTURE"
+exit 0
+`);
+  chmodSync(fakeBun, 0o755);
+  writeFileSync(fakeNorth, `#!/usr/bin/env bash
+printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":"integrator"},{"predicate":"goal","value":"contract probe"},{"predicate":"provider","value":"anthropic"},{"predicate":"provider_target","value":"claude-personal-tompas0x-gmail"},{"predicate":"model","value":"claude-opus-4-8"},{"predicate":"effort","value":"xhigh"},{"predicate":"composition_kind","value":"preset"},{"predicate":"composition_id","value":"integrator"},{"predicate":"composition_overrides","value":"[]"},{"predicate":"repo","value":"north"},{"predicate":"spawned_at","value":"2026-07-17T00:00:00Z"},{"predicate":"display_handle","value":"anthropic-claude-gmail-opus-xhigh-integrator-probe"},{"predicate":"display_name","value":"anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:integrator · contract probe"},{"predicate":"identity_manifest_sha256","value":"6accbefdabbad748a1bc37ba82db7171ed923930d498bcb8cfe47174f60cdb33"},{"predicate":"outcome","value":"ran"}]'
+`);
+  chmodSync(fakeNorth, 0o755);
+
+  const selectors = [
+    "FRAM_LOG", "FRAM_TELEMETRY_LOG", "FRAM_THREADS", "NORTH_PORT",
+    "AGENT_MODEL", "AGENT_PROVIDER", "AGENT_TARGET", "AGENT_TIER",
+    "AGENT_REASONING", "AGENT_EFFORT", "AGENT_POSTURE", "AGENT_COMPOSITION",
+    "AGENT_TASK_GRADE", "AGENT_DOMAIN_REQUIREMENTS", "AGENT_TOPOLOGY",
+    "NORTH_RUN_ID", "NORTH_THREAD_ID", "NORTH_RUN_CAPABILITY",
+  ];
+  const env = Object.fromEntries(
+    Object.entries(process.env)
+      .filter(([key, value]) => value !== undefined && !selectors.includes(key)),
+  ) as Record<string, string>;
+  Object.assign(env, {
+    HOME: home,
+    NORTH_BIN: fakeNorth,
+    NORTH_MCP_BUN: fakeBun,
+    NORTH_MCP_CAPTURE: capture,
+    NORTH_SPAWN_STARTUP_TIMEOUT_MS: "1000",
+    NO_COLOR: "1",
+    // Every ambient routing/proof axis below must be absent from the child;
+    // only request-owned AGENT_ROLE may be rebuilt.
+    AGENT_MODEL: "ambient-model",
+    AGENT_PROVIDER: "openai",
+    AGENT_TARGET: "ambient-account",
+    AGENT_TIER: "economy",
+    AGENT_REASONING: "low",
+    AGENT_EFFORT: "low",
+    AGENT_POSTURE: "explore",
+    AGENT_COMPOSITION: "{\"kind\":\"ambient\"}",
+    AGENT_TASK_GRADE: "novice",
+    AGENT_DOMAIN_REQUIREMENTS: "[\"ambient\"]",
+    AGENT_TOPOLOGY: "orchestrator",
+    NORTH_RUN_ID: "run-parent",
+    NORTH_THREAD_ID: "thread-parent",
+    NORTH_RUN_CAPABILITY: "parent-capability",
+  });
+  configure(home, env);
+
+  const north = resolve(import.meta.dir, "../..");
+  const request = `${JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "spawn", arguments: {
+      prompt: "contract probe",
+      role: "integrator",
+      composition: { kind: "preset", id: "integrator", overrides: [] },
+    } },
+  })}\n`;
+  const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
+    input: request,
+    encoding: "utf8",
+    env,
+  });
+  expect(result.status).toBe(0);
+  const response = JSON.parse(result.stdout.trim());
+  expect(response.result.isError).not.toBe(true);
+  const childEnv = Object.fromEntries(
+    readFileSync(capture, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const split = line.indexOf("=");
+        return [line.slice(0, split), line.slice(split + 1)];
+      }),
+  );
+  expect(childEnv.AGENT_ROLE).toBe("integrator");
+  expect(childEnv.AGENT_COMPOSITION).toBe(
+    "{\"kind\":\"preset\",\"id\":\"integrator\",\"overrides\":[]}",
+  );
+  for (const residue of [
+    "AGENT_MODEL", "AGENT_PROVIDER", "AGENT_TARGET", "AGENT_TIER",
+    "AGENT_REASONING", "AGENT_EFFORT", "AGENT_POSTURE",
+    "AGENT_TASK_GRADE", "AGENT_DOMAIN_REQUIREMENTS", "AGENT_TOPOLOGY",
+    "NORTH_RUN_ID", "NORTH_THREAD_ID", "NORTH_RUN_CAPABILITY",
+  ]) expect(childEnv).not.toHaveProperty(residue);
+  return { home, childEnv };
+}
+
+test("env-less MCP SDK launches materialize the canonical North instance exactly once", () => {
+  const defaulted = mcpSpawnEnvironment(() => {});
+  expect(defaulted.childEnv).toMatchObject({
+    FRAM_LOG: join(defaulted.home, ".local/state/north/facts.log"),
+    FRAM_THREADS: join(defaulted.home, ".local/state/north/threads"),
+    NORTH_PORT: "7977",
+  });
+  expect(defaulted.childEnv).not.toHaveProperty("FRAM_TELEMETRY_LOG");
+
+  const split = mcpSpawnEnvironment((home) => {
+    const state = join(home, ".local/state/north");
+    mkdirSync(state, { recursive: true });
+    writeFileSync(join(state, "coordination.log"), "");
+  });
+  expect(split.childEnv).toMatchObject({
+    FRAM_LOG: join(split.home, ".local/state/north/coordination.log"),
+    FRAM_TELEMETRY_LOG: join(split.home, ".local/state/north/telemetry.log"),
+    FRAM_THREADS: join(split.home, ".local/state/north/threads"),
+    NORTH_PORT: "7977",
+  });
+
+  const explicit = mcpSpawnEnvironment((_home, env) => {
+    const selected = join(_home, "selected");
+    mkdirSync(selected, { recursive: true });
+    writeFileSync(join(selected, "coordination.log"), "");
+    env.FRAM_LOG = join(selected, "custom.log");
+    env.FRAM_THREADS = join(selected, "custom-threads");
+    env.NORTH_PORT = "64129";
+  });
+  expect(explicit.childEnv).toMatchObject({
+    FRAM_LOG: join(explicit.home, "selected/custom.log"),
+    FRAM_THREADS: join(explicit.home, "selected/custom-threads"),
+    NORTH_PORT: "64129",
+  });
+  expect(explicit.childEnv).not.toHaveProperty("FRAM_TELEMETRY_LOG");
 });
 
 test("MCP dispatch advertises and forwards an exact account target to the SDK process", () => {

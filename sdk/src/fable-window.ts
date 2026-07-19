@@ -1,5 +1,5 @@
 // Fable window — the OWNER-ORDERED, time-gated exception (routing-overhaul PART 3).
-// A TEMPORARY, MECHANICAL (not prose) gate: until the cutoff, orchestrator forks route
+// A TEMPORARY, MECHANICAL (not prose) gate: until the cutoff, eligible frontier routes use
 // model=fable and the escalation ladder gains a Fable rung above opus/xhigh. After the
 // cutoff the gate closes with ZERO code change — the date comparison simply flips.
 //
