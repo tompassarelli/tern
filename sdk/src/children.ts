@@ -17,7 +17,8 @@
 // unavailability is not the same state as no children.
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
-import { getThreadFacts } from "./north-client";
+import { normalizeNorthEntityId, type Fact } from "./north-client";
+import { parseStrictJson } from "./strict-json";
 import { laneResolvedByFacts } from "./terminal-projection";
 
 const REPO = resolve(import.meta.dir, "..", "..");
@@ -25,24 +26,127 @@ const MSG_CLI = `${REPO}/cli/msg-cli.clj`;
 const northBin = () => process.env.NORTH_BIN ?? `${REPO}/bin/north`;
 const port = () => process.env.NORTH_PORT ?? "7977";
 
-// Run a single-column rules query against the engine; return the bare string values
-// (rows arrive as JSON arrays like ["@agent:x"]). Any transport/protocol defect
-// throws into the explicit `unavailable` settlement state below.
-function queryCol(rules: unknown): string[] {
-  const out = execFileSync(northBin(), ["query", JSON.stringify(rules)], {
-    encoding: "utf8",
-    timeout: 5000,
+export const CHILD_SETTLEMENT_MAX_CHILDREN = 128;
+export const CHILD_SETTLEMENT_MAX_RUNS = 512;
+export const CHILD_SETTLEMENT_MAX_FACT_ROWS = 32_768;
+export const CHILD_SETTLEMENT_DEADLINE_MS = 5_000;
+const CHILD_SETTLEMENT_MAX_COMMAND_BYTES = 2 * 1024 * 1024;
+const CHILD_SETTLEMENT_PROTOCOL = "north.child-settlement";
+const CHILD_SETTLEMENT_VERSION = 1;
+
+interface ChildSettlementCommandOptions {
+  timeoutMs: number;
+  maxBuffer: number;
+}
+
+export interface ChildSettlementBulkDependencies {
+  run: (
+    command: string,
+    args: string[],
+    options: ChildSettlementCommandOptions,
+  ) => string | Uint8Array;
+  now?: () => number;
+  /** Tests may tighten, never widen, the production wall-clock budget. */
+  deadlineMs?: number;
+}
+
+function productionChildSettlementCommand(
+  command: string,
+  args: string[],
+  options: ChildSettlementCommandOptions,
+): Uint8Array {
+  return execFileSync(command, args, {
+    timeout: options.timeoutMs,
+    maxBuffer: options.maxBuffer,
     stdio: ["ignore", "pipe", "ignore"],
   });
-  const lines = out.split("\n").map((line) => line.trim()).filter(Boolean);
-  if (lines.length === 0 || (lines.length === 1 && lines[0] === "(no results)")) return [];
-  return lines.map((line) => {
-    const row = JSON.parse(line);
-    if (!Array.isArray(row) || row.length !== 1 || typeof row[0] !== "string") {
-      throw new Error("child settlement query returned an invalid row");
+}
+
+function decodedOutput(value: string | Uint8Array, label: string): string {
+  const bytes = typeof value === "string"
+    ? Buffer.from(value, "utf8")
+    : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (bytes.byteLength > CHILD_SETTLEMENT_MAX_COMMAND_BYTES)
+    throw new Error(`${label} exceeded its output bound`);
+  let text: string;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new Error(`${label} returned invalid UTF-8`); }
+  return text;
+}
+
+interface SubjectFact extends Fact {
+  subject: string;
+}
+
+function subjectFactRows(parsed: unknown, label: string): SubjectFact[] {
+  if (!Array.isArray(parsed) || parsed.length > CHILD_SETTLEMENT_MAX_FACT_ROWS)
+    throw new Error(`${label} exceeded its row bound`);
+  const rows: SubjectFact[] = [];
+  const observed = new Set<string>();
+  for (const row of parsed) {
+    if (typeof row !== "object" || row === null || Array.isArray(row)
+        || Object.keys(row).sort().join("\0") !== "predicate\0subject\0value") {
+      throw new Error(`${label} returned an invalid fact row`);
     }
-    return row[0];
-  });
+    const fact = row as Record<string, unknown>;
+    if (typeof fact.subject !== "string" || typeof fact.predicate !== "string"
+        || typeof fact.value !== "string") {
+      throw new Error(`${label} returned an invalid fact row`);
+    }
+    const signature = `${fact.subject}\0${fact.predicate}\0${fact.value}`;
+    if (observed.has(signature))
+      throw new Error(`${label} returned a duplicate fact row`);
+    observed.add(signature);
+    rows.push({
+      subject: fact.subject,
+      predicate: fact.predicate,
+      value: fact.value,
+    });
+  }
+  return rows;
+}
+
+function groupedSubjectFacts(rows: SubjectFact[]): Map<string, Fact[]> {
+  const grouped = new Map<string, Fact[]>();
+  for (const row of rows) {
+    const facts = grouped.get(row.subject) ?? [];
+    facts.push({ predicate: row.predicate, value: row.value });
+    grouped.set(row.subject, facts);
+  }
+  return grouped;
+}
+
+interface ChildIdentity {
+  subject: string;
+  graphId: string;
+  agentId: string;
+}
+
+function childIdentity(value: string): ChildIdentity {
+  if (!value.startsWith("agent:"))
+    throw new Error("child settlement projection returned a non-agent child");
+  const graphId = normalizeNorthEntityId(value);
+  if (graphId !== value || graphId.length === "agent:".length)
+    throw new Error("child settlement projection returned a noncanonical child");
+  return {
+    subject: `@${graphId}`,
+    graphId,
+    agentId: graphId.slice("agent:".length),
+  };
+}
+
+function runIdentity(value: string): string {
+  if (!value.startsWith("run-"))
+    throw new Error("child settlement projection returned a non-run subject");
+  const graphId = normalizeNorthEntityId(value);
+  if (graphId !== value || graphId.length === "run-".length)
+    throw new Error("child settlement projection returned a noncanonical run");
+  return graphId;
+}
+
+function exactFactValue(facts: readonly Fact[], predicate: string): string | undefined {
+  const values = facts.filter((fact) => fact.predicate === predicate).map((fact) => fact.value);
+  return values.length === 1 ? values[0] : undefined;
 }
 
 export type ChildSettlement =
@@ -271,50 +375,12 @@ export function assessChildFinalization(
   };
 }
 
-const oneColRule = (bindPred: string, subj: string, pred: string, val: string) => ({
-  find: bindPred,
-  rules: [
-    {
-      head: { rel: bindPred, args: [{ var: bindPred }] },
-      body: [{ rel: "triple", args: [subj === "?" ? { var: bindPred } : subj, pred, val === "?" ? { var: "_v" } : val] }],
-    },
-  ],
-});
-
-// Agents whose `coordinator` fact points at this lane.
-function childrenOf(coordId: string): string[] {
-  return queryCol(oneColRule("c", "?", "coordinator", coordId));
-}
-
 export function resolveChildLifecycle(
-  laneFacts: ReturnType<typeof getThreadFacts>,
-  readTaggedRuns: () => ReturnType<typeof getThreadFacts>[],
+  laneFacts: Fact[],
+  readTaggedRuns: () => Fact[][],
 ): boolean {
   if (laneResolvedByFacts(laneFacts, [])) return true;
   return laneResolvedByFacts([], readTaggedRuns());
-}
-
-// Does this child (subject literal, e.g. "@agent:x") carry a completion signal?
-function childResolved(childSubject: string): boolean {
-  const bare = childSubject.replace(/^@?agent:/, "");
-  const laneFacts = getThreadFacts(`agent:${bare}`);
-  return resolveChildLifecycle(laneFacts, () => {
-    // The kind predicate is the run writer's commit marker, so a subject
-    // carrying agent/outcome body facts but no kind is absent from this join.
-    const runs = queryCol({
-      find: "r",
-      rules: [
-        {
-          head: { rel: "r", args: [{ var: "r" }] },
-          body: [
-            { rel: "triple", args: [{ var: "r" }, "agent", bare] },
-            { rel: "triple", args: [{ var: "r" }, "kind", "run"] },
-          ],
-        },
-      ],
-    });
-    return runs.map((run) => getThreadFacts(run.replace(/^@/, "")));
-  });
 }
 
 // Classify every child under one snapshot attempt. An empty or fully-terminal
@@ -341,8 +407,109 @@ export function gatherChildSettlement(
   }
 }
 
+/**
+ * One-command child projection. North derives direct children, their complete
+ * fact sets, and every tagged run for those children from one `live-facts`
+ * vector and emits a closed, versioned envelope. This is one actual snapshot:
+ * child growth/shrink and run commit cannot split across reads. The SDK still
+ * independently validates the complete envelope, identities, authority facts,
+ * cardinality and lifecycle markers before classifying anything.
+ */
+export function settleChildrenBounded(
+  coordId: string,
+  dependencies: ChildSettlementBulkDependencies,
+): ChildSettlement {
+  try {
+    if (!coordId) return { kind: "settled", children: [] };
+    const canonicalCoordId = normalizeNorthEntityId(coordId);
+    const deadlineMs = dependencies.deadlineMs ?? CHILD_SETTLEMENT_DEADLINE_MS;
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0
+        || deadlineMs > CHILD_SETTLEMENT_DEADLINE_MS) {
+      throw new Error("child settlement deadline is invalid");
+    }
+    const now = dependencies.now ?? (() => performance.now());
+    const deadline = now() + deadlineMs;
+    const remaining = Math.floor(deadline - now());
+    if (remaining <= 0) throw new Error("child settlement aggregate deadline exceeded");
+    const output = decodedOutput(
+      dependencies.run(
+        northBin(),
+        ["json", "child-settlement", canonicalCoordId],
+        {
+          timeoutMs: Math.max(1, remaining),
+          maxBuffer: CHILD_SETTLEMENT_MAX_COMMAND_BYTES,
+        },
+      ),
+      "child settlement projection",
+    );
+    if (now() > deadline) throw new Error("child settlement aggregate deadline exceeded");
+    const parsed = parseStrictJson(output, "child settlement projection", {
+      maxBytes: CHILD_SETTLEMENT_MAX_COMMAND_BYTES,
+      maxDepth: 32,
+      maxNodes: CHILD_SETTLEMENT_MAX_FACT_ROWS * 8 + 16,
+    });
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join("\0")
+          !== "children\0coordinator\0protocol\0runs\0version") {
+      throw new Error("child settlement projection returned an invalid envelope");
+    }
+    const envelope = parsed as Record<string, unknown>;
+    if (envelope.protocol !== CHILD_SETTLEMENT_PROTOCOL
+        || envelope.version !== CHILD_SETTLEMENT_VERSION
+        || envelope.coordinator !== canonicalCoordId) {
+      throw new Error("child settlement projection returned an incompatible envelope");
+    }
+    const childRows = subjectFactRows(
+      envelope.children,
+      "child settlement child projection",
+    );
+    const runRows = subjectFactRows(
+      envelope.runs,
+      "child settlement run projection",
+    );
+    if (childRows.length + runRows.length > CHILD_SETTLEMENT_MAX_FACT_ROWS)
+      throw new Error("child settlement projection exceeded its cumulative row bound");
+    const childFacts = groupedSubjectFacts(childRows);
+    if (childFacts.size > CHILD_SETTLEMENT_MAX_CHILDREN)
+      throw new Error("child settlement child projection exceeded its subject bound");
+    const children = [...childFacts.keys()].map(childIdentity)
+      .sort((left, right) => left.subject < right.subject ? -1 : left.subject > right.subject ? 1 : 0);
+    for (const child of children) {
+      const facts = childFacts.get(child.graphId)!;
+      if (exactFactValue(facts, "coordinator") !== canonicalCoordId)
+        throw new Error("child settlement projection returned invalid child authority");
+    }
+    const runFacts = groupedSubjectFacts(runRows);
+    if (runFacts.size > CHILD_SETTLEMENT_MAX_RUNS)
+      throw new Error("child settlement run projection exceeded its subject bound");
+    const runsByAgent = new Map(children.map((child) => [child.agentId, [] as Fact[][]]));
+    for (const [rawRunId, facts] of runFacts) {
+      runIdentity(rawRunId);
+      const agent = exactFactValue(facts, "agent");
+      if (exactFactValue(facts, "kind") !== "run" || !agent || !runsByAgent.has(agent))
+        throw new Error("child settlement projection returned invalid run authority");
+      runsByAgent.get(agent)!.push(facts);
+    }
+
+    const childSubjects = children.map((child) => child.subject);
+    const live = children.filter((child) =>
+      !resolveChildLifecycle(
+        childFacts.get(child.graphId)!,
+        () => runsByAgent.get(child.agentId)!,
+      )).map((child) => child.subject);
+    return live.length
+      ? { kind: "live", children: childSubjects, live }
+      : { kind: "settled", children: childSubjects };
+  } catch (error) {
+    return {
+      kind: "unavailable",
+      reason: error instanceof Error ? error.message : "unknown child settlement failure",
+    };
+  }
+}
+
 export function settleChildren(coordId: string): ChildSettlement {
-  return gatherChildSettlement(coordId, childrenOf, childResolved);
+  return settleChildrenBounded(coordId, { run: productionChildSettlementCommand });
 }
 
 export function childContinuationMessage(liveIds: string[]): string {

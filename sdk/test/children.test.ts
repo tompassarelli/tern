@@ -4,12 +4,15 @@
 import { test, expect, describe } from "bun:test";
 import {
   assessChildFinalization,
+  CHILD_SETTLEMENT_MAX_CHILDREN,
+  CHILD_SETTLEMENT_MAX_RUNS,
   childReductionMessage,
   decideChildTurnEnd,
   earlyExitCommands,
   gatherChildSettlement,
   initialChildContinuationState,
   resolveChildLifecycle,
+  settleChildrenBounded,
 } from "../src/children";
 import {
   laneResolvedByFacts,
@@ -42,6 +45,49 @@ const committedRun: TerminalFact[] = [
   ...partialRun,
   { predicate: "kind", value: "run" },
 ];
+
+type CommandCall = {
+  command: string;
+  args: string[];
+  options: { timeoutMs: number; maxBuffer: number };
+};
+
+const factRows = (
+  subject: string,
+  facts: readonly TerminalFact[],
+): Array<{ subject: string; predicate: string; value: string }> =>
+  facts.map((fact) => ({ subject, predicate: fact.predicate, value: fact.value }));
+
+const childEnvelope = (
+  children: Array<{ subject: string; predicate: string; value: string }> = [],
+  runs: Array<{ subject: string; predicate: string; value: string }> = [],
+  overrides: Record<string, unknown> = {},
+): string => JSON.stringify({
+  protocol: "north.child-settlement",
+  version: 1,
+  coordinator: "director",
+  children,
+  runs,
+  ...overrides,
+});
+
+function boundedSettlement(
+  responses: Array<string | Uint8Array | Error>,
+  options: { now?: () => number; deadlineMs?: number } = {},
+): { settlement: ReturnType<typeof settleChildrenBounded>; calls: CommandCall[] } {
+  const calls: CommandCall[] = [];
+  const settlement = settleChildrenBounded("director", {
+    run: (command, args, commandOptions) => {
+      calls.push({ command, args, options: commandOptions });
+      const response = responses[calls.length - 1];
+      if (response instanceof Error) throw response;
+      if (response === undefined) throw new Error("unexpected child settlement command");
+      return response;
+    },
+    ...options,
+  });
+  return { settlement, calls };
+}
 
 describe("committed child lifecycle evidence", () => {
   test("terminal digest uses the cross-runtime canonical encoding", () => {
@@ -109,6 +155,286 @@ describe("committed child lifecycle evidence", () => {
       throw new Error("run query unavailable");
     })).toBe(true);
     expect(runRead).toBe(false);
+  });
+});
+
+describe("bounded atomic child settlement", () => {
+  test("classifies lane and run terminals from exactly one snapshot subprocess", () => {
+    const laneTerminal = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:lane-child", predicate: "coordinator", value: "director" },
+        ...factRows("agent:lane-child", markedLane),
+      ]),
+    ]);
+    expect(laneTerminal.settlement).toEqual({
+      kind: "settled",
+      children: ["@agent:lane-child"],
+    });
+    expect(laneTerminal.calls).toHaveLength(1);
+    expect(laneTerminal.calls[0]!.args).toEqual([
+      "json", "child-settlement", "director",
+    ]);
+
+    const runTerminal = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:run-child", predicate: "coordinator", value: "director" },
+      ], [
+        { subject: "run-terminal", predicate: "agent", value: "run-child" },
+        ...factRows("run-terminal", committedRun.filter((fact) => fact.predicate !== "agent")),
+      ]),
+    ]);
+    expect(runTerminal.settlement).toEqual({
+      kind: "settled",
+      children: ["@agent:run-child"],
+    });
+    expect(runTerminal.calls).toHaveLength(1);
+  });
+
+  test("a maximum-cardinality live set remains one subprocess with no fallback", () => {
+    const subjects = Array.from(
+      { length: CHILD_SETTLEMENT_MAX_CHILDREN },
+      (_, index) => `agent:child-${index}`,
+    );
+    const childFacts = subjects.map((subject) => ({
+      subject,
+      predicate: "coordinator",
+      value: "director",
+    }));
+    const { settlement, calls } = boundedSettlement([
+      childEnvelope(childFacts),
+    ]);
+    expect(settlement.kind).toBe("live");
+    if (settlement.kind !== "live") throw new Error("expected live settlement");
+    expect(settlement.live).toHaveLength(CHILD_SETTLEMENT_MAX_CHILDREN);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("child and run cardinality overflow fail before any per-subject fallback", () => {
+    const children = Array.from(
+      { length: CHILD_SETTLEMENT_MAX_CHILDREN + 1 },
+      (_, index) => ({
+        subject: `agent:child-${index}`,
+        predicate: "coordinator",
+        value: "director",
+      }),
+    );
+    const childOverflow = boundedSettlement([childEnvelope(children)]);
+    expect(childOverflow.settlement).toMatchObject({
+      kind: "unavailable",
+      reason: expect.stringContaining("subject bound"),
+    });
+    expect(childOverflow.calls).toHaveLength(1);
+
+    const runs = Array.from(
+      { length: CHILD_SETTLEMENT_MAX_RUNS + 1 },
+      (_, index) => [
+        { subject: `run-${index}`, predicate: "agent", value: "child" },
+        { subject: `run-${index}`, predicate: "kind", value: "run" },
+      ],
+    ).flat();
+    const runOverflow = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+      ], runs),
+    ]);
+    expect(runOverflow.settlement).toMatchObject({
+      kind: "unavailable",
+      reason: expect.stringContaining("subject bound"),
+    });
+    expect(runOverflow.calls).toHaveLength(1);
+  });
+
+  test("one wall-clock deadline bounds the sole subprocess and its validation", () => {
+    const samples = [0, 0, 60];
+    const { settlement, calls } = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+      ]),
+    ], {
+      deadlineMs: 50,
+      now: () => samples.shift() ?? 60,
+    });
+    expect(settlement).toEqual({
+      kind: "unavailable",
+      reason: "child settlement aggregate deadline exceeded",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.options.timeoutMs).toBe(50);
+
+    const expired = boundedSettlement([childEnvelope()], {
+      deadlineMs: 50,
+      now: (() => {
+        const values = [0, 51];
+        return () => values.shift() ?? 51;
+      })(),
+    });
+    expect(expired.settlement).toMatchObject({
+      kind: "unavailable",
+      reason: "child settlement aggregate deadline exceeded",
+    });
+    expect(expired.calls).toHaveLength(0);
+  });
+
+  test("malformed, partial, oversized, duplicate-key, and invalid UTF-8 envelopes fail closed", () => {
+    for (const output of [
+      "{\"not\":\"an envelope\"}\n",
+      "{\"protocol\":\"north.child-settlement\"",
+      '{"protocol":"north.child-settlement","protocol":"other","version":1,"coordinator":"director","children":[],"runs":[]}',
+    ]) {
+      const attempt = boundedSettlement([output]);
+      expect(attempt.settlement.kind).toBe("unavailable");
+      expect(attempt.calls).toHaveLength(1);
+    }
+
+    const oversized = boundedSettlement([
+      "x".repeat(2 * 1024 * 1024 + 1),
+    ]);
+    expect(oversized.settlement).toMatchObject({
+      kind: "unavailable",
+      reason: expect.stringContaining("output bound"),
+    });
+    expect(oversized.calls).toHaveLength(1);
+
+    const invalidUtf8 = boundedSettlement([new Uint8Array([0xff])]);
+    expect(invalidUtf8.settlement).toEqual({
+      kind: "unavailable",
+      reason: "child settlement projection returned invalid UTF-8",
+    });
+    expect(invalidUtf8.calls).toHaveLength(1);
+  });
+
+  test("the versioned envelope is closed and coordinator-bound", () => {
+    for (const overrides of [
+      { protocol: "north.child-settlement.v2" },
+      { version: 2 },
+      { coordinator: "other" },
+      { unknown: true },
+    ]) {
+      const attempt = boundedSettlement([childEnvelope([], [], overrides)]);
+      expect(attempt.settlement.kind).toBe("unavailable");
+      expect(attempt.calls).toHaveLength(1);
+    }
+  });
+
+  test("noncanonical and unknown identities fail closed", () => {
+    for (const children of [
+      [{ subject: "@agent:child", predicate: "coordinator", value: "director" }],
+      [{ subject: "thread:child", predicate: "coordinator", value: "director" }],
+      [{ subject: "agent:", predicate: "coordinator", value: "director" }],
+    ]) {
+      const attempt = boundedSettlement([childEnvelope(children)]);
+      expect(attempt.settlement.kind).toBe("unavailable");
+    }
+    for (const run of [
+      "agent:not-a-run",
+      "@run-child",
+      "run-",
+    ]) {
+      const attempt = boundedSettlement([
+        childEnvelope([
+          { subject: "agent:child", predicate: "coordinator", value: "director" },
+        ], [
+          { subject: run, predicate: "agent", value: "child" },
+          { subject: run, predicate: "kind", value: "run" },
+        ]),
+      ]);
+      expect(attempt.settlement.kind).toBe("unavailable");
+    }
+  });
+
+  test("duplicate rows and duplicate authority values fail closed", () => {
+    const duplicateRow = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+      ]),
+    ]);
+    expect(duplicateRow.settlement).toMatchObject({
+      kind: "unavailable",
+      reason: expect.stringContaining("duplicate fact row"),
+    });
+
+    const duplicateAuthority = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+        { subject: "agent:child", predicate: "coordinator", value: "other" },
+      ]),
+    ]);
+    expect(duplicateAuthority.settlement).toEqual({
+      kind: "unavailable",
+      reason: "child settlement projection returned invalid child authority",
+    });
+
+    const duplicateRunAuthority = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+      ], [
+        { subject: "run-child", predicate: "agent", value: "child" },
+        { subject: "run-child", predicate: "agent", value: "other" },
+        { subject: "run-child", predicate: "kind", value: "run" },
+      ]),
+    ]);
+    expect(duplicateRunAuthority.settlement).toEqual({
+      kind: "unavailable",
+      reason: "child settlement projection returned invalid run authority",
+    });
+  });
+
+  test("partial run commits and unrelated run authority never become terminals", () => {
+    const partial = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+      ], [
+        { subject: "run-child", predicate: "agent", value: "child" },
+        { subject: "run-child", predicate: "outcome", value: "ran" },
+      ]),
+    ]);
+    expect(partial.settlement).toEqual({
+      kind: "unavailable",
+      reason: "child settlement projection returned invalid run authority",
+    });
+
+    const unrelated = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:child", predicate: "coordinator", value: "director" },
+      ], [
+        { subject: "run-other", predicate: "agent", value: "other" },
+        { subject: "run-other", predicate: "kind", value: "run" },
+      ]),
+    ]);
+    expect(unrelated.settlement).toEqual({
+      kind: "unavailable",
+      reason: "child settlement projection returned invalid run authority",
+    });
+  });
+
+  test("empty snapshot remains distinct from command or protocol unavailability", () => {
+    const empty = boundedSettlement([childEnvelope()]);
+    expect(empty.settlement).toEqual({ kind: "settled", children: [] });
+    expect(empty.calls).toHaveLength(1);
+
+    const unavailable = boundedSettlement([new Error("coordinator unavailable")]);
+    expect(unavailable.settlement).toEqual({
+      kind: "unavailable",
+      reason: "coordinator unavailable",
+    });
+    expect(unavailable.calls).toHaveLength(1);
+  });
+
+  test("mixed terminal/live children preserve the exact live identity", () => {
+    const { settlement, calls } = boundedSettlement([
+      childEnvelope([
+        { subject: "agent:done", predicate: "coordinator", value: "director" },
+        ...factRows("agent:done", markedLane),
+        { subject: "agent:live", predicate: "coordinator", value: "director" },
+      ]),
+    ]);
+    expect(settlement).toEqual({
+      kind: "live",
+      children: ["@agent:done", "@agent:live"],
+      live: ["@agent:live"],
+    });
+    expect(calls).toHaveLength(1);
   });
 });
 

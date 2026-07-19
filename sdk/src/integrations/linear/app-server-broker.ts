@@ -7,7 +7,9 @@ import type {
   PreparedMcpToolCall,
 } from "./mcp-broker";
 import { normalizeLinearOpaqueToken } from "./normalize";
-import { parseStrictJson } from "./strict-json";
+import { parseStrictJson, StrictJsonlFrames } from "../../strict-json";
+
+export { StrictJsonlFrames } from "../../strict-json";
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -47,52 +49,6 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   resolve(value: unknown): void;
   reject(error: Error): void;
-}
-
-export class StrictJsonlFrames {
-  private fragments: Buffer[] = [];
-  private bufferedBytes = 0;
-  private decoder = new TextDecoder("utf-8", { fatal: true });
-
-  push(chunk: Uint8Array): readonly string[] {
-    const incoming = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-    const lines: string[] = [];
-    let start = 0;
-    for (;;) {
-      const newline = incoming.indexOf(0x0a, start);
-      if (newline < 0) break;
-      const segment = incoming.subarray(start, newline);
-      if (this.bufferedBytes + segment.byteLength > MAX_LINE_BYTES)
-        throw new Error("Codex app-server JSONL response exceeded 1 MiB");
-      if (segment.byteLength) {
-        this.fragments.push(segment);
-        this.bufferedBytes += segment.byteLength;
-      }
-      const rawLine = this.fragments.length === 1
-        ? this.fragments[0]!
-        : Buffer.concat(this.fragments, this.bufferedBytes);
-      this.fragments = [];
-      this.bufferedBytes = 0;
-      let line: string;
-      try { line = this.decoder.decode(rawLine); }
-      catch { throw new Error("Codex app-server emitted invalid UTF-8 JSONL output"); }
-      if (!/^[ \t\r]*$/.test(line)) lines.push(line);
-      start = newline + 1;
-    }
-    const remainder = incoming.subarray(start);
-    if (this.bufferedBytes + remainder.byteLength > MAX_LINE_BYTES)
-      throw new Error("Codex app-server JSONL response exceeded 1 MiB");
-    if (remainder.byteLength) {
-      this.fragments.push(remainder);
-      this.bufferedBytes += remainder.byteLength;
-    }
-    return lines;
-  }
-
-  finish(): void {
-    if (this.bufferedBytes)
-      throw new Error("Codex app-server closed with a partial JSONL frame");
-  }
 }
 
 function increment(counter: Map<string, number>, method: string): void {
@@ -140,7 +96,10 @@ function toolDefinition(name: string, value: unknown): McpToolDefinition {
 class JsonlRpcClient {
   private nextId = 0;
   private pending = new Map<RpcId, PendingRequest>();
-  private frames = new StrictJsonlFrames();
+  private frames = new StrictJsonlFrames({
+    label: "Codex app-server",
+    maxLineBytes: MAX_LINE_BYTES,
+  });
   private terminalError?: Error;
   private closePromise?: Promise<void>;
   private closingByClient = false;

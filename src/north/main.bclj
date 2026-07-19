@@ -763,6 +763,12 @@
 (defrecord JReview [id :- String title :- String pred :- String detail :- String])
 (defrecord JFact [predicate :- String value :- String])
 (defrecord JSubjectFact [subject :- String predicate :- String value :- String])
+(defrecord JChildSettlementProjection
+  [protocol :- String
+   version :- Int
+   coordinator :- String
+   children :- (Vec JSubjectFact)
+   runs :- (Vec JSubjectFact)])
 (defrecord JAgentFact [id :- String predicate :- String value :- String])
 (defrecord JClockRow [id :- String title :- String est_h :- Int actual_sec :- Int done :- Bool])
 (defrecord JCalib [pct :- Int sample :- Int])
@@ -800,6 +806,55 @@
             ready (vec (take 15 (sort-by (fn [te :- String] :- Int (- 0 (proj/leverage-score idx te)))
                                          (in-condition idx threads today before? "ready"))))]
         (vec (concat active ready))))))
+
+(defn- matching-subjects
+  [facts :- (Vec k/Fact) predicate :- String value :- String] :- (Map String Bool)
+  (reduce
+   (fn [subjects :- (Map String Bool) fact :- k/Fact] :- (Map String Bool)
+     (if (and (= (:p fact) predicate) (= (:r fact) value))
+       (assoc subjects (:l fact) true)
+       subjects))
+   {} facts))
+
+(defn- direct-child-subjects
+  [facts :- (Vec k/Fact) coordinator :- String] :- (Map String Bool)
+  (reduce
+   (fn [subjects :- (Map String Bool) fact :- k/Fact] :- (Map String Bool)
+     (if (and (= (:p fact) "coordinator")
+              (= (:r fact) coordinator)
+              (str/starts-with? (:l fact) "@agent:"))
+       (assoc subjects (:l fact) true)
+       subjects))
+   {} facts))
+
+(defn- child-agent-ids
+  [subjects :- (Map String Bool)] :- (Map String Bool)
+  (reduce-kv
+   (fn [ids :- (Map String Bool) subject :- String _present :- Bool] :- (Map String Bool)
+     (assoc ids (subs subject (count "@agent:")) true))
+   {} subjects))
+
+(defn- child-run-subjects
+  [facts :- (Vec k/Fact)
+   children :- (Map String Bool)
+   committed-runs :- (Map String Bool)] :- (Map String Bool)
+  (reduce
+   (fn [subjects :- (Map String Bool) fact :- k/Fact] :- (Map String Bool)
+     (if (and (= (:p fact) "agent")
+              (get children (:r fact) false)
+              (get committed-runs (:l fact) false))
+       (assoc subjects (:l fact) true)
+       subjects))
+   {} facts))
+
+(defn- subject-fact-projection
+  [facts :- (Vec k/Fact) subjects :- (Map String Bool)] :- (Vec JSubjectFact)
+  (mapv
+   (fn [fact :- k/Fact] :- JSubjectFact
+     (->JSubjectFact (short-id (:l fact)) (:p fact) (:r fact)))
+   (filterv
+    (fn [fact :- k/Fact] :- Bool (get subjects (:l fact) false))
+    facts)))
 
 (defn cmd-json [log :- String what :- String arg :- String all? :- Bool] :- Nil
   (let [facts (live-facts log)
@@ -859,6 +914,24 @@
                            (->JSubjectFact (short-id (:l c)) (:p c) (:r c)))
                          (filterv (fn [c :- k/Fact] :- Bool (get subject-set (:l c) false))
                                   facts)))))]
+      [(= what "child-settlement")
+       ;; One warm fact-vector projection is an actual snapshot. The SDK used to
+       ;; compose child/run state from four separate CLI reads; process startup
+       ;; consumed the deadline and concurrent child growth made the result only
+       ;; consistency-checked, never atomic. Keep this read mechanical and return
+       ;; every fact needed for the SDK's strict independent validation.
+       (let [children (direct-child-subjects facts arg)
+             child-ids (child-agent-ids children)
+             committed-runs (matching-subjects facts "kind" "run")
+             runs (child-run-subjects facts child-ids committed-runs)]
+         (println
+          (fram.rt/to-json
+           (->JChildSettlementProjection
+            "north.child-settlement"
+            1
+            arg
+            (subject-fact-projection facts children)
+            (subject-fact-projection facts runs)))))]
       [(= what "agents")
        (println (fram.rt/to-json
                  (mapv (fn [c :- k/Fact] :- JAgentFact
@@ -876,7 +949,7 @@
        (println (fram.rt/to-json
                  (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready")
                                   (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))]
-      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|agents|presentation")])))
+      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|child-settlement <coordinator>|agents|presentation")])))
 
 (defn cmd-needs-review [log :- String] :- Nil
   (let [as (fram.rt/read-log log)

@@ -26,7 +26,7 @@ import {
   replaceManagedLinearDescription,
 } from "./projection";
 import { createLinearSyncBaseline, reconcileLinearIssue } from "./reconcile";
-import { assertWellFormedUnicode } from "./strict-json";
+import { assertWellFormedUnicode } from "../../strict-json";
 import type {
   LinearApplyPlan, LinearIssueIdentity, LinearRemoteComment, LinearReconciliationResult,
   LinearThreadProjection, ProjectedLinearComment,

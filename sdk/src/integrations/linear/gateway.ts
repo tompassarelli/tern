@@ -3,7 +3,7 @@ import type {
   McpToolDefinition, McpToolResult, ModelFreeTransportReceipt,
 } from "./mcp-broker";
 import { canonicalJson, normalizeLinearConnector, normalizeLinearRemoteKey } from "./normalize";
-import { parseStrictJson } from "./strict-json";
+import { parseStrictJson } from "../../strict-json";
 
 export const LINEAR_READ_TOOL = "get_issue";
 export const LINEAR_LIST_ISSUES_TOOL = "list_issues";

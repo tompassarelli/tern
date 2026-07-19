@@ -6,7 +6,7 @@ import type {
   NorthLifecycleCategory,
   Nullable,
 } from "./types";
-import { assertWellFormedUnicode } from "./strict-json";
+import { assertWellFormedUnicode } from "../../strict-json";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;

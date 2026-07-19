@@ -1,11 +1,20 @@
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_MAX_DEPTH = 128;
 const DEFAULT_MAX_NODES = 100_000;
+const DEFAULT_MAX_JSONL_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_JSONL_FRAMES = 100_000;
 
 export interface StrictJsonLimits {
   maxBytes?: number;
   maxDepth?: number;
   maxNodes?: number;
+}
+
+export interface StrictJsonlLimits {
+  label?: string;
+  maxLineBytes?: number;
+  maxTotalBytes?: number;
+  maxFrames?: number;
 }
 
 export function assertWellFormedUnicode(value: string, label: string): void {
@@ -107,4 +116,92 @@ export function parseStrictJson(
   catch { throw new Error(`${label} is invalid JSON`); }
   inspectParsedValue(parsed, label, maxDepth, maxNodes);
   return parsed;
+}
+
+/**
+ * Incremental, fatal UTF-8 JSONL framing with independent per-line, cumulative
+ * byte, and frame-count bounds. A non-newline-terminated tail is never a frame.
+ */
+export class StrictJsonlFrames {
+  private fragments: Buffer[] = [];
+  private bufferedBytes = 0;
+  private totalBytes = 0;
+  private frameCount = 0;
+  private readonly decoder = new TextDecoder("utf-8", { fatal: true });
+  private readonly label: string;
+  private readonly maxLineBytes: number;
+  private readonly maxTotalBytes: number;
+  private readonly maxFrames: number;
+
+  constructor(limits: StrictJsonlLimits = {}) {
+    this.label = limits.label ?? "Codex app-server";
+    this.maxLineBytes = limits.maxLineBytes ?? DEFAULT_MAX_BYTES;
+    this.maxTotalBytes = limits.maxTotalBytes ?? DEFAULT_MAX_JSONL_BYTES;
+    this.maxFrames = limits.maxFrames ?? DEFAULT_MAX_JSONL_FRAMES;
+    for (const [name, value] of [
+      ["maxLineBytes", this.maxLineBytes],
+      ["maxTotalBytes", this.maxTotalBytes],
+      ["maxFrames", this.maxFrames],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value <= 0)
+        throw new Error(`${name} must be a positive safe integer`);
+    }
+  }
+
+  push(chunk: Uint8Array): readonly string[] {
+    const incoming = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    this.totalBytes += incoming.byteLength;
+    if (!Number.isSafeInteger(this.totalBytes) || this.totalBytes > this.maxTotalBytes)
+      throw new Error(`${this.label} JSONL output exceeded its cumulative byte bound`);
+
+    const lines: string[] = [];
+    let start = 0;
+    for (;;) {
+      const newline = incoming.indexOf(0x0a, start);
+      if (newline < 0) break;
+      const segment = incoming.subarray(start, newline);
+      if (this.bufferedBytes + segment.byteLength > this.maxLineBytes) {
+        const bound = this.maxLineBytes === 1024 * 1024
+          ? "1 MiB"
+          : `${this.maxLineBytes} bytes`;
+        throw new Error(`${this.label} JSONL response exceeded ${bound}`);
+      }
+      if (segment.byteLength) {
+        this.fragments.push(segment);
+        this.bufferedBytes += segment.byteLength;
+      }
+      const rawLine = this.fragments.length === 1
+        ? this.fragments[0]!
+        : Buffer.concat(this.fragments, this.bufferedBytes);
+      this.fragments = [];
+      this.bufferedBytes = 0;
+      let line: string;
+      try { line = this.decoder.decode(rawLine); }
+      catch { throw new Error(`${this.label} emitted invalid UTF-8 JSONL output`); }
+      if (!/^[ \t\r]*$/.test(line)) {
+        this.frameCount++;
+        if (this.frameCount > this.maxFrames)
+          throw new Error(`${this.label} JSONL output exceeded its frame-count bound`);
+        lines.push(line);
+      }
+      start = newline + 1;
+    }
+    const remainder = incoming.subarray(start);
+    if (this.bufferedBytes + remainder.byteLength > this.maxLineBytes) {
+      const bound = this.maxLineBytes === 1024 * 1024
+        ? "1 MiB"
+        : `${this.maxLineBytes} bytes`;
+      throw new Error(`${this.label} JSONL response exceeded ${bound}`);
+    }
+    if (remainder.byteLength) {
+      this.fragments.push(remainder);
+      this.bufferedBytes += remainder.byteLength;
+    }
+    return lines;
+  }
+
+  finish(): void {
+    if (this.bufferedBytes)
+      throw new Error(`${this.label} closed with a partial JSONL frame`);
+  }
 }

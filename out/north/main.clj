@@ -445,6 +445,18 @@
 
 (defn jsubjectfact-value [r] (:value r))
 
+(defrecord JChildSettlementProjection [protocol version coordinator children runs])
+
+(defn jchildsettlementprojection-protocol [r] (:protocol r))
+
+(defn jchildsettlementprojection-version [r] (:version r))
+
+(defn jchildsettlementprojection-coordinator [r] (:coordinator r))
+
+(defn jchildsettlementprojection-children [r] (:children r))
+
+(defn jchildsettlementprojection-runs [r] (:runs r))
+
 (defrecord JAgentFact [id predicate value])
 
 (defn jagentfact-id [r] (:id r))
@@ -496,6 +508,21 @@
    ready (vec (take 15 (sort-by (fn [te] (- 0 (proj/leverage-score idx te))) (in-condition idx threads today before? "ready"))))]
   (vec (concat active ready))))))
 
+(defn- matching-subjects [facts ^String predicate ^String value]
+  (reduce (fn [subjects fact] (if (and (= (:p fact) predicate) (= (:r fact) value)) (assoc subjects (:l fact) true) subjects)) {} facts))
+
+(defn- direct-child-subjects [facts ^String coordinator]
+  (reduce (fn [subjects fact] (if (and (= (:p fact) "coordinator") (= (:r fact) coordinator) (str/starts-with? (:l fact) "@agent:")) (assoc subjects (:l fact) true) subjects)) {} facts))
+
+(defn- child-agent-ids [subjects]
+  (reduce-kv (fn [ids subject _present] (assoc ids (subs subject (count "@agent:")) true)) {} subjects))
+
+(defn- child-run-subjects [facts children committed-runs]
+  (reduce (fn [subjects fact] (if (and (= (:p fact) "agent") (get children (:r fact) false) (get committed-runs (:l fact) false)) (assoc subjects (:l fact) true) subjects)) {} facts))
+
+(defn- subject-fact-projection [facts subjects]
+  (mapv (fn [fact] (->JSubjectFact (short-id (:l fact)) (:p fact) (:r fact))) (filterv (fn [fact] (get subjects (:l fact) false)) facts)))
+
 (defn cmd-json [^String log ^String what ^String arg ^Boolean all?]
   (let [facts (live-facts log)
    idx (k/build-index facts)
@@ -518,10 +545,15 @@
   (= what "show-many") (let [subjects (filterv (fn [s] (not (str/blank? s))) (mapv (fn [s] (short-id s)) (vec (str/split arg #","))))
    subject-set (reduce (fn [m s] (assoc m (str "@" s) true)) {} subjects)]
   (println (fram.rt/to-json (mapv (fn [c] (->JSubjectFact (short-id (:l c)) (:p c) (:r c))) (filterv (fn [c] (get subject-set (:l c) false)) facts)))))
+  (= what "child-settlement") (let [children (direct-child-subjects facts arg)
+   child-ids (child-agent-ids children)
+   committed-runs (matching-subjects facts "kind" "run")
+   runs (child-run-subjects facts child-ids committed-runs)]
+  (println (fram.rt/to-json (->JChildSettlementProjection "north.child-settlement" 1 arg (subject-fact-projection facts children) (subject-fact-projection facts runs)))))
   (= what "agents") (println (fram.rt/to-json (mapv (fn [c] (->JAgentFact (subs (:l c) (count "@agent:")) (:p c) (:r c))) (filterv (fn [c] (let [l (:l c)]
   (and (some? l) (str/starts-with? l "@agent:")))) facts))))
   (= what "presentation") (println (fram.rt/to-json (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready") (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))
-  :else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|agents|presentation"))))
+  :else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|child-settlement <coordinator>|agents|presentation"))))
 
 (defn cmd-needs-review [^String log]
   (let [as (fram.rt/read-log log)

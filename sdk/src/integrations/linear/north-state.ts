@@ -8,7 +8,7 @@ import {
   normalizeLinearRemoteKey, normalizeLinearUuid, normalizeText, normalizeThreadId,
   sha256Canonical,
 } from "./normalize";
-import { assertWellFormedUnicode, parseStrictJson } from "./strict-json";
+import { assertWellFormedUnicode, parseStrictJson } from "../../strict-json";
 import { createLinearSyncBaseline, validateLinearSyncBaseline } from "./reconcile";
 import { parseManagedLinearDescription } from "./projection";
 import type {
