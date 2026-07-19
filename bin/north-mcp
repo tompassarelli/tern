@@ -54,6 +54,21 @@
 (def server-property
   {:type "string" :minLength 1 :description "Optional configured Linear MCP server name"})
 
+(def evidence-argument-keys #{"bar" "observed"})
+(defn evidence-argument-problem [arguments]
+  (cond
+    (not (map? arguments)) "arguments must be an object"
+    (seq (remove evidence-argument-keys (keys arguments)))
+    (str "unknown evidence_record arguments: "
+         (str/join ", " (sort (remove evidence-argument-keys (keys arguments)))))
+    (not (and (string? (get arguments "bar"))
+              (not (str/blank? (get arguments "bar")))))
+    "bar must be a non-empty string"
+    (not (and (string? (get arguments "observed"))
+              (not (str/blank? (get arguments "observed")))))
+    "observed must be a non-empty string"
+    :else nil))
+
 (def tools
   [{:name "ready"        :desc "Threads doable now (committed, unblocked, not active, not done). Default: kind=thread, top-15 by leverage. Pass all=true for the full unscoped list. Returns JSON [{id,title,condition,emoji}]."
     :schema {:type "object" :properties {:all {:type "boolean" :description "return every ready thread, unscoped (default false: kind=thread top-15 by leverage)"}}}
@@ -90,6 +105,16 @@
                                          :value {:type "string"}}
              :required ["id" "predicate" "value"]}
     :argv (fn [a] ["tell" (get a "id") (get a "predicate") (get a "value")])}
+   {:name "evidence_record"
+    :desc "Record an observed result for one exact done_when bar on this managed run. Run, thread, reporter, capability, North port, and Fram log are derived from the managed environment; callers supply only bar and observed."
+    :schema {:type "object"
+             :properties {:bar {:type "string" :minLength 1}
+                          :observed {:type "string" :minLength 1}}
+             :required ["bar" "observed"]
+             :additionalProperties false}
+    :annotations local-write-annotations
+    :argument-problem evidence-argument-problem
+    :argv (fn [a] ["evidence" "record" (get a "bar") (get a "observed")])}
    {:name "retract"      :desc "Retract one fact about a thread. (untell accepted as a legacy alias.)"
     :schema {:type "object" :properties {:id {:type "string"}
                                          :predicate {:type "string"}
@@ -780,15 +805,19 @@
   (if-let [st (find-sdk-tool nm)]
     (call-sdk nm (or args {}))
     (if-let [t (find-tool nm)]
-      (let [argv (mapv str ((:argv t) (or args {})))
-            {:keys [out err exit]} (apply proc/sh engine argv)
-            errs (str/trim (or err ""))
-            raw (str/trim (str out (when (seq errs) (str "\n[stderr] " errs))))
-            text (if (zero? exit)
-                   (slim-output nm (or args {}) raw)
-                   (bound-tool-error raw))]
-        {:content [{:type "text" :text (if (str/blank? text) (str "(done; exit " exit ")") text)}]
-         :isError (not (zero? exit))})
+      (let [arguments (or args {})]
+        (if-let [problem (when-let [argument-problem (:argument-problem t)]
+                           (argument-problem arguments))]
+          {:content [{:type "text" :text problem}] :isError true}
+          (let [argv (mapv str ((:argv t) arguments))
+                {:keys [out err exit]} (apply proc/sh engine argv)
+                errs (str/trim (or err ""))
+                raw (str/trim (str out (when (seq errs) (str "\n[stderr] " errs))))
+                text (if (zero? exit)
+                       (slim-output nm arguments raw)
+                       (bound-tool-error raw))]
+            {:content [{:type "text" :text (if (str/blank? text) (str "(done; exit " exit ")") text)}]
+             :isError (not (zero? exit))})))
       {:content [{:type "text" :text (str "unknown tool: " nm)}] :isError true})))
 
 (defn tool-descriptor [t]

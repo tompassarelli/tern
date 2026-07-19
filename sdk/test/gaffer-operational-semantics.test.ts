@@ -241,7 +241,7 @@ test("Codex receives per-run native-agent disablement and a worker North allowli
   });
   expect(worker).toEqual([
     "--disable", "multi_agent", "--config",
-    "mcp_servers.north.enabled_tools=[\"capture\",\"tell\",\"show\",\"ready\",\"next\",\"board\",\"plate\"]",
+    "mcp_servers.north.enabled_tools=[\"capture\",\"tell\",\"evidence_record\",\"show\",\"ready\",\"next\",\"board\",\"plate\"]",
   ]);
   expect(codexHarnessArguments({ disallowedTools: ["Agent"] })).toEqual(["--disable", "multi_agent"]);
 });

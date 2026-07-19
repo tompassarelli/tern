@@ -1,13 +1,15 @@
 #!/usr/bin/env bb
 (require '[babashka.process :as proc]
          '[cheshire.core :as json]
-         '[clojure.java.io :as io])
+         '[clojure.java.io :as io]
+         '[clojure.string :as str])
 
 (def root (.getCanonicalPath
            (io/file (.getParent (io/file (System/getProperty "babashka.file"))) "../..")))
 (def fram (str (System/getProperty "user.home") "/code/fram"))
 (def run-writer (str root "/cli/run-fact-internal.clj"))
 (def evidence-writer (str root "/cli/delivery-evidence-internal.clj"))
+(def north-mcp (str root "/bin/north-mcp"))
 (def conformance
   (json/parse-string
    (slurp (str root "/sdk/test/fixtures/delivery-conformance.json"))))
@@ -45,6 +47,19 @@
   (apply proc/shell {:out :string :err :string :continue true
                      :extra-env {"FRAM_LOG" @test-log}}
          args))
+(defn mcp-request [environment method params]
+  (let [request
+        (json/generate-string
+         {"jsonrpc" "2.0" "id" 1 "method" method "params" params})
+        result
+        (proc/shell {:out :string :err :string :continue true
+                     :in (str request "\n")
+                     :extra-env (merge {"FRAM_LOG" @test-log} environment)}
+                    "bb" north-mcp)
+        output (str/trim (:out result))]
+    (assoc result :response
+           (when (and (zero? (:exit result)) (not (str/blank? output)))
+             (json/parse-string output)))))
 (defn reserve-request [run thread reporter capability]
   {"run" run "thread" thread "reporter" reporter
    "capabilitySha256" (north.terminal-projection/sha256 capability)})
@@ -289,6 +304,81 @@
                                             (apply str (repeat 64 "b"))
                                             "tests pass" "24/24")))]
       (check "wrong run capability cannot author evidence" (not (zero? (:exit wrong-cap)))))
+    (let [mcp-run "@run-mcp-evidence"
+          mcp-thread "@thread-mcp-evidence"
+          mcp-reporter "@agent:readonly-mcp-worker"
+          mcp-capability (apply str (repeat 64 "6"))
+          mcp-bar "read-only worker records exact proof"
+          mcp-environment
+          {"NORTH_BIN" (str root "/bin/north")
+           "NORTH_PORT" (str port)
+           "AGENT_ID" (subs mcp-reporter (count "@agent:"))
+           "AGENT_TOPOLOGY" "worker"
+           "NORTH_RUN_ID" (subs mcp-run 1)
+           "NORTH_THREAD_ID" (subs mcp-thread 1)
+           "NORTH_RUN_CAPABILITY" mcp-capability
+           "FRAM_LOG" @test-log}]
+      (north.coord/append! port mcp-thread "title" "MCP evidence binding")
+      (north.coord/append! port mcp-thread "done_when" mcp-bar)
+      (let [reserved
+            (shell "bb" evidence-writer (str port) "reserve"
+                   (json/generate-string
+                    (reserve-request mcp-run mcp-thread mcp-reporter
+                                     mcp-capability)))
+            listed (mcp-request mcp-environment "tools/list" {})
+            descriptor
+            (some #(when (= "evidence_record" (get % "name")) %)
+                  (get-in listed [:response "result" "tools"]))
+            forged
+            (mcp-request
+             mcp-environment "tools/call"
+             {"name" "evidence_record"
+              "arguments"
+              {"bar" mcp-bar "observed" "exit 0"
+               "run" "run-other" "thread" "thread-other"
+               "reporter" "agent:other" "capability" (apply str (repeat 64 "5"))}})
+            after-forgery (facts-of port mcp-run)
+            wrong-log
+            (mcp-request
+             (assoc mcp-environment "FRAM_LOG" (str @test-log ".wrong"))
+             "tools/call"
+             {"name" "evidence_record"
+              "arguments" {"bar" mcp-bar "observed" "exit 0"}})
+            after-wrong-log (facts-of port mcp-run)
+            recorded
+            (mcp-request
+             mcp-environment "tools/call"
+             {"name" "evidence_record"
+              "arguments" {"bar" mcp-bar "observed" "exit 0"}})
+            stored (facts-of port mcp-run)
+            record
+            (some-> recorded :response (get-in ["result" "content" 0 "text"])
+                    json/parse-string)]
+        (check "MCP evidence run reserves against the exact coordinator"
+               (zero? (:exit reserved)))
+        (check "evidence_record exposes only bar and observed in its MCP schema"
+               (= {"type" "object"
+                   "properties" {"bar" {"type" "string" "minLength" 1}
+                                 "observed" {"type" "string" "minLength" 1}}
+                   "required" ["bar" "observed"]
+                   "additionalProperties" false}
+                  (get descriptor "inputSchema")))
+        (check "evidence_record rejects caller-supplied run identity fields"
+               (and (true? (get-in forged [:response "result" "isError"]))
+                    (empty? (get after-forgery "run_bar_evidence" #{}))))
+        (check "evidence_record preserves the managed Fram log fence"
+               (and (true? (get-in wrong-log [:response "result" "isError"]))
+                    (empty? (get after-wrong-log "run_bar_evidence" #{}))))
+        (check "read-only worker records evidence through MCP end-to-end"
+               (and (false? (get-in recorded [:response "result" "isError"]))
+                    (= mcp-run (get record "run"))
+                    (= mcp-thread (get record "thread"))
+                    (= mcp-reporter (get record "reporter"))
+                    (= mcp-bar (get record "bar"))
+                    (= "exit 0" (get record "observed"))
+                    (= 1 (count (get stored "run_bar_evidence" #{})))
+                    (= #{(str mcp-bar " → exit 0")}
+                       (get (facts-of port mcp-thread) "bar_evidence"))))))
     (let [normalized-run "@run-normalized-bar"
           normalized-thread "@thread-normalized-bar"
           normalized-capability (apply str (repeat 64 "e"))]

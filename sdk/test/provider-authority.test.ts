@@ -65,6 +65,9 @@ test("North MCP tool inventory and managed Anthropic exposure stay in exact pari
   expect(options.allowedTools).toEqual([
     "Read", "Grep", "Glob", "mcp__north-readonly-shell__run", ...COORDINATION_TOOLS,
   ]);
+  expect(options.allowedTools).toContain("mcp__north__evidence_record");
+  expect(options.allowedTools).not.toContain("mcp__north__dispatch");
+  expect(options.allowedTools).not.toContain("mcp__north__spawn");
   const contractNorth = new Set([
     ...COORDINATION_TOOLS.map((name) => name.replace("mcp__north__", "")),
   ]);
@@ -79,6 +82,14 @@ test("North MCP tool inventory and managed Anthropic exposure stay in exact pari
     "mcp__north__spawn",
   ]));
 
+  const openaiWorker = designer("openai", "openai-exact-worker-surface");
+  const workerEnabledTools = codexHarnessArguments(openaiWorker).find((argument) =>
+    argument.startsWith("mcp_servers.north.enabled_tools="))!;
+  expect(workerEnabledTools).toBe(
+    'mcp_servers.north.enabled_tools=["capture","tell","evidence_record","show","ready","next","board","plate"]',
+  );
+  expect(workerEnabledTools).not.toMatch(/dispatch|spawn/);
+
   const director = harnessOptions({
     self: "openai-exact-orchestrator-surface",
     provider: "openai",
@@ -90,7 +101,7 @@ test("North MCP tool inventory and managed Anthropic exposure stay in exact pari
   const enabledTools = codexArgs.find((argument) =>
     argument.startsWith("mcp_servers.north.enabled_tools="))!;
   expect(enabledTools).toBe(
-    'mcp_servers.north.enabled_tools=["capture","tell","show","ready","next","board","plate","dispatch","spawn"]',
+    'mcp_servers.north.enabled_tools=["capture","tell","evidence_record","show","ready","next","board","plate","dispatch","spawn"]',
   );
   expect(enabledTools).not.toMatch(/clock|linear|retract|validate/);
 });

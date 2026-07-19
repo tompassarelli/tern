@@ -158,6 +158,7 @@ export function peerCommandServer(self: string) {
 export const COORDINATION_TOOLS = [
   "mcp__north__capture",
   "mcp__north__tell",
+  "mcp__north__evidence_record",
   "mcp__north__show",
   "mcp__north__ready",
   "mcp__north__next",
@@ -183,6 +184,7 @@ export const NORTH_MCP_TOOL_NAMES = [
   "show",
   "capture",
   "tell",
+  "evidence_record",
   "retract",
   "clock_start",
   "clock_stop",

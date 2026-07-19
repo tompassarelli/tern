@@ -13,7 +13,7 @@ const STALL_TURNS = Number(process.env.STRUGGLE_STALL_TURNS) || 6;
 // changed). A run that keeps producing these isn't stuck, however many turns it takes.
 const PROGRESS_TOOLS = new Set([
   "Edit", "Write", "NotebookEdit",
-  "mcp__north__capture", "mcp__north__tell",
+  "mcp__north__capture", "mcp__north__tell", "mcp__north__evidence_record",
 ]);
 
 export type StruggleTrigger = "consecutive_errors" | "tool_loop" | "no_progress";

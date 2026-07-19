@@ -20,7 +20,9 @@ import {
 
 function command(env: NodeJS.ProcessEnv): string { return env.NORTH_CODEX_BIN ?? "codex"; }
 
-const WORKER_NORTH_TOOLS = ["capture", "tell", "show", "ready", "next", "board", "plate"];
+const WORKER_NORTH_TOOLS = [
+  "capture", "tell", "evidence_record", "show", "ready", "next", "board", "plate",
+];
 const ORCHESTRATOR_NORTH_TOOLS = [...WORKER_NORTH_TOOLS, "dispatch", "spawn"];
 
 /** Per-invocation Codex restrictions derived from the provider-neutral harness contract. */
