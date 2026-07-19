@@ -171,6 +171,40 @@ On a cross-provider fallback, North resolves the same semantic tier again throug
 the new provider's catalog before invocation. Once execution may have produced a
 side effect, the failure is surfaced instead of replaying the task.
 
+## Spend guard
+
+Providers are billed one of two ways. `anthropic` and `openai` draw on a
+subscription entitlement pool; every other provider id is API-billed per token.
+Billing class is derived from a single authoritative allowlist and is fail-closed
+by construction: only the allowlist is subscription, so an unknown or malformed
+provider id is API-billed — unknown means guarded, never unguarded.
+
+An API-billed target is structurally inert unless a complete, readable
+`@spend-budget:<target>` entity exists for it, carrying at minimum
+`budget_cap_microusd`, `budget_period`, `lane_envelope_default_microusd`,
+`lane_envelope_max_microusd`, `burn_limit_microusd_per_hour`, and
+`layer1_confirmed`. A missing entity, a missing or ambiguous predicate, a
+malformed micro-USD amount, or a ledger read failure all refuse: an unreadable
+ledger is never treated as headroom.
+
+The guard binds at two seams. At routing eligibility, an API-billed target
+without a complete budget is ineligible exactly like an exhausted target, so
+auto-route flows past it to a subscription sibling; an exact pin has no sibling
+and fails at admission. At admission, `admitExecution` refuses an API-billed
+target whose budget check has not passed, as defense in depth against a direct
+adapter call. That refusal is `SpendGuardError` with the distinct code and
+terminal outcome `blocked_spend_guard` — kept queryable in run evidence rather
+than conflated with `blocked_preflight`. Because it is retry-safe before
+acceptance, an auto-routed spawn degrades to subscription work instead of
+failing.
+
+Subscription targets never touch this path beyond an O(1) classification branch:
+they read no ledger and incur no new admission cost. The guard ships ahead of any
+API-billed provider, inverting the risk order so the capability cannot exist
+unguarded. Ledger reservation, settlement, the circuit breaker, and the `north
+spend` surface are separate, later concerns; this seam only classifies billing
+and verifies budget-entity completeness.
+
 ## Identity and routing evidence
 
 The active route is visible in both live agent identity and immutable run facts.

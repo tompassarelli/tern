@@ -4,7 +4,8 @@ import { isAbsolute, resolve } from "node:path";
 import type { GafferCapability } from "./gaffer-capabilities";
 import { providerSupportsCapabilities } from "./gaffer-capabilities";
 import { preflightReadonlyShell, ReadonlyShellUnavailableError } from "./readonly-shell";
-import { ProviderRetrySafeError, type ProviderId } from "./providers/types";
+import { ProviderRetrySafeError, type ProviderId, type RoutingTarget } from "./providers/types";
+import { spendGuardVerdict } from "./spend-guard";
 
 const REPO = resolve(import.meta.dir, "../..");
 const ENGINE = `${REPO}/bin/north`;
@@ -113,12 +114,44 @@ export function consumeExecutionAdmission(provider: ProviderId, options: unknown
 }
 
 export class ExecutionAdmissionError extends ProviderRetrySafeError {
-  readonly code = "blocked_preflight";
-  readonly processOutcome = "blocked_preflight";
+  // Typed as string so a subclass may carry a distinct, queryable terminal
+  // outcome (e.g. the spend guard) without masquerading as a preflight block.
+  readonly code: string = "blocked_preflight";
+  readonly processOutcome: string = "blocked_preflight";
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ExecutionAdmissionError";
   }
+}
+
+/**
+ * Refusal of an API-billed provider target that lacks a complete spend budget.
+ * A distinct code/outcome (`blocked_spend_guard`) keeps a spend-policy refusal
+ * queryable in run evidence instead of conflating it with infra preflight. It
+ * still extends ExecutionAdmissionError → ProviderRetrySafeError, so an
+ * auto-routed spawn falls back to a subscription sibling under the existing
+ * pre-side-effect proof rules; budget absence degrades to subscription work.
+ */
+export class SpendGuardError extends ExecutionAdmissionError {
+  readonly code = "blocked_spend_guard";
+  readonly processOutcome = "blocked_spend_guard";
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SpendGuardError";
+  }
+}
+
+/**
+ * Fail-closed spend admission. Subscription providers are an O(1) branch that
+ * never reads the ledger; an API-billed provider target must carry a complete,
+ * readable `@spend-budget:<target>` entity or admission refuses. Defense in
+ * depth for the routing-eligibility guard: a direct adapter call cannot admit an
+ * unguarded API-billed target.
+ */
+export function admitSpendGuard(provider: string, target?: RoutingTarget): void {
+  const targetId = target?.id ?? provider;
+  const verdict = spendGuardVerdict(target?.provider ?? provider, targetId);
+  if (!verdict.ok) throw new SpendGuardError(verdict.reason ?? `${provider}_spend_budget_incomplete`);
 }
 
 /**
@@ -245,10 +278,15 @@ export async function admitExecution(
   capabilities: readonly GafferCapability[],
   cwd: string,
   options?: any,
+  target?: RoutingTarget,
 ): Promise<void> {
   if (!providerSupportsCapabilities(provider, capabilities)) {
     throw new ExecutionAdmissionError(`${provider}_adapter_cannot_enforce_gaffer_capabilities`);
   }
+  // Fail-closed spend guard (defense in depth). Subscription providers return
+  // O(1) without a ledger read; an API-billed target without a complete budget
+  // refuses here even if it somehow bypassed routing eligibility.
+  admitSpendGuard(provider, target);
   try {
     accessSync(ENGINE, constants.X_OK);
   } catch (cause) {

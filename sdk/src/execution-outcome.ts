@@ -15,6 +15,7 @@ export interface ExecutionTerminal {
 
 const BLOCKED_REASON: Record<string, string> = {
   blocked_preflight: "execution_preflight_blocked",
+  blocked_spend_guard: "spend_guard_budget_incomplete",
   provider_error: "provider_terminal_error",
   died: "provider_process_died",
   stalled: "provider_process_stalled",

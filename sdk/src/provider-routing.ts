@@ -45,6 +45,7 @@ import { codexConfigArguments, isClaudeSubscriptionStatus, providerEnvironmentFo
 import {
   providerSupportsCapabilities, type GafferCapability,
 } from "./gaffer-capabilities";
+import { spendGuardEligible } from "./spend-guard";
 
 const PROVIDERS: ProviderId[] = ["anthropic", "openai"];
 
@@ -596,7 +597,11 @@ export function balancedAllocationEstimates(
       && providerSupportsModel(target.provider, model)
       && providerSupportsCapabilities(target.provider, capabilities)
       && stateOfTarget(availability, target).available
-      && targetPressure !== "exhausted";
+      && targetPressure !== "exhausted"
+      // An API-billed target without a complete spend budget is ineligible
+      // exactly like an exhausted target; auto-route flows to subscription
+      // siblings. Subscription targets are O(1) and never read the ledger.
+      && spendGuardEligible(target.provider, target.id);
     const manual = policy.pressureObservations?.[target.id];
     const categoricalFactor = categorical ? pressureWeight[categorical.pressure] : undefined;
     const fallbackEvidence = categorical?.evidence ?? {
@@ -665,7 +670,8 @@ export function selectProviderFromAvailability(
   ])) as Record<string, EntitlementPressure>;
   const targetAvailable = (target: RoutingTarget) => stateOfTarget(availability, target).available;
   const eligible = (target: RoutingTarget) => routeCompatible(target)
-    && targetAvailable(target) && targetPressures[target.id] !== "exhausted";
+    && targetAvailable(target) && targetPressures[target.id] !== "exhausted"
+    && spendGuardEligible(target.provider, target.id);
   const routeFailure = (providers: ProviderId[]) => {
     const support = [...new Set(providers)].map((provider) =>
       `${provider}=[${tier ? supportedReasoning(provider, tier).join(",") : "provider default"}]`).join("; ");

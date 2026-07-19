@@ -369,8 +369,11 @@ async function runDispatch(
       outcome = "resource_envelope_exceeded";
       console.error(`[envelope] @agent:${agentId} ${err.message}`);
     } else if (err instanceof ProviderRetrySafeError) {
-      outcome = "blocked_preflight";
-      console.error(`[preflight] @agent:${agentId} ${err.message}`);
+      // A spend-guard refusal carries its own terminal outcome; every other
+      // retry-safe preflight block stays blocked_preflight.
+      const carried = (err as { processOutcome?: unknown }).processOutcome;
+      outcome = typeof carried === "string" ? carried : "blocked_preflight";
+      console.error(`[${outcome}] @agent:${agentId} ${err.message}`);
     } else {
       outcome = "died";
       notifyDeath(agentId, err, { thread: threadId, coordinator: process.env.AGENT_COORDINATOR });
@@ -452,7 +455,8 @@ async function runDispatch(
     ? resultMsg.num_turns
     // A retry-safe preflight block proves the provider accepted no turn. This
     // zero is North-observed; every other missing provider value stays absent.
-    : terminal.processOutcome === "blocked_preflight" ? 0 : undefined;
+    : terminal.processOutcome === "blocked_preflight"
+      || terminal.processOutcome === "blocked_spend_guard" ? 0 : undefined;
   recordRun({ thread: threadId, agent: agentId, tokenUsage,
               model: routing.resolvedModel ?? resolved.model, effort: routing.resolvedEffort ?? resolved.effort,
               role,

@@ -434,8 +434,11 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
       outcome = "resource_envelope_exceeded";
       console.error(`[envelope] @agent:${agentId} ${err.message}`);
     } else if (err instanceof ProviderRetrySafeError) {
-      outcome = "blocked_preflight";
-      console.error(`[preflight] @agent:${agentId} ${err.message}`);
+      // A spend-guard refusal carries its own terminal outcome; every other
+      // retry-safe preflight block stays blocked_preflight.
+      const carried = (err as { processOutcome?: unknown }).processOutcome;
+      outcome = typeof carried === "string" ? carried : "blocked_preflight";
+      console.error(`[${outcome}] @agent:${agentId} ${err.message}`);
     } else {
       outcome = "died";
       notifyDeath(agentId, err, { thread: undefined, coordinator: opts.coordinator });
@@ -519,7 +522,8 @@ async function runSpawn(opts: SpawnOptions & { routingMetadata: RoutingMetadata 
     ? resultMsg.num_turns
     // A retry-safe preflight block proves the provider accepted no turn. This
     // zero is North-observed; every other missing provider value stays absent.
-    : terminal.processOutcome === "blocked_preflight" ? 0 : undefined;
+    : terminal.processOutcome === "blocked_preflight"
+      || terminal.processOutcome === "blocked_spend_guard" ? 0 : undefined;
   recordRun({
     thread: opts.thread ?? "(ad-hoc)", agent: agentId, posture: "spawn",
     // Effective FINAL dial (rung() reflects any in-flight escalation); env-fallback
