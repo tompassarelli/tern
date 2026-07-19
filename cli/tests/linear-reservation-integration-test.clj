@@ -86,6 +86,14 @@
                       {:subject subject :predicate predicate :result result})))
     result))
 
+(defn retract-fact! [port subject predicate value]
+  (let [result (north.coord/retract! port subject predicate value)]
+    (when-not (and (= #{:ok} (set (keys result)))
+                   (integer? (:ok result)))
+      (throw (ex-info "fixture fact retraction failed"
+                      {:subject subject :predicate predicate :result result})))
+    result))
+
 (defn reserve-once!
   [log reserve port evidence-resource identity-resource link thread connector
    created-at initial-key evidence-subject suffix]
@@ -433,7 +441,108 @@
                        :body [{:rel "triple"
                                :args ["@linear_test_schema"
                                       "value_kind"
-                                      {:var "value"}]}]}]}})))))
+                                     {:var "value"}]}]}]}})))))
+
+    (let [duplicate-connector "linear-duplicate-election"
+          duplicate-created-at "2026-07-16T14:13:00.639Z"
+          duplicate-link
+          "@link:linear:mcp-bootstrap-v2:linear-duplicate-election:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          duplicate-subject
+          (str
+           "@linear-bootstrap:"
+           (canonical-hash
+            {"connector" duplicate-connector
+             "createdAt" duplicate-created-at}))
+          duplicate-election
+          (str
+           "{\"canonicalLink\":\"" duplicate-link
+           "\",\"canonicalLink\":\"" duplicate-link
+           "\",\"connector\":\"" duplicate-connector
+           "\",\"createdAt\":\"" duplicate-created-at
+           "\",\"initialKey\":\"MSA-420\","
+           "\"linkedThread\":\"@thread-duplicate-election\"}")
+          bad-time-connector "linear-bad-time"
+          bad-time "2026-07-16 14:14:00"
+          bad-time-subject
+          (str
+           "@linear-bootstrap:"
+           (canonical-hash
+            {"connector" bad-time-connector "createdAt" bad-time}))
+          bad-time-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink"
+             "@link:linear:mcp-bootstrap-v2:linear-bad-time:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+             "connector" bad-time-connector
+             "createdAt" bad-time
+             "initialKey" "MSA-421"
+             "linkedThread" "@thread-bad-time"}))
+          control-connector "linear-control\nconnector"
+          control-created-at "2026-07-16T14:15:00.639Z"
+          control-subject
+          (str
+           "@linear-bootstrap:"
+           (canonical-hash
+            {"connector" control-connector
+             "createdAt" control-created-at}))
+          control-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink"
+             "@link:linear:mcp-bootstrap-v2:linear-control:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+             "connector" control-connector
+             "createdAt" control-created-at
+             "initialKey" "MSA-422"
+             "linkedThread" "@thread-control"}))
+          oversize-connector "linear-oversize-election"
+          oversize-created-at "2026-07-16T14:16:00.639Z"
+          oversize-subject
+          (str
+           "@linear-bootstrap:"
+           (canonical-hash
+            {"connector" oversize-connector
+             "createdAt" oversize-created-at}))
+          oversize-election
+          (json/generate-string
+           (into
+            (sorted-map)
+            {"canonicalLink"
+             "@link:linear:mcp-bootstrap-v2:linear-oversize-election:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+             "connector" oversize-connector
+             "createdAt" oversize-created-at
+             "initialKey" (apply str (repeat 5000 "x"))
+             "linkedThread" "@thread-oversize"}))
+          corruptions
+          [["malformed JSON" "@linear-bootstrap:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "{"]
+           ["duplicate authority key" duplicate-subject duplicate-election]
+           ["noncanonical timestamp" bad-time-subject bad-time-election]
+           ["control-bearing connector" control-subject control-election]
+           ["oversized envelope" oversize-subject oversize-election]]
+          rejected?
+          (doall
+           (map-indexed
+            (fn [index [_ subject election]]
+              (assert-fact! port subject "bootstrap_election" election)
+              (try
+                (let [result
+                      (reserve-once!
+                       log reserve port evidence-resource v1-resource
+                       v1-link "thread-v1" connector created-at initial-key
+                       evidence-subject
+                       (str "corrupt-election-" index))]
+                  (and
+                   (string? (get result "reject"))
+                   (not (str/blank? (get result "reject")))))
+                (finally
+                  (retract-fact!
+                   port subject "bootstrap_election" election))))
+            corruptions))]
+      (doseq [[[label _ _] rejected] (map vector corruptions rejected?)]
+        (check!
+         (str "stored bootstrap election rejects " label)
+         rejected)))
 
     (let [failed (remove second @checks)]
       (doseq [[label ok?] @checks]

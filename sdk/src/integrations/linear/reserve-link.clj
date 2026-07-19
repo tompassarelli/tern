@@ -25,6 +25,44 @@
     (fail! (str label " must be canonical nonblank text")))
   value)
 
+(defn utf8-bytes [value]
+  (alength (.getBytes (str value) java.nio.charset.StandardCharsets/UTF_8)))
+
+(defn authority-token [label value max-bytes]
+  (let [exact (required-text label value)]
+    (when (or (> (utf8-bytes exact) max-bytes)
+              (some
+               (fn [character]
+                 (let [codepoint (int character)]
+                   (or (Character/isWhitespace codepoint)
+                       (Character/isSpaceChar codepoint)
+                       (Character/isISOControl codepoint))))
+               exact))
+      (fail! (str label " is not a bounded canonical authority token")))
+    exact))
+
+(def canonical-instant-formatter
+  (.withZone
+   (java.time.format.DateTimeFormatter/ofPattern
+    "uuuu-MM-dd'T'HH:mm:ss.SSS'Z'")
+   java.time.ZoneOffset/UTC))
+
+(defn canonical-instant [label value]
+  (let [exact (required-text label value)]
+    (when-not
+     (and
+      (re-matches
+       #"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
+       exact)
+      (try
+        (= exact
+           (.format
+            canonical-instant-formatter
+            (java.time.Instant/parse exact)))
+        (catch Exception _ false)))
+      (fail! (str label " must be a canonical millisecond UTC instant")))
+    exact))
+
 (defn nonnegative-long? [value]
   (and (integer? value) (<= 0 value) (<= value Long/MAX_VALUE)))
 
@@ -78,6 +116,7 @@
 
 (def max-bootstrap-authorities 10000)
 (def max-bootstrap-authority-bytes (* 160 1024))
+(def max-bootstrap-election-bytes 4096)
 
 (defn authority-row-string? [value]
   (and (string? value)
@@ -115,7 +154,10 @@
 
 (defn parse-bootstrap-election! [subject raw]
   (try
-    (let [record (json/parse-string raw)
+    (let [_bound
+          (when (> (utf8-bytes raw) max-bootstrap-election-bytes)
+            (fail! "Linear reservation found an oversized bootstrap election"))
+          record (json/parse-string raw)
           canonical
           (when (map? record)
             (json/generate-string (into (sorted-map) record)))
@@ -128,13 +170,16 @@
        (and (re-matches #"@linear-bootstrap:[0-9a-f]{64}" subject)
             (= (set (keys record)) bootstrap-election-keys)
             (= raw canonical)
+            (authority-row-string? canonical-link)
+            (<= (utf8-bytes canonical-link) 1024)
             (re-matches #"@link:linear:[A-Za-z0-9:._!~*'()%-]+" canonical-link)
-            (string? connector) (not (str/blank? connector))
-            (= connector (str/trim connector))
-            (string? created-at) (not (str/blank? created-at))
-            (= created-at (str/trim created-at))
-            (string? initial-key) (not (str/blank? initial-key))
-            (= initial-key (str/trim initial-key))
+            (= connector (authority-token "bootstrap connector" connector 256))
+            (= created-at
+               (canonical-instant "bootstrap createdAt" created-at))
+            (= initial-key
+               (authority-token "bootstrap initial key" initial-key 512))
+            (authority-row-string? linked-thread)
+            (<= (utf8-bytes linked-thread) 513)
             (re-matches #"@[A-Za-z0-9][A-Za-z0-9._:-]*" linked-thread)
             (= subject
                (str "@linear-bootstrap:"
@@ -294,11 +339,14 @@
              :holder (required-text "bootstrap evidence holder" evidence-holder)
              :epoch (positive-long "bootstrap evidence epoch" evidence-epoch-token)})
           evidence-connector (when bootstrap?
-                               (required-text "bootstrap connector" evidence-connector))
+                               (authority-token
+                                "bootstrap connector" evidence-connector 256))
           evidence-created-at (when bootstrap?
-                                (required-text "bootstrap createdAt" evidence-created-at))
+                                (canonical-instant
+                                 "bootstrap createdAt" evidence-created-at))
           evidence-initial-key (when bootstrap?
-                                (required-text "bootstrap initial key" evidence-initial-key))
+                                (authority-token
+                                 "bootstrap initial key" evidence-initial-key 512))
           evidence-hash
           (when bootstrap?
             (canonical-hash {"connector" evidence-connector
@@ -316,10 +364,16 @@
                          (str "linear-sync:bootstrap:" evidence-hash))
               (fail! "bootstrap evidence lease does not match connector+createdAt")))
           _link-shape
-          (when-not (re-matches #"link:linear:[A-Za-z0-9:._!~*'()%-]+" bare-link)
+          (when-not (and
+                     (<= (utf8-bytes bare-link) 1023)
+                     (re-matches
+                      #"link:linear:[A-Za-z0-9:._!~*'()%-]+"
+                      bare-link))
             (fail! "link subject is not a canonical Linear link id"))
           _thread-shape
-          (when-not (re-matches #"[A-Za-z0-9][A-Za-z0-9._:-]*" bare-thread)
+          (when-not (and
+                     (<= (utf8-bytes bare-thread) 512)
+                     (re-matches #"[A-Za-z0-9][A-Za-z0-9._:-]*" bare-thread))
             (fail! "thread is not a canonical North thread id"))
           identity-key (subs bare-link (count "link:"))
           identity
