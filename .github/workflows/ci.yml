@@ -116,6 +116,7 @@ jobs:
           bb -cp "$CP" cli/tests/coordinator-diagnostic-test.clj
           bb -cp "$CP" staleness_test.clj
           bb reap_test.clj      # reactor reap verdict (daemon-free; guards the @run-join false positive)
+          bb cli/tests/reactor-heartbeat-test.clj   # durable last-sweep heartbeat + doctor stale/missing verdict (daemon-free)
           # Fram no longer ships a facts.log, so generate one (and exercise the
           # current log format) before the lifecycle test — otherwise it skips.
           ( cd ../fram && bin/fram import )

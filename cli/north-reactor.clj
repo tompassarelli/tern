@@ -40,6 +40,9 @@
 ;; PURE reap decisions (verdict off in-memory facts) — split out so reap_test.clj can
 ;; drive the join/lapse/verdict logic with no live daemon. Sibling of coord.clj.
 (load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/reap.clj"))
+;; DURABLE last-sweep heartbeat — the reactor's liveness trace `north doctor` reads.
+;; Shared writer/reader lib (doctor loads the same file); we stamp it at each sweep.
+(load-file (str (.getParent (io/file (System/getProperty "babashka.file"))) "/reactor-heartbeat.clj"))
 
 ;; `sweep-once` verb: one-shot reap for testing. `bb cli/north-reactor.clj sweep-once
 ;; [--dry-run] [--repo <repo>]`. Otherwise argv = [port debounce] for the reactor loop.
@@ -381,6 +384,9 @@
         nd (sweep-unpublished-driver-claims! dry?)
         al (sweep-agent-logs! dry?)
         ca (maybe-clock-audit! dry?)]
+    ;; Durable last-sweep heartbeat — write ONLY on a real sweep so doctor can tell a
+    ;; running reactor from a dead one. --dry-run leaves no trace (mirrors clock-audit).
+    (when-not dry? (north.reactor-heartbeat/write-heartbeat! port))
     (println (str "[sweep] " (when dry? "(dry-run) ") "concerns abandoned=" nc
                   " lanes reaped=" nl " unpublished drivers released=" nd
                   " logs deleted=" (:deleted al) " capped=" (:capped al)
@@ -478,6 +484,9 @@
                 " (debounce " debounce-ms "ms) -> " north-bin " heal"
                 " | liveness sweep every 5min"))
   (flush)
+  ;; Stamp once at startup so a just-booted reactor reads FRESH in doctor immediately,
+  ;; rather than MISSING for the first 5-min interval before sweep-loop's first pass.
+  (north.reactor-heartbeat/write-heartbeat! port)
   (future (flusher))
   (future (sweep-loop))       ; liveness-derived reaping on the reactor cadence
   (loop []

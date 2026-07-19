@@ -25,6 +25,8 @@
 (def NIXCFG (or (System/getenv "NIXOS_CONFIG_HOME") (str HOME "/code/nixos-config")))
 (def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
 (load-file (str NORTH "/cli/harness-state.clj"))
+;; Shared reader for the reactor's durable last-sweep heartbeat (reactor writes it).
+(load-file (str NORTH "/cli/reactor-heartbeat.clj"))
 (def CACHE-DIR (str HOME "/.cache/north"))
 (def PORT (or (System/getenv "NORTH_PORT") "7977"))
 (def CACHE-SCOPE (str (hash (str (or (System/getenv "FRAM_LOG") "default") "|"
@@ -468,6 +470,24 @@
                                           "code edited as text"))))))
     (println (dim "  north doctor  ·  north  (the card)"))))
 
+(defn reactor-doctor-line
+  "One-line reactor-sweep verdict from the durable last-sweep heartbeat for `port`.
+   A running-vs-dead reactor is otherwise invisible in doctor: the :7977 daemon can
+   be up while the reactor sidecar is stopped, so a fresh heartbeat is the ONLY proof
+   sweeps are landing. STALE (>15min) and MISSING are LOUD [ERR]; a stopped reactor
+   can never read healthy. `port` is NORTH_PORT-derived here — see reactor-heartbeat.clj
+   on why the reactor's FRAM_PORT derivation is duplicated rather than shared (both 7977)."
+  [port]
+  (let [{:keys [state age-ms ts]} (north.reactor-heartbeat/heartbeat-status port)]
+    (case state
+      :fresh   (str (grn "[ok]  ") " last sweep "
+                    (north.reactor-heartbeat/humanize-age age-ms) " ago (" ts ")")
+      :stale   (str (red "[ERR] ") " reactor STALE — last sweep "
+                    (north.reactor-heartbeat/humanize-age age-ms)
+                    " ago (threshold 15m); reactor hung or stopped — `north reactor &`")
+      :missing (str (red "[ERR] ") " reactor heartbeat MISSING — reactor has not swept "
+                    "(never started or stopped); start it: `north reactor &`"))))
+
 (defn cmd-doctor [_]
   (println (bold "north doctor"))
   ;; coordinator handshake — the engine-level safety verdict (tell/untell safe,
@@ -499,6 +519,9 @@
       (let [up (get dh k)]
         (println (str "    " (if up (grn "[ok]  ") (if crit (red "[ERR] ") (ylw "[warn]")))
                       " " label " " (ok-x up))))))
+  ;; reactor sweep liveness — see reactor-doctor-line.
+  (println (bold "  reactor sweep"))
+  (println (str "    " (reactor-doctor-line PORT)))
   ;; health — lane activity + stale concerns from north health. LIVE (uncached, unlike
   ;; the dashboard's cached hot path) but with a budget that matches reality: `north
   ;; health` folds the whole log and takes ~21-24s, so the old 4s default always warned
