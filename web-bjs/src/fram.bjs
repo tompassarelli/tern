@@ -126,6 +126,96 @@
   (export (function parseFloatSafe (v)
     (const n (parseFloat (String v)))
     (return (? (isNaN n) 0 n))))
+  ;; Agent-roster reads are deliberately two indexed coordinator calls:
+  ;; one lease scan, then one subject-literal union for only unexpired controls.
+  ;; Control ids came from graph data, so validate + JSON-encode every literal
+  ;; before it enters the EDN query. Bounds fail closed instead of recreating the
+  ;; old N-handles × N-fields timeout surface.
+  (const SESSION_LEASE_PREFIX "@lease:session:")
+  (const MAX_AGENT_LEASE_ROWS 100000)
+  (const MAX_LIVE_AGENT_CONTROLS 256)
+  (const MAX_AGENT_CONTROL_BYTES 256)
+  (const MAX_AGENT_BUNDLE_QUERY_BYTES 262144)
+  (const MAX_AGENT_BUNDLE_ROWS 32768)
+  (const CONTROL_RE (new RegExp "^[A-Za-z0-9][A-Za-z0-9._:-]*$"))
+  (const LEASE_INT_RE (new RegExp "^[+-]?[0-9]+$"))
+  (export (function validAgentControl (value)
+    (if (! (=== (typeof value) "string")) (return false))
+    (if (> (.byteLength Buffer value "utf8") MAX_AGENT_CONTROL_BYTES) (return false))
+    (return (.test CONTROL_RE value))))
+  (export (function liveAgentLeases (rows now)
+    (if (! (.isArray Array rows)) (return null))
+    (if (> (dot rows length) MAX_AGENT_LEASE_ROWS) (return null))
+    (const live (new Map))
+    (.forEach rows (=> (row)
+      (if (! (.isArray Array row)) (return))
+      (if (< (dot row length) 2) (return))
+      (const entity (bracket row 0))
+      (const value (bracket row 1))
+      (if (! (=== (typeof entity) "string")) (return))
+      (if (! (=== (typeof value) "string")) (return))
+      (if (! (.startsWith entity SESSION_LEASE_PREFIX)) (return))
+      (const control (.slice entity (dot SESSION_LEASE_PREFIX length)))
+      (if (! (validAgentControl control)) (return))
+      (const parts (.split value "|"))
+      (if (< (dot parts length) 2) (return))
+      (const exp-text (bracket parts 1))
+      (if (! (.test LEASE_INT_RE exp-text)) (return))
+      (const exp (Number exp-text))
+      (if (and (.isSafeInteger Number exp) (> exp now))
+        (if (or (! (.has live control)) (> exp (.get live control)))
+          (.set live control exp)))))
+    (const controls (.sort (.from Array (.keys live))))
+    (if (> (dot controls length) MAX_LIVE_AGENT_CONTROLS) (return null))
+    (const leases (array))
+    (.forEach controls (=> (control)
+      (const lease (object control control))
+      ;; Use an explicit property string: raw identifier underscore escaping is
+      ;; for Beagle symbols (`expires_s` would compile to `expires__s`).
+      (= (bracket lease "expires_s")
+         (.floor Math (/ (- (.get live control) now) 1000)))
+      (.push leases lease)))
+    (return leases)))
+  (export (function liveAgentControls (rows now)
+    (const leases (liveAgentLeases rows now))
+    (if (=== leases null) (return null))
+    (return (.map leases (=> (lease) (dot lease control))))))
+  (export (function agentBundleOp (controls)
+    (if (! (.isArray Array controls)) (return null))
+    (if (> (dot controls length) MAX_LIVE_AGENT_CONTROLS) (return null))
+    (const unique (.sort (.from Array (new Set controls))))
+    (if (! (.every unique (=> (control) (validAgentControl control)))) (return null))
+    (const rules (array))
+    (.forEach unique (=> (control)
+      (.forEach (array (tpl "@agent:" control) (tpl "@session:" control)) (=> (subject)
+        (const literal (.stringify JSON subject))
+        (.push rules
+          (tpl "{:head {:rel \"agent_bundle\" :args [" literal
+               " {:var \"p\"} {:var \"o\"}]} :body [{:rel \"triple\" :args ["
+               literal " {:var \"p\"} {:var \"o\"}]}]}"))))))
+    (const op
+      (tpl "{:op :query :query {:find \"agent_bundle\" :rules ["
+           (.join rules " ") "]}}"))
+    (if (> (.byteLength Buffer op "utf8") MAX_AGENT_BUNDLE_QUERY_BYTES) (return null))
+    (return op)))
+  (export (function validAgentBundleRow (row)
+    (if (! (.isArray Array row)) (return false))
+    (if (! (=== (dot row length) 3)) (return false))
+    (if (! (=== (typeof (bracket row 0)) "string")) (return false))
+    (if (! (=== (typeof (bracket row 1)) "string")) (return false))
+    (if (! (=== (typeof (bracket row 2)) "string")) (return false))
+    (const subject (bracket row 0))
+    (if (.startsWith subject "@agent:")
+      (return (validAgentControl (.slice subject 7))))
+    (if (.startsWith subject "@session:")
+      (return (validAgentControl (.slice subject 9))))
+    (return false)))
+  (export (function boundedAgentBundleRows (rows)
+    (if (! (.isArray Array rows)) (return null))
+    (if (> (dot rows length) MAX_AGENT_BUNDLE_ROWS) (return null))
+    (if (! (.every rows (=> (row) (validAgentBundleRow row))))
+      (return null))
+    (return rows)))
   ;; lexical >= for ISO-8601 strings (Beagle >= is numeric).
   (export (function strGte (a b)
     (return (>= a b))))
@@ -176,6 +266,12 @@
 (declare-extern parseIntSafe [Any -> Int])
 (declare-extern parseTokenCount [Any -> Any])
 (declare-extern parseFloatSafe [Any -> Float])
+(declare-extern validAgentControl [Any -> Bool])
+(declare-extern liveAgentLeases [Any Int -> Any])
+(declare-extern liveAgentControls [Any Int -> Any])
+(declare-extern agentBundleOp [Any -> Any])
+(declare-extern validAgentBundleRow [Any -> Bool])
+(declare-extern boundedAgentBundleRows [Any -> Any])
 (declare-extern strGte [String String -> Bool])
 (declare-extern runUsageTriplesFromLogs [-> (Promise Any)])
 (declare-extern process Any)
@@ -249,6 +345,9 @@
 (def all-triples-op :- String
   "{:op :query :query {:find \"t\" :rules [{:head {:rel \"t\" :args [{:var \"s\"} {:var \"p\"} {:var \"o\"}]} :body [{:rel \"triple\" :args [{:var \"s\"} {:var \"p\"} {:var \"o\"}]}]}]}}")
 
+(def session-leases-op :- String
+  "{:op :query :query {:find \"session_lease\" :rules [{:head {:rel \"session_lease\" :args [{:var \"e\"} {:var \"v\"}]} :body [{:rel \"triple\" :args [{:var \"e\"} \"lease\" {:var \"v\"}]}]}]}}")
+
 (defn resolved-op [(te :- String) (pred :- String)] :- String
   (str "{:op :resolved :te \"" te "\" :p \"" pred "\"}"))
 
@@ -264,6 +363,31 @@
       (let [sess (filterv (fn [row] (.startsWith (nth row 0) "@session:")) (.-ok resp))
             m (reduce (fn [acc row] (assoc acc (nth row 1) row)) {} sess)]
         (vals m))))))
+
+;; One lease query plus one indexed union query for the complete raw facts of
+;; live agent/session subjects. An expired lease never contributes a subject;
+;; a just-finished lane remains present until that same lease lapses.
+(js/export (defn agent-live-leases [(port :- Int) (now :- Int)] :- (Promise Any)
+  (let [lease-resp (js/await (query port session-leases-op))
+        lease-rows (if (or (nil? lease-resp) (nil? (.-ok lease-resp))) nil (.-ok lease-resp))]
+    (liveAgentLeases lease-rows now))))
+
+(js/export (defn agent-roster-bundle [(port :- Int) (now :- Int)] :- (Promise Any)
+  (let [leases (js/await (agent-live-leases port now))
+        controls (if (nil? leases) nil (.map leases (fn [lease] (.-control lease))))]
+    (if (nil? leases)
+      {"controls" [] "leases" [] "rows" [] "bounded" false}
+      (if (= (count controls) 0)
+        {"controls" controls "leases" leases "rows" [] "bounded" true}
+        (let [op (agentBundleOp controls)]
+          (if (nil? op)
+            {"controls" [] "leases" [] "rows" [] "bounded" false}
+            (let [resp (js/await (query port op))
+                  rows (if (or (nil? resp) (nil? (.-ok resp))) nil
+                         (boundedAgentBundleRows (.-ok resp)))]
+              (if (nil? rows)
+                {"controls" [] "leases" [] "rows" [] "bounded" false}
+                {"controls" controls "leases" leases "rows" rows "bounded" true})))))))))
 
 ;; Single resolved value for entity+predicate, or nil.
 (js/export (defn resolved [(port :- Int) (te :- String) (pred :- String)] :- (Promise Any)

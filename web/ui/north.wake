@@ -17,8 +17,25 @@
 
 (entity agent
   (uuid : String :unique identity)
+  (control_id : String)
+  (display_name : String)
+  (display_handle : String)
+  (kind : String)
+  (provider : String)
+  (provider_target : String)
+  (provider_label : String)
   (roles : String)
   (model : String)
+  (model_display : String)
+  (effort : String)
+  (gaffer_provenance : String)
+  (goal : String)
+  (task : String)
+  (state : String)
+  (state_label : String)
+  (lifecycle : String)
+  (process_outcome : String)
+  (delivery_outcome : String)
   (online : String)
   (current_thread : String)
   (active_workflow : String)
@@ -26,23 +43,55 @@
   (total_tokens : String))
 
 (component agent-row
-  :props [uuid roles online]
+  :props [display_name display_handle provider_label model_display effort
+          gaffer_provenance task state_label lifecycle uuid online]
   (div :class "px-4 py-3 border-b border-border"
     (div :class "flex items-center justify-between"
-      (span :class "text-sm font-medium text-foreground" :text uuid)
-      (span :class "text-xs text-muted-foreground" :text online))
-    (div :class "text-xs text-muted-foreground mt-1" :text roles)))
+      (span :class "text-sm font-medium text-foreground" :text display_name)
+      (span :class "text-xs text-muted-foreground" :text state_label))
+    (div :class "text-xs text-muted-foreground mt-1 flex gap-2"
+      (span :text provider_label)
+      (span :text model_display)
+      (span :text effort)
+      (span :text gaffer_provenance))
+    (div :class "text-xs text-muted-foreground mt-1" :text task)
+    (div :class "text-xs text-muted-foreground mt-1 flex gap-2"
+      (span :text "Lifecycle")
+      (span :text lifecycle))
+    (div :class "text-xs text-muted-foreground mt-1" :text display_handle)
+    (div :class "text-xs text-muted-foreground mt-1" :text uuid)))
 
 (component agent-detail
-  :props [uuid roles model online current_thread active_workflow context_tokens total_tokens]
+  :props [display_name display_handle provider provider_target provider_label
+          model model_display effort gaffer_provenance kind goal task state_label
+          lifecycle process_outcome delivery_outcome uuid control_id roles online
+          current_thread active_workflow context_tokens total_tokens]
   (div :class "p-6 flex flex-col gap-3"
-    (h2 :class "text-lg font-semibold text-foreground" :text uuid)
+    (h2 :class "text-lg font-semibold text-foreground" :text display_name)
+    (div :class "text-sm text-muted-foreground" :text display_handle)
+    (div :class "text-xs text-muted-foreground" :text control_id)
     (div :class "text-sm text-muted-foreground" :text roles)
     (div :class "flex flex-col gap-1 mt-2"
+      (div :class "text-xs uppercase text-muted-foreground" :text "Provider account")
+      (div :class "text-sm text-foreground" :text provider_label)
       (div :class "text-xs uppercase text-muted-foreground" :text "Model")
       (div :class "text-sm text-foreground" :text model)
-      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Online")
-      (div :class "text-sm text-foreground" :text online)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Effort")
+      (div :class "text-sm text-foreground" :text effort)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Gaffer")
+      (div :class "text-sm text-foreground" :text gaffer_provenance)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "State")
+      (div :class "text-sm text-foreground" :text state_label)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Lifecycle")
+      (div :class "text-sm text-foreground" :text lifecycle)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Task")
+      (div :class "text-sm text-foreground" :text task)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Goal")
+      (div :class "text-sm text-foreground" :text goal)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Process outcome")
+      (div :class "text-sm text-foreground" :text process_outcome)
+      (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Delivery outcome")
+      (div :class "text-sm text-foreground" :text delivery_outcome)
       (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Thread")
       (div :class "text-sm text-foreground" :text current_thread)
       (div :class "text-xs uppercase text-muted-foreground mt-2" :text "Workflow")

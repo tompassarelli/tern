@@ -126,8 +126,25 @@ describe("active web usage reporting", () => {
     expect(activeAgentsUi).toContain("(incomplete)");
     expect(activeAgentsUi).toContain('return "unknown"');
     expect(activeAgentsUi).not.toContain("toFixed(1)");
+    expect(activeAgentsUi).toContain("function semanticName(a)");
+    expect(activeAgentsUi).toContain("a.display_name || a.display_handle");
+    expect(activeAgentsUi).toContain("a.provider_label || a.provider");
+    expect(activeAgentsUi).toContain('a.gaffer_provenance || "gaffer:legacy-debt"');
+    expect(activeAgentsUi).toContain("a.state_label || a.state");
+    expect(activeAgentsUi).toContain('a.lifecycle || "unrecorded"');
+    expect(activeAgentsUi).toContain("control ${a.control_id || handle}");
+    expect(activeAgentsUi).not.toContain("gaffer:none");
     expect(generatedWakeUi).toContain("props.context_tokens || ''");
     expect(generatedWakeUi).toContain("props.total_tokens || ''");
+    expect(generatedWakeUi).toContain("props.display_name || ''");
+    expect(generatedWakeUi).toContain("props.provider_label || ''");
+    expect(generatedWakeUi).toContain("props.gaffer_provenance || ''");
+    expect(generatedWakeUi).toContain("props.state_label || ''");
+    expect(generatedWakeUi).toContain("props.lifecycle || ''");
+    expect(generatedWakeUi).toContain("props.control_id || ''");
+    expect(generatedWakeUi.indexOf("props.display_name || ''"))
+      .toBeLessThan(generatedWakeUi.indexOf("props.uuid || ''"));
+    expect(generatedWakeUi).not.toContain("gaffer:none");
     expect(generatedWakeUi).not.toContain("cost_usd");
   });
 

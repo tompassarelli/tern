@@ -91,7 +91,7 @@
     const left = el("div", `flex:1 1 58%;border-right:1px solid ${EF.edge};min-width:0;overflow:hidden;`);
     left.append(wb.f);
 
-    // RIGHT — agents. Claude-Code-shaped: the panel owns its OWN layout (chat →
+    // RIGHT — agents. The panel owns its conversation-first layout (chat →
     // steer input → agent picker), so the frame adds no CLI here.
     const ag = frame("frame: agents", null);
     const right = el("div", "flex:1 1 42%;min-width:0;overflow:hidden;");

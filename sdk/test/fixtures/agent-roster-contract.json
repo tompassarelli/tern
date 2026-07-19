@@ -1,0 +1,183 @@
+[
+  {
+    "name": "native-session",
+    "id": "session-native-7841e6b2",
+    "facts": {
+      "kind": "session",
+      "provider": "openai",
+      "provider_target": "codex-personal-tom-passarelli-proton",
+      "model": "gpt-5.6-sol",
+      "effort": "unobserved",
+      "repo": "north",
+      "display_handle": "openai-codex-personal-tom-passarelli-proton-sol-unobserved-gaffer-not-selected-7841e6b2",
+      "display_name": "openai:codex-personal-tom-passarelli-proton · sol · unobserved · gaffer:not-selected · unknown"
+    },
+    "expected": {
+      "providerLabel": "openai:codex-personal-tom-passarelli-proton",
+      "modelDisplay": "sol",
+      "effortDisplay": "effort:unobserved",
+      "gafferProvenance": "gaffer:not-selected",
+      "semanticHandle": "openai-codex-personal-tom-passarelli-proton-sol-unobserved-gaffer-not-selected-7841e6b2",
+      "displayName": "openai:codex-personal-tom-passarelli-proton · sol · unobserved · gaffer:not-selected · unknown"
+    },
+    "observationCases": [
+      {
+        "name": "sentinel-plus-concrete",
+        "observations": [
+          ["kind", "session"],
+          ["provider", "unobserved"],
+          ["provider", "openai"],
+          ["provider_target", "codex-personal-tom-passarelli-proton"],
+          ["model", "gpt-5.6-sol"],
+          ["effort", "unobserved"],
+          ["display_handle", "unknown-gpt-5-6-sol-unknown-native-7841e6b2"],
+          ["display_handle", "openai:codex-personal-tom-passarelli-proton · sol · unobserved · gaffer:not-selected · unknown"],
+          ["display_name", "openai:codex-personal-tom-passarelli-proton · sol · unobserved · gaffer:not-selected · unknown"]
+        ],
+        "expected": {
+          "providerLabel": "openai:codex-personal-tom-passarelli-proton",
+          "modelDisplay": "sol",
+          "effortDisplay": "effort:unobserved",
+          "gafferProvenance": "gaffer:not-selected",
+          "semanticHandle": "openai-codex-personal-tom-passarelli-proton-sol-unobserved-gaffer-not-selected-7841e6b2",
+          "displayName": "openai:codex-personal-tom-passarelli-proton · sol · unobserved · gaffer:not-selected · unknown",
+          "displayHandle": "openai:codex-personal-tom-passarelli-proton · sol · unobserved · gaffer:not-selected · unknown"
+        }
+      },
+      {
+        "name": "two-concrete-providers",
+        "observations": [
+          ["kind", "session"],
+          ["provider", "openai"],
+          ["provider", "anthropic"],
+          ["model", "gpt-5.6-sol"],
+          ["effort", "unobserved"],
+          ["display_name", "Ambiguous provider native session"]
+        ],
+        "expected": {
+          "providerLabel": "provider:conflict",
+          "modelDisplay": "sol",
+          "effortDisplay": "effort:unobserved",
+          "gafferProvenance": "gaffer:not-selected",
+          "semanticHandle": "provider-conflict-sol-unobserved-gaffer-not-selected-7841e6b2",
+          "displayName": "Ambiguous provider native session",
+          "displayHandle": "provider-conflict-sol-unobserved-gaffer-not-selected-7841e6b2"
+        }
+      }
+    ]
+  },
+  {
+    "name": "exact-preset",
+    "id": "lane-preset-a205e9ce",
+    "facts": {
+      "kind": "lane",
+      "role": "designer",
+      "goal": "Design semantic roster",
+      "provider": "anthropic",
+      "provider_target": "claude-personal-tompas0x-gmail",
+      "model": "claude-opus-4-8",
+      "effort": "xhigh",
+      "composition_kind": "preset",
+      "composition_id": "designer",
+      "composition_overrides": "[]",
+      "repo": "~/code/north",
+      "spawned_at": "2026-07-19T01:00:00Z",
+      "display_handle": "anthropic-claude-personal-tompas0x-gmail-opus-xhigh-gaffer-designer-a205e9ce",
+      "display_name": "anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:designer · Design semantic roster",
+      "identity_manifest_sha256": "527ae34e2ca807296ef6087f757a358611256c5d8aa1fcfb198c68919aa2f205"
+    },
+    "expected": {
+      "providerLabel": "anthropic:claude-personal-tompas0x-gmail",
+      "modelDisplay": "opus",
+      "effortDisplay": "xhigh",
+      "gafferProvenance": "gaffer:designer",
+      "semanticHandle": "anthropic-claude-personal-tompas0x-gmail-opus-xhigh-gaffer-designer-a205e9ce",
+      "displayName": "anthropic:claude-personal-tompas0x-gmail · opus · xhigh · gaffer:designer · Design semantic roster"
+    }
+  },
+  {
+    "name": "preset-override",
+    "id": "lane-override-fb3ba9b4",
+    "facts": {
+      "kind": "lane",
+      "role": "integrator",
+      "goal": "Integrate provider seams",
+      "provider": "openai",
+      "provider_target": "codex-personal-tom-passarelli-proton",
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh",
+      "composition_kind": "preset",
+      "composition_id": "integrator",
+      "composition_overrides": "[\"tier\",\"reasoning\"]",
+      "composition_override_reason": "high leverage integration seam",
+      "repo": "~/code/north",
+      "spawned_at": "2026-07-19T01:01:00Z",
+      "display_handle": "openai-codex-personal-tom-passarelli-proton-sol-xhigh-gaffer-integrator-override-tier-reasoning-fb3ba9b4",
+      "display_name": "openai:codex-personal-tom-passarelli-proton · sol · xhigh · gaffer:integrator+override(tier,reasoning) · Integrate provider seams",
+      "identity_manifest_sha256": "44c579e1c07573722985c29e314209110b8b84939e73555fa13904809ea180eb"
+    },
+    "expected": {
+      "providerLabel": "openai:codex-personal-tom-passarelli-proton",
+      "modelDisplay": "sol",
+      "effortDisplay": "xhigh",
+      "gafferProvenance": "gaffer:integrator+override(tier,reasoning)",
+      "semanticHandle": "openai-codex-personal-tom-passarelli-proton-sol-xhigh-gaffer-integrator-override-tier-reasoning-fb3ba9b4",
+      "displayName": "openai:codex-personal-tom-passarelli-proton · sol · xhigh · gaffer:integrator+override(tier,reasoning) · Integrate provider seams"
+    }
+  },
+  {
+    "name": "bespoke-composition",
+    "id": "lane-bespoke-6bcf1234",
+    "facts": {
+      "kind": "lane",
+      "role": "migration-forensics",
+      "goal": "Trace historical identity drift",
+      "provider": "anthropic",
+      "provider_target": "claude-personal-tom-passarelli-proton",
+      "model": "claude-opus-4-8",
+      "effort": "xhigh",
+      "composition_kind": "bespoke",
+      "composition_id": "migration-forensics",
+      "bespoke_reason": "one-off identity provenance analysis",
+      "nearest_preset": "analyst",
+      "promotion_candidate": "false",
+      "composition_contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "composition_contract_fingerprint_version": "v1",
+      "composition_contract_fingerprint_domain": "north:bespoke-contract:v1",
+      "repo": "~/code/north",
+      "spawned_at": "2026-07-19T01:02:00Z",
+      "display_handle": "anthropic-claude-personal-tom-passarelli-proton-opus-xhigh-gaffer-bespoke-migration-forensics-6bcf1234",
+      "display_name": "anthropic:claude-personal-tom-passarelli-proton · opus · xhigh · gaffer:bespoke:migration-forensics · Trace historical identity drift",
+      "identity_manifest_sha256": "74a17df989c7ff455de002dc3dbe8b85bce06c7507741916dad9858a09a7b29b"
+    },
+    "expected": {
+      "providerLabel": "anthropic:claude-personal-tom-passarelli-proton",
+      "modelDisplay": "opus",
+      "effortDisplay": "xhigh",
+      "gafferProvenance": "gaffer:bespoke:migration-forensics",
+      "semanticHandle": "anthropic-claude-personal-tom-passarelli-proton-opus-xhigh-gaffer-bespoke-migration-forensics-6bcf1234",
+      "displayName": "anthropic:claude-personal-tom-passarelli-proton · opus · xhigh · gaffer:bespoke:migration-forensics · Trace historical identity drift"
+    }
+  },
+  {
+    "name": "missing-managed-axes",
+    "id": "lane-legacy",
+    "facts": {
+      "kind": "lane",
+      "provider": "openai",
+      "provider_target": "codex-personal-tom-passarelli-proton",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "display_handle": "misleading-designer-handle",
+      "display_name": "Misleading legacy display says designer"
+    },
+    "expected": {
+      "providerLabel": "openai:codex-personal-tom-passarelli-proton",
+      "modelDisplay": "sol",
+      "effortDisplay": "high",
+      "gafferProvenance": "gaffer:legacy-debt",
+      "semanticHandle": "openai-codex-personal-tom-passarelli-proton-sol-high-gaffer-legacy-debt-legacy",
+      "displayName": "Misleading legacy display says designer"
+    }
+  }
+]

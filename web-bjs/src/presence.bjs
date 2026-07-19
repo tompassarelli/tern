@@ -1,41 +1,237 @@
 #lang beagle/js
 (ns north.presence)
 
-;; Live agent roster for the right panel. Port of web/lib/north/presence.ex.
-;; Per-handle row built from @agent:<h>, @session:<h>, and the
-;; @lease:session:<h> liveness lease, sorted online-first then focus then handle.
-;; Server-side: drives north.fram over TCP (:7977). Display strings precomputed
-;; server-side so the frontend stays client-stdlib-free.
+;; Semantic live-agent roster shared by /api/agents and Wake. Liveness is the
+;; unexpired @lease:session:<control> fact; identity is the raw @agent:<control>
+;; projection. Stored display_name/display_handle are presentation facts only:
+;; no reader reverse-parses them to reconstruct provider or Gaffer authority.
 
 (require north.fram :as fram)
 
-;; ---- raw-JS helpers (js/quote — Date.now / string compare / JS-array plumbing).
-;; Beagle blocks argless Date in some contexts and `<`/`>` are numeric-only, so the
-;; lexical compare, epoch parse, and JS-array accumulators live here where JS is raw.
+;; Graph dictionaries, JSON manifests, and cryptographic digest checks are true
+;; dynamic boundaries. Keep that interop in one raw-JS island.
 (js/quote
   (export (function nowMs () (return (.now Date))))
-  ;; lexical -1/0/1 compare (typed Beagle < / > are numeric-only)
   (export (function strCmp (a b) (return (? (< a b) -1 (? (> a b) 1 0)))))
-  (export (function parseIntSafe (v)
-    (const n (parseInt (String v) 10))
-    (return (? (isNaN n) 0 n))))
   (export (function fdiv (a b) (return (.floor Math (/ a b)))))
   (export (function frem (a b) (return (% a b))))
-  ;; ISO-8601 -> epoch ms, or -1 when unparseable
   (export (function parseEpochMs (s)
     (const t (.parse Date s))
     (return (? (isNaN t) -1 t))))
-  ;; JS-array accumulators: rows/refs must serialize as JSON arrays, and the fram
-  ;; results are a mix of Beagle vectors and JS arrays — normalize into real arrays.
   (export (function mkArr () (return (array))))
   (export (function pushArr (a x) (.push a x) (return a)))
   (export (function sortArr (a cmp) (return (.sort a cmp))))
-  ;; typed-Beagle `(new Set x)` emits an undefined `new$` helper — build it here.
-  (export (function mkSet (a) (return (new Set a)))))
+  (export (function mkSet (a) (return (new Set a))))
+  (export (function safeRoleId (value)
+    (return (and (=== (typeof value) "string")
+                 (.test (new RegExp "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$") value)))))
+  (export (function validSha256 (value)
+    (return (and (=== (typeof value) "string")
+                 (.test (new RegExp "^[0-9a-f]{64}$") value)))))
+  (export (function sha256Hex (value)
+    (const crypto (.getBuiltinModule process "node:crypto"))
+    (return (.digest (.update (.createHash crypto "sha256") (String value) "utf8") "hex"))))
+  (export (function safePresetOverrides (raw)
+    (try
+      (const parsed (.parse JSON raw))
+      (if (! (.isArray Array parsed)) (return null))
+      (const allowed (new Set (array
+        "taskGrade" "domainRequirements" "topology" "tier" "reasoning" "posture")))
+      (if (! (.every parsed (=> (value)
+        (and (=== (typeof value) "string") (.has allowed value))))) (return null))
+      (if (! (=== (dot (new Set parsed) size) (dot parsed length))) (return null))
+      (return parsed)
+      (catch e (return null)))))
+  (export (function slugValue (value)
+    (const text (.trim (String (or value "unknown"))))
+    (const normalized
+      (.replace (.replace (.toLowerCase text) (new RegExp "[^a-z0-9]+" "g") "-")
+                (new RegExp "(^-|-$)" "g") ""))
+    (return (or normalized "unknown"))))
+  (export (function modelFamily (value)
+    (const normalized (slugValue value))
+    (const parts (.split normalized "-"))
+    (const families (array "opus" "sonnet" "haiku" "fable" "sol" "terra" "luna"))
+    (return (or (.find families (=> (family) (.includes parts family))) normalized))))
+  ;; Strict delivery-evidence reader shared semantically with the SDK and CLI.
+  ;; The web roster must never display a terminal that either canonical reader
+  ;; rejects: lifecycle text is an authority boundary, not decorative JSON.
+  (const MAX_DELIVERY_BARS 32)
+  (const MAX_DELIVERY_BAR_UTF8_BYTES 512)
+  (const MAX_DELIVERY_OBSERVED_UTF8_BYTES 2048)
+  (const MAX_DELIVERY_ENVELOPE_UTF8_BYTES 262144)
+  (const MAX_DELIVERY_THREAD_ID_UTF8_BYTES 512)
+  (const MAX_DELIVERY_RUN_ID_UTF8_BYTES 512)
+  (const MAX_DELIVERY_AGENT_ID_UTF8_BYTES 256)
+  (const CONTROL_CODE_RE (new RegExp "[\\u0000-\\u001f\\u007f-\\u009f]"))
+  (const ENTITY_FORBIDDEN_RE
+    (new RegExp "[@\\u0000-\\u0020\\u007f-\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"))
+  (const RUN_ENTITY_RE (new RegExp "^@run-[A-Za-z0-9][A-Za-z0-9._:-]*$"))
+  (const AGENT_ENTITY_RE (new RegExp "^@agent:[A-Za-z0-9][A-Za-z0-9._:-]*$"))
+  (const INSTANT_RE
+    (new RegExp "^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})(?:\\.(\\d{1,9}))?Z$"))
+  (const validUnicodeScalars (=> (value)
+    (if (! (=== (typeof value) "string")) (return false))
+    (let index 0)
+    (let valid true)
+    (while (and valid (< index (dot value length)))
+      (const code (.charCodeAt value index))
+      (const next
+        (? (< (+ index 1) (dot value length))
+           (.charCodeAt value (+ index 1))
+           -1))
+      (if (and (>= code 55296) (<= code 56319))
+        (if (and (>= next 56320) (<= next 57343))
+          (= index (+ index 2))
+          (= valid false))
+        (if (and (>= code 56320) (<= code 57343))
+          (= valid false)
+          (= index (+ index 1)))))
+    (return valid)))
+  (const canonicalEvidenceText (=> (value)
+    (if (! (validUnicodeScalars value)) (return null))
+    (if (.test CONTROL_CODE_RE value) (return null))
+    (const canonical (.replace value (new RegExp "^ +| +$" "g") ""))
+    (return (? (> (dot canonical length) 0) canonical null))))
+  (const boundedNonblankText (=> (value maxBytes)
+    (if (! (=== (typeof value) "string")) (return false))
+    (if (! (=== (canonicalEvidenceText value) value)) (return false))
+    (return (<= (.byteLength Buffer value "utf8") maxBytes))))
+  (const sameStrings (=> (left right)
+    (and (=== (dot left length) (dot right length))
+         (.every left (=> (value index)
+           (=== value (bracket right index)))))))
+  (const boundedDoneBars (=> (values allowEmpty)
+    (if (! (.isArray Array values)) (return false))
+    (if (and (! allowEmpty) (=== (dot values length) 0)) (return false))
+    (if (> (dot values length) MAX_DELIVERY_BARS) (return false))
+    (if (! (.every values (=> (value)
+      (boundedNonblankText value MAX_DELIVERY_BAR_UTF8_BYTES)))) (return false))
+    (const canonical (.sort (.from Array (new Set values))))
+    (return (sameStrings values canonical))))
+  (const exactKeys (=> (value expected)
+    (if (! value) (return false))
+    (if (! (=== (typeof value) "object")) (return false))
+    (if (.isArray Array value) (return false))
+    (const actual (.sort (.keys Object value)))
+    (const wanted (.sort (.from Array expected)))
+    (return (sameStrings actual wanted))))
+  (const validThreadEntity (=> (value)
+    (if (! (validUnicodeScalars value)) (return false))
+    (if (> (.byteLength Buffer value "utf8") MAX_DELIVERY_THREAD_ID_UTF8_BYTES)
+      (return false))
+    (if (! (.startsWith value "@")) (return false))
+    (if (=== (dot value length) 1) (return false))
+    (let index 1)
+    (let valid true)
+    (while (and valid (< index (dot value length)))
+      (const code (.charCodeAt value index))
+      (const forbidden (.test ENTITY_FORBIDDEN_RE (.charAt value index)))
+      (if (and (>= code 55296) (<= code 56319))
+        (= index (+ index 2))
+        (if forbidden
+          (= valid false)
+          (= index (+ index 1)))))
+    (return valid)))
+  (const validRunEntity (=> (value)
+    (if (! (=== (typeof value) "string")) (return false))
+    (if (> (.byteLength Buffer value "utf8") MAX_DELIVERY_RUN_ID_UTF8_BYTES)
+      (return false))
+    (return (.test RUN_ENTITY_RE value))))
+  (const validAgentEntity (=> (value)
+    (if (! (=== (typeof value) "string")) (return false))
+    (if (> (.byteLength Buffer value "utf8") MAX_DELIVERY_AGENT_ID_UTF8_BYTES)
+      (return false))
+    (return (.test AGENT_ENTITY_RE value))))
+  (const validInstant (=> (value)
+    (if (! (=== (typeof value) "string")) (return false))
+    (const match (.match value INSTANT_RE))
+    (if (! match) (return false))
+    (const year (Number (bracket match 1)))
+    (const month (Number (bracket match 2)))
+    (const day (Number (bracket match 3)))
+    (const hour (Number (bracket match 4)))
+    (const minute (Number (bracket match 5)))
+    (const second (Number (bracket match 6)))
+    (if (< month 1) (return false))
+    (if (> month 12) (return false))
+    (if (> hour 23) (return false))
+    (if (> minute 59) (return false))
+    (if (> second 59) (return false))
+    (const leap
+      (and (=== (% year 4) 0)
+           (or (! (=== (% year 100) 0)) (=== (% year 400) 0))))
+    (const days
+      (array 31 (? leap 29 28) 31 30 31 30 31 31 30 31 30 31))
+    (return (and (>= day 1) (<= day (bracket days (- month 1)))))))
+  (const validRunBarEvidence (=> (record)
+    (if (! (exactKeys record
+      (array "bar" "observed" "recordedAt" "reporter" "run" "thread" "version")))
+      (return false))
+    (if (! (=== (bracket record "version") "north:run-bar-evidence:v1"))
+      (return false))
+    (if (! (validRunEntity (bracket record "run"))) (return false))
+    (if (! (validThreadEntity (bracket record "thread"))) (return false))
+    (if (! (validAgentEntity (bracket record "reporter"))) (return false))
+    (if (! (boundedNonblankText
+      (bracket record "bar") MAX_DELIVERY_BAR_UTF8_BYTES)) (return false))
+    (if (! (boundedNonblankText
+      (bracket record "observed") MAX_DELIVERY_OBSERVED_UTF8_BYTES)) (return false))
+    (return (validInstant (bracket record "recordedAt")))))
+  (export (function validReportedEvidence (raw digest)
+    (if (! (and (=== (typeof raw) "string") (=== digest (sha256Hex raw))))
+      (return false))
+    (if (! (validUnicodeScalars raw)) (return false))
+    (if (> (.byteLength Buffer raw "utf8") MAX_DELIVERY_ENVELOPE_UTF8_BYTES)
+      (return false))
+    (try
+      (const parsed (.parse JSON raw))
+      (if (! (exactKeys parsed
+        (array "baselineDoneWhen" "contractOrigin" "doneWhen" "matches"
+               "reporter" "run" "thread" "version"))) (return false))
+      (const version (bracket parsed "version"))
+      (const run (bracket parsed "run"))
+      (const thread (bracket parsed "thread"))
+      (const reporter (bracket parsed "reporter"))
+      (const origin (bracket parsed "contractOrigin"))
+      (const baseline (bracket parsed "baselineDoneWhen"))
+      (const bars (bracket parsed "doneWhen"))
+      (const matches (bracket parsed "matches"))
+      (if (! (=== version "north:done-bars:v2")) (return false))
+      (if (! (validRunEntity run)) (return false))
+      (if (! (validThreadEntity thread)) (return false))
+      (if (! (validAgentEntity reporter)) (return false))
+      (if (! (or (=== origin "accepted") (=== origin "worker-defined")))
+        (return false))
+      (if (! (boundedDoneBars baseline true)) (return false))
+      (if (! (boundedDoneBars bars false)) (return false))
+      (if (=== origin "accepted")
+        (if (or (=== (dot baseline length) 0) (! (sameStrings baseline bars)))
+          (return false))
+        (if (! (=== (dot baseline length) 0)) (return false)))
+      (if (! (.isArray Array matches)) (return false))
+      (if (! (=== (dot matches length) (dot bars length))) (return false))
+      (let index 0)
+      (while (< index (dot bars length))
+        (const match (bracket matches index))
+        (if (! (exactKeys match (array "bar" "evidence"))) (return false))
+        (if (! (=== (bracket match "bar") (bracket bars index))) (return false))
+        (const evidence (bracket match "evidence"))
+        (if (! (.isArray Array evidence)) (return false))
+        (if (! (=== (dot evidence length) 1)) (return false))
+        (const record (bracket evidence 0))
+        (if (! (validRunBarEvidence record)) (return false))
+        (if (! (=== (bracket record "bar") (bracket bars index))) (return false))
+        (if (! (=== (bracket record "run") run)) (return false))
+        (if (! (=== (bracket record "thread") thread)) (return false))
+        (if (! (=== (bracket record "reporter") reporter)) (return false))
+        (= index (+ index 1)))
+      (return true)
+      (catch e (return false)))))
+  )
 
 (declare-extern nowMs [-> Int])
 (declare-extern strCmp [String String -> Int])
-(declare-extern parseIntSafe [Any -> Int])
 (declare-extern fdiv [Int Int -> Int])
 (declare-extern frem [Int Int -> Int])
 (declare-extern parseEpochMs [String -> Int])
@@ -43,11 +239,16 @@
 (declare-extern pushArr [Any Any -> Any])
 (declare-extern sortArr [Any Any -> Any])
 (declare-extern mkSet [Any -> Any])
+(declare-extern safeRoleId [Any -> Bool])
+(declare-extern validSha256 [Any -> Bool])
+(declare-extern sha256Hex [Any -> String])
+(declare-extern safePresetOverrides [Any -> Any])
+(declare-extern slugValue [Any -> String])
+(declare-extern modelFamily [Any -> String])
+(declare-extern validReportedEvidence [Any Any -> Bool])
 
-;; ---- display formatting -----------------------------------------------------
+;; ---- usage -----------------------------------------------------------------
 
-;; Keep the provider's exact integer visible. Approximate k/M abbreviations make
-;; an exact fact look estimated and cannot represent lower-bound coverage.
 (defn fmt-tokens [(n :- Any)] :- String (str n))
 
 (js/export (defn usage-display [(n :- Any) (status :- String)] :- String
@@ -57,7 +258,6 @@
     (= status "incomplete") (str ">=" (fmt-tokens n) " (incomplete)")
     :else "unknown")))
 
-;; Normalize nullable usage + coverage once, before it reaches any frontend.
 (js/export (defn usage-projection [(tok :- Any)] :- Any
   (let [ctx (fram/parseTokenCount (get tok "context"))
         total (fram/parseTokenCount (get tok "total"))
@@ -76,131 +276,500 @@
      "context_display" (usage-display ctx ctx-status)
      "total_display" (usage-display total total-status)})))
 
-;; whole-second elapsed -> "Xh Ym" / "Xm Ys" / "Xs"
 (defn fmt-duration [(s :- Int)] :- String
   (cond
     (>= s 3600) (str (fdiv s 3600) "h " (fdiv (frem s 3600) 60) "m")
     (>= s 60) (str (fdiv s 60) "m " (frem s 60) "s")
     :else (str (if (> s 0) s 0) "s")))
 
-;; spawned_at (ISO-8601, nil, or unparseable) -> elapsed string; "" when absent.
 (defn elapsed-str [(spawned :- Any) (now :- Int)] :- String
   (if (nil? spawned)
     ""
     (let [ms (parseEpochMs spawned)]
-      (if (< ms 0)
-        ""
-        (fmt-duration (- (fdiv now 1000) (fdiv ms 1000)))))))
+      (if (< ms 0) "" (fmt-duration (- (fdiv now 1000) (fdiv ms 1000)))))))
 
-;; ", "-join over a JS array / Beagle seq of strings; "" when empty.
 (defn join-comma [(xs :- Any)] :- String
   (reduce (fn [acc x] (if (= acc "") (str x) (str acc ", " x))) "" xs))
 
-;; ---- lease liveness ---------------------------------------------------------
-;; lease format: "holder|exp_ms|epoch"; online iff a parseable exp is in the future.
-;; Returns [online expires-s] ([false nil] when offline/absent/unparseable).
-(defn lease-state [(port :- Int) (h :- String) (now :- Int)] :- (Promise Any)
-  (let [raw (js/await (fram/resolved port (str "@lease:session:" h) "lease"))]
-    (if (nil? raw)
-      [false nil]
-      (let [parts (.split raw "|")]
-        (if (< (count parts) 2)
-          [false nil]
-          (let [exp (parseIntSafe (nth parts 1))]
-            (if (> exp now)
-              [true (fdiv (- exp now) 1000)]
-              [false nil])))))))
+;; ---- canonical fact projection ---------------------------------------------
 
-;; sorted roles (JS array) with the "@role:" prefix stripped.
-(defn roles-of [(port :- Int) (h :- String)] :- (Promise Any)
-  (let [all (js/await (fram/resolved-many port (str "@agent:" h) "holds"))
-        acc (reduce (fn [a r] (if (.startsWith r "@role:") (pushArr a (.slice r 6)) a))
-                    (mkArr) all)]
-    (sortArr acc strCmp)))
+(def identity-predicates :- Any
+  ["bespoke_reason"
+   "composition_contract_fingerprint_domain"
+   "composition_contract_fingerprint_version"
+   "composition_contract_sha256"
+   "composition_id"
+   "composition_kind"
+   "composition_override_reason"
+   "composition_overrides"
+   "coordinator"
+   "effort"
+   "goal"
+   "kind"
+   "model"
+   "nearest_preset"
+   "promotion_candidate"
+   "provider"
+   "provider_target"
+   "repo"
+   "role"
+   "spawned_at"])
 
-;; ---- row shape --------------------------------------------------------------
-;; Field names kebab->snake on emit (current-thread -> current_thread), matching
-;; the wire keys the frontend reads. nil-or-string display values are Any.
+(def required-identity-predicates :- Any
+  ["kind" "role" "goal" "provider" "provider_target" "model" "effort"
+   "composition_kind" "composition_id" "repo" "spawned_at" "display_handle"
+   "display_name" "identity_manifest_sha256"])
+
+(def terminal-projection-predicates :- Any
+  ["delivery_attestation" "delivery_attestation_sha256"
+   "delivery_evidence" "delivery_evidence_sha256"
+   "delivery_outcome" "delivery_reason" "outcome" "process_outcome"])
+
+(defn member? [(xs :- Any) (value :- String)] :- Bool
+  (> (reduce (fn [n x] (+ n (if (= x value) 1 0))) 0 xs) 0))
+
+(defn known [(value :- Any)] :- Any
+  (if (nil? value)
+    nil
+    (let [text (.trim (str value))]
+      (if (= text "") nil text))))
+
+(defn fact-one [(facts :- Any) (predicate :- String)] :- Any
+  (if (some? (get (get facts "__conflicts" {}) predicate))
+    nil
+    (known (get facts predicate))))
+
+(defn fact-values [(facts :- Any) (predicate :- String)] :- Any
+  (let [values (get (get facts "__values" {}) predicate)
+        fallback (known (get facts predicate))]
+    (if (and (some? values) (> (count values) 0))
+      values
+      (if (some? fallback) [fallback] []))))
+
+(defn terminal-one [(facts :- Any) (predicate :- String)] :- Any
+  (if (some? (get (get facts "__conflicts" {}) predicate))
+    nil
+    (let [value (get facts predicate)]
+      (if (and (some? value) (not= (.trim (str value)) ""))
+        value nil))))
+
+(defn fold-fact [(facts :- Any) (predicate :- String) (value :- String)] :- Any
+  (if (= predicate "holds")
+    (assoc facts predicate (pushArr (get facts predicate (mkArr)) value))
+    (let [prior (get facts predicate)
+          prior-values (get (get facts "__values" {}) predicate (mkArr))
+          values (if (member? prior-values value)
+                   prior-values (pushArr prior-values value))
+          next (assoc (assoc facts predicate value)
+                      "__values"
+                      (assoc (get facts "__values" {}) predicate values))]
+      (if (and (some? prior) (not= prior value))
+        (assoc next "__conflicts"
+               (assoc (get facts "__conflicts" {}) predicate true))
+        next))))
+
+(defn native-axis-value [(facts :- Any) (predicate :- String)] :- Any
+  (let [values (fact-values facts predicate)
+        concrete
+        (reduce (fn [out value]
+                  (let [observation (known value)]
+                    (if (or (nil? observation)
+                            (member? ["unknown" "unobserved"] observation))
+                      out
+                      (pushArr out observation))))
+                (mkArr) values)]
+    (cond
+      (= (count concrete) 1) (nth concrete 0)
+      (> (count concrete) 1) nil
+      (member? values "unobserved") "unobserved"
+      (member? values "unknown") "unknown"
+      :else nil)))
+
+(defn native-axis-conflict? [(facts :- Any) (predicate :- String)] :- Bool
+  (> (reduce (fn [count value]
+               (let [observation (known value)]
+                 (+ count
+                    (if (or (nil? observation)
+                            (member? ["unknown" "unobserved"] observation))
+                      0 1))))
+             0 (fact-values facts predicate))
+     1))
+
+(defn axis-value [(facts :- Any) (predicate :- String)] :- Any
+  (if (= "session" (fact-one facts "kind"))
+    (native-axis-value facts predicate)
+    (fact-one facts predicate)))
+
+(defn axis-conflict? [(facts :- Any) (predicate :- String)] :- Bool
+  (if (= "session" (fact-one facts "kind"))
+    (native-axis-conflict? facts predicate)
+    (some? (get (get facts "__conflicts" {}) predicate))))
+
+(js/export (defn fold-bundle [(rows :- Any)] :- Any
+  (reduce
+   (fn [subjects row]
+     (let [subject (str (nth row 0))
+           predicate (str (nth row 1))
+           value (str (nth row 2))]
+       (assoc subjects subject
+              (fold-fact (get subjects subject {}) predicate value))))
+   {} rows)))
+
+(defn canonical-identity [(facts :- Any)] :- String
+  (reduce
+   (fn [out predicate]
+     (let [value (fact-one facts predicate)]
+       (if (nil? value) out (str out predicate "\u0000" value "\n"))))
+   "" identity-predicates))
+
+(defn required-identity-present? [(facts :- Any)] :- Bool
+  (= 0
+     (reduce (fn [missing predicate]
+               (let [value (if (member? ["display_handle" "display_name"] predicate)
+                             (known (get facts predicate))
+                             (fact-one facts predicate))]
+                 (+ missing (if (some? value) 0 1))))
+             0 required-identity-predicates)))
+
+(defn identity-conflicts? [(facts :- Any)] :- Bool
+  (let [conflicts (get facts "__conflicts" {})]
+    (or (some? (get conflicts "identity_manifest_sha256"))
+        (> (reduce (fn [count predicate]
+                     (+ count (if (some? (get conflicts predicate)) 1 0)))
+                   0 identity-predicates)
+           0))))
+
+(defn terminal-conflicts? [(facts :- Any)] :- Bool
+  (let [conflicts (get facts "__conflicts" {})]
+    (> (reduce (fn [count predicate]
+                 (+ count (if (some? (get conflicts predicate)) 1 0)))
+               0 terminal-projection-predicates)
+       0)))
+
+(defn preset-valid? [(facts :- Any)] :- Bool
+  (let [raw (fact-one facts "composition_overrides")
+        overrides (if (nil? raw) nil (safePresetOverrides raw))
+        reason (fact-one facts "composition_override_reason")]
+    (and (some? overrides)
+         (= (> (count overrides) 0) (some? reason)))))
+
+(defn bespoke-valid? [(facts :- Any)] :- Bool
+  (and (some? (fact-one facts "bespoke_reason"))
+       (member? ["true" "false"] (or (fact-one facts "promotion_candidate") ""))
+       (validSha256 (fact-one facts "composition_contract_sha256"))
+       (= "v1" (fact-one facts "composition_contract_fingerprint_version"))
+       (= "north:bespoke-contract:v1"
+          (fact-one facts "composition_contract_fingerprint_domain"))))
+
+(defn managed-valid? [(facts :- Any)] :- Bool
+  (let [kind (fact-one facts "kind")
+        role (fact-one facts "role")
+        composition-kind (fact-one facts "composition_kind")
+        composition-id (fact-one facts "composition_id")
+        marker (fact-one facts "identity_manifest_sha256")]
+    (and (= kind "lane")
+         (required-identity-present? facts)
+         (not (identity-conflicts? facts))
+         (safeRoleId role)
+         (safeRoleId composition-id)
+         (= role composition-id)
+         (or (and (= composition-kind "preset") (preset-valid? facts))
+             (and (= composition-kind "bespoke") (bespoke-valid? facts)))
+         (= marker (sha256Hex (canonical-identity facts))))))
+
+(js/export (defn gaffer-provenance [(facts :- Any)] :- String
+  (let [kind (fact-one facts "kind")
+        composition-kind (fact-one facts "composition_kind")
+        composition-id (fact-one facts "composition_id")]
+    (cond
+      (= kind "session") "gaffer:not-selected"
+      (not (managed-valid? facts)) "gaffer:legacy-debt"
+      (= composition-kind "preset")
+      (let [overrides (safePresetOverrides (fact-one facts "composition_overrides"))
+            base (str "gaffer:" composition-id)]
+        (if (> (count overrides) 0)
+          (str base "+override(" (.join overrides ",") ")")
+          base))
+      (= composition-kind "bespoke") (str "gaffer:bespoke:" composition-id)
+      :else "gaffer:legacy-debt"))))
+
+(js/export (defn provider-target-label [(facts :- Any)] :- String
+  (let [provider-value (axis-value facts "provider")
+        vendor-value (axis-value facts "vendor")
+        provider-conflict (axis-conflict? facts "provider")
+        vendor-conflict (axis-conflict? facts "vendor")
+        target-conflict (axis-conflict? facts "provider_target")
+        provider (or provider-value vendor-value "unknown")
+        target (axis-value facts "provider_target")]
+    (cond
+      (or provider-conflict (and (nil? provider-value) vendor-conflict))
+      "provider:conflict"
+      target-conflict (str provider ":target-conflict")
+      (nil? target) provider
+      :else (str provider ":" (if (or (= target provider) (= target "ambient"))
+                                "ambient" target))))))
+
+(defn provider-axis [(facts :- Any)] :- String
+  (let [kind (fact-one facts "kind")
+        provider-value (axis-value facts "provider")
+        vendor-value (axis-value facts "vendor")
+        conflict (or (axis-conflict? facts "provider")
+                     (and (nil? provider-value)
+                          (axis-conflict? facts "vendor")))
+        provider (or provider-value vendor-value)]
+    (cond
+      conflict "provider:conflict"
+      (and (= kind "session") (nil? provider)) "provider:historical-unrecorded"
+      (= provider "unobserved") "provider:unobserved"
+      :else (provider-target-label facts))))
+
+(defn model-axis [(facts :- Any)] :- String
+  (let [kind (fact-one facts "kind")
+        model (axis-value facts "model")]
+    (cond
+      (axis-conflict? facts "model") "model:conflict"
+      (and (= kind "session") (nil? model)) "model:historical-unrecorded"
+      (= model "unobserved") "model:unobserved"
+      :else (modelFamily (or model "unknown")))))
+
+(defn effort-axis [(facts :- Any)] :- String
+  (let [kind (fact-one facts "kind")
+        effort (axis-value facts "effort")]
+    (cond
+      (axis-conflict? facts "effort") "effort:conflict"
+      (and (= kind "session") (nil? effort)) "effort:historical-unrecorded"
+      (= effort "unobserved") "effort:unobserved"
+      :else (slugValue (or effort "unknown")))))
+
+(js/export (defn semantic-handle [(id :- String) (facts :- Any)] :- String
+  (let [parts (.split id "-")
+        suffix (nth parts (- (count parts) 1))]
+    (str (slugValue (provider-target-label facts)) "-"
+         (modelFamily (if (axis-conflict? facts "model")
+                        "model:conflict" (axis-value facts "model"))) "-"
+         (slugValue (if (axis-conflict? facts "effort")
+                      "effort:conflict" (axis-value facts "effort"))) "-"
+         (slugValue (gaffer-provenance facts)) "-"
+         (slugValue suffix)))))
+
+(defn display-name [(id :- String) (facts :- Any)] :- String
+  (or (fact-one facts "display_name")
+      (let [goal (fact-one facts "goal")
+            abbreviated (if (and (some? goal) (> (count goal) 40))
+                          (str (.slice goal 0 37) "…") goal)]
+        (str (semantic-handle id facts)
+             (if (some? abbreviated) (str " — " abbreviated) "")))))
+
+(defn display-handle [(id :- String) (facts :- Any)] :- String
+  (or (fact-one facts "display_handle")
+      (let [name (fact-one facts "display_name")]
+        (if (and (= "session" (fact-one facts "kind"))
+                 (some? name)
+                 (member? (fact-values facts "display_handle") name))
+          name nil))
+      (semantic-handle id facts)))
+
+(defn meaningful-task [(value :- Any)] :- Any
+  (let [task (known value)]
+    (if (member? ["CONTEXT BRIEF:" "DELEGATE TASK:" "TASK:"] (or task ""))
+      nil task)))
+
+(defn task-of [(facts :- Any) (session :- Any)] :- String
+  (or (meaningful-task (fact-one session "current_thread"))
+      (meaningful-task (fact-one session "active_workflow"))
+      (meaningful-task (fact-one session "task"))
+      (meaningful-task (fact-one facts "current_thread"))
+      (meaningful-task (fact-one facts "active_workflow"))
+      (meaningful-task (fact-one facts "task"))
+      (meaningful-task (fact-one facts "goal"))
+      (if (and (= "session" (fact-one facts "kind"))
+               (some? (fact-one facts "repo")))
+        (str "native session in " (fact-one facts "repo"))
+        "unknown")))
+
+;; Modern terminals become visible only after the terminal digest commits and
+;; the delivery shape is internally coherent. True legacy rows have `outcome`
+;; without `process_outcome`, matching the CLI compatibility rule.
+(defn terminal-manifest-sha [(facts :- Any)] :- Any
+  (let [required ["outcome" "process_outcome" "delivery_outcome" "delivery_reason"]
+        missing (reduce (fn [n predicate]
+                          (+ n (if (some? (terminal-one facts predicate)) 0 1)))
+                        0 required)
+        projection
+        (reduce (fn [out predicate]
+                  (let [value (terminal-one facts predicate)]
+                    (if (nil? value) out (str out predicate "\u0000" value "\n"))))
+                "" terminal-projection-predicates)]
+    (if (or (> missing 0) (terminal-conflicts? facts))
+      nil
+      (sha256Hex projection))))
+
+(defn delivery-valid? [(facts :- Any)] :- Bool
+  (let [process (terminal-one facts "process_outcome")
+        outcome (terminal-one facts "delivery_outcome")
+        reason (terminal-one facts "delivery_reason")
+        evidence (terminal-one facts "delivery_evidence")
+        evidence-sha (terminal-one facts "delivery_evidence_sha256")
+        attestation (terminal-one facts "delivery_attestation")
+        attestation-sha (terminal-one facts "delivery_attestation_sha256")
+        ;; Presence, not parseability, owns proof residue: an empty/malformed
+        ;; proof field still prevents unverified/blocked from being clean.
+        proof-count (+ (if (some? (get facts "delivery_evidence")) 1 0)
+                       (+ (if (some? (get facts "delivery_evidence_sha256")) 1 0)
+                          (+ (if (some? (get facts "delivery_attestation")) 1 0)
+                             (if (some? (get facts "delivery_attestation_sha256")) 1 0))))]
+    (and (some? process)
+         (if (= process "ran") (not= outcome "blocked") (= outcome "blocked"))
+         (cond
+           (= outcome "blocked") (and (= proof-count 0) (some? reason))
+           (= outcome "unverified") (and (= proof-count 0) (some? reason))
+           (= outcome "reported")
+           (and (= reason "complete_run_scoped_done_bar_evidence_self_reported")
+                (= proof-count 2)
+                (some? evidence) (some? evidence-sha)
+                (nil? attestation) (nil? attestation-sha)
+                (validReportedEvidence evidence evidence-sha))
+           :else false))))
+
+(defn terminal-process-outcome [(facts :- Any)] :- Any
+  (let [process (terminal-one facts "process_outcome")]
+    ;; Raw presence selects the modern protocol even when the folded value
+    ;; conflicts. Never reinterpret a torn modern terminal as a legacy row.
+    (if (some? (get facts "process_outcome"))
+      (if (and (= process (terminal-one facts "outcome"))
+               (= (terminal-one facts "terminal_manifest_sha256")
+                  (terminal-manifest-sha facts))
+               (delivery-valid? facts))
+        (known process) nil)
+      (known (terminal-one facts "outcome")))))
+
+(defn terminal-delivery-outcome [(facts :- Any)] :- Any
+  ;; Legacy `outcome` remains readable for process compatibility, but delivery
+  ;; truth exists only in a digest-committed modern terminal.
+  (if (and (some? (get facts "process_outcome"))
+           (some? (terminal-process-outcome facts)))
+    (known (terminal-one facts "delivery_outcome"))
+    nil))
+
+(defn roles-of [(facts :- Any)] :- Any
+  (sortArr
+   (reduce (fn [roles role]
+             (if (.startsWith role "@role:")
+               (pushArr roles (.slice role 6))
+               roles))
+           (mkArr) (get facts "holds" []))
+   strCmp))
+
+;; ---- row + public API -------------------------------------------------------
+
 (defrecord Row
-  [(uuid :- String) (online :- Bool) (expires-s :- Any) (roles :- Any)
-   (model :- Any) (effort :- Any) (lifecycle :- Any) (current-thread :- Any)
-   (active-workflow :- Any) (task :- Any) (context-tokens :- Any) (total-tokens :- Any)
+  [(uuid :- String) (control-id :- String)
+   (display-name :- String) (display-handle :- String)
+   (kind :- String) (provider :- String) (provider-target :- String)
+   (provider-label :- String) (model :- String) (model-display :- String)
+   (effort :- String) (gaffer-provenance :- String)
+   (goal :- String) (task :- String) (state :- String) (state-label :- String)
+   (lifecycle :- String) (process-outcome :- String) (delivery-outcome :- String)
+   (online :- Bool) (expires-s :- Any) (roles :- Any)
+   (current-thread :- Any) (active-workflow :- Any)
+   (context-tokens :- Any) (total-tokens :- Any)
    (context-status :- String) (total-status :- String)
    (focus :- Bool) (spawned-at :- Any) (thinking :- Bool) (elapsed-str :- String)
    (roles-str :- String) (model-str :- Any) (ctx-str :- String)
    (total-str :- String) (focus-str :- Any)])
 
-(defn build-row [(port :- Int) (h :- String) (now :- Int) (tokens :- Any)] :- (Promise Any)
-  (let [ls (js/await (lease-state port h now))
-        online (nth ls 0)
-        expires (nth ls 1)
-        current-thread (js/await (fram/resolved port (str "@session:" h) "current_thread"))
-        active-workflow (js/await (fram/resolved port (str "@session:" h) "active_workflow"))
-        task (js/await (fram/resolved port (str "@session:" h) "task"))
-        rls (js/await (roles-of port h))
-        model (js/await (fram/resolved port (str "@agent:" h) "model"))
-        effort (js/await (fram/resolved port (str "@agent:" h) "effort"))
-        lifecycle (js/await (fram/resolved port (str "@agent:" h) "lifecycle"))
-        spawned (js/await (fram/resolved port (str "@agent:" h) "spawned_at"))
+(js/export (defn project-agent
+  [(h :- String) (facts :- Any) (session :- Any) (lease :- Any)
+   (tokens :- Any) (now :- Int)] :- Row
+  (let [current-thread (fact-one session "current_thread")
+        active-workflow (fact-one session "active_workflow")
+        task (task-of facts session)
+        goal (or (fact-one facts "goal") "")
+        rls (roles-of facts)
+        model (if (axis-conflict? facts "model")
+                "conflict" (or (axis-value facts "model") ""))
+        process (or (terminal-process-outcome facts) "")
+        delivery (or (terminal-delivery-outcome facts) "")
+        state (cond
+                (not= process "") "finished"
+                (some? (fact-one facts "stalled")) "stalled"
+                :else "working")
+        state-label (if (= state "finished")
+                      (str "finished(process:" process ", delivery:"
+                           (if (= delivery "") "unrecorded" delivery) ")")
+                      state)
+        lifecycle (or (fact-one facts "lifecycle") state)
+        spawned (fact-one facts "spawned_at")
         tok (get tokens h {})
         usage (usage-projection tok)
         ctx (get usage "context")
         tot (get usage "total")
         ctx-status (get usage "context_status")
         total-status (get usage "total_status")
-        focus (or (some? active-workflow) (some? current-thread) (some? task))]
-    (->Row h online expires rls model effort lifecycle current-thread active-workflow task
-           ctx tot ctx-status total-status focus spawned (and online focus) (elapsed-str spawned now)
-           (join-comma rls) (or model "") (get usage "context_display") (get usage "total_display")
-           (or active-workflow current-thread task ""))))
+        focus (or (some? current-thread)
+                  (some? active-workflow)
+                  (some? (fact-one session "task")))
+        provider (if (or (axis-conflict? facts "provider")
+                         (and (nil? (axis-value facts "provider"))
+                              (axis-conflict? facts "vendor")))
+                   "conflict"
+                   (or (axis-value facts "provider")
+                       (axis-value facts "vendor") ""))
+        provider-target (if (axis-conflict? facts "provider_target")
+                          "conflict" (or (axis-value facts "provider_target") ""))]
+    (->Row h h (display-name h facts) (display-handle h facts)
+           (or (fact-one facts "kind") "unclassified")
+           provider provider-target (provider-axis facts) model (model-axis facts)
+           (effort-axis facts) (gaffer-provenance facts)
+           goal task state state-label lifecycle process delivery
+           true (.-expires_s lease) rls current-thread active-workflow
+           ctx tot ctx-status total-status focus spawned focus (elapsed-str spawned now)
+           (join-comma rls) (model-axis facts)
+           (get usage "context_display") (get usage "total_display") task))))
 
-;; ---- sort key: online-first, then focus, then handle ------------------------
 (defn row-key [(r :- Row)] :- String
-  (str (if (.-online r) "0" "1") (if (.-focus r) "0" "1") (.-uuid r)))
+  (str (cond
+         (= (.-state r) "finished") "3"
+         (= (.-kind r) "lane") "0"
+         (= (.-kind r) "session") "1"
+         :else "2")
+       (.-display-name r) (.-uuid r)))
 
 (defn row-cmp [(a :- Row) (b :- Row)] :- Int
   (strCmp (row-key a) (row-key b)))
 
-;; sequential fan-out (correctness over speed): one build-row per handle, in order.
-(defn build-rows [(port :- Int) (ags :- Any) (i :- Int) (now :- Int) (tokens :- Any) (acc :- Any)] :- (Promise Any)
-  (if (>= i (count ags))
-    acc
-    (let [h (nth (nth ags i) 1)
-          row (js/await (build-row port h now tokens))]
-      (js/await (build-rows port ags (+ i 1) now tokens (pushArr acc row))))))
-
-;; ---- public API -------------------------------------------------------------
-
-;; Roster of Row objects for rendering, sorted online-first / focus / handle.
+;; Exactly two indexed coordinator calls when at least one live lease exists:
+;; one lease scan and one literal-subject union. Richer identity fields do not
+;; add round trips. Expired leases are removed before subject construction.
 (js/export (defn roster [(port :- Int)] :- (Promise Any)
   (let [now (nowMs)
         tokens (js/await (fram/agent-tokens port))
-        ags (js/await (fram/agents port))
-        rows (js/await (build-rows port ags 0 now tokens (mkArr)))]
+        bundle (js/await (fram/agent-roster-bundle port now))
+        facts-by-subject (fold-bundle (get bundle "rows" []))
+        rows
+        (reduce
+         (fn [out lease]
+           (let [h (.-control lease)
+                 facts (get facts-by-subject (str "@agent:" h) {})
+                 session (get facts-by-subject (str "@session:" h) {})]
+             (pushArr out (project-agent h facts session lease tokens now))))
+         (mkArr) (get bundle "leases" []))]
     (sortArr rows (fn [a b] (row-cmp a b))))))
-
-;; live @agent:<h> lease refs, as a JS Set (threads.bjs decides "active" from it).
-(defn collect-refs [(port :- Int) (ags :- Any) (i :- Int) (now :- Int) (acc :- Any)] :- (Promise Any)
-  (if (>= i (count ags))
-    acc
-    (let [row (nth ags i)
-          h (nth row 1)
-          ls (js/await (lease-state port h now))]
-      (js/await (collect-refs port ags (+ i 1) now
-                  (if (nth ls 0) (pushArr acc (str "@agent:" h)) acc))))))
 
 (js/export (defn online-refs [(port :- Int)] :- (Promise Any)
   (let [now (nowMs)
-        ags (js/await (fram/agents port))
-        refs (js/await (collect-refs port ags 0 now (mkArr)))]
+        leases (js/await (fram/agent-live-leases port now))
+        refs (reduce (fn [out lease]
+                       (pushArr out (str "@agent:" (.-control lease))))
+                     (mkArr) (or leases []))]
     (mkSet refs))))
 
-;; ---- swarm totals -----------------------------------------------------------
+;; ---- aggregate usage --------------------------------------------------------
+
 (defrecord Swarm
   [(context :- String) (total :- String)
    (context-status :- String) (total-status :- String)])
 
-;; Swarm token totals for the status line: {context, total} as display strings.
 (js/export (defn swarm-tokens [(roster :- Any)] :- Any
   (let [ctx (reduce (fn [acc r]
                       (if (some? (.-context-tokens r))

@@ -136,28 +136,74 @@ function agent_row_create(props) {
   el_1.className = "flex items-center justify-between";
   const el_2 = document.createElement("span");
   el_2.className = "text-sm font-medium text-foreground";
-  el_2.textContent = props.uuid || '';
+  el_2.textContent = props.display_name || '';
   const el_3 = document.createElement("span");
   el_3.className = "text-xs text-muted-foreground";
-  el_3.textContent = props.online || '';
+  el_3.textContent = props.state_label || '';
   el_1.appendChild(el_2);
   el_1.appendChild(el_3);
   const el_4 = document.createElement("div");
-  el_4.className = "text-xs text-muted-foreground mt-1";
-  el_4.textContent = props.roles || '';
+  el_4.className = "text-xs text-muted-foreground mt-1 flex gap-2";
+  const el_5 = document.createElement("span");
+  el_5.textContent = props.provider_label || '';
+  const el_6 = document.createElement("span");
+  el_6.textContent = props.model_display || '';
+  const el_7 = document.createElement("span");
+  el_7.textContent = props.effort || '';
+  const el_8 = document.createElement("span");
+  el_8.textContent = props.gaffer_provenance || '';
+  el_4.appendChild(el_5);
+  el_4.appendChild(el_6);
+  el_4.appendChild(el_7);
+  el_4.appendChild(el_8);
+  const el_9 = document.createElement("div");
+  el_9.className = "text-xs text-muted-foreground mt-1";
+  el_9.textContent = props.task || '';
+  const el_10 = document.createElement("div");
+  el_10.className = "text-xs text-muted-foreground mt-1 flex gap-2";
+  const el_11 = document.createElement("span");
+  el_11.textContent = "Lifecycle";
+  const el_12 = document.createElement("span");
+  el_12.textContent = props.lifecycle || '';
+  el_10.appendChild(el_11);
+  el_10.appendChild(el_12);
+  const el_13 = document.createElement("div");
+  el_13.className = "text-xs text-muted-foreground mt-1";
+  el_13.textContent = props.display_handle || '';
+  const el_14 = document.createElement("div");
+  el_14.className = "text-xs text-muted-foreground mt-1";
+  el_14.textContent = props.uuid || '';
   el_0.appendChild(el_1);
   el_0.appendChild(el_4);
+  el_0.appendChild(el_9);
+  el_0.appendChild(el_10);
+  el_0.appendChild(el_13);
+  el_0.appendChild(el_14);
   return {
     el: el_0,
     update: {
-    uuid(v) { el_2.textContent = v; },
-    online(v) { el_3.textContent = v; },
-    roles(v) { el_4.textContent = v; }
+    display_name(v) { el_2.textContent = v; },
+    state_label(v) { el_3.textContent = v; },
+    provider_label(v) { el_5.textContent = v; },
+    model_display(v) { el_6.textContent = v; },
+    effort(v) { el_7.textContent = v; },
+    gaffer_provenance(v) { el_8.textContent = v; },
+    task(v) { el_9.textContent = v; },
+    lifecycle(v) { el_12.textContent = v; },
+    display_handle(v) { el_13.textContent = v; },
+    uuid(v) { el_14.textContent = v; }
     },
     nodes: {
-    uuid: el_2,
-    online: el_3,
-    roles: el_4
+    display_name: el_2,
+    state_label: el_3,
+    provider_label: el_5,
+    model_display: el_6,
+    effort: el_7,
+    gaffer_provenance: el_8,
+    task: el_9,
+    lifecycle: el_12,
+    display_handle: el_13,
+    uuid: el_14
     },
     destroy() { el_0.remove(); }
   };
@@ -169,84 +215,176 @@ function agent_detail_create(props) {
   el_0.className = "p-6 flex flex-col gap-3";
   const el_1 = document.createElement("h2");
   el_1.className = "text-lg font-semibold text-foreground";
-  el_1.textContent = props.uuid || '';
+  el_1.textContent = props.display_name || '';
   const el_2 = document.createElement("div");
   el_2.className = "text-sm text-muted-foreground";
-  el_2.textContent = props.roles || '';
+  el_2.textContent = props.display_handle || '';
   const el_3 = document.createElement("div");
-  el_3.className = "flex flex-col gap-1 mt-2";
+  el_3.className = "text-xs text-muted-foreground";
+  el_3.textContent = props.control_id || '';
   const el_4 = document.createElement("div");
-  el_4.className = "text-xs uppercase text-muted-foreground";
-  el_4.textContent = "Model";
+  el_4.className = "text-sm text-muted-foreground";
+  el_4.textContent = props.roles || '';
   const el_5 = document.createElement("div");
-  el_5.className = "text-sm text-foreground";
-  el_5.textContent = props.model || '';
+  el_5.className = "flex flex-col gap-1 mt-2";
   const el_6 = document.createElement("div");
-  el_6.className = "text-xs uppercase text-muted-foreground mt-2";
-  el_6.textContent = "Online";
+  el_6.className = "text-xs uppercase text-muted-foreground";
+  el_6.textContent = "Provider account";
   const el_7 = document.createElement("div");
   el_7.className = "text-sm text-foreground";
-  el_7.textContent = props.online || '';
+  el_7.textContent = props.provider_label || '';
   const el_8 = document.createElement("div");
-  el_8.className = "text-xs uppercase text-muted-foreground mt-2";
-  el_8.textContent = "Thread";
+  el_8.className = "text-xs uppercase text-muted-foreground";
+  el_8.textContent = "Model";
   const el_9 = document.createElement("div");
   el_9.className = "text-sm text-foreground";
-  el_9.textContent = props.current_thread || '';
+  el_9.textContent = props.model || '';
   const el_10 = document.createElement("div");
   el_10.className = "text-xs uppercase text-muted-foreground mt-2";
-  el_10.textContent = "Workflow";
+  el_10.textContent = "Effort";
   const el_11 = document.createElement("div");
   el_11.className = "text-sm text-foreground";
-  el_11.textContent = props.active_workflow || '';
+  el_11.textContent = props.effort || '';
   const el_12 = document.createElement("div");
   el_12.className = "text-xs uppercase text-muted-foreground mt-2";
-  el_12.textContent = "Context tokens";
+  el_12.textContent = "Gaffer";
   const el_13 = document.createElement("div");
   el_13.className = "text-sm text-foreground";
-  el_13.textContent = props.context_tokens || '';
+  el_13.textContent = props.gaffer_provenance || '';
   const el_14 = document.createElement("div");
   el_14.className = "text-xs uppercase text-muted-foreground mt-2";
-  el_14.textContent = "Total tokens";
+  el_14.textContent = "State";
   const el_15 = document.createElement("div");
   el_15.className = "text-sm text-foreground";
-  el_15.textContent = props.total_tokens || '';
-  el_3.appendChild(el_4);
-  el_3.appendChild(el_5);
-  el_3.appendChild(el_6);
-  el_3.appendChild(el_7);
-  el_3.appendChild(el_8);
-  el_3.appendChild(el_9);
-  el_3.appendChild(el_10);
-  el_3.appendChild(el_11);
-  el_3.appendChild(el_12);
-  el_3.appendChild(el_13);
-  el_3.appendChild(el_14);
-  el_3.appendChild(el_15);
+  el_15.textContent = props.state_label || '';
+  const el_16 = document.createElement("div");
+  el_16.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_16.textContent = "Lifecycle";
+  const el_17 = document.createElement("div");
+  el_17.className = "text-sm text-foreground";
+  el_17.textContent = props.lifecycle || '';
+  const el_18 = document.createElement("div");
+  el_18.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_18.textContent = "Task";
+  const el_19 = document.createElement("div");
+  el_19.className = "text-sm text-foreground";
+  el_19.textContent = props.task || '';
+  const el_20 = document.createElement("div");
+  el_20.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_20.textContent = "Goal";
+  const el_21 = document.createElement("div");
+  el_21.className = "text-sm text-foreground";
+  el_21.textContent = props.goal || '';
+  const el_22 = document.createElement("div");
+  el_22.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_22.textContent = "Process outcome";
+  const el_23 = document.createElement("div");
+  el_23.className = "text-sm text-foreground";
+  el_23.textContent = props.process_outcome || '';
+  const el_24 = document.createElement("div");
+  el_24.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_24.textContent = "Delivery outcome";
+  const el_25 = document.createElement("div");
+  el_25.className = "text-sm text-foreground";
+  el_25.textContent = props.delivery_outcome || '';
+  const el_26 = document.createElement("div");
+  el_26.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_26.textContent = "Thread";
+  const el_27 = document.createElement("div");
+  el_27.className = "text-sm text-foreground";
+  el_27.textContent = props.current_thread || '';
+  const el_28 = document.createElement("div");
+  el_28.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_28.textContent = "Workflow";
+  const el_29 = document.createElement("div");
+  el_29.className = "text-sm text-foreground";
+  el_29.textContent = props.active_workflow || '';
+  const el_30 = document.createElement("div");
+  el_30.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_30.textContent = "Context tokens";
+  const el_31 = document.createElement("div");
+  el_31.className = "text-sm text-foreground";
+  el_31.textContent = props.context_tokens || '';
+  const el_32 = document.createElement("div");
+  el_32.className = "text-xs uppercase text-muted-foreground mt-2";
+  el_32.textContent = "Total tokens";
+  const el_33 = document.createElement("div");
+  el_33.className = "text-sm text-foreground";
+  el_33.textContent = props.total_tokens || '';
+  el_5.appendChild(el_6);
+  el_5.appendChild(el_7);
+  el_5.appendChild(el_8);
+  el_5.appendChild(el_9);
+  el_5.appendChild(el_10);
+  el_5.appendChild(el_11);
+  el_5.appendChild(el_12);
+  el_5.appendChild(el_13);
+  el_5.appendChild(el_14);
+  el_5.appendChild(el_15);
+  el_5.appendChild(el_16);
+  el_5.appendChild(el_17);
+  el_5.appendChild(el_18);
+  el_5.appendChild(el_19);
+  el_5.appendChild(el_20);
+  el_5.appendChild(el_21);
+  el_5.appendChild(el_22);
+  el_5.appendChild(el_23);
+  el_5.appendChild(el_24);
+  el_5.appendChild(el_25);
+  el_5.appendChild(el_26);
+  el_5.appendChild(el_27);
+  el_5.appendChild(el_28);
+  el_5.appendChild(el_29);
+  el_5.appendChild(el_30);
+  el_5.appendChild(el_31);
+  el_5.appendChild(el_32);
+  el_5.appendChild(el_33);
   el_0.appendChild(el_1);
   el_0.appendChild(el_2);
   el_0.appendChild(el_3);
+  el_0.appendChild(el_4);
+  el_0.appendChild(el_5);
   return {
     el: el_0,
     update: {
-    uuid(v) { el_1.textContent = v; },
-    roles(v) { el_2.textContent = v; },
-    model(v) { el_5.textContent = v; },
-    online(v) { el_7.textContent = v; },
-    current_thread(v) { el_9.textContent = v; },
-    active_workflow(v) { el_11.textContent = v; },
-    context_tokens(v) { el_13.textContent = v; },
-    total_tokens(v) { el_15.textContent = v; }
+    display_name(v) { el_1.textContent = v; },
+    display_handle(v) { el_2.textContent = v; },
+    control_id(v) { el_3.textContent = v; },
+    roles(v) { el_4.textContent = v; },
+    provider_label(v) { el_7.textContent = v; },
+    model(v) { el_9.textContent = v; },
+    effort(v) { el_11.textContent = v; },
+    gaffer_provenance(v) { el_13.textContent = v; },
+    state_label(v) { el_15.textContent = v; },
+    lifecycle(v) { el_17.textContent = v; },
+    task(v) { el_19.textContent = v; },
+    goal(v) { el_21.textContent = v; },
+    process_outcome(v) { el_23.textContent = v; },
+    delivery_outcome(v) { el_25.textContent = v; },
+    current_thread(v) { el_27.textContent = v; },
+    active_workflow(v) { el_29.textContent = v; },
+    context_tokens(v) { el_31.textContent = v; },
+    total_tokens(v) { el_33.textContent = v; }
     },
     nodes: {
-    uuid: el_1,
-    roles: el_2,
-    model: el_5,
-    online: el_7,
-    current_thread: el_9,
-    active_workflow: el_11,
-    context_tokens: el_13,
-    total_tokens: el_15
+    display_name: el_1,
+    display_handle: el_2,
+    control_id: el_3,
+    roles: el_4,
+    provider_label: el_7,
+    model: el_9,
+    effort: el_11,
+    gaffer_provenance: el_13,
+    state_label: el_15,
+    lifecycle: el_17,
+    task: el_19,
+    goal: el_21,
+    process_outcome: el_23,
+    delivery_outcome: el_25,
+    current_thread: el_27,
+    active_workflow: el_29,
+    context_tokens: el_31,
+    total_tokens: el_33
     },
     destroy() { el_0.remove(); }
   };

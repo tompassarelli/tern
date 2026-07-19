@@ -1,7 +1,65 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   agentRouteFacts, gafferProvenance, goalFromPrompt, providerTargetLabel, renderDisplayName, semanticHandle,
 } from "../src/identity";
+import type { ObservedAgentIdentity } from "../src/identity";
+
+interface RosterFixture {
+  name: string;
+  id: string;
+  facts: Record<string, string>;
+  expected: {
+    providerLabel: string;
+    modelDisplay: string;
+    effortDisplay: string;
+    gafferProvenance: string;
+    semanticHandle: string;
+    displayName: string;
+  };
+}
+
+const rosterFixtures = JSON.parse(readFileSync(
+  new URL("./fixtures/agent-roster-contract.json", import.meta.url),
+  "utf8",
+)) as RosterFixture[];
+
+function observedIdentity(facts: Record<string, string>): ObservedAgentIdentity {
+  const promotion = facts.promotion_candidate === undefined
+    ? undefined : facts.promotion_candidate === "true";
+  return {
+    kind: (facts.kind ?? "lane") as ObservedAgentIdentity["kind"],
+    role: facts.role,
+    model: facts.model,
+    provider: facts.provider,
+    providerTarget: facts.provider_target,
+    effort: facts.effort,
+    compositionKind: facts.composition_kind as ObservedAgentIdentity["compositionKind"],
+    compositionId: facts.composition_id,
+    compositionOverrides: facts.composition_overrides === undefined
+      ? undefined : JSON.parse(facts.composition_overrides),
+    compositionOverrideReason: facts.composition_override_reason,
+    compositionNearestPreset: facts.nearest_preset,
+    compositionBespokeReason: facts.bespoke_reason,
+    compositionPromotionCandidate: promotion,
+    compositionContractFingerprint: facts.composition_contract_sha256,
+    compositionContractFingerprintVersion: facts.composition_contract_fingerprint_version,
+    compositionContractFingerprintDomain: facts.composition_contract_fingerprint_domain,
+    repo: facts.repo,
+    goal: facts.goal,
+  };
+}
+
+test("shared roster fixtures preserve semantic identity across provider adapters", () => {
+  for (const fixture of rosterFixtures) {
+    const identity = observedIdentity(fixture.facts);
+    expect(providerTargetLabel(identity), fixture.name).toBe(fixture.expected.providerLabel);
+    expect(gafferProvenance(identity), fixture.name).toBe(fixture.expected.gafferProvenance);
+    expect(semanticHandle(fixture.id, identity), fixture.name).toBe(fixture.expected.semanticHandle);
+    if (fixture.name !== "missing-managed-axes")
+      expect(renderDisplayName(fixture.id, identity), fixture.name).toBe(fixture.expected.displayName);
+  }
+});
 
 test("semantic handles keep provider-specific model families and stable control suffixes", () => {
   expect(semanticHandle("sdk-a205e9ce", {

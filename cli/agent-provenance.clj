@@ -25,6 +25,11 @@
     "delivery_attestation" "delivery_attestation_sha256"
     "terminal_manifest_sha256"})
 (def conflict-key "__identity_conflicts")
+(def values-key "__identity_values")
+(def observation-sentinels #{"unknown" "unobserved"})
+
+(defn known [value]
+  (let [s (some-> value str str/trim)] (when (seq s) s)))
 
 (defn- fold-terminal-value [prior value]
   (cond
@@ -32,6 +37,14 @@
     (set? prior) (conj prior value)
     (and (sequential? prior) (not (string? prior))) (conj (set prior) value)
     :else #{prior value}))
+
+(defn- fold-observed-value [prior value]
+  (let [prior (cond
+                (set? prior) prior
+                (and (sequential? prior) (not (string? prior))) (set prior)
+                (nil? prior) #{}
+                :else #{prior})]
+    (conj prior value)))
 
 (defn fold-fact
   "Fold one graph row without hiding a second live managed value. Identity
@@ -44,12 +57,35 @@
     (let [managed-predicate? (or (identity-predicates predicate)
                                  (= "identity_manifest_sha256" predicate))
           prior (get facts predicate)]
-      (cond-> (assoc facts predicate value)
+      (cond-> (-> facts
+                  (assoc predicate value)
+                  (update-in [values-key predicate] fold-observed-value value))
         (and managed-predicate? (some? prior) (not= prior value))
         (update conflict-key (fnil conj #{}) predicate)))))
 
-(defn known [value]
-  (let [s (some-> value str str/trim)] (when (seq s) s)))
+(defn observed-values
+  "All distinct raw values seen for one non-terminal predicate. Plain fact maps
+  remain supported so tests and callers that did not come through fold-fact keep
+  the same projection."
+  [facts predicate]
+  (or (seq (get-in facts [values-key predicate]))
+      (when-let [value (known (get facts predicate))] [value])
+      []))
+
+(defn native-axis
+  "Order-independent selection for provider/model/effort observations on native
+  provider sessions. A concrete observation supersedes only historical
+  unknown/unobserved sentinels. Two concrete observations are an honest
+  conflict; neither row order nor a stored display string gets to elect one."
+  [facts predicate]
+  (let [values (set (keep known (observed-values facts predicate)))
+        concrete (vec (sort (remove observation-sentinels values)))]
+    (cond
+      (= 1 (count concrete)) {:value (first concrete) :conflict false}
+      (> (count concrete) 1) {:value nil :conflict true}
+      (contains? values "unobserved") {:value "unobserved" :conflict false}
+      (contains? values "unknown") {:value "unknown" :conflict false}
+      :else {:value nil :conflict false})))
 
 (defn safe-role-id? [value]
   (boolean (and (string? value)

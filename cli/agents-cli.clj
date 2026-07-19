@@ -205,6 +205,13 @@
   (let [task (known value)]
     (when-not (#{"CONTEXT BRIEF:" "DELEGATE TASK:" "TASK:"} task) task)))
 
+(defn- axis-observation [facts predicate]
+  (if (= "session" (get facts "kind"))
+    (north.agent-provenance/native-axis facts predicate)
+    {:value (known (get facts predicate))
+     :conflict (contains? (get facts north.agent-provenance/conflict-key #{})
+                          predicate)}))
+
 (defn- composition-overrides [facts]
   (north.agent-provenance/composition-overrides facts))
 
@@ -212,20 +219,35 @@
   (north.agent-provenance/gaffer-provenance facts))
 
 (defn- provider-target-label [facts]
-  (let [provider (or (known (get facts "provider")) (known (get facts "vendor")) "unknown")
-        target (known (get facts "provider_target"))]
-    (if target
-      (str provider ":" (if (or (= target provider) (= target "ambient")) "ambient" target))
-      provider)))
+  (let [provider-observation (axis-observation facts "provider")
+        vendor-observation (axis-observation facts "vendor")
+        target-observation (axis-observation facts "provider_target")
+        provider (or (:value provider-observation) (:value vendor-observation) "unknown")
+        target (:value target-observation)]
+    (cond
+      (or (:conflict provider-observation)
+          (and (nil? (:value provider-observation)) (:conflict vendor-observation)))
+      "provider:conflict"
+
+      (:conflict target-observation) (str provider ":target-conflict")
+      target (str provider ":" (if (or (= target provider) (= target "ambient"))
+                                  "ambient" target))
+      :else provider)))
 
 (defn semantic-handle [id facts]
   (let [provider-axis (provider-target-label facts)
         composition (gaffer-provenance facts)
+        model-observation (axis-observation facts "model")
+        effort-observation (axis-observation facts "effort")
+        model (if (:conflict model-observation) "model:conflict"
+                  (:value model-observation))
+        effort (if (:conflict effort-observation) "effort:conflict"
+                   (:value effort-observation))
         suffix (last (str/split (str id) #"-"))]
     ;; `display_handle` is a write-time projection and can lag live route facts.
     ;; The roster derives its visible identity from the canonical axes every read.
-    (str/join "-" [(slug provider-axis) (model-display (get facts "model"))
-                    (slug (get facts "effort")) (slug composition) (slug suffix)])))
+    (str/join "-" [(slug provider-axis) (model-display model)
+                    (slug effort) (slug composition) (slug suffix)])))
 
 (defn render-display-name [id facts]
   (let [goal (known (get facts "goal"))
@@ -234,18 +256,28 @@
 
 (defn agent-primary-line [presence facts]
   (let [native? (= "session" (get facts "kind"))
-        provider-value (or (known (get facts "provider")) (known (get facts "vendor")))
+        provider-observation (axis-observation facts "provider")
+        vendor-observation (axis-observation facts "vendor")
+        provider-conflict? (or (:conflict provider-observation)
+                               (and (nil? (:value provider-observation))
+                                    (:conflict vendor-observation)))
+        provider-value (or (:value provider-observation) (:value vendor-observation))
         provider-axis (cond
+                        provider-conflict? "provider:conflict"
                         (and native? (nil? provider-value)) "provider:historical-unrecorded"
                         (= provider-value "unobserved") "provider:unobserved"
                         :else (provider-target-label facts))
-        model-value (known (get facts "model"))
+        model-observation (axis-observation facts "model")
+        model-value (:value model-observation)
         model-axis (cond
+                     (:conflict model-observation) "model:conflict"
                      (and native? (nil? model-value)) "model:historical-unrecorded"
                      (= model-value "unobserved") "model:unobserved"
                      :else (model-display (or model-value "unknown")))
-        effort-value (known (get facts "effort"))
+        effort-observation (axis-observation facts "effort")
+        effort-value (:value effort-observation)
         effort-axis (cond
+                      (:conflict effort-observation) "effort:conflict"
                       (and native? (nil? effort-value)) "effort:historical-unrecorded"
                       (= effort-value "unobserved") "effort:unobserved"
                       :else (slug (or effort-value "unknown")))

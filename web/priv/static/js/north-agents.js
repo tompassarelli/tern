@@ -1,4 +1,4 @@
-// Claude-Code-shaped AGENTS panel. Reads /api/agents (the live agent roster) and
+// Provider-neutral AGENTS panel. Reads /api/agents (the live semantic roster) and
 // /api/agents/<handle>/stream (one agent's chat), rendering a two-region view:
 // a roster up top, the selected agent's conversation below. Writes go back via
 // /api/tell — the same fact round-trip the rest of the surface uses. Roster
@@ -53,6 +53,17 @@
 
   function handleOf(a) { return a.uuid; }
   function find(handle) { return agents.find((a) => handleOf(a) === handle) || null; }
+  function semanticName(a) {
+    return a.display_name || a.display_handle || "unnamed agent";
+  }
+  function semanticAxes(a) {
+    return [
+      a.provider_label || a.provider || "provider:unobserved",
+      a.model_display || a.model || "model:unobserved",
+      a.effort || "effort:unobserved",
+      a.gaffer_provenance || "gaffer:legacy-debt",
+    ].join(" · ");
+  }
 
   function rosterRow(a) {
     const handle = handleOf(a);
@@ -68,11 +79,19 @@
     const dot = el("span",
       `flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:${a.online ? EF.ok : EF.edge};`);
 
-    const name = el("span",
-      `flex:0 0 auto;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;` +
-      `font-weight:${isSel ? 600 : 400};`, handle);
-
-    const model = el("span", `flex:0 0 auto;font-size:11px;color:${EF.accent};`, a.model || "");
+    const identity = el("span",
+      `flex:0 1 330px;min-width:180px;display:flex;flex-direction:column;gap:2px;overflow:hidden;`);
+    identity.append(
+      el("span",
+        `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:${isSel ? 600 : 400};`,
+        semanticName(a)),
+      el("span",
+        `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:${EF.accent};`,
+        semanticAxes(a)),
+      el("span",
+        `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:${EF.muted};`,
+        `${a.state_label || a.state || "state:unrecorded"} · lifecycle:${a.lifecycle || "unrecorded"}`),
+    );
 
     // context (active) / total (all-time) token figure
     const toks = el("span", `flex:0 0 auto;font-size:11px;color:${EF.star};`,
@@ -83,9 +102,18 @@
     const snippet = el("span",
       `flex:1 1 auto;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;` +
       `font-size:11px;color:${EF.muted};`,
-      a.active_workflow || a.current_thread || "");
+      a.task || a.goal || a.active_workflow || a.current_thread || a.state_label || "");
 
-    r.append(dot, name, model, toks, elapsed, snippet);
+    r.title = [
+      semanticName(a),
+      semanticAxes(a),
+      `model ${a.model || "unrecorded"}`,
+      `state ${a.state_label || a.state || "unrecorded"}`,
+      `lifecycle ${a.lifecycle || "unrecorded"}`,
+      `task ${a.task || a.goal || "unrecorded"}`,
+      `control ${a.control_id || handle}`,
+    ].join("\n");
+    r.append(dot, identity, toks, elapsed, snippet);
     return r;
   }
 
@@ -130,7 +158,17 @@
       `display:flex;align-items:center;gap:8px;padding:8px 14px;position:sticky;top:0;background:${EF.bg};` +
       `font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${EF.muted};`);
     head.append(el("span", `width:7px;height:7px;border-radius:50%;background:${a.online ? EF.ok : EF.edge};`));
-    head.append(el("span", null, selected));
+    const identity = el("span", "display:flex;flex-direction:column;gap:1px;min-width:0;");
+    identity.append(
+      el("span", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", semanticName(a)),
+      el("span", `color:${EF.accent};font-size:10px;font-weight:400;text-transform:none;`,
+        semanticAxes(a)),
+      el("span", `color:${EF.muted};font-size:9px;font-weight:400;text-transform:none;`,
+        `${a.state_label || a.state || "state:unrecorded"} · lifecycle:${a.lifecycle || "unrecorded"}`),
+      el("span", `color:${EF.muted};font-size:9px;font-weight:400;text-transform:none;`,
+        `control ${a.control_id || selected}`),
+    );
+    head.append(identity);
     if (a.roles_str) head.append(el("span", `color:${EF.accent};font-weight:400;text-transform:none;`, a.roles_str));
     wrap.append(head);
 
@@ -228,9 +266,8 @@
   window.north = window.north || {};
   window.north.mountAgents = function ({ el: root }) {
     if (!root) return;
-    // CLAUDE-CODE shape, top→bottom: the selected agent's CHAT (dominant) → the
-    // steer INPUT → the agent PICKER beneath the input (the spawned agents show
-    // up here; navigate via /resume + spawn, switch by clicking).
+    // Conversation-first shape, top→bottom: the selected agent's chat
+    // (dominant) → steer input → agent picker beneath it.
     root.style.cssText = "height:100%;display:flex;flex-direction:column;";
     chatEl = el("div", "flex:1 1 auto;min-height:0;overflow:auto;");
 

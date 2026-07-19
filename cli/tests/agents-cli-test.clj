@@ -32,6 +32,50 @@
 (defn fold-observed [facts]
   (reduce-kv north.agent-provenance/fold-fact {} facts))
 
+(let [fixtures (json/parse-string
+                (slurp (io/file root "sdk/test/fixtures/agent-roster-contract.json")))]
+  (check
+   "shared roster fixtures preserve semantic identity in the CLI projection"
+   (every?
+    true?
+    (for [{:strs [name id facts expected]} fixtures
+          :let [line (agent-primary-line {:online true} facts)
+                axes (str (get expected "providerLabel")
+                          " · " (get expected "modelDisplay")
+                          " · " (get expected "effortDisplay")
+                          " · " (get expected "gafferProvenance"))]]
+      (and (= (get expected "gafferProvenance") (gaffer-provenance facts))
+           (= (get expected "semanticHandle") (semantic-handle id facts))
+           (str/starts-with? line axes)
+           (= (get expected "displayName") (get facts "display_name"))
+           ;; Display text is output only. It cannot repair missing structured axes.
+           (or (not= name "missing-managed-axes")
+               (and (str/includes? line "gaffer:legacy-debt")
+                    (not (str/includes? line "designer")))))))))
+
+(let [native (first (json/parse-string
+                     (slurp (io/file root "sdk/test/fixtures/agent-roster-contract.json"))))
+      cases (get native "observationCases")]
+  (check
+   "native observation conflicts are deterministic and match the shared roster golden"
+   (every?
+    true?
+    (for [{:strs [observations expected]} cases
+          :let [facts (reduce (fn [acc [predicate value]]
+                                (north.agent-provenance/fold-fact acc predicate value))
+                              {} observations)
+                line (agent-primary-line {:online true} facts)]]
+      (and (= (get expected "providerLabel") (provider-target-label facts))
+           (= (get expected "gafferProvenance") (gaffer-provenance facts))
+           (= (get expected "semanticHandle")
+              (semantic-handle "session-native-7841e6b2" facts))
+           (str/starts-with?
+            line
+            (str (get expected "providerLabel") " · "
+                 (get expected "modelDisplay") " · "
+                 (get expected "effortDisplay") " · "
+                 (get expected "gafferProvenance"))))))))
+
 (check "preset roster line uses canonical structured axes"
        (= "anthropic:ambient · opus · xhigh · gaffer:designer · working: build the roster"
           (agent-primary-line {:online true}
@@ -250,7 +294,7 @@
               (agent-facts ["sdk-recovered" "legacy-session"]))]
   (check "a failed bulk projection recovers structured identity per live agent"
          (= {"provider" "openai" "model" "gpt-5.6-sol"}
-            (get facts "sdk-recovered")))
+            (select-keys (get facts "sdk-recovered") ["provider" "model"])))
   (check "a fact-less legacy row stays honestly unknown"
          (and (= {} (get facts "legacy-session"))
               (str/starts-with? (agent-primary-line {:online true} (get facts "legacy-session" {}))
