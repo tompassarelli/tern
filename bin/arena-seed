@@ -1,5 +1,5 @@
 #!/usr/bin/env bb
-;; EXP-025 ARENA seed — fabricates a filmable demo run for the north web arena.
+;; EXP-025 ARENA seed — fabricates a filmable demo run for North's fact corpus.
 ;;
 ;; Creates 5 shared tasks × 2 arms (control | graph) as board threads carrying
 ;; the fixed event contract (exp_id, arm, task_id, title, state, tokens,
@@ -78,7 +78,7 @@
     (assert! id "updated"  (now-iso))))
 
 (println "arena exp:" exp)
-(println "open:      http://127.0.0.1:8088/arena?exp=" exp)
+(println "inspect with: north arena" )
 (println)
 (println "capturing 10 task threads…")
 (doseq [idx (range 5) arm ["control" "graph"]] (capture! arm idx))
@@ -131,4 +131,4 @@
 
 (println)
 (println "done. control landed 3/5 (PR-188 blocked, PR-219 failed); graph landed 5/5.")
-(println "arena still live at: http://127.0.0.1:8088/arena?exp=" exp)
+(println "arena facts remain in the corpus; inspect with north arena")

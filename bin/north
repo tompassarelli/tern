@@ -139,7 +139,6 @@ north — your one card. Type a command to do the thing next to it.
     north routing report promotions   bespoke patterns for stock-template review
     north routing report calibration  run-local judgment/struggle detector cohorts
     north schema                       the fact vocabulary in use
-    web  http://127.0.0.1:8088         the browser cockpit (stakeholder view)
 
   HAND OFF WORK   (starts a new lane — your own channel never blocks)
     /delegate "<thing>" [--new]        chat: delegate; session context rides by

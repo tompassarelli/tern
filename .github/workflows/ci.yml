@@ -25,8 +25,6 @@ jobs:
           {
             echo "fram_repository=$(north/bin/github-flake-input-pin north/flake.lock fram repository)"
             echo "fram_ref=$(north/bin/github-flake-input-pin north/flake.lock fram revision)"
-            echo "beagle_repository=$(north/bin/github-flake-input-pin north/flake.lock beagle repository)"
-            echo "beagle_ref=$(north/bin/github-flake-input-pin north/flake.lock beagle revision)"
             echo "gaffer_repository=$(north/bin/github-flake-input-pin north/flake.lock gaffer repository)"
             echo "gaffer_ref=$(north/bin/github-flake-input-pin north/flake.lock gaffer revision)"
           } >> "$GITHUB_OUTPUT"
@@ -36,29 +34,6 @@ jobs:
           repository: ${{ steps.sources.outputs.fram_repository }}
           ref: ${{ steps.sources.outputs.fram_ref }}
           path: fram
-
-      # web-bjs/out is generated, never trusted from a checkout. Pin the
-      # compiler used to regenerate it just as strictly as the Fram engine.
-      - name: Checkout Beagle compiler (pinned)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: ${{ steps.sources.outputs.beagle_repository }}
-          ref: ${{ steps.sources.outputs.beagle_ref }}
-          path: beagle
-
-      - name: Checkout Gaffer routing contract (pinned)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          repository: ${{ steps.sources.outputs.gaffer_repository }}
-          ref: ${{ steps.sources.outputs.gaffer_ref }}
-          path: gaffer
-
-      - name: Verify locked source identities
-        run: |
-          set -euo pipefail
-          test "$(git -C fram rev-parse HEAD)" = "${{ steps.sources.outputs.fram_ref }}"
-          test "$(git -C beagle rev-parse HEAD)" = "${{ steps.sources.outputs.beagle_ref }}"
-          test "$(git -C gaffer rev-parse HEAD)" = "${{ steps.sources.outputs.gaffer_ref }}"
 
       - name: Install babashka
         run: |
@@ -289,32 +264,6 @@ jobs:
           bun run check
           bun run test
 
-      - name: Build pinned Beagle compiler
-        id: beagle
-        working-directory: north
-        run: |
-          set -euo pipefail
-          out="$(nix build --no-link --print-out-paths 'path:../beagle#beagle')"
-          test -x "$out/bin/beagle"
-          test -f "$out/beagle-lib/lib/beagle/core.js"
-          echo "$out/bin" >> "$GITHUB_PATH"
-          echo "runtime=$out/beagle-lib/lib/beagle" >> "$GITHUB_OUTPUT"
-
-      - name: Compile and test Beagle web boundary
-        working-directory: north
-        env:
-          BEAGLE_RUNTIME: ${{ steps.beagle.outputs.runtime }}
-        run: |
-          set -euo pipefail
-          rm -rf web-bjs/out web-bjs/node_modules
-          mkdir -p web-bjs/node_modules
-          ln -s "$BEAGLE_RUNTIME" web-bjs/node_modules/beagle
-          BEAGLE_EMIT_SRCLOC=0 beagle build web-bjs/src --out web-bjs/out
-          while IFS= read -r -d '' js; do
-            node --check "$js"
-          done < <(find web-bjs/out -type f -name '*.js' -print0)
-          bun test web-bjs/test/*.test.js
-
       - name: Build locked North Nix package
         working-directory: north
         run: |
@@ -322,24 +271,6 @@ jobs:
           out="$(nix build --no-link --print-build-logs --print-out-paths \
             'path:.#packages.x86_64-linux.default')"
           test -x "$out/bin/north"
-          web_out="$(nix build --no-link --print-build-logs --print-out-paths \
-            'path:.#packages.x86_64-linux.north-web')"
-          test -x "$web_out/bin/north-web"
-          test ! -e "$web_out/libexec/north-web/smoke.js"
-          test -f "$web_out/libexec/north-web/node_modules/beagle/core.js"
-          test -f "$web_out/libexec/north-web/node_modules/beagle/hamt.js"
-          test -f "$web_out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
-          grep -q 'The Cytoscape Consortium' \
-            "$web_out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
-          test ! -e "$web_out/share/north-web/static/assets/js/app.js"
-          test ! -e "$web_out/share/north-web/static/hologram"
-          test ! -e "$web_out/share/north-web/static/images/logo.svg"
-          test ! -e "$web_out/share/north-web/static/js/dag.js"
-          if nix-store -qR "$web_out" |
-            grep -Ei '/[^/]*(beagle|racket|nodejs|babashka)-'; then
-            echo "north-web retained a compiler/test-only runtime dependency" >&2
-            exit 1
-          fi
   package-x86_64-linux:
     needs: test
     runs-on: ${{ vars.NORTH_PACKAGE_RUNNER || 'ubuntu-24.04' }}

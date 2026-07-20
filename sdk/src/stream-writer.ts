@@ -9,8 +9,8 @@ const streamDir = () =>
   process.env.NORTH_STREAM_DIR ??
   join(process.env.HOME ?? "", "code/agent-data");
 
-// Write SDK messages to .stream.jsonl in the same format the web client tails.
-// This bridges SDK dispatch into the existing web client without changing the bridge.
+// Write SDK messages to .stream.jsonl in the stable stream format consumed by
+// North's local coordination tools.
 export class StreamWriter {
   private path: string;
 
@@ -28,7 +28,7 @@ export class StreamWriter {
     appendFileSync(this.path, JSON.stringify(event) + "\n");
   }
 
-  // Normalize an SDK message into the stream format the web client expects.
+  // Normalize an SDK message into the canonical stream format.
   writeSDKMessage(message: any) {
     if (message.type === "assistant" && message.message?.content) {
       this.write({

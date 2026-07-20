@@ -12,11 +12,11 @@ always-loaded surface: load-bearing rules + thin pointers. Detail lives in what 
 
 Agent coordination uses the **TypeScript SDK** (`~/code/north/sdk/`), not bash scripts.
 
-- **Dispatch**: `bun run ~/code/north/sdk/src/dispatch.ts <thread-id>` — reads thread facts, derives posture (unplanned/atomic/composite), injects the right prompt + tool set, streams to the web client.
+- **Dispatch**: `bun run ~/code/north/sdk/src/dispatch.ts <thread-id>` — reads thread facts, derives posture (unplanned/atomic/composite), injects the right prompt + tool set, and records the run stream.
 - **Spawn**: `bun run ~/code/north/sdk/src/spawn.ts <prompt>` — direct agent spawn with SDK `query()`.
 - **Parallel**: `spawnParallel()` in `~/code/north/sdk/src/spawn.ts` — `Promise.all` over multiple agents.
 - **Work queue**: north threads on **:7977** — `ready`/`next`/`leverage` to pick; acquire a thread with `driver @agent`.
-- **Observe/steer**: web client on **:8088** — tails each agent's stream, `/steer`.
+- **Observe/steer**: `north agents`, `north show`, and `north steer` over the coordination CLI.
 - **Concurrency lives in the engine** (the DB owns it): write-serialization + OCC + the **lease** primitive in fram's `coord.clj`.
 
 ## Write safely (fact-backed, concurrent agents)

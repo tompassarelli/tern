@@ -175,11 +175,10 @@
           #{})))))
 
 (defn daemon-health []
-  ;; Two daemons is the whole surface (2026-07-09): the fact coordinator and
-  ;; the web cockpit. :7978/:7980 retired — modules deleted in nixos-config.
+  ;; The fact coordinator is the only North daemon surface. Web modules and
+  ;; their listeners were retired; dashboard health must not report them.
   (let [ports (listening-ports)]
     {:north (contains? ports PORT)     ; fact coordinator (the canonical log)
-     :web  (contains? ports "8088")   ; bjs/Bun cockpit
      :ports ports}))
 
 ;; ---- presence: live agents --------------------------------------------------
@@ -441,8 +440,7 @@
     (println)
     ;; daemons
     (println (bold "daemons"))
-    (println (str "  " PORT " facts " (ok-x (:north dh))
-                  "   8088 web " (ok-x (:web dh))))
+    (println (str "  " PORT " facts " (ok-x (:north dh))))
     (println)
     ;; health — north health condensed (lanes ran/died + STALE concerns)
     (println (bold "health") (dim "» north health"))
@@ -514,8 +512,7 @@
   ;; daemons
   (let [dh (daemon-health)]
     (println (bold "  daemons"))
-    (doseq [[label k crit] [[(str PORT " facts (the coordinator — everything reads/writes here)") :north true]
-                            ["8088 web (bjs/Bun cockpit)" :web false]]]
+    (doseq [[label k crit] [[(str PORT " facts (the coordinator — everything reads/writes here)") :north true]]]
       (let [up (get dh k)]
         (println (str "    " (if up (grn "[ok]  ") (if crit (red "[ERR] ") (ylw "[warn]")))
                       " " label " " (ok-x up))))))

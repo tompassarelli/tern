@@ -768,7 +768,7 @@
                 {:content [{:type "text"
                             :text (str (startup-summary "dispatched" startup suffix)
                                        (when (= :ready (:status startup))
-                                         " Watch via web client (:8088) or `show` the thread."))}]}
+                                         " Watch with `north show` or `north agents`."))}]}
                 (do
                   (release-driver! id agent-id)
                   {:content [{:type "text" :text (north.spawn-process/failure-message startup)}]
@@ -824,7 +824,7 @@
               {:content [{:type "text"
                           :text (str (startup-summary "spawned" startup suffix)
                                      (when (= :ready (:status startup))
-                                       " Watch via web client (:8088)."))}]}
+                                       " Watch with `north show` or `north agents`."))}]}
               {:content [{:type "text" :text (north.spawn-process/failure-message startup)}]
                :isError true}))
             (catch Exception _

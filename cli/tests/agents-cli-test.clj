@@ -398,70 +398,15 @@
   (check "roster intake rejects prose instead of scraping human columns"
          (= "presence projection was malformed" (:err prose))))
 
-(let [identity
-      {"control_id" "lane-a"
-       "display_handle" "openai-sol-high-gaffer-integrator-a"
-       "kind" "lane"
-       "provider" "openai"
-       "provider_target" "codex-personal"
-       "provider_label" "openai:codex-personal"
-       "model" "gpt-5.6-sol"
-       "model_display" "sol"
-       "effort" "high"
-       "gaffer_provenance" "gaffer:integrator"}
-      cli {"version" ROSTER-CONTRACT-VERSION
-           "agents" [(merge identity
-                            {"display_name" "working: old task"
-                             "state" "working"
-                             "state_label" "working"
-                             "task" "old task"})]}
-      web {"version" ROSTER-CONTRACT-VERSION
-           "agents" [(merge identity
-                            {"display_name" "finished: new task"
-                             "state" "finished"
-                             "state_label" "finished(process:ran, delivery:reported)"
-                             "task" "new task"})]}]
-  (check "CLI/web parity compares stable semantic identity, not a volatile task snapshot"
-         (= (comparable-roster cli) (comparable-roster web)))
-  (check "CLI/web parity still detects a semantic handle mismatch"
-         (not=
-          (comparable-roster cli)
-          (comparable-roster
-           (assoc-in web ["agents" 0 "display_handle"]
-                     "anthropic-opus-xhigh-gaffer-designer-a"))))
-  (let [web-samples (atom [web web])
-        refreshes (atom 0)
-        converged
-        (parity-with-resample
-         (assoc-in cli ["agents" 0 "display_handle"] "stale-route-a")
-         #(let [sample (first @web-samples)]
-            (swap! web-samples subvec 1)
-            sample)
-         #(do (swap! refreshes inc) {:snapshot web}))
-        persistent
-        (parity-with-resample
-         cli
-         (constantly
-          (assoc-in web ["agents" 0 "display_handle"]
-                    "persistently-different-a"))
-         #(do (swap! refreshes inc) {:snapshot cli}))]
-    (check "parity accepts a stable second sample after one honest route transition"
-           (and (:ok converged) (= 2 (:attempts converged))))
-    (check "parity fails after one bounded resample when semantic drift persists"
-           (and (false? (:ok persistent)) (= 2 (:attempts persistent))))
-    (check "parity performs at most one fresh CLI resample per comparison"
-           (= 2 @refreshes))))
-
 (let [help (proc/shell {:out :string :err :string :continue true
                         :extra-env {"NO_COLOR" "1"}}
                        (str root "/bin/north") "agents" "--help")
       unknown (proc/shell {:out :string :err :string :continue true
                            :extra-env {"NO_COLOR" "1"}}
                           (str root "/bin/north") "agents" "--bogus")]
-  (check "agents help documents the versioned JSON and parity modes"
+  (check "agents help documents the versioned JSON mode"
          (and (zero? (:exit help))
-              (str/includes? (:out help) "north:agent-roster:v1")
-              (str/includes? (:out help) "--check-web")))
+              (str/includes? (:out help) "north:agent-roster:v1")))
   (check "agents rejects unknown options without probing presence"
          (and (= 1 (:exit unknown))
               (str/includes? (:err unknown) "unknown option --bogus")

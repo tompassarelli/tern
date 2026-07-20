@@ -601,10 +601,9 @@
   (println "  north agents")
   (println "  north agents --verbose")
   (println "  north agents --json")
-  (println "  north agents --check-web http://127.0.0.1:8088")
   (println)
-  (println "--json emits the versioned north:agent-roster:v1 machine contract.")
-  (println "--check-web mechanically compares the CLI projection with /api/agents."))
+  (println "--json emits the versioned north:agent-roster:v1 machine contract."))
+
 
 (defn- agents-error! [message]
   (binding [*out* *err*]
@@ -631,14 +630,6 @@
           (if (or (:verbose options) (not= :human (:mode options)))
             (agents-error! "conflicting or duplicate option --json")
             (recur (vec more) (assoc options :mode :json)))
-
-          (= "--check-web" arg)
-          (let [url (first more)]
-            (when (or (nil? url) (str/starts-with? url "-"))
-              (agents-error! "--check-web requires one loopback HTTP URL"))
-            (when (or (:verbose options) (not= :human (:mode options)))
-              (agents-error! "conflicting or duplicate option --check-web"))
-            (recur (vec (rest more)) (assoc options :mode :check-web :web-url url)))
 
           :else (agents-error! (str "unknown option " arg)))))))
 
@@ -697,87 +688,8 @@
              (sort-by #(get % "control_id"))
              vec)))))
 
-(defn- canonical-web-roster-url [raw]
-  (try
-    (let [base (java.net.URI/create raw)
-          host (some-> (.getHost base) str/lower-case)
-          scheme (.getScheme base)]
-      (when-not (and (= "http" scheme)
-                     (#{"127.0.0.1" "localhost" "::1"} host)
-                     (pos? (.getPort base))
-                     (nil? (.getUserInfo base))
-                     (nil? (.getQuery base))
-                     (nil? (.getFragment base)))
-        (throw (ex-info "not an explicit loopback HTTP origin" {})))
-      (let [path (or (.getPath base) "")
-            endpoint (cond
-                       (= path "/api/agents") raw
-                       (= path "") (str raw "/api/agents")
-                       (= path "/") (str/replace raw #"/$" "/api/agents")
-                       :else (throw (ex-info "path must be / or /api/agents" {})))]
-        endpoint))
-    (catch Exception _
-      (agents-error! "--check-web requires http://127.0.0.1:<port>[/api/agents]"))))
-
-(defn- fetch-web-roster [raw-url]
-  (let [url (canonical-web-roster-url raw-url)
-        client (java.net.http.HttpClient/newBuilder)
-        client (-> client
-                   (.connectTimeout (java.time.Duration/ofSeconds 3))
-                   (.build))
-        request (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
-                    (.timeout (java.time.Duration/ofSeconds 10))
-                    (.GET)
-                    (.build))
-        response (.send client request
-                        (java.net.http.HttpResponse$BodyHandlers/ofString))]
-    (when-not (= 200 (.statusCode response))
-      (agents-error! (str "web roster returned HTTP " (.statusCode response))))
-    (try
-      (json/parse-string (.body response))
-      (catch Exception _ (agents-error! "web roster returned malformed JSON")))))
-
-(defn- parity-with-resample [initial-snapshot sample-web refresh-cli]
-  (loop [snapshot initial-snapshot attempt 1]
-    (let [cli (comparable-roster snapshot)
-          web (comparable-roster (sample-web))]
-      (cond
-        (nil? cli) {:error "CLI roster violated north:agent-roster:v1"}
-        (nil? web) {:error "web roster violated north:agent-roster:v1"}
-        (= cli web) {:ok true :cli cli :web web :attempts attempt}
-        (= attempt 1)
-        (let [fresh (refresh-cli)]
-          (if (:err fresh)
-            {:error (:err fresh)}
-            (recur (:snapshot fresh) 2)))
-        :else {:ok false :cli cli :web web :attempts attempt}))))
-
-(defn- check-web-parity! [snapshot url]
-  (let [{:keys [ok error cli web attempts]}
-        (parity-with-resample snapshot
-                              #(fetch-web-roster url)
-                              read-roster-snapshot)]
-    (cond
-      error (agents-error! error)
-      (not ok)
-      (let [cli-ids (set (map #(get % "control_id") cli))
-            web-ids (set (map #(get % "control_id") web))
-            mismatch (first (remove (fn [[left right]] (= left right))
-                                    (map vector cli web)))]
-        (binding [*out* *err*]
-          (println "north agents: CLI/web roster parity FAILED")
-          (println "  CLI-only controls:" (str/join "," (sort (set/difference cli-ids web-ids))))
-          (println "  web-only controls:" (str/join "," (sort (set/difference web-ids cli-ids))))
-          (when mismatch
-            (println "  first projection mismatch:" (json/generate-string mismatch))))
-        (System/exit 1))
-      :else
-      (println (str "agent roster parity: OK · " (count cli)
-                    " active controls · " ROSTER-CONTRACT-VERSION
-                    (when (= attempts 2) " · stable after one resample"))))))
-
 (defn cmd-agents [args]
-  (let [{:keys [mode verbose help web-url]} (parse-agents-options args)]
+  (let [{:keys [mode verbose help]} (parse-agents-options args)]
     (if help
       (agents-usage)
       (do
@@ -796,7 +708,6 @@
                   snapshot (:snapshot loaded)]
               (case mode
                 :json (println (json/generate-string snapshot))
-                :check-web (check-web-parity! snapshot web-url)
                 (let [categorized
                           (group-by (fn [a] (roster-category (get af (:id a) {}))) rows)
                           active-agents (vec (get categorized :active-agent []))
@@ -1655,7 +1566,7 @@
         (do (echo-cmd "tail -n 40 -f" (str log))
             (p/exec "tail" "-n" "40" "-f" (str log)))
         (do (println (ylw "no transcript log at") (str log))
-            (println "fallback:" (cyn "open http://127.0.0.1:8088") (dim "(north web)")))))))
+            (println "fallback: run north agents or north show from the coordination CLI"))))))
 
 (defn cmd-tell-agent [args]
   (north.topology-authority/require-coordination! "steer")

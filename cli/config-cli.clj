@@ -481,7 +481,7 @@
    north   (default) native Agent/Task/Workflow calls are DENIED by a
            PreToolUse hook and redirected to the north SDK: mcp__north__spawn
            (ad-hoc) / mcp__north__dispatch (thread-driven). SDK workers are
-           persistent, dormant-until-pinged, observable (web :8088),
+           persistent, dormant-until-pinged, observable through North CLI/MCP,
            steerable (msg-cli :7977). Model, effort, and caveman all have
            per-spawn opts on mcp__north__spawn. Managed children scrub ambient
            routing/staffing variables: model and effort come from the request's

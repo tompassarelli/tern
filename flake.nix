@@ -16,17 +16,13 @@
       url = "github:tompassarelli/fram";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    beagle = {
-      url = "github:tompassarelli/beagle";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     gaffer = {
       url = "github:tompassarelli/gaffer";
       flake = false;
     };
   };
 
-  outputs = { self, nixpkgs, nixpkgs-master, flake-utils, fram, beagle, gaffer }:
+  outputs = { self, nixpkgs, nixpkgs-master, flake-utils, fram, gaffer }:
     # nixpkgs' current Babashka no longer supports x86_64-darwin. Publish only
     # the three systems whose complete North runtime closure is evaluable.
     flake-utils.lib.eachSystem [
@@ -162,8 +158,6 @@
         framBabashkaClasspath =
           framPkg.babashkaClasspath or
             (throw "Fram package must publish passthru.babashkaClasspath");
-        beaglePkg = beagle.packages.${system}.default;
-        beagleSource = beagle.outPath;
         sdkPlatform =
           if pkgs.stdenv.hostPlatform.isLinux then
             if pkgs.stdenv.hostPlatform.isx86_64 then
@@ -215,26 +209,6 @@
             ./bin/ensure-private-docs
           ];
         };
-        webRuntimeSource = lib.fileset.toSource {
-          root = ./.;
-          fileset = lib.fileset.unions [
-            ./web-bjs/src
-            ./web/priv/static/assets/css/app.css
-            ./web/priv/static/favicon.ico
-            ./web/priv/static/js/board-write.js
-            ./web/priv/static/js/cytoscape.min.js
-            ./web/priv/static/js/north-agents.js
-            ./web/priv/static/js/north-app.js
-            ./web/priv/static/js/north-arena.js
-            ./web/priv/static/js/north-board.js
-            ./web/priv/static/js/north-list.js
-            ./web/priv/static/js/north-ui.js
-            ./web/priv/static/js/wake-mounts.js
-            ./web/priv/static/robots.txt
-            ./LICENSE
-          ];
-        };
-
         # Runtime-only Gaffer contract. Generated adapters, authoring scripts,
         # skills, and private docs stay out of North's closure.
         gafferContract = pkgs.stdenvNoCC.mkDerivation {
@@ -276,269 +250,6 @@
             chmod +x $out/node_modules/${sdkPlatform.packageName}/claude
             runHook postInstall
           '';
-        };
-
-        # The web cockpit is compiled from Beagle/JS by the exact locked
-        # compiler, but its runtime closure contains only emitted JavaScript,
-        # static assets, Beagle's two small JS runtime files, and Bun.
-        northWebPkg = pkgs.stdenvNoCC.mkDerivation {
-          pname = "north-web";
-          version = "0.1.0";
-          src = webRuntimeSource;
-          nativeBuildInputs = [
-            beaglePkg
-            pkgs.babashka
-            pkgs.makeWrapper
-            pkgs.nodejs
-            pkgs.ripgrep
-          ];
-          disallowedReferences = [
-            beaglePkg
-            beagleSource
-            pkgs.babashka
-            pkgs.nodejs
-          ];
-          dontConfigure = true;
-          buildPhase = ''
-            runHook preBuild
-            export HOME="$TMPDIR/home"
-            mkdir -p "$HOME" build
-            BEAGLE_EMIT_SRCLOC=0 \
-              ${beaglePkg}/bin/beagle build web-bjs/src --out build/out
-            # smoke.bjs is a developer probe, not part of the boot import
-            # graph. Keep the source tool while making the production graph
-            # exact and reviewable.
-            rm build/out/smoke.js
-            actual_modules="$(${pkgs.findutils}/bin/find \
-              build/out -type f -name "*.js" -printf "%P\n" \
-              | LC_ALL=C ${pkgs.coreutils}/bin/sort)"
-            expected_modules="$(cat <<'EOF'
-north/arena.js
-north/boot.js
-north/dict.js
-north/fram.js
-north/id.js
-north/presence.js
-north/server.js
-north/stream.js
-north/threads.js
-EOF
-)"
-            if [ "$actual_modules" != "$expected_modules" ]; then
-              echo "north-web emitted module manifest drifted" >&2
-              ${pkgs.diffutils}/bin/diff -u \
-                <(printf "%s\n" "$expected_modules") \
-                <(printf "%s\n" "$actual_modules") >&2 || true
-              exit 1
-            fi
-            while IFS= read -r -d "" js; do
-              ${pkgs.nodejs}/bin/node --check "$js"
-            done < <(${pkgs.findutils}/bin/find build/out -type f -name "*.js" -print0)
-            if ${pkgs.ripgrep}/bin/rg -n \
-              '\bor\(|\b(?:await|if|new)[$]|delete[$]' build/out; then
-              echo "north-web compiler emitted an unresolved helper" >&2
-              exit 1
-            fi
-            runHook postBuild
-          '';
-          installPhase = ''
-            runHook preInstall
-            mkdir -p \
-              "$out/bin" \
-              "$out/libexec/north-web/node_modules/beagle" \
-              "$out/share/licenses/north-web" \
-              "$out/share/north-web/static/assets/css" \
-              "$out/share/north-web/static/js"
-            cp -r build/out/. "$out/libexec/north-web/"
-            cp \
-              ${beaglePkg}/beagle-lib/lib/beagle/core.js \
-              ${beaglePkg}/beagle-lib/lib/beagle/hamt.js \
-              "$out/libexec/north-web/node_modules/beagle/"
-            cp web/priv/static/assets/css/app.css \
-              "$out/share/north-web/static/assets/css/"
-            cp \
-              web/priv/static/js/board-write.js \
-              web/priv/static/js/cytoscape.min.js \
-              web/priv/static/js/north-agents.js \
-              web/priv/static/js/north-app.js \
-              web/priv/static/js/north-arena.js \
-              web/priv/static/js/north-board.js \
-              web/priv/static/js/north-list.js \
-              web/priv/static/js/north-ui.js \
-              web/priv/static/js/wake-mounts.js \
-              "$out/share/north-web/static/js/"
-            cp \
-              web/priv/static/favicon.ico \
-              web/priv/static/robots.txt \
-              "$out/share/north-web/static/"
-            cp LICENSE "$out/share/licenses/north-web/NORTH-LICENSE"
-            cp ${beagleSource}/LICENSE \
-              "$out/share/licenses/north-web/BEAGLE-LICENSE"
-            # Cytoscape's vendored bundle begins with its complete MIT notice.
-            # Publish that header separately while retaining it in the asset.
-            ${pkgs.gnused}/bin/sed -n '1,21p' \
-              web/priv/static/js/cytoscape.min.js \
-              > "$out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
-            ${pkgs.gnugrep}/bin/grep -q \
-              'Copyright (c) 2016-2024, The Cytoscape Consortium' \
-              "$out/share/licenses/north-web/CYTOSCAPE-MIT-LICENSE"
-            test "$(${pkgs.findutils}/bin/find \
-              "$out/share/north-web/static" -type f | wc -l)" -eq 12
-            makeWrapper ${pkgs.bun}/bin/bun "$out/bin/north-web" \
-              --add-flags "$out/libexec/north-web/north/boot.js" \
-              --set-default NORTH_WEB_BIND 127.0.0.1 \
-              --set-default STATIC_DIR "$out/share/north-web/static"
-
-            impurity_pattern='/(home|Users)/|/run/current-system/sw|/code/north(?:/|\b)|~/code/north|[$]HOME/code/north|[.]m2|[.]cpcache|[.]cache/babashka'
-            if LC_ALL=C ${pkgs.ripgrep}/bin/rg --hidden --no-ignore -l \
-              "$impurity_pattern" "$out"; then
-              echo "north-web package contains a checkout/home/cache path" >&2
-              exit 1
-            fi
-            if LC_ALL=C ${pkgs.ripgrep}/bin/rg --hidden --no-ignore -l -F \
-              '${beaglePkg}' "$out"; then
-              echo "north-web package retains the Beagle compiler" >&2
-              exit 1
-            fi
-            runHook postInstall
-          '';
-          doInstallCheck = true;
-          installCheckPhase = ''
-            runHook preInstallCheck
-
-            # The runtime module graph must import with no HOME, PATH, checkout,
-            # compiler, or ambient node_modules.
-            ${pkgs.coreutils}/bin/env -i \
-              PATH= NORTH_WEB_NO_AUTOSTART=1 \
-              ${pkgs.bun}/bin/bun -e \
-                'await import(process.argv[1])' \
-                "$out/libexec/north-web/north/boot.js"
-
-            if ${pkgs.coreutils}/bin/env -i PATH= \
-              "$out/bin/north-web" \
-              > "$TMPDIR/missing-corpus.out" \
-              2> "$TMPDIR/missing-corpus.err"; then
-              echo "north-web started without FRAM_LOG" >&2
-              exit 1
-            fi
-            ${pkgs.gnugrep}/bin/grep -Fq \
-              'FRAM_LOG must name an existing corpus before north-web can start' \
-              "$TMPDIR/missing-corpus.err"
-
-            if ${pkgs.coreutils}/bin/env -i \
-              PATH= FRAM_LOG="$TMPDIR/nonexistent/facts.log" \
-              "$out/bin/north-web" \
-              > "$TMPDIR/nonexistent-corpus.out" \
-              2> "$TMPDIR/nonexistent-corpus.err"; then
-              echo "north-web started with a nonexistent FRAM_LOG" >&2
-              exit 1
-            fi
-            ${pkgs.gnugrep}/bin/grep -Fq \
-              'FRAM_LOG must name an existing corpus before north-web can start' \
-              "$TMPDIR/nonexistent-corpus.err"
-
-            smoke="$TMPDIR/north-web-smoke"
-            mkdir -p "$smoke"
-            : > "$smoke/facts.log"
-            web_port="$(${pkgs.babashka}/bin/bb -e \
-              '(with-open [s (java.net.ServerSocket. 0)]
-                 (println (.getLocalPort s)))')"
-            coord_port="$(${pkgs.babashka}/bin/bb -e \
-              '(with-open [s (java.net.ServerSocket. 0)]
-                 (println (.getLocalPort s)))')"
-            web_pid=
-            cleanup_web_smoke() {
-              if [ -n "$web_pid" ]; then
-                kill "$web_pid" 2>/dev/null || true
-                wait "$web_pid" 2>/dev/null || true
-              fi
-            }
-            trap cleanup_web_smoke EXIT
-            ${pkgs.coreutils}/bin/env -i \
-              PATH= \
-              FRAM_LOG="$smoke/facts.log" \
-              NORTH_PORT="$coord_port" \
-              PORT="$web_port" \
-              "$out/bin/north-web" \
-              > "$smoke/server.out" 2> "$smoke/server.err" &
-            web_pid=$!
-
-            ready=0
-            for _ in $(seq 1 100); do
-              if ${pkgs.bun}/bin/bun -e \
-                'try {
-                   const response = await fetch(process.argv[1]);
-                   process.exit(response.status === 200 ? 0 : 1);
-                 } catch {
-                   process.exit(1);
-                 }' \
-                "http://127.0.0.1:$web_port/"; then
-                ready=1
-                break
-              fi
-              sleep 0.05
-            done
-            if [ "$ready" -ne 1 ]; then
-              cat "$smoke/server.err" >&2
-              echo "north-web package smoke: server did not become ready" >&2
-              exit 1
-            fi
-
-            ${pkgs.bun}/bin/bun -e \
-              'const base = process.argv[1];
-               const html = await fetch(base + "/");
-               if (html.status !== 200
-                   || !(await html.text()).includes("<!doctype html>")) {
-                 process.exit(1);
-               }
-               const assets = [
-                 "/assets/css/app.css",
-                 "/favicon.ico",
-                 "/js/board-write.js",
-                 "/js/cytoscape.min.js",
-                 "/js/north-agents.js",
-                 "/js/north-app.js",
-                 "/js/north-arena.js",
-                 "/js/north-board.js",
-                 "/js/north-list.js",
-                 "/js/north-ui.js",
-                 "/js/wake-mounts.js",
-                 "/robots.txt",
-               ];
-               for (const path of assets) {
-                 const response = await fetch(base + path);
-                 if (response.status !== 200
-                     || (await response.arrayBuffer()).byteLength === 0) {
-                   process.exit(1);
-                 }
-               }
-               for (const retired of [
-                 "/assets/js/app.js",
-                 "/hologram/runtime.js",
-                 "/images/logo.svg",
-                 "/js/dag.js",
-               ]) {
-                 if ((await fetch(base + retired)).status !== 404) {
-                   process.exit(1);
-                 }
-               }' \
-              "http://127.0.0.1:$web_port"
-            kill "$web_pid"
-            wait "$web_pid" 2>/dev/null || true
-            web_pid=
-            runHook postInstallCheck
-          '';
-
-          meta = with lib; {
-            description = "North local web cockpit";
-            license = [ licenses.asl20 licenses.mit ];
-            mainProgram = "north-web";
-            platforms = [
-              "x86_64-linux"
-              "aarch64-linux"
-              "aarch64-darwin"
-            ];
-          };
         };
 
         # north CLI + MCP. Same relocatable layout. FRAM_HOME is baked to the
@@ -1227,7 +938,6 @@ PY
           # This is the exact derivation injected into managed OpenAI lanes;
           # Firn can install and attest the same executable without repackaging.
           codex = codexPkg;
-          north-web = northWebPkg;
           fram-engine = framPkg;
         };
 
@@ -1253,20 +963,12 @@ PY
             program = "${northPkg}/bin/north-mcp";
             meta.description = "North fact and coordination MCP server";
           };
-          north-web = {
-            type = "app";
-            program = "${northWebPkg}/bin/north-web";
-            meta.description = "North local web cockpit";
-          };
         };
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            # north CLI + the bjs/Bun web cockpit (web-bjs/). The Elixir/Phoenix
-            # app was retired 2026-07-10 (see web-v1-archive/); beagle is provided
-            # system-wide by the nixos beagle module.
+            # North CLI + MCP. Archived web sources are not part of the shell.
             babashka
-            bun
           ];
         };
       });
