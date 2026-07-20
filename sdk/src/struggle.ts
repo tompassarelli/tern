@@ -19,7 +19,14 @@ export interface StrugglePolicy {
 
 export interface StruggleState {
   readonly policy: StrugglePolicy;
+  // `turn` counts every assistant message the provider emits (raw provider event
+  // index, used only for the diagnostic breadcrumb). `workTurns` counts only turns
+  // that issued at least one tool_use — the genuine progress-attempt turns the
+  // no-progress clock is measured against. Pre-tool provider events (streamed
+  // text, reasoning/thinking-only assistant messages) advance `turn` but NOT
+  // `workTurns`, so a startup narration burst cannot masquerade as a stall.
   turn: number;
+  workTurns: number;
   consecutiveErrors: number;
   totalErrors: number;
   lastProgressTurn: number;
@@ -146,6 +153,7 @@ export function makeStruggleState(
   return {
     policy,
     turn: 0,
+    workTurns: 0,
     consecutiveErrors: 0,
     totalErrors: 0,
     lastProgressTurn: 0,
@@ -164,12 +172,20 @@ function fingerprint(name: string, input: unknown): string {
 export function updateStruggle(message: any, state: StruggleState): void {
   if (message?.type === "assistant") {
     state.turn++;
+    let toolUses = 0;
     for (const block of message.message?.content ?? []) {
       if (block?.type !== "tool_use") continue;
+      toolUses++;
       state.pending.set(block.id, block.name);
       state.fingerprints.push(fingerprint(block.name, block.input));
       if (state.fingerprints.length > state.policy.loopWindow) state.fingerprints.shift();
     }
+    // Only tool-issuing turns are work turns. A tool_use-free assistant message is
+    // provider narration/reasoning or a streamed pre-tool event — real evidence of
+    // NON-progress requires the agent to have actually acted. Advancing the stall
+    // clock on these events is exactly the observed false positive: no_progress
+    // fired at turn 6, 0 tool errors, before the worker's first tool call.
+    if (toolUses > 0) state.workTurns++;
     return;
   }
   if (message?.type !== "user") return;
@@ -182,7 +198,8 @@ export function updateStruggle(message: any, state: StruggleState): void {
       state.totalErrors++;
     } else {
       state.consecutiveErrors = 0;
-      if (STRUGGLE_PROGRESS_TOOLS.has(name)) state.lastProgressTurn = state.turn;
+      // Baseline the no-progress clock in work-turn units (see StruggleState.turn).
+      if (STRUGGLE_PROGRESS_TOOLS.has(name)) state.lastProgressTurn = state.workTurns;
     }
   }
 }
@@ -195,7 +212,7 @@ export function checkStruggle(state: StruggleState): StruggleTrigger | null {
     counts.set(value, count);
     if (count >= state.policy.loopRepeat) return "tool_loop";
   }
-  if (state.turn - state.lastProgressTurn >= state.policy.noProgressTurns) return "no_progress";
+  if (state.workTurns - state.lastProgressTurn >= state.policy.noProgressTurns) return "no_progress";
   return null;
 }
 

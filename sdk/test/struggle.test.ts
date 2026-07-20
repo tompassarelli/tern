@@ -19,6 +19,20 @@ function toolResult(
   ] } }, state);
 }
 
+// Tool_use-free assistant messages, one per applicable provider event shape: a
+// streamed text preamble, an Anthropic extended-thinking block, a Codex-style
+// reasoning block, and empty/absent content. None of these carries tool activity,
+// so none is a work turn.
+function preToolShapes(index: number): unknown[] {
+  return [
+    { type: "assistant", message: { content: [{ type: "text", text: `planning ${index}` }] } },
+    { type: "assistant", message: { content: [{ type: "thinking", thinking: `weighing ${index}` }] } },
+    { type: "assistant", message: { content: [{ type: "reasoning", summary: `reasoning ${index}` }] } },
+    { type: "assistant", message: { content: [] } },
+    { type: "assistant", message: {} },
+  ];
+}
+
 test("topology policy defaults and strict bounded overrides are deterministic", () => {
   const workerPolicy = resolveStrugglePolicy("worker", {});
   expect(workerPolicy).toEqual({
@@ -124,4 +138,67 @@ test("no-progress is topology-bound and the observer snapshots the full policy",
     expect(Object.isFrozen(snapshot.triggers)).toBe(true);
     expect(() => { (snapshot.triggers as StruggleTrigger[]).push("tool_loop"); }).toThrow(TypeError);
   }
+});
+
+// FALSE POSITIVE: the exact systemic regression seen on three terminal workers —
+// no_progress fired at turn 6, 0 tool errors, BEFORE the first tool call. A burst
+// of tool_use-free provider events (any shape) must not exhaust the stall budget.
+test("pre-tool provider events never fire no_progress before the first tool call", () => {
+  for (const [topology, threshold] of [["worker", 6], ["orchestrator", 12]] as const) {
+    const observer = makeStruggleObserver(resolveStrugglePolicy(topology, {}));
+    // Feed well past the threshold across every applicable pre-tool event shape.
+    for (let index = 0; index < threshold * 2; index++) {
+      for (const message of preToolShapes(index)) {
+        expect(observer.observe(message)).toBeNull();
+      }
+    }
+    // The raw provider turn counter advanced, but no work turn ever did.
+    expect(observer.state.turn).toBe(threshold * 2 * preToolShapes(0).length);
+    expect(observer.state.workTurns).toBe(0);
+    expect(observer.state.totalErrors).toBe(0);
+    expect(checkStruggle(observer.state)).toBeNull();
+    // The first real tool call proceeds normally; the preamble consumed no budget.
+    toolResult(observer.state, "Read", `${topology}-first`);
+    expect(observer.state.workTurns).toBe(1);
+    expect(observer.state.lastProgressTurn).toBe(1);
+    expect(checkStruggle(observer.state)).toBeNull();
+  }
+});
+
+// TRUE POSITIVE preserved: an initial pre-tool burst must not spend the stall
+// budget, yet a genuine configured-length run of non-progress WORK turns after it
+// still emits no_progress. Proves the fix shifts the baseline, never disables it.
+test("genuine stall after a pre-tool preamble still emits no_progress at the bound", () => {
+  for (const [topology, threshold] of [["worker", 6], ["orchestrator", 12]] as const) {
+    const observer = makeStruggleObserver(resolveStrugglePolicy(topology, {}));
+    for (let index = 0; index < threshold; index++)
+      for (const message of preToolShapes(index)) observer.observe(message);
+    expect(checkStruggle(observer.state)).toBeNull();
+
+    // threshold - 1 non-progress work turns: still no fire.
+    for (let turn = 1; turn < threshold; turn++) {
+      toolResult(observer.state, "UnknownTool", `${topology}-stall-${turn}`);
+      expect(checkStruggle(observer.state)).toBeNull();
+    }
+    // The configured-bound work turn trips it, exactly as the pre-fix bound did.
+    toolResult(observer.state, "UnknownTool", `${topology}-stall-${threshold}`);
+    expect(checkStruggle(observer.state)).toBe("no_progress");
+    expect(observer.state.workTurns).toBe(threshold);
+    expect(observer.observe({ type: "system", subtype: "heartbeat" })).toBe("no_progress");
+    expect(observer.snapshot().triggers).toEqual(["no_progress"]);
+  }
+});
+
+// Interleaved pre-tool events among work turns extend wall-clock but neither reset
+// nor advance the work-turn clock, so a stall spread across narration still fires.
+test("interleaved pre-tool narration does not reset or accelerate the stall clock", () => {
+  const observer = makeStruggleObserver(resolveStrugglePolicy("worker", {}));
+  for (let turn = 1; turn <= 6; turn++) {
+    observer.observe({ type: "assistant", message: { content: [{ type: "text", text: `note ${turn}` }] } });
+    toolResult(observer.state, "UnknownTool", `mixed-${turn}`);
+    if (turn < 6) expect(checkStruggle(observer.state)).toBeNull();
+  }
+  expect(checkStruggle(observer.state)).toBe("no_progress");
+  expect(observer.state.workTurns).toBe(6);
+  expect(observer.state.turn).toBe(12); // 6 narration + 6 tool_use assistant messages
 });
