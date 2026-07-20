@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   mkdtempSync,
@@ -8,41 +9,93 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeAgentTerminal } from "../src/identity";
+import {
+  type ManagedWriterRuntime,
+  writeAgentTerminal,
+} from "../src/identity";
+
+const blockedTerminal = {
+  processOutcome: "died",
+  deliveryOutcome: "blocked",
+  deliveryReason: "provider_process_died",
+} as const;
 
 test("commit-unknown retry reuses one logical operation and lifecycle holder", () => {
+  let nowMs = 0;
+  const attempts: Array<{ args: string[]; timeoutMs: number }> = [];
+  const runtime: ManagedWriterRuntime = {
+    now: () => nowMs,
+    execute: (args, timeoutMs) => {
+      attempts.push({ args: [...args], timeoutMs });
+      if (attempts.length === 1) {
+        nowMs += 40;
+        throw new Error("transport closed after durable commit");
+      }
+      nowMs += 10;
+      return JSON.stringify({
+        ok: true,
+        result: {
+          status: "committed",
+          operation_id: args[6],
+          reason: "exact_replay",
+        },
+      });
+    },
+  };
+
+  const status = writeAgentTerminal(
+    `lost-ack-${process.pid}`,
+    blockedTerminal,
+    200,
+    runtime,
+  );
+
+  expect(status).toBe("recorded");
+  expect(attempts).toHaveLength(2);
+  expect(attempts[0]?.args).toEqual(attempts[1]?.args);
+  expect(attempts.map(({ timeoutMs }) => timeoutMs)).toEqual([160, 160]);
+  expect(attempts[0]?.args[5]).toMatch(
+    /^managed-agent-writer:[0-9a-f-]{36}$/,
+  );
+  expect(attempts[0]?.args[6]).toMatch(/^[0-9a-f-]{36}$/);
+});
+
+test("real writer subprocess parses one typed acknowledgement under a measured startup bar", () => {
   const dir = mkdtempSync(join(tmpdir(), "north-identity-recovery-"));
   const fakeBb = join(dir, "bb");
   const calls = join(dir, "calls");
-  const gate = join(dir, "first-call");
   const previousPath = process.env.PATH;
   const previousRedirect = process.env.NORTH_IDENTITY_TEST_REDIRECT;
   try {
     writeFileSync(fakeBb, `#!/usr/bin/env bash
-printf '%s %s\n' "$6" "$7" >> "${calls}"
-if [ ! -e "${gate}" ]; then
-  : > "${gate}"
-  sleep 1
+if [ "\${1-}" = "--startup-probe" ]; then
+  exit 0
 fi
+printf '%s %s\n' "$6" "$7" >> "${calls}"
 printf '{"ok":true,"result":{"status":"committed","operation_id":"%s","reason":"exact_replay"}}\n' "$7"
 `);
     chmodSync(fakeBb, 0o755);
     process.env.PATH = `${dir}:${previousPath ?? ""}`;
     delete process.env.NORTH_IDENTITY_TEST_REDIRECT;
 
+    const startupSamples = Array.from({ length: 5 }, () => {
+      const startedAt = performance.now();
+      execFileSync(fakeBb, ["--startup-probe"], { stdio: "ignore" });
+      return performance.now() - startedAt;
+    });
+    const observedStartupMs = Math.max(...startupSamples);
+    // This is process-invocation coverage, not the absolute-budget assertion.
+    // Derive a generous scheduler/load bar from a prewarmed executable; the
+    // deterministic runtime tests below own exact deadline arithmetic.
+    const stabilityBudgetMs = Math.ceil(Math.max(25, observedStartupMs) * 40);
     const status = writeAgentTerminal(
-      `lost-ack-${process.pid}`,
-      {
-        processOutcome: "died",
-        deliveryOutcome: "blocked",
-        deliveryReason: "provider_process_died",
-      },
-      50,
+      `real-process-${process.pid}`,
+      blockedTerminal,
+      stabilityBudgetMs,
     );
     const attempts = readFileSync(calls, "utf8").trim().split("\n");
     expect(status).toBe("recorded");
-    expect(attempts).toHaveLength(2);
-    expect(attempts[0]).toBe(attempts[1]);
+    expect(attempts).toHaveLength(1);
     expect(attempts[0]).toMatch(
       /^managed-agent-writer:[0-9a-f-]{36} [0-9a-f-]{36}$/,
     );
@@ -56,39 +109,26 @@ printf '{"ok":true,"result":{"status":"committed","operation_id":"%s","reason":"
 });
 
 test("commit-unknown classification stays inside one absolute writer budget", () => {
-  const dir = mkdtempSync(join(tmpdir(), "north-identity-budget-"));
-  const fakeBb = join(dir, "bb");
-  const previousPath = process.env.PATH;
-  const previousRedirect = process.env.NORTH_IDENTITY_TEST_REDIRECT;
-  try {
-    writeFileSync(fakeBb, "#!/usr/bin/env bash\nsleep 2\n");
-    chmodSync(fakeBb, 0o755);
-    process.env.PATH = `${dir}:${previousPath ?? ""}`;
-    delete process.env.NORTH_IDENTITY_TEST_REDIRECT;
+  const budgetMs = 200;
+  let nowMs = 0;
+  const attemptBudgets: number[] = [];
+  const runtime: ManagedWriterRuntime = {
+    now: () => nowMs,
+    execute: (_args, timeoutMs) => {
+      attemptBudgets.push(timeoutMs);
+      nowMs += timeoutMs;
+      throw new Error("simulated timeout at the exact attempt deadline");
+    },
+  };
 
-    const budgetMs = 200;
-    const startedAt = performance.now();
-    const status = writeAgentTerminal(
-      `absolute-budget-${process.pid}`,
-      {
-        processOutcome: "died",
-        deliveryOutcome: "blocked",
-        deliveryReason: "provider_process_died",
-      },
-      budgetMs,
-    );
-    const elapsedMs = performance.now() - startedAt;
+  const status = writeAgentTerminal(
+    `absolute-budget-${process.pid}`,
+    blockedTerminal,
+    budgetMs,
+    runtime,
+  );
 
-    expect(status).toBe("indeterminate");
-    expect(elapsedMs).toBeGreaterThanOrEqual(budgetMs * 0.75);
-    // Two independent 200ms attempts would exceed 400ms. Allow ordinary CI
-    // process-reap jitter while proving both attempts share one deadline.
-    expect(elapsedMs).toBeLessThan(budgetMs * 1.625);
-  } finally {
-    if (previousPath === undefined) delete process.env.PATH;
-    else process.env.PATH = previousPath;
-    if (previousRedirect === undefined) delete process.env.NORTH_IDENTITY_TEST_REDIRECT;
-    else process.env.NORTH_IDENTITY_TEST_REDIRECT = previousRedirect;
-    rmSync(dir, { recursive: true, force: true });
-  }
+  expect(status).toBe("indeterminate");
+  expect(attemptBudgets).toEqual([160, 40]);
+  expect(nowMs).toBe(budgetMs);
 });

@@ -33,6 +33,25 @@ const internalWriter = resolve(REPO, "cli/agent-fact-internal.clj");
 const INTERNAL_WRITER_TIMEOUT_MS = 10_000;
 const INTERNAL_WRITE_LEASE_TTL_MS = 60_000;
 
+export interface ManagedWriterRuntime {
+  now(): number;
+  execute(
+    args: string[],
+    timeoutMs: number,
+    env: NodeJS.ProcessEnv,
+  ): string;
+}
+
+const defaultManagedWriterRuntime: ManagedWriterRuntime = {
+  now: () => performance.now(),
+  execute: (args, timeoutMs, env) => execFileSync("bb", args, {
+    encoding: "utf8",
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: Math.max(1, Math.floor(timeoutMs)),
+  }),
+};
+
 /** Read-side projection. `none` is accepted only for historical native rows. */
 export interface ObservedAgentIdentity {
   kind: "lane" | "session" | "cron";
@@ -230,6 +249,7 @@ function writeHarnessAgentOperation(
     expectedIdentity?: Record<string, string>;
   },
   timeoutMs = INTERNAL_WRITER_TIMEOUT_MS,
+  runtime = defaultManagedWriterRuntime,
 ): ManagedWriteResult {
   if (process.env.NORTH_IDENTITY_TEST_REDIRECT === "1") {
     // Hermetic tests point NORTH_BIN at a tiny capture engine. Preserve the
@@ -280,18 +300,17 @@ function writeHarnessAgentOperation(
     recovery.desiredIdentity ? JSON.stringify(recovery.desiredIdentity) : "",
     recovery.expectedIdentity ? JSON.stringify(recovery.expectedIdentity) : "",
   ];
-  const startedAt = performance.now();
+  const startedAt = runtime.now();
   const execute = (attemptTimeoutMs: number): ManagedWriteResult => {
-    const output = execFileSync("bb", args, {
-      encoding: "utf8",
-      env: {
+    const output = runtime.execute(
+      args,
+      Math.max(1, Math.floor(attemptTimeoutMs)),
+      {
         ...process.env,
         NORTH_IDENTITY_WRITER_TIMEOUT_MS: String(timeoutMs),
         NORTH_IDENTITY_WRITE_LEASE_TTL_MS: String(INTERNAL_WRITE_LEASE_TTL_MS),
       },
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: Math.max(1, Math.floor(attemptTimeoutMs)),
-    });
+    );
     const envelope = JSON.parse(output.trim().split("\n").at(-1) ?? "") as {
       ok?: boolean;
       result?: { status?: ManagedWriteStatus; operation_id?: string; reason?: string };
@@ -329,7 +348,7 @@ function writeHarnessAgentOperation(
   // same logical operation with the same holder rotates the coordinator epoch,
   // fences the stale child, and classifies the durable expected/desired state.
   try {
-    const remaining = Math.max(1, timeoutMs - (performance.now() - startedAt));
+    const remaining = Math.max(1, timeoutMs - (runtime.now() - startedAt));
     const recovered = execute(remaining);
     if (recovered.status !== "committed")
       throw new ManagedAgentWriteError(operation, recovered, { cause: firstCause });
@@ -451,6 +470,7 @@ export function writeAgentTerminal(
   agentId: string,
   terminal: ExecutionTerminal,
   timeoutMs = INTERNAL_WRITER_TIMEOUT_MS,
+  runtime = defaultManagedWriterRuntime,
 ): TerminalPublicationStatus {
   if (!terminal.processOutcome) return "unavailable";
   const session = managedWriterSession(agentId);
@@ -472,7 +492,7 @@ export function writeAgentTerminal(
       holder: session.holder,
       operationId: randomUUID(),
       expectedIdentity: session.identity,
-    }, timeoutMs);
+    }, timeoutMs, runtime);
     session.terminalCommitted = true;
     return "recorded";
   } catch (error) {
