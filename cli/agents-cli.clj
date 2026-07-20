@@ -19,6 +19,8 @@
 (def NORTH-CLI (or (System/getenv "NORTH_BIN") (str NORTH "/bin/north")))
 (def GAFFER (or (System/getenv "GAFFER_HOME") (str HOME "/code/gaffer")))
 (def AGENT-LOGDIR (str HOME "/.local/state/north/agents"))
+(def AGENT-STREAMDIR (or (System/getenv "NORTH_STREAM_DIR")
+                         (str HOME "/code/agent-data")))
 (def GAFFER-STAFFING (or (System/getenv "GAFFER_STAFFING_CATALOG")
                          (str GAFFER "/staffing/catalog.json")))
 (def PORT (or (System/getenv "NORTH_PORT") "7977"))
@@ -1667,15 +1669,81 @@
       (cmd-spawn (cond-> (into [spawn-role task] forward)
                    inherited-notify (into ["--notify" inherited-notify]))))))
 
-(defn cmd-watch [[id & _]]
-  (if (nil? id)
-    (println (red "usage:") "north watch <agent-id>")
-    (let [log (io/file AGENT-LOGDIR (str id ".log"))]
-      (if (.exists log)
-        (do (echo-cmd "tail -n 40 -f" (str log))
-            (p/exec "tail" "-n" "40" "-f" (str log)))
-        (do (println (ylw "no transcript log at") (str log))
-            (println "fallback: run north agents or north show from the coordination CLI"))))))
+(def watch-usage "north watch <agent-id> [--control]")
+
+(defn- watch-file-observation [file]
+  (let [present? (.isFile file)
+        bytes (when present? (.length file))]
+    {:path (str file)
+     :present? present?
+     :bytes bytes
+     :modified-at (when present?
+                    (str (java.time.Instant/ofEpochMilli (.lastModified file))))}))
+
+(defn watch-plan
+  "Resolve the canonical event stream and sparse process/control diagnostic for
+   one exact agent ID. The optional roots arity keeps path/status behavior
+   directly testable without consulting live agent state."
+  ([args] (watch-plan args AGENT-STREAMDIR AGENT-LOGDIR))
+  ([args stream-dir control-dir]
+   (let [[id option & extra] args]
+     (cond
+       (or (nil? id) (seq extra))
+       {:error watch-usage}
+
+       (contains? #{"--help" "-h" "help"} id)
+       {:help watch-usage}
+
+       (not (valid-control-id? id))
+       {:error (str "invalid agent ID; expected " control-id-pattern
+                    " and at most " max-control-id-bytes " UTF-8 bytes")}
+
+       (and option (not= option "--control"))
+       {:error (str "unknown watch option: " option)}
+
+       :else
+       (let [stream-file (io/file stream-dir (str "agent-" id ".stream.jsonl"))
+             control-file (io/file control-dir (str id ".log"))]
+         {:id id
+          :mode (if (= option "--control") :control :stream)
+          :stream (watch-file-observation stream-file)
+          :control (watch-file-observation control-file)})))))
+
+(defn- watch-status [label data-kind {:keys [path present? bytes modified-at]}]
+  (str label ": " path " — "
+       (cond
+         (not present?) "not present yet"
+         (zero? bytes) "present but empty"
+         :else (str data-kind " present (" bytes " bytes, modified " modified-at ")"))))
+
+(defn watch-status-lines [{:keys [mode stream control]}]
+  [(str "watch target: " (if (= mode :stream)
+                           "canonical SDK event stream"
+                           "process/control diagnostics (explicit opt-in)"))
+   (watch-status "canonical SDK event stream" "event data" stream)
+   (watch-status "process/control diagnostics" "diagnostic data" control)
+   (str "liveness guardrail: process/control logs are sparse diagnostics; "
+        "their silence is not evidence that a worker stalled or died.")])
+
+(defn cmd-watch [args]
+  (let [{:keys [error help mode stream control] :as plan} (watch-plan args)]
+    (cond
+      help (println "usage:" help)
+      error
+      (do
+        (binding [*out* *err*]
+          (println (red error))
+          (println (red "usage:") watch-usage))
+        (System/exit 2))
+      :else
+      (let [target (if (= mode :control) control stream)]
+        (doseq [line (watch-status-lines plan)] (println line))
+        (when-not (:present? target)
+          (println (ylw "waiting for selected file to appear; absence alone is not a terminal verdict.")))
+        (when (= mode :stream)
+          (println "explicit diagnostics mode:" (cyn (str "north watch " (:id plan) " --control"))))
+        (echo-cmd "tail -n 40 -F" (:path target))
+        (p/exec "tail" "-n" "40" "-F" (:path target))))))
 
 (defn cmd-tell-agent [args]
   (north.topology-authority/require-coordination! "steer")

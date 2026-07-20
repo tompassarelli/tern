@@ -9,6 +9,42 @@
 
 (def checks (atom []))
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
+
+(let [scratch (.toFile (java.nio.file.Files/createTempDirectory
+                        "north-watch-test-"
+                        (make-array java.nio.file.attribute.FileAttribute 0)))
+      stream-dir (io/file scratch "streams")
+      control-dir (io/file scratch "control")
+      id "lane-watch-probe-1234"
+      stream-file (io/file stream-dir (str "agent-" id ".stream.jsonl"))
+      control-file (io/file control-dir (str id ".log"))]
+  (.mkdirs stream-dir)
+  (.mkdirs control-dir)
+  (spit stream-file "{\"type\":\"assistant\",\"message\":\"working\"}\n")
+  ;; The production failure this guards against had a healthy canonical stream
+  ;; while its process/control log was effectively silent.
+  (spit control-file "")
+  (let [plan (watch-plan [id] (str stream-dir) (str control-dir))
+        rendered (str/join "\n" (watch-status-lines plan))]
+    (check "watch defaults to the active canonical stream when the control log is silent"
+           (and (= :stream (:mode plan))
+                (= (str stream-file) (get-in plan [:stream :path]))
+                (pos? (get-in plan [:stream :bytes]))
+                (zero? (get-in plan [:control :bytes]))
+                (str/includes? rendered "watch target: canonical SDK event stream")
+                (str/includes? rendered "event data present")
+                (str/includes? rendered "present but empty")
+                (str/includes? rendered "silence is not evidence that a worker stalled or died"))))
+  (let [plan (watch-plan [id "--control"] (str stream-dir) (str control-dir))]
+    (check "control-log following requires explicit opt-in and retains both paths"
+           (and (= :control (:mode plan))
+                (= (str stream-file) (get-in plan [:stream :path]))
+                (= (str control-file) (get-in plan [:control :path])))))
+  (check "watch rejects path traversal and extra arguments before resolving files"
+         (and (:error (watch-plan ["../lane"] (str stream-dir) (str control-dir)))
+              (:error (watch-plan [id "--control" "extra"]
+                                  (str stream-dir) (str control-dir))))))
+
 (defn managed [facts]
   (let [base (merge {"kind" "lane" "goal" "fixture" "repo" "~/code/north"
                      "spawned_at" "2026-07-17T00:00:00Z"
