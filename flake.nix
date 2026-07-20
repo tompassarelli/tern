@@ -480,6 +480,64 @@ EOF
               exit 1
             fi
             grep -q 'usage: north up' "$smoke/north-coord-up-usage.out"
+
+            # The legacy store-revision fallback is based on the actual
+            # canonical closure, never a store-shaped string. Symlinked public
+            # seams may converge on one immutable output; mixed executables or
+            # mutable code/classpath seams must fail provenance before probing.
+            fallback_port="$(${pkgs.babashka}/bin/bb -e \
+              '(with-open [socket (java.net.ServerSocket. 0)] (println (.getLocalPort socket)))')"
+            mkdir -p "$smoke/fram-bin-links"
+            ln -s ${framRuntimeRoot} "$smoke/fram-home-link"
+            ln -s ${framPkg}/bin/fram "$smoke/fram-bin-links/fram"
+            ln -s ${framPkg}/bin/fram-daemon "$smoke/fram-bin-links/fram-daemon"
+            fallback_rc=0
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH="${runtimePath}" \
+              NORTH_BB=${pkgs.babashka}/bin/bb NORTH_FRAM_RUNTIME=package \
+              FRAM_HOME="$smoke/fram-home-link" FRAM_BIN="$smoke/fram-bin-links" \
+              FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= FRAM_PORT="$fallback_port" \
+              FRAM_LOG="$smoke/home/.local/state/north/facts.log" \
+              $out/bin/.north-coord-up-wrapped --check-runtime \
+              > "$smoke/store-fallback.out" 2>&1 || fallback_rc=$?
+            test "$fallback_rc" -eq 1
+            grep -Fq 'no listener identity available' "$smoke/store-fallback.out"
+            if grep -Fq 'package runtime provenance is unknown' "$smoke/store-fallback.out"; then
+              echo "north package smoke: coherent canonical store fallback was rejected" >&2
+              exit 1
+            fi
+
+            rm "''${smoke:?}/fram-bin-links/fram-daemon"
+            ln -s ${pkgs.coreutils}/bin/true "$smoke/fram-bin-links/fram-daemon"
+            mixed_rc=0
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH="${runtimePath}" \
+              NORTH_BB=${pkgs.babashka}/bin/bb NORTH_FRAM_RUNTIME=package \
+              FRAM_HOME="$smoke/fram-home-link" FRAM_BIN="$smoke/fram-bin-links" \
+              FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= FRAM_PORT="$fallback_port" \
+              FRAM_LOG="$smoke/home/.local/state/north/facts.log" \
+              $out/bin/.north-coord-up-wrapped --check-runtime \
+              > "$smoke/mixed-store-fallback.out" 2>&1 || mixed_rc=$?
+            test "$mixed_rc" -eq 2
+            grep -Fq 'package runtime provenance is unknown' \
+              "$smoke/mixed-store-fallback.out"
+
+            rm "''${smoke:?}/fram-bin-links/fram-daemon"
+            ln -s ${framPkg}/bin/fram-daemon "$smoke/fram-bin-links/fram-daemon"
+            mixed_code_rc=0
+            ${pkgs.coreutils}/bin/env -i \
+              HOME="$smoke/home" PATH="${runtimePath}" \
+              NORTH_BB=${pkgs.babashka}/bin/bb NORTH_FRAM_RUNTIME=package \
+              FRAM_HOME="$smoke/fram-home-link" FRAM_BIN="$smoke/fram-bin-links" \
+              FRAM_OUT="$smoke/home" FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= \
+              FRAM_PORT="$fallback_port" \
+              FRAM_LOG="$smoke/home/.local/state/north/facts.log" \
+              $out/bin/.north-coord-up-wrapped --check-runtime \
+              > "$smoke/mixed-code-fallback.out" 2>&1 || mixed_code_rc=$?
+            test "$mixed_code_rc" -eq 2
+            grep -Fq 'package runtime provenance is unknown' \
+              "$smoke/mixed-code-fallback.out"
+
             ${pkgs.coreutils}/bin/env -i \
               HOME="$smoke/home" PATH= \
               $out/bin/ensure-private-docs "$client_repo"

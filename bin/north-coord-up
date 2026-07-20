@@ -98,7 +98,11 @@ for executable in "$fram" "$daemon" "$north_bb"; do
 done
 
 canonical_path() {
-  local path="$1" parent base
+  local path="$1" parent base canonical
+  if canonical="$(realpath -e -- "$path" 2>/dev/null)"; then
+    printf '%s\n' "$canonical"
+    return
+  fi
   if [[ -d "$path" ]]; then
     (cd "$path" && pwd -P)
     return
@@ -110,6 +114,38 @@ canonical_path() {
     return
   fi
   printf '%s\n' "$path"
+}
+
+nix_store_object_for_existing_path() {
+  local path="$1" canonical relative object
+  canonical="$(realpath -e -- "$path" 2>/dev/null)" || return 1
+  [[ "$canonical" == /nix/store/* ]] || return 1
+  relative="${canonical#/nix/store/}"
+  object="${relative%%/*}"
+  [[ -n "$object" && -e "/nix/store/$object" ]] || return 1
+  printf '/nix/store/%s\n' "$object"
+}
+
+immutable_store_fallback_revision() {
+  local source_object fram_object daemon_object
+  local provenance_name provenance_path provenance_object
+  source_object="$(nix_store_object_for_existing_path "$FRAM_HOME")" || return 1
+  fram_object="$(nix_store_object_for_existing_path "$fram")" || return 1
+  daemon_object="$(nix_store_object_for_existing_path "$daemon")" || return 1
+  [[ "$fram_object" == "$source_object" &&
+     "$daemon_object" == "$source_object" ]] || return 1
+
+  # When callers expose package code/classpath seams, each Fram-owned path must
+  # resolve into the same immutable output. Dependency executables such as the
+  # JDK may legitimately live in other store objects and are not Fram identity.
+  for provenance_name in FRAM FRAM_OUT FRAM_RESOLVE FRAM_DAEMON_CLASSPATH_FILE; do
+    provenance_path="${!provenance_name:-}"
+    [[ -n "$provenance_path" ]] || continue
+    provenance_object="$(nix_store_object_for_existing_path "$provenance_path")" || return 1
+    [[ "$provenance_object" == "$source_object" ]] || return 1
+  done
+
+  printf 'store:%s\n' "${source_object#/nix/store/}"
 }
 
 runtime_source="$(canonical_path "$FRAM_HOME")"
@@ -128,17 +164,16 @@ if [[ "$runtime_selector" == checkout ]]; then
     exit 2
   fi
 else
-  # FRAM_PACKAGE_REV is the package wrapper's authoritative pin. Ambient
-  # FRAM_RUNTIME_REV is only a fallback for an explicitly selected custom
-  # package seam whose wrapper predates the package-revision contract.
-  runtime_rev="${FRAM_PACKAGE_REV:-${FRAM_RUNTIME_REV:-}}"
+  # FRAM_PACKAGE_REV is the package wrapper's authoritative pin. The runtime
+  # observation variable is never package authority: without the package pin,
+  # provenance must be earned from one coherent immutable store object below.
+  runtime_rev="${FRAM_PACKAGE_REV:-}"
 fi
-if [[ -z "$runtime_rev" && "$runtime_source" == /nix/store/* ]]; then
-  # The canonical store root is immutable and content-addressed. Keep the
-  # revision field non-empty even when an older package wrapper did not export
-  # FRAM_PACKAGE_REV.
-  store_object="${runtime_source#/nix/store/}"
-  runtime_rev="store:${store_object%%/*}"
+if [[ -z "$runtime_rev" ]]; then
+  # Backward compatibility for an older package wrapper is earned only from a
+  # real, canonical, internally coherent store output. A store-shaped string,
+  # a dangling symlink, or a mutable/mixed executable is not provenance.
+  runtime_rev="$(immutable_store_fallback_revision || true)"
 fi
 if [[ -z "$runtime_rev" ]]; then
   echo "north up: package runtime provenance is unknown for $runtime_source; set authoritative FRAM_PACKAGE_REV" >&2

@@ -345,6 +345,55 @@ if env "${common_env[@]}" NORTH_FRAM_RUNTIME=package \
 fi
 grep -q 'package runtime provenance is unknown' "$TMP/unknown-package.out"
 
+if env "${common_env[@]}" NORTH_FRAM_RUNTIME=package \
+  FRAM_PACKAGE_REV= FRAM_RUNTIME_REV=forged-runtime-observation \
+  "$UP" --check-runtime >"$TMP/ambient-runtime-revision.out" 2>&1; then
+  echo "north-coord-up test: ambient runtime observation became package authority" >&2
+  exit 1
+fi
+grep -q 'package runtime provenance is unknown' "$TMP/ambient-runtime-revision.out"
+
+# A store-shaped string is not immutable provenance. Neither a nonexistent
+# source nor a mutable executable may synthesize a store revision.
+if env "${common_env[@]}" NORTH_FRAM_RUNTIME=package \
+  FRAM_HOME=/nix/store/does-not-exist FRAM_BIN="$FRAM_CHECKOUT/bin" \
+  FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= FRAM_OUT= FRAM_RESOLVE= \
+  FRAM_DAEMON_CLASSPATH_FILE= \
+  "$UP" --check-runtime >"$TMP/nonexistent-store-package.out" 2>&1; then
+  echo "north-coord-up test: nonexistent store string became package provenance" >&2
+  exit 1
+fi
+grep -q 'package runtime provenance is unknown' "$TMP/nonexistent-store-package.out"
+
+# Canonicalization must not turn a dangling alias or an existing store object
+# paired with mutable Fram executables into one coherent package identity.
+ln -s /nix/store/does-not-exist "$TMP/dangling-store-alias"
+if env "${common_env[@]}" NORTH_FRAM_RUNTIME=package \
+  FRAM_HOME="$TMP/dangling-store-alias" FRAM_BIN="$FRAM_CHECKOUT/bin" \
+  FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= FRAM_OUT= FRAM_RESOLVE= \
+  FRAM_DAEMON_CLASSPATH_FILE= \
+  "$UP" --check-runtime >"$TMP/dangling-store-package.out" 2>&1; then
+  echo "north-coord-up test: dangling store alias became package provenance" >&2
+  exit 1
+fi
+grep -q 'package runtime provenance is unknown' "$TMP/dangling-store-package.out"
+
+real_bb_path="$(realpath -e "$REAL_BB" 2>/dev/null || true)"
+if [[ "$real_bb_path" == /nix/store/* ]]; then
+  store_relative="${real_bb_path#/nix/store/}"
+  existing_store_root="/nix/store/${store_relative%%/*}"
+  ln -s "$existing_store_root" "$TMP/existing-store-alias"
+  if env "${common_env[@]}" NORTH_FRAM_RUNTIME=package \
+    FRAM_HOME="$TMP/existing-store-alias" FRAM_BIN="$FRAM_CHECKOUT/bin" \
+    FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= FRAM_OUT= FRAM_RESOLVE= \
+    FRAM_DAEMON_CLASSPATH_FILE= \
+    "$UP" --check-runtime >"$TMP/mixed-store-package.out" 2>&1; then
+    echo "north-coord-up test: canonical store source accepted mutable Fram executables" >&2
+    exit 1
+  fi
+  grep -q 'package runtime provenance is unknown' "$TMP/mixed-store-package.out"
+fi
+
 # A same-log compatibility daemon is never "already up". Even an explicit
 # restart cannot signal it without a matching launcher ownership record.
 sleep 60 &
