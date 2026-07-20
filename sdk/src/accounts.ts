@@ -196,21 +196,30 @@ export function bootstrapAccountConfig(account: ProviderAccount, context: Accoun
   ensurePrivateDirectory(account.root);
   if (account.provider === "openai") ensurePrivateDirectory(join(account.root, "sqlite"));
 
-  // Retire only links created by North's former account projection. A bespoke
-  // file or differently targeted link is an authority-bearing account state,
-  // so admission fails instead of silently ignoring or replacing it.
+  // The isolated home must inherit no ambient/user authority. The only such
+  // projection North can create is a symlink escaping the home into the ambient
+  // Codex config, so retirement acts strictly on symlinks: retire the exact link
+  // North's former account projection installed, and fail closed on any other
+  // symlink rather than silently trusting redirected authority. A *self-contained
+  // regular file* under these names — e.g. the `config.toml` trust and
+  // model-availability UI state Codex itself writes inside CODEX_HOME — is
+  // managed per-account state, not an ambient projection, and is left untouched.
   if (account.provider === "openai") {
     for (const name of OPENAI_LEGACY_AUTHORITY_LINKS) {
-      const legacySource = join(sourceRoot, name);
       const legacyDestination = join(account.root, name);
+      let entry;
       try {
-        if (!matchesConfigLink(legacyDestination, legacySource))
-          throw new Error(`refusing authority-bearing Codex account path ${legacyDestination}`);
-        unlinkSync(legacyDestination);
+        entry = lstatSync(legacyDestination);
       } catch (error) {
         if (isErrno(error, "ENOENT")) continue;
         throw error;
       }
+      if (!entry.isSymbolicLink()) continue;
+      if (readlinkSync(legacyDestination) === join(sourceRoot, name)) {
+        unlinkSync(legacyDestination);
+        continue;
+      }
+      throw new Error(`refusing authority-bearing Codex account path ${legacyDestination}`);
     }
   }
 
@@ -381,10 +390,11 @@ export function accountEnvironment(account: ProviderAccount, context: AccountCon
   return env;
 }
 
-export function providerEnvironmentForTarget(
+function resolveTargetEnvironment(
   provider: AccountProvider,
   target: RoutingTarget | undefined,
-  context: AccountContext = {},
+  context: AccountContext,
+  provision: boolean,
 ): NodeJS.ProcessEnv {
   if (target && target.provider !== provider)
     throw new Error(`routing target ${target.id} belongs to ${target.provider}, not ${provider}`);
@@ -399,7 +409,7 @@ export function providerEnvironmentForTarget(
       authMode: "isolated",
       root: accountRoot(provider, target.profile, context),
     };
-    bootstrapAccountConfig(account, context);
+    if (provision) bootstrapAccountConfig(account, context);
     return accountEnvironment(account, context);
   }
   if (authMode !== "ambient") throw new Error(`routing target ${target?.id ?? "<unknown>"} has invalid auth mode`);
@@ -410,6 +420,34 @@ export function providerEnvironmentForTarget(
     env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED = "1";
   }
   return env;
+}
+
+/**
+ * Managed-execution environment. Provisions the isolated home and retires any
+ * ambient-authority projection (fail-closed) before the target may run a turn.
+ */
+export function providerEnvironmentForTarget(
+  provider: AccountProvider,
+  target: RoutingTarget | undefined,
+  context: AccountContext = {},
+): NodeJS.ProcessEnv {
+  return resolveTargetEnvironment(provider, target, context, true);
+}
+
+/**
+ * Read-only observation environment. Resolves the same target state roots
+ * WITHOUT provisioning: status/snapshot probes observe an account, they never
+ * bootstrap it, create its directories, or run the execution-authority
+ * retirement. Keeping observation non-mutating is what lets one account's local
+ * state (a Codex-written config.toml, a broken home) stay isolated to that
+ * target instead of aborting a cross-provider snapshot.
+ */
+export function observeEnvironmentForTarget(
+  provider: AccountProvider,
+  target: RoutingTarget | undefined,
+  context: AccountContext = {},
+): NodeJS.ProcessEnv {
+  return resolveTargetEnvironment(provider, target, context, false);
 }
 
 export function codexConfigArguments(env: NodeJS.ProcessEnv): string[] {
@@ -439,7 +477,7 @@ export function loginProviderAccount(account: ProviderAccount, context: AccountC
 }
 
 export function statusProviderAccount(account: ProviderAccount, context: AccountContext = {}): AccountAuthState {
-  bootstrapAccountConfig(account, context);
+  // Observation is read-only: do not bootstrap/mutate the account home here.
   const env = accountEnvironment(account, context);
   const command = account.provider === "anthropic"
     ? env.NORTH_CLAUDE_BIN ?? "claude"

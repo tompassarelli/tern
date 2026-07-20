@@ -280,10 +280,27 @@ export async function collectProvidersStatus(): Promise<ProvidersStatusDocument>
     { id: "anthropic", provider: "anthropic" as const, authMode: "ambient" as const },
     { id: "openai", provider: "openai" as const, authMode: "ambient" as const },
   ];
-  const availability = targets.map((target) => ({
-    ...(target.provider === "anthropic" ? probeAnthropic(target) : probeOpenAI(target)),
-    targetId: target.id,
-  }));
+  const availability = targets.map((target) => {
+    // Isolate a per-target probe failure. One account's local fault (a broken
+    // home, refused authority-bearing state) must degrade to explicit
+    // unknown-unavailable for that target only — never abort the cross-provider
+    // snapshot nor hide a healthy sibling. Unknown failure stays unavailable; it
+    // is never silently promoted to eligibility.
+    try {
+      const probe = target.provider === "anthropic" ? probeAnthropic(target) : probeOpenAI(target);
+      return { ...probe, targetId: target.id };
+    } catch {
+      return {
+        provider: target.provider,
+        targetId: target.id,
+        installed: false,
+        authenticated: false,
+        available: false,
+        reason: "unknown",
+        detail: "probe failed",
+      } satisfies ProviderAvailability;
+    }
+  });
   return buildProvidersStatusDocument({
     source: sourceIdentity(), accountUsage, policy, availability,
   });

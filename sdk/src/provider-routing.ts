@@ -41,7 +41,7 @@ import type {
   ProviderUsageObservation,
   ProviderUsageWindow,
 } from "./providers/types";
-import { codexConfigArguments, isClaudeSubscriptionStatus, providerEnvironmentForTarget } from "./accounts";
+import { codexConfigArguments, isClaudeSubscriptionStatus, observeEnvironmentForTarget } from "./accounts";
 import {
   providerSupportsCapabilities, type GafferCapability,
 } from "./gaffer-capabilities";
@@ -296,7 +296,7 @@ export function resourcePolicyFromEnv(
 }
 
 export function probeAnthropic(target?: RoutingTarget): ProviderAvailability {
-  const env = providerEnvironmentForTarget("anthropic", target);
+  const env = observeEnvironmentForTarget("anthropic", target);
   const disabled = env.NORTH_DISABLE_ANTHROPIC === "1";
   const cachePath = authStateCachePath();
   const key = authCacheKey("anthropic", target?.id);
@@ -328,7 +328,7 @@ export function probeAnthropic(target?: RoutingTarget): ProviderAvailability {
 }
 
 export function probeOpenAI(target?: RoutingTarget): ProviderAvailability {
-  const env = providerEnvironmentForTarget("openai", target);
+  const env = observeEnvironmentForTarget("openai", target);
   const disabled = env.NORTH_DISABLE_OPENAI === "1";
   const cachePath = authStateCachePath();
   const key = authCacheKey("openai", target?.id);

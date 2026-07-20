@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
-  bootstrapAccountConfig, codexConfigArguments, providerEnvironmentForTarget,
+  bootstrapAccountConfig, codexConfigArguments, observeEnvironmentForTarget, providerEnvironmentForTarget,
 } from "../src/accounts";
 
 const root = join(import.meta.dir, "..");
@@ -183,6 +183,66 @@ test("OpenAI bootstrap retires only North's legacy authority links and refuses b
   expect(() => bootstrapAccountConfig(account, { home }))
     .toThrow("refusing authority-bearing Codex account path");
   expect(readlinkSync(join(account.root, "hooks.json"))).toBe(customHooks);
+});
+
+test("OpenAI bootstrap tolerates Codex-written per-account UI state while managed authority stays fail-closed", () => {
+  const { home } = fixture();
+  const account = {
+    id: "codex-ui",
+    provider: "openai" as const,
+    profile: "codex-ui",
+    authMode: "isolated" as const,
+    root: join(home, ".local/state/north/accounts/openai/codex-ui"),
+  };
+  bootstrapAccountConfig(account, { home });
+
+  // Codex, running inside CODEX_HOME, writes its own 0600 config.toml carrying
+  // only trust and model-availability UI state. That self-contained regular
+  // file is ordinary managed state, not an ambient-authority projection, and a
+  // re-bootstrap must tolerate it without throwing or mutating it.
+  const config = join(account.root, "config.toml");
+  const uiState = '[projects."/work"]\ntrust_level = "trusted"\n';
+  writeFileSync(config, uiState, { mode: 0o600 });
+  expect(() => bootstrapAccountConfig(account, { home })).not.toThrow();
+  expect(lstatSync(config).isSymbolicLink()).toBe(false);
+  expect(readFileSync(config, "utf8")).toBe(uiState);
+  expect(statSync(config).mode & 0o777).toBe(0o600);
+
+  // Managed execution still resolves and still forces its authority at CLI
+  // precedence over whatever the isolated config.toml holds.
+  const env = providerEnvironmentForTarget("openai", {
+    id: account.id, provider: "openai", profile: account.profile, authMode: "isolated",
+  }, { home });
+  expect(env.CODEX_HOME).toBe(account.root);
+  expect(codexConfigArguments(env)).toContain('forced_login_method="chatgpt"');
+  expect(codexConfigArguments(env)).toContain('cli_auth_credentials_store="file"');
+  expect(codexConfigArguments(env)).toContain('model_provider="openai"');
+
+  // A symlink escaping the home into ambient/user Codex config remains an
+  // authority projection and is still refused (hostile authority-bearing case).
+  rmSync(config);
+  symlinkSync(join(home, ".codex/config.toml"), config);
+  bootstrapAccountConfig(account, { home });
+  expect(() => lstatSync(config)).toThrow(); // exact legacy ambient link is retired
+  symlinkSync(join(home, "outside-config.toml"), config);
+  expect(() => bootstrapAccountConfig(account, { home }))
+    .toThrow("refusing authority-bearing Codex account path");
+});
+
+test("observation resolves target roots read-only while execution provisions them", () => {
+  const { home } = fixture();
+  const target = {
+    id: "codex-obs", provider: "openai" as const, profile: "codex-obs", authMode: "isolated" as const,
+  };
+  const accountRoot = join(home, ".local/state/north/accounts/openai/codex-obs");
+
+  const observed = observeEnvironmentForTarget("openai", target, { home });
+  expect(observed.CODEX_HOME).toBe(accountRoot);
+  expect(() => lstatSync(accountRoot)).toThrow(); // observation created nothing
+
+  const executed = providerEnvironmentForTarget("openai", target, { home });
+  expect(executed.CODEX_HOME).toBe(accountRoot);
+  expect(statSync(accountRoot).isDirectory()).toBe(true); // execution provisioned it
 });
 
 test("the first account creates a balanced routing policy", () => {
