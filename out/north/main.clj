@@ -677,9 +677,10 @@
    st (k/one-i idx run "start_time")
    owner (clk/session-owner idx run)
    rate (k/one-i idx run "rate")
+   shown-rate (if (some? rate) rate "?")
    te (session-thread idx run)
    dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)]
-  (println (str "clocked in for client " (if (some? owner) owner "?") "  (session " (short-id run) (if (some? rate) (str ", rate " rate "/h") "") ")"))
+  (println (str "clocked in for client " (if (some? owner) owner "?") "  (session " (short-id run) ", rate " shown-rate "/h)"))
   (if (not (= te "")) (do
   (println (str "  legacy thread " (short-id te) "  " (trunc (title-of idx te) 40)))))
   (println (str "  since " (if (some? st) st "?") "  (" (fmt-hm dur) " elapsed)"))))))

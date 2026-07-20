@@ -4,7 +4,8 @@
 ;; human session_of rows remain on client-owned threads. This tool moves those
 ;; exact billable entities through invoice states by asserting facts — no
 ;; separate ledger, the graph IS the ledger. Managed-agent sessions never enter
-;; the invoice state machine.
+;; a NEW invoice. A legacy parent thread already carrying invoice_id remains
+;; payable and its frozen historical total remains visible in north-timelog.
 ;;
 ;;   uninvoiced  (no invoice_id)                     ← work as you go, no ceremony
 ;;      │  bill <invoice_id> [owner]

@@ -16,7 +16,10 @@
 ;; New sessions are owner-scoped entities:
 ;;   kind client_session · owner <client> · clocked_by user · rate <snapshot>
 ;;   start_time/end_time
-;; Legacy session_of rows remain billable only when clocked_by is absent/user.
+;; Legacy session_of rows remain newly billable only when clocked_by is
+;; absent/user. Explicit agent rows on a thread that already carries invoice_id
+;; remain in that historical invoice: durable sent totals never shrink merely
+;; because the clock model changed.
 ;;
 ;; Usage:  north-timelog [owner] [invoice_id]
 ;;   owner       default "msa"
@@ -58,18 +61,27 @@
                                    (= (one s "owner") OWNER)
                                    (human? s)
                                    (closed? s)))
+      historical-invoiced-agent? (fn [s]
+                                   (let [thread (one s "session_of")]
+                                     (and (not (human? s))
+                                          (and (closed? s)
+                                               (and (some? thread)
+                                                    (some? (one thread "invoice_id")))))))
       ;; billable threads for this owner (must carry a title = a real thread)
       threads (filter (fn [s] (and (= (one s "owner") OWNER)
                                    (some? (one s "title")))) allsub)
       tset    (set (map strip-at threads))
-      ;; Roll only legacy HUMAN clock sessions up to their thread. Explicit
-      ;; managed actors are task telemetry and are intentionally excluded.
+      ;; Roll current human time plus invoice-frozen legacy agent time up to its
+      ;; thread. An explicit actor without prior invoice evidence remains task
+      ;; telemetry and cannot enter a new invoice.
       per     (reduce
                 (fn [m s]
                   (let [thr (strip-at (one s "session_of"))
                         st  (one s "start_time")
                         en  (one s "end_time")]
-                    (if (and (contains? tset thr) (and (human? s) (closed? s)))
+                    (if (and (contains? tset thr)
+                             (and (closed? s)
+                                  (or (human? s) (historical-invoiced-agent? s))))
                       (let [secs (- (iso->sec en) (iso->sec st))
                             day  (subs st 0 10)]
                         (-> m
@@ -121,7 +133,8 @@
                                   (and (closed? s)
                                        (and (some? so)
                                             (and (= (one so "owner") OWNER)
-                                                 (not (human? s)))))))
+                                                 (and (not (human? s))
+                                                      (not (historical-invoiced-agent? s))))))))
                               allsub)]
 
   (println "date,ticket,description,hours,rate,amount,invoice_id,invoice_state")

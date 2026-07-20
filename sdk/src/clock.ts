@@ -22,6 +22,8 @@ export type BillableClockPreflightCode =
   | "billable_thread_linear_mismatch"
   | "billable_client_session_required"
   | "billable_client_session_mismatch"
+  | "billable_client_session_rate_required"
+  | "billable_client_session_rate_invalid"
   | "billable_client_session_readback_failed";
 
 export class BillableClockPreflightError extends Error {
@@ -38,6 +40,7 @@ export type BillableClockAdmission =
   | {
       kind: "verified";
       client: string;
+      rate: string;
       threadId: string;
     };
 
@@ -97,10 +100,18 @@ export function clientTicketForBranch(
   return candidates.length === 1 ? candidates[0]![0].toUpperCase() : undefined;
 }
 
-function clientStatusOwner(output: string): string | undefined {
+function clientStatus(output: string): { owner: string; rate?: string } | undefined {
   const line = output.split(/\r?\n/, 1)[0] ?? "";
-  const match = /^clocked in for client ([A-Za-z0-9][A-Za-z0-9._-]*)  \(session /.exec(line);
-  return match?.[1];
+  const owner = /^clocked in for client ([A-Za-z0-9][A-Za-z0-9._-]*)  \(session /.exec(line)?.[1];
+  if (!owner) return undefined;
+  const rate = /, rate ([^\s)]+)\/h\)$/.exec(line)?.[1];
+  return { owner, ...(rate ? { rate } : {}) };
+}
+
+function validCapturedRate(rate: string): boolean {
+  if (!/^[1-9][0-9]{0,9}$/.test(rate)) return false;
+  const parsed = Number(rate);
+  return Number.isInteger(parsed) && parsed <= 2_147_483_647;
 }
 
 /**
@@ -176,12 +187,18 @@ export function admitBillableClock(
   const execute = runtime.execute ?? runNorthCapture;
   const status = { args: ["clock", "status"], agentEnv: "user" };
   try {
-    const owner = clientStatusOwner(execute(status));
-    if (!owner)
+    const observed = clientStatus(execute(status));
+    if (!observed)
       throw new BillableClockPreflightError("billable_client_session_required");
-    if (owner !== client)
+    if (observed.owner !== client)
       throw new BillableClockPreflightError("billable_client_session_mismatch");
-    return { kind: "verified", client, threadId: input.threadId };
+    if (!observed.rate || observed.rate === "?")
+      throw new BillableClockPreflightError("billable_client_session_rate_required");
+    if (!validCapturedRate(observed.rate))
+      throw new BillableClockPreflightError("billable_client_session_rate_invalid");
+    return {
+      kind: "verified", client, rate: observed.rate, threadId: input.threadId,
+    };
   } catch (error) {
     if (error instanceof BillableClockPreflightError) throw error;
     throw new BillableClockPreflightError("billable_client_session_readback_failed");

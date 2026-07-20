@@ -129,6 +129,30 @@ describe("required client clock admission", () => {
     ), "billable_client_session_readback_failed");
   });
 
+  test("missing or placeholder captured rate fails closed before provider work", () => {
+    for (const output of [
+      "clocked in for client msa  (session human-session)",
+      "clocked in for client msa  (session human-session, rate ?/h)",
+    ]) {
+      failureCode(() => admitBillableClock(
+        { ...base, threadId: "thread-clock-proof" },
+        { projectRoot, branchName, readThreadFacts: thread, execute: () => output },
+      ), "billable_client_session_rate_required");
+    }
+  });
+
+  test("invalid captured rate fails closed before provider work", () => {
+    for (const rate of ["0", "-1", "120.5", "nope", "2147483648"]) {
+      failureCode(() => admitBillableClock(
+        { ...base, threadId: "thread-clock-proof" },
+        {
+          projectRoot, branchName, readThreadFacts: thread,
+          execute: () => `clocked in for client msa  (session human-session, rate ${rate}/h)`,
+        },
+      ), "billable_client_session_rate_invalid");
+    }
+  });
+
   test("success verifies the exact human client and performs no clock mutation", () => {
     const calls: string[][] = [];
     expect(admitBillableClock(
@@ -145,6 +169,7 @@ describe("required client clock admission", () => {
     )).toEqual({
       kind: "verified",
       client: "msa",
+      rate: "120",
       threadId: "thread-clock-proof",
     });
     expect(calls).toEqual([["clock", "status"]]);

@@ -1030,7 +1030,12 @@
                       (tell-retry port log "assert" ssub "start_time" now 5)
                       "skipped: rate failed")
                  ;; kind is the visibility marker: a failed prefix never opens
-                 ;; a partially attributed human billing session.
+                 ;; a partially attributed human billing session. Fram's domain
+                 ;; coordinator currently commits one fact per OCC request; it
+                 ;; has no atomic transaction spanning the global open-session
+                 ;; check and this new subject. Concurrent interactive clock-ins
+                 ;; can therefore both publish. Status (and SDK admission) sees
+                 ;; multiple opens and fails closed; it never guesses a winner.
                  r5 (if (str/starts-with? r4 "ok:")
                       (tell-retry port log "assert" ssub "kind" "client_session" 5)
                       "skipped: start_time failed")]
@@ -1149,11 +1154,12 @@
              st (k/one-i idx run "start_time")
              owner (clk/session-owner idx run)
              rate (k/one-i idx run "rate")
+             shown-rate (if (some? rate) rate "?")
              te (session-thread idx run)
              dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)]
          (println (str "clocked in for client " (if (some? owner) owner "?")
                        "  (session " (short-id run)
-                       (if (some? rate) (str ", rate " rate "/h") "") ")"))
+                       ", rate " shown-rate "/h)"))
          (when (not (= te ""))
            (println (str "  legacy thread " (short-id te) "  " (trunc (title-of idx te) 40))))
          (println (str "  since " (if (some? st) st "?") "  (" (fmt-hm dur) " elapsed)")))])))
