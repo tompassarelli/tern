@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  runGuardScript, evaluateGuards, resolveManagedGuardChain,
+  authoringHooksDir, runGuardScript, evaluateGuards, resolveManagedGuardChain,
 } from "../src/authoring-guards";
 
 let dir: string;
@@ -90,6 +90,27 @@ afterAll(() => {
 });
 
 const HOOK = { tool_name: "Write", tool_input: { file_path: "/x" }, cwd: "/x", session_id: "s" };
+
+describe("authoringHooksDir — portable default and exact override", () => {
+  test("defaults to ~/.agents/hooks, never a provider checkout", () => {
+    const home = join(dir, "hooks-home");
+    const dflt = authoringHooksDir({ HOME: home });
+    expect(dflt).toBe(join(home, ".agents", "hooks"));
+    expect(dflt).not.toContain("nixos-config");
+    expect(dflt).not.toContain(".claude");
+    expect(dflt).not.toContain(".codex");
+  });
+
+  test("an exact AGENT_HOOKS_DIR override wins outright and is home-independent", () => {
+    const override = join(dir, "portable-hooks");
+    expect(authoringHooksDir({ HOME: join(dir, "hooks-home"), AGENT_HOOKS_DIR: override }))
+      .toBe(override);
+    expect(authoringHooksDir({ AGENT_HOOKS_DIR: override })).toBe(override);
+    // A blank override is ignored and falls back to the portable default.
+    expect(authoringHooksDir({ HOME: join(dir, "hooks-home"), AGENT_HOOKS_DIR: "  " }))
+      .toBe(join(dir, "hooks-home", ".agents", "hooks"));
+  });
+});
 
 describe("runGuardScript — result protocol", () => {
   test("deny JSON on stdout -> deny surfaced with its reason", async () => {

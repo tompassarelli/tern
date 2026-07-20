@@ -9,7 +9,9 @@ import {
   applyHarnessRoute,
   canonicalGlobalAgents,
   COORDINATION_TOOLS,
+  domainSkillsDir,
   GLOBAL_AGENTS_MAX_BYTES,
+  globalLawsPath,
   hasCanonicalHarnessAuthority,
   hasCanonicalAuthoringHooks,
   harnessOptions,
@@ -36,7 +38,8 @@ import {
 const north = join(import.meta.dir, "../..");
 const temporary: string[] = [];
 const envKeys = [
-  "HOME", "AGENT_LAWS", "NORTH_PORT", "FRAM_LOG", "FRAM_TELEMETRY_LOG",
+  "HOME", "AGENT_LAWS", "AGENT_LAWS_PATH", "AGENT_SKILLS_DIR", "NORTH_PORT",
+  "FRAM_LOG", "FRAM_TELEMETRY_LOG",
   "FRAM_THREADS", "UNRELATED_SECRET_CANARY", "GAFFER_HOME", "NORTH_MANAGED_LANE",
   "NORTH_CODEX_BIN", "NORTH_MANAGED_CODEX_BIN",
 ] as const;
@@ -307,10 +310,13 @@ test("managed lanes materialize the canonical default North port in lane and MCP
 test("canonical global AGENTS is fail-closed, bounded, valid UTF-8, and injected once for Anthropic", () => {
   const home = mkdtempSync(join(tmpdir(), "north-global-agents-"));
   temporary.push(home);
-  const codexHome = join(home, ".codex");
-  const source = join(codexHome, "AGENTS.md");
-  mkdirSync(codexHome, { recursive: true });
+  // Exercise DEFAULT resolution: no explicit override, so laws must resolve from
+  // ~/.agents/AGENTS.md — never a provider config home like ~/.codex.
+  const agentsHome = join(home, ".agents");
+  const source = join(agentsHome, "AGENTS.md");
+  mkdirSync(agentsHome, { recursive: true });
   process.env.HOME = home;
+  delete process.env.AGENT_LAWS_PATH;
   process.env.AGENT_LAWS = "on";
 
   expect(() => canonicalGlobalAgents()).toThrow("global AGENTS bootstrap cannot inspect canonical source");
@@ -382,14 +388,59 @@ test("canonical global AGENTS is fail-closed, bounded, valid UTF-8, and injected
   })).not.toThrow();
 });
 
+test("global laws path resolves an exact override or the portable ~/.agents default, never a provider home", () => {
+  const home = mkdtempSync(join(tmpdir(), "north-laws-path-"));
+  temporary.push(home);
+
+  // Default: ~/.agents/AGENTS.md, and specifically NOT a provider config home.
+  const dfault = globalLawsPath({ HOME: home });
+  expect(dfault).toBe(join(home, ".agents", "AGENTS.md"));
+  expect(dfault).not.toBe(join(home, ".codex", "AGENTS.md"));
+  expect(dfault).not.toContain(".codex");
+
+  // An explicit AGENT_LAWS_PATH wins outright and is home-independent.
+  const override = join(home, "custom", "LAWS.md");
+  expect(globalLawsPath({ HOME: home, AGENT_LAWS_PATH: override })).toBe(override);
+  expect(globalLawsPath({ AGENT_LAWS_PATH: override })).toBe(override);
+  expect(globalLawsPath({ HOME: home, AGENT_LAWS_PATH: "  " })).toBe(dfault); // blank ignored
+
+  // No override and no HOME is a hard configuration error, not a silent guess.
+  expect(() => globalLawsPath({})).toThrow(
+    "global AGENTS bootstrap requires AGENT_LAWS_PATH or HOME",
+  );
+});
+
+test("domain skills dir resolves an exact override or the portable ~/.agents/skills default, never a provider checkout", () => {
+  const home = mkdtempSync(join(tmpdir(), "north-skills-dir-"));
+  temporary.push(home);
+
+  const dfault = domainSkillsDir({ HOME: home });
+  expect(dfault).toBe(join(home, ".agents", "skills"));
+  expect(dfault).not.toBe(join(home, ".codex", "skills"));
+  expect(dfault).not.toContain("nixos-config");
+
+  const override = join(home, "portable-skills");
+  expect(domainSkillsDir({ HOME: home, AGENT_SKILLS_DIR: override })).toBe(override);
+  expect(domainSkillsDir({ AGENT_SKILLS_DIR: override })).toBe(override);
+  expect(domainSkillsDir({ HOME: home, AGENT_SKILLS_DIR: "  " })).toBe(dfault); // blank ignored
+});
+
 test("ambient and isolated Codex targets resolve the exact canonical global AGENTS source", () => {
   const home = mkdtempSync(join(tmpdir(), "north-codex-global-targets-"));
   temporary.push(home);
+  // The one canonical provider-neutral source lives at the portable ~/.agents
+  // path (resolved via the explicit AGENT_LAWS_PATH override). Native Codex still
+  // loads CODEX_HOME/AGENTS.md, so in the portable topology that file is a symlink
+  // ONTO the one canonical source — their realpaths agree, so no divergence.
+  const agentsHome = join(home, ".agents");
+  const lawsSource = join(agentsHome, "AGENTS.md");
+  mkdirSync(agentsHome, { recursive: true });
+  writeFileSync(lawsSource, "CODEX_TARGET_GLOBAL_CANARY_81277\n");
   const codexHome = join(home, ".codex");
-  const source = join(codexHome, "AGENTS.md");
   mkdirSync(codexHome, { recursive: true });
-  writeFileSync(source, "CODEX_TARGET_GLOBAL_CANARY_81277\n");
-  const baseEnv = { ...process.env, HOME: home, AGENT_LAWS: "on" };
+  const source = join(codexHome, "AGENTS.md");
+  symlinkSync(lawsSource, source);
+  const baseEnv = { ...process.env, HOME: home, AGENT_LAWS: "on", AGENT_LAWS_PATH: lawsSource };
 
   const ambient = providerEnvironmentForTarget("openai", undefined, { env: baseEnv });
   expect(ambient.CODEX_HOME).toBe(codexHome);
@@ -508,13 +559,14 @@ test("project AGENTS composition is bounded, root-to-cwd, override-aware, and pr
   const nested = join(project, "src", "module");
   mkdirSync(join(project, ".git"), { recursive: true });
   mkdirSync(nested, { recursive: true });
-  mkdirSync(join(home, ".codex"), { recursive: true });
-  writeFileSync(join(home, ".codex", "AGENTS.md"), "GLOBAL_AUTHORITY_CANARY\n");
+  mkdirSync(join(home, ".agents"), { recursive: true });
+  writeFileSync(join(home, ".agents", "AGENTS.md"), "GLOBAL_AUTHORITY_CANARY\n");
   writeFileSync(join(project, "AGENTS.md"), "ROOT_PROJECT_CANARY\n");
   writeFileSync(join(project, "src", "AGENTS.md"), "SRC_PROJECT_CANARY\n");
   writeFileSync(join(nested, "AGENTS.md"), "SHADOWED_PROJECT_CANARY\n");
   writeFileSync(join(nested, "AGENTS.override.md"), "OVERRIDE_PROJECT_CANARY\n");
   process.env.HOME = home;
+  delete process.env.AGENT_LAWS_PATH;
   process.env.AGENT_LAWS = "on";
   process.env.GAFFER_HOME = inheritedEnv.GAFFER_HOME ?? join(north, "../gaffer");
 

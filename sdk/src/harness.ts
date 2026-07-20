@@ -407,8 +407,9 @@ function esoAppendix(): string {
 // the constitution. Project AGENTS files are composed explicitly for both providers below.
 // A custom-string systemPrompt bypasses the SDK's claude_code preset, which is the
 // only path that injects CLAUDE.md — so without this, workers get NONE of the
-// global laws interactive sessions live under. ~/.codex/AGENTS.md is the one
-// provider-neutral bootstrap source. Missing, replaced, unreadable, malformed,
+// global laws interactive sessions live under. The provider-neutral bootstrap
+// source resolves to an exact AGENT_LAWS_PATH or, failing that, ~/.agents/AGENTS.md —
+// never a provider home like ~/.codex. Missing, replaced, unreadable, malformed,
 // or oversized authority is a hard configuration error; AGENT_LAWS=off is the
 // sole explicit escape hatch.
 export const GLOBAL_AGENTS_MAX_BYTES = 32 * 1024;
@@ -455,14 +456,25 @@ function readGlobalAgents(path: string, label: string): Omit<CanonicalGlobalAgen
   return { bytes, text };
 }
 
+/**
+ * The exact provider-neutral global-authority path: an explicit AGENT_LAWS_PATH
+ * wins outright, otherwise ~/.agents/AGENTS.md. Never a provider config home
+ * (~/.codex, ~/.claude) — those remain each provider's own native surface.
+ */
+export function globalLawsPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.AGENT_LAWS_PATH?.trim();
+  if (override) return resolve(override);
+  const home = env.HOME?.trim();
+  if (!home) throw new Error("global AGENTS bootstrap requires AGENT_LAWS_PATH or HOME");
+  return resolve(home, ".agents", "AGENTS.md");
+}
+
 /** The exact provider-neutral global authority source for this process home. */
 export function canonicalGlobalAgents(
   env: NodeJS.ProcessEnv = process.env,
 ): CanonicalGlobalAgents | undefined {
   if (!agentLawsEnabled(env)) return undefined;
-  const home = env.HOME?.trim();
-  if (!home) throw new Error("global AGENTS bootstrap requires HOME");
-  const path = resolve(home, ".codex", "AGENTS.md");
+  const path = globalLawsPath(env);
   const source = readGlobalAgents(path, "canonical source");
   let canonicalPath: string;
   try { canonicalPath = realpathSync(path); }
@@ -820,15 +832,24 @@ function requirementSlug(requirement: string): string {
   return requirement.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
+/**
+ * The portable domain-skill root: an explicit AGENT_SKILLS_DIR wins outright,
+ * otherwise ~/.agents/skills. No provider config home (~/.codex) and no repo
+ * checkout (nixos-config) fallback — a missing root simply yields no candidate.
+ */
+export function domainSkillsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.AGENT_SKILLS_DIR?.trim();
+  if (override) return resolve(override);
+  return resolve(env.HOME ?? "", ".agents", "skills");
+}
+
 function domainContextCandidates(cwd: string, requirement: string): string[] {
   const slug = requirementSlug(requirement);
   const candidates = [
     resolve(cwd, "AGENTS.md"),
     resolve(cwd, "docs", `${slug}.md`),
     resolve(cwd, "docs", "domains", `${slug}.md`),
-    resolve(process.env.HOME ?? "", ".agents", "skills", slug, "SKILL.md"),
-    resolve(process.env.HOME ?? "", ".codex", "skills", slug, "SKILL.md"),
-    resolve(process.env.HOME ?? "", "code/nixos-config/dotfiles/agents/skills", slug, "SKILL.md"),
+    resolve(domainSkillsDir(), slug, "SKILL.md"),
     resolve(gafferHome(), "docs", "domains", `${slug}.md`),
   ];
   return [...new Set(candidates.filter(existsSync))];

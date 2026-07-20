@@ -31,13 +31,17 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseStrictJson } from "./strict-json";
 
-// Guard scripts live in nixos-config (the ~/.claude/* symlink source). Resolved
-// absolute so the SDK stays portable — a machine without the checkout simply finds
-// no scripts and every guard is skipped (fail-open).
-export const HOOKS_DIR = resolve(
-  process.env.HOME ?? "",
-  "code/nixos-config/dotfiles/claude/hooks",
-);
+// Guard scripts default to the portable ~/.agents/hooks, overridable by an exact
+// AGENT_HOOKS_DIR. No provider checkout fallback: a host without the directory
+// simply finds no scripts and every advisory guard is skipped (fail-open); the
+// canonical clock guard's absence denies unavailable instead.
+export function authoringHooksDir(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.AGENT_HOOKS_DIR?.trim();
+  if (override) return resolve(override);
+  return resolve(env.HOME ?? "", ".agents", "hooks");
+}
+
+export const HOOKS_DIR = authoringHooksDir();
 
 export type GuardDecision =
   | { decision: "deny"; reason: string }
