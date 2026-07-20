@@ -287,3 +287,64 @@ describe("trustedGitExecutable — default discovery never trusts $PATH", () => 
     expect(STORE_GIT.test(resolved)).toBe(true);
   });
 });
+
+// The wrapper's explicit NORTH_GIT_BIN injection is the highest-priority entry
+// hint, and the /run/current-system/sw/bin/git literal the purity guard now
+// exempts is only a lower-priority fallback for managed spawns that never got
+// that env. Both remain untrusted until the canonical /nix/store + X_OK proof
+// passes, so this block pins that NORTH_GIT_BIN is honored when genuine and
+// rejected — never blindly trusted by name — when forged.
+describe("trustedGitExecutable — NORTH_GIT_BIN entry hint is gated, not trusted", () => {
+  const env = { ...process.env };
+  let scratch: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "trusted-git-envbin-"));
+  });
+  afterEach(() => {
+    process.env = { ...env };
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  test("default discovery honors a genuine store NORTH_GIT_BIN as first choice", () => {
+    const git = realStoreGit();
+    const hint = join(scratch, "wrapper-git"); // a wrapper-style symlink into the store
+    symlinkSync(git, hint);
+    process.env.NORTH_GIT_BIN = hint;
+    process.env.PATH = "/nonexistent";
+    expect(trustedGitExecutable()).toBe(git);
+  });
+
+  test("a NORTH_GIT_BIN pointing at a writable non-store shim is never selected", () => {
+    const shim = join(scratch, "git"); // attacker-writable, canonical path outside the store
+    writeFileSync(shim, "#!/bin/sh\necho pwned\n");
+    chmodSync(shim, 0o755);
+    process.env.NORTH_GIT_BIN = shim;
+    process.env.PATH = join(scratch, "empty");
+
+    let resolved: string | undefined;
+    try {
+      resolved = trustedGitExecutable();
+    } catch {
+      resolved = undefined; // fail-closed if no genuine store git is reachable
+    }
+    expect(resolved).not.toBe(shim);
+    if (resolved !== undefined) expect(STORE_GIT.test(resolved)).toBe(true);
+  });
+
+  test("a forged entry hint repointed at a writable shim is rejected, a later store git wins", () => {
+    const git = realStoreGit();
+    // A profile-shaped pointer an attacker repointed at their own shim.
+    const shim = join(scratch, "shim");
+    writeFileSync(shim, "#!/bin/sh\necho pwned\n");
+    chmodSync(shim, 0o755);
+    const forged = join(scratch, "profile-git");
+    symlinkSync(shim, forged);
+    // The forged hint precedes a genuine store git in the candidate order.
+    expect(trustedGitExecutable([forged, git])).toBe(git);
+    // And alone it fails closed — the forgery is never accepted.
+    expect(() => trustedGitExecutable([forged])).toThrow(
+      "trusted Nix-store Git executable unavailable",
+    );
+  });
+});

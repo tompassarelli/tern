@@ -88,6 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           bash bin/tests/github-flake-input-pin-test.sh
+          bash bin/tests/package-purity-check-test.sh
           bash bin/tests/ci-required-bars-test.sh
           bash bin/tests/sdk-test-entrypoint-test.sh
           bash cli/tests/package-helper-smoke-test.sh

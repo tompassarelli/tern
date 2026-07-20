@@ -376,7 +376,21 @@
               --set NORTH_HOME $out
 
             impurity_pattern='/(home|Users)/|/run/current-system/sw|/code/north(?:/|\b)|~/code/north|[$]HOME/code/north|[.]m2|[.]cpcache|[.]cache/babashka'
-            if LC_ALL=C rg --hidden -n "$impurity_pattern" "$out"; then
+            # Two audited exceptions to the store-external scan, and only these:
+            # sdk/src/trusted-runtime.ts's NixOS entry-hint pointers
+            # /run/current-system/sw/bin/{git,bb}. They are root-managed runtime
+            # symlinks, NOT baked store paths — trustedStoreExecutable() still
+            # forces each to canonicalize (realpathSync) into the immutable
+            # /nix/store and be executable, so they never widen trust. They are
+            # required because managed spawns don't always inherit the wrapper's
+            # NORTH_GIT_BIN / NORTH_BB. The exemption is line-exact: any other
+            # path in that same file, any other system-profile target, and every
+            # match in every other file stays fatal.
+            sanctioned='(^|/)sdk/src/trusted-runtime\.ts:[0-9]+:[[:space:]]*"/run/current-system/sw/bin/(git|bb)",$'
+            residual=$(LC_ALL=C rg --hidden -n "$impurity_pattern" "$out" \
+              | LC_ALL=C rg -v "$sanctioned" || true)
+            if [ -n "$residual" ]; then
+              printf '%s\n' "$residual" >&2
               echo "north package contains a checkout/home/cache path" >&2
               exit 1
             fi
