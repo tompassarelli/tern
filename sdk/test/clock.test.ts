@@ -23,6 +23,7 @@ describe("required client clock admission", () => {
   const projectRoot = () => "/home/tom/code/client/msa/kea";
   const branchName = () => "msa-242-clock-admission";
   const thread = () => [
+    { predicate: "title", value: "Clock admission work" },
     { predicate: "owner", value: "msa" },
     { predicate: "linear", value: "MSA-242" },
   ];
@@ -56,9 +57,29 @@ describe("required client clock admission", () => {
       {
         projectRoot,
         branchName,
-        readThreadFacts: () => [{ predicate: "owner", value: "other" }],
+        readThreadFacts: () => [
+          { predicate: "title", value: "Clock admission work" },
+          { predicate: "owner", value: "other" },
+        ],
       },
     ), "billable_thread_owner_mismatch");
+  });
+
+  test("billing admission requires exactly one nonempty title-bearing thread", () => {
+    for (const titles of [[], [""], ["   "], ["one", "two"]]) {
+      failureCode(() => admitBillableClock(
+        { ...base, threadId: "thread-clock-proof" },
+        {
+          projectRoot,
+          branchName,
+          readThreadFacts: () => [
+            ...titles.map((value) => ({ predicate: "title", value })),
+            { predicate: "owner", value: "msa" },
+            { predicate: "linear", value: "MSA-242" },
+          ],
+        },
+      ), "billable_thread_title_required");
+    }
   });
 
   test("branch must carry one client ticket and thread linear must match it exactly", () => {
@@ -76,6 +97,7 @@ describe("required client clock admission", () => {
         projectRoot,
         branchName,
         readThreadFacts: () => [
+          { predicate: "title", value: "Clock admission work" },
           { predicate: "owner", value: "msa" },
           { predicate: "linear", value: "MSA-241" },
         ],
@@ -205,6 +227,7 @@ describe("required client clock admission", () => {
           projectRoot,
           branchName: () => `${ticket.toLowerCase()}-work`,
           readThreadFacts: () => [
+            { predicate: "title", value: `Clock admission ${ticket}` },
             { predicate: "owner", value: "msa" },
             { predicate: "linear", value: ticket },
           ],

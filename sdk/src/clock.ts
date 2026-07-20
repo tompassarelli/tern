@@ -18,6 +18,7 @@ export type BillableClockPreflightCode =
   | "billable_thread_required"
   | "billable_ticket_required"
   | "billable_thread_owner_unavailable"
+  | "billable_thread_title_required"
   | "billable_thread_owner_mismatch"
   | "billable_thread_linear_mismatch"
   | "billable_client_session_required"
@@ -171,6 +172,11 @@ export function admitBillableClock(
         "billable_thread_owner_unavailable",
       );
     }
+    const titles = facts
+      .filter(({ predicate }) => predicate === "title")
+      .map(({ value }) => value);
+    if (titles.length !== 1 || titles[0]!.trim().length === 0)
+      throw new BillableClockPreflightError("billable_thread_title_required");
     const owners = facts
       .filter(({ predicate }) => predicate === "owner")
       .map(({ value }) => value);
