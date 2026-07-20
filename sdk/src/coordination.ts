@@ -8,6 +8,7 @@ import { spawn as procSpawn, type ChildProcess } from "node:child_process";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { parseStrictJson } from "./strict-json";
+import { trustedNorthBabashkaExecutable } from "./trusted-runtime";
 
 const REPO = resolve(import.meta.dir, "..", "..");
 const LIVE_FEED = `${REPO}/cli/north-live-feed.clj`;
@@ -164,10 +165,23 @@ function positiveInteger(value: number, label: string): number {
   return value;
 }
 
-function peerBabashkaExecutable(candidate: string | undefined): string {
-  if (!candidate || !NIX_BABASHKA.test(candidate))
+function peerBabashkaExecutable(injected: string | undefined): string {
+  // An explicit in-process injection (SubscriptionRuntime.bbExecutable) is a
+  // test seam — never attacker-reachable env — honored on the canonical
+  // store-shape check alone. Production passes undefined and resolves the
+  // immutable Nix-store bb from trusted entry pointers under the full realpath +
+  // X_OK proof: managed children do not always inherit the wrapper's
+  // NORTH_PEER_BB, so the feed's bb must be discoverable from the same immutable
+  // system/profile layout as trusted Git, not a bare env assumption.
+  if (injected !== undefined) {
+    if (!NIX_BABASHKA.test(injected)) throw new LiveFeedConfigurationError();
+    return injected;
+  }
+  try {
+    return trustedNorthBabashkaExecutable();
+  } catch {
     throw new LiveFeedConfigurationError();
-  return candidate;
+  }
 }
 
 function userMsg(text: string): SDKUserMessage {
@@ -512,9 +526,7 @@ function subscribeFeedMode(
   settlementOnly: boolean,
 ): FeedSubscription {
   const spawn = runtime.spawn ?? procSpawn;
-  const bbExecutable = peerBabashkaExecutable(
-    runtime.bbExecutable ?? process.env.NORTH_PEER_BB,
-  );
+  const bbExecutable = peerBabashkaExecutable(runtime.bbExecutable);
   // Resolve at spawn time so a per-lane / restarted coordinator port is honored,
   // and so hermetic suites pin it deterministically instead of racing ambient env.
   const feedPort = runtime.port ?? process.env.NORTH_PORT ?? DEFAULT_PORT;

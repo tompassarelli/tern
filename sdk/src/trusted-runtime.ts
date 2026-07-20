@@ -71,8 +71,58 @@ export function trustedGitExecutable(
 }
 
 /**
- * Managed provider execution never consults NORTH_CODEX_BIN or PATH. The
- * package wrapper overwrites this private selector with its exact Codex input.
+ * Fixed, non-arbitrary entry points to a NixOS-immutable Babashka, most trusted
+ * first: the wrapper's explicit peer/MCP/CLI injections, then the same
+ * root-managed system-profile, home-manager per-user profile, and per-user Nix
+ * profile layout as Git. Managed children do not always inherit the wrapper's
+ * NORTH_PEER_BB/NORTH_MCP_BB, so the `bb` powering the durable North mail feed
+ * must be discoverable from these immutable pointers. As with Git these are ENTRY
+ * hints only — every candidate still passes the canonical `/nix/store` +
+ * executable proof below, so a repointed profile symlink or writable shim can
+ * only resolve into the immutable store or be rejected. Ambient `$PATH` is
+ * deliberately absent, and absence of proof stays fail-closed.
+ */
+function defaultTrustedBabashkaPointers(): readonly (string | undefined)[] {
+  const home = process.env.HOME;
+  const user = safeProfileUser(process.env.USER);
+  return [
+    process.env.NORTH_PEER_BB,
+    process.env.NORTH_MCP_BB,
+    process.env.NORTH_BB,
+    "/run/current-system/sw/bin/bb",
+    user ? `/etc/profiles/per-user/${user}/bin/bb` : undefined,
+    home ? `${home}/.nix-profile/bin/bb` : undefined,
+  ];
+}
+
+/**
+ * Resolve the Babashka that runs North's own coordinator/live-feed scripts, whose
+ * real canonical executable lives in the immutable Nix store. Unlike the provider
+ * CLI, `bb` only interprets North's version-controlled `.clj` and its exact
+ * store hash is behaviorally irrelevant to trust, so any canonical
+ * `/nix/store/*-babashka/bin/bb` that is executable is safely discoverable from
+ * the entry hints above. Ambient `$PATH` and writable shim locations are never
+ * candidates; absent the `/nix/store` + X_OK proof, resolution fails closed.
+ */
+export function trustedNorthBabashkaExecutable(
+  candidates: readonly (string | undefined)[] = defaultTrustedBabashkaPointers(),
+): string {
+  return trustedStoreExecutable(
+    candidates,
+    /^\/nix\/store\/[0-9a-z]{32}-babashka(?:-[^/]+)?\/bin\/bb$/,
+    "Babashka",
+  );
+}
+
+/**
+ * Managed provider execution never consults NORTH_CODEX_BIN or PATH, and unlike
+ * Git/Babashka it is NOT broadened to ambient system pointers: the managed Codex
+ * IS the billed provider, so its exact wrapper-pinned build is an identity, not a
+ * fungible infrastructure tool. Substituting whatever `codex` the ambient system
+ * profile happens to expose would let the environment swap the provider binary
+ * (and its protocol/version) out from under a managed run. The package wrapper
+ * overwrites this private selector with its exact Codex input; absent that, it
+ * fails closed by design.
  */
 export function trustedManagedCodexExecutable(
   candidates: readonly (string | undefined)[] =

@@ -11,9 +11,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { trustedGitExecutable } from "../src/trusted-runtime";
+import { trustedGitExecutable, trustedNorthBabashkaExecutable } from "../src/trusted-runtime";
 
 const STORE_GIT = /^\/nix\/store\/[0-9a-z]{32}-git(?:-[^/]+)?\/bin\/git$/;
+const STORE_BB = /^\/nix\/store\/[0-9a-z]{32}-babashka(?:-[^/]+)?\/bin\/bb$/;
 
 // A genuine canonical /nix/store git present on this host. Tests that need a real
 // store target (symlink chains, positive canonical acceptance) build atop it,
@@ -97,6 +98,141 @@ describe("trustedGitExecutable — canonical store proof", () => {
     expect(() => trustedGitExecutable([undefined])).toThrow(
       "trusted Nix-store Git executable unavailable",
     );
+  });
+});
+
+// A genuine canonical /nix/store babashka present on this host, resolved from the
+// same immutable system/profile layout the discovery trusts. Symlink-chain and
+// positive-acceptance cases build atop it because a temp dir can never be a real
+// /nix/store path.
+function realStoreBabashka(): string {
+  const candidates = [
+    process.env.NORTH_PEER_BB,
+    process.env.NORTH_MCP_BB,
+    process.env.NORTH_BB,
+    "/run/current-system/sw/bin/bb",
+    "/etc/profiles/per-user/" + (process.env.USER ?? "") + "/bin/bb",
+    `${process.env.HOME}/.nix-profile/bin/bb`,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const real = realpathSync(candidate);
+      if (STORE_BB.test(real)) return real;
+    } catch {
+      // keep looking
+    }
+  }
+  throw new Error("test host exposes no canonical /nix/store babashka");
+}
+
+describe("trustedNorthBabashkaExecutable — canonical store proof", () => {
+  const bb = realStoreBabashka();
+  let scratch: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "trusted-bb-"));
+  });
+  afterEach(() => {
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  // The exact matrix the fix's added fallback must satisfy: a direct store bb, a
+  // supported multi-hop profile symlink chain into the store, a broken candidate
+  // recovered by a later valid one, and every rejection shape.
+  const rejects = "trusted Nix-store Babashka executable unavailable";
+
+  test("accepts a canonical Nix-store bb given directly", () => {
+    expect(trustedNorthBabashkaExecutable([bb])).toBe(bb);
+  });
+
+  test("accepts a supported multi-hop profile symlink chain into the store", () => {
+    const hop2 = join(scratch, "bb");
+    const hop1 = join(scratch, "profile-bb");
+    symlinkSync(bb, hop2);
+    symlinkSync(hop2, hop1);
+    expect(trustedNorthBabashkaExecutable([hop1])).toBe(bb);
+  });
+
+  test("skips a broken candidate and resolves a later valid store bb", () => {
+    expect(trustedNorthBabashkaExecutable([join(scratch, "absent"), bb])).toBe(bb);
+  });
+
+  test("rejects a non-store bb even when it is executable", () => {
+    const shim = join(scratch, "bb");
+    writeFileSync(shim, "#!/bin/sh\nexit 0\n");
+    chmodSync(shim, 0o755);
+    expect(() => trustedNorthBabashkaExecutable([shim])).toThrow(rejects);
+  });
+
+  test("rejects a writable shim whose path merely CONTAINS /nix/store", () => {
+    const fake = join(scratch, "nix", "store", "0".repeat(32) + "-babashka-9.9.9", "bin", "bb");
+    mkdirSync(dirname(fake), { recursive: true });
+    writeFileSync(fake, "#!/bin/sh\nexit 0\n");
+    chmodSync(fake, 0o755);
+    expect(() => trustedNorthBabashkaExecutable([fake])).toThrow(rejects);
+  });
+
+  test("rejects a missing executable", () => {
+    expect(() => trustedNorthBabashkaExecutable([join(scratch, "does-not-exist")]))
+      .toThrow(rejects);
+  });
+
+  test("fails closed with no candidates", () => {
+    expect(() => trustedNorthBabashkaExecutable([undefined])).toThrow(rejects);
+  });
+});
+
+describe("trustedNorthBabashkaExecutable — default discovery never trusts $PATH", () => {
+  const env = { ...process.env };
+  let scratch: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "trusted-bb-env-"));
+  });
+  afterEach(() => {
+    process.env = { ...env };
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  test("default resolution ignores a hostile PATH bb and yields only a store bb", () => {
+    const evilDir = join(scratch, "evil");
+    mkdirSync(evilDir, { recursive: true });
+    const evil = join(evilDir, "bb");
+    writeFileSync(evil, "#!/bin/sh\necho pwned\n");
+    chmodSync(evil, 0o755);
+    process.env.PATH = evilDir;
+    delete process.env.NORTH_PEER_BB;
+    delete process.env.NORTH_MCP_BB;
+    delete process.env.NORTH_BB;
+
+    let resolved: string | undefined;
+    try {
+      resolved = trustedNorthBabashkaExecutable();
+    } catch {
+      resolved = undefined; // fail-closed is an acceptable outcome
+    }
+    expect(resolved).not.toBe(evil);
+    if (resolved !== undefined) expect(STORE_BB.test(resolved)).toBe(true);
+  });
+
+  test("default resolution follows the user Nix profile entry hint into the store", () => {
+    const bb = realStoreBabashka();
+    const home = join(scratch, "home");
+    const profileBin = join(home, ".nix-profile", "bin");
+    mkdirSync(profileBin, { recursive: true });
+    symlinkSync(bb, join(profileBin, "bb"));
+    process.env.HOME = home;
+    process.env.USER = "no-such-user-xyz"; // /etc per-user pointer absent
+    process.env.PATH = "/nonexistent";
+    delete process.env.NORTH_PEER_BB;
+    delete process.env.NORTH_MCP_BB;
+    delete process.env.NORTH_BB;
+
+    // /run/current-system/sw/bin/bb may or may not exist on the host; either way
+    // the resolved path is a canonical store bb, and never the empty PATH.
+    const resolved = trustedNorthBabashkaExecutable();
+    expect(STORE_BB.test(resolved)).toBe(true);
   });
 });
 
