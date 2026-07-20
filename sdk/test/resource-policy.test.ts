@@ -39,7 +39,7 @@ const complete = {
   reservedFrontierTarget: "claude-primary",
   pressures: {
     "claude-primary": { state: "plenty", observedAt: "2026-07-16T00:00:00Z" },
-    "codex-primary": { state: "low", observedAt: "2026-07-01T00:00:00Z", until: "2026-07-20T00:00:00Z" },
+    "codex-primary": { state: "low", observedAt: "2026-07-01T00:00:00Z", until: "2099-01-01T00:00:00Z" },
   },
   envelopes: {
     default: { runs: 100, frontierRuns: 10, retries: 5, parallelism: 4 },
