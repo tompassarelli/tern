@@ -263,21 +263,62 @@ export async function admitOpenAI(options: any, target?: RoutingTarget): Promise
   );
 }
 
+function frameText(v: any): string {
+  if (typeof v === "string") return v;
+  if (v?.type === "user" && typeof v.message?.content === "string") return v.message.content;
+  if (v?.type === "user" && Array.isArray(v.message?.content))
+    return v.message.content.map((x: any) => x.text ?? "").join("\n");
+  return String(v?.text ?? v?.content ?? v ?? "");
+}
+
 async function initialPrompt(value: string | AsyncIterable<any>): Promise<string> {
   if (typeof value === "string") return value;
   const it = value[Symbol.asyncIterator]();
   try {
     const first = await it.next();
     if (first.done) return "";
-    const v = first.value;
-    if (typeof v === "string") return v;
-    if (v?.type === "user" && typeof v.message?.content === "string") return v.message.content;
-    if (v?.type === "user" && Array.isArray(v.message?.content))
-      return v.message.content.map((x: any) => x.text ?? "").join("\n");
-    return String(v?.text ?? v?.content ?? v ?? "");
+    return frameText(first.value);
   } finally {
     try { await it.return?.(); } catch { /* provider teardown owns the terminal error */ }
   }
+}
+
+// A persistent view over the streamed North input: `first()` is the launch
+// prompt, `next()` yields each LATER frame the orchestrator loop pushes on the
+// same provider thread (or `undefined` when the channel closes). A string
+// prompt is single-turn. Unlike `initialPrompt`, the iterator is NOT closed
+// after the first frame — continuation depends on pulling later frames.
+interface PromptFrames {
+  first(): Promise<string>;
+  next(): Promise<string | undefined>;
+  close(): Promise<void>;
+}
+
+function promptFrames(value: string | AsyncIterable<any>): PromptFrames {
+  if (typeof value === "string") {
+    return {
+      async first() { return value; },
+      async next() { return undefined; },
+      async close() { /* no iterator to release */ },
+    };
+  }
+  const it = value[Symbol.asyncIterator]();
+  let done = false;
+  const pull = async (): Promise<string | undefined> => {
+    if (done) return undefined;
+    const frame = await it.next();
+    if (frame.done) { done = true; return undefined; }
+    return frameText(frame.value);
+  };
+  return {
+    async first() { return (await pull()) ?? ""; },
+    async next() { return pull(); },
+    async close() {
+      if (done) return;
+      done = true;
+      try { await it.return?.(); } catch { /* provider teardown owns the terminal error */ }
+    },
+  };
 }
 
 function modelForCodex(model?: string): string | undefined {
@@ -752,12 +793,6 @@ class CodexQuery implements AgentQuery {
     this.admittedManagedCommand = undefined;
     if (managed && !managedCommand)
       throw new ProviderRetrySafeError("openai_managed_command_receipt_unavailable");
-    const task = await initialPrompt(this.prompt);
-    const prompt = managed
-      ? task
-      : this.options.systemPrompt
-      ? `${this.options.systemPrompt}\n\n## Task\n${task}`
-      : task;
     if (managed) {
       const surface = compileProviderAuthoritySurface(
         "openai", this.options,
@@ -766,11 +801,17 @@ class CodexQuery implements AgentQuery {
       if (!model)
         throw new ProviderRetrySafeError("openai_exact_model_resolution_missing");
       const north = this.options.mcpServers.north;
+      // The launch prompt is the first North frame; later frames (an
+      // orchestrator's post-settlement reduction directive, a live steer) are
+      // consumed as additional turns on the SAME provider thread. A string
+      // prompt or a channel that closes after one frame stays single-turn.
+      const frames = promptFrames(this.prompt);
+      const launchPrompt = await frames.first();
       const run = new ManagedCodexAppServerRun({
         command: managedCommand!,
         env,
         cwd: this.options.cwd ?? process.cwd(),
-        prompt,
+        prompt: launchPrompt,
         model,
         effort: this.options.effort,
         developerInstructions: managedDeveloperInstructions(this.options),
@@ -783,31 +824,39 @@ class CodexQuery implements AgentQuery {
         onActivity: () => renewHarnessPresence(this.options),
       });
       this.managedRun = run;
+      let turns = 0;
       try {
-        const completed = await run.execute();
-        if (completed.text) yield {
-          type: "assistant",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: completed.text }],
-          },
-        };
-        const normalizedUsage = codexUsage(completed.usage);
-        yield {
-          type: "result", subtype: "success", result: completed.text,
-          num_turns: 1,
-          usage: normalizedUsage.usage,
-          _north_usage: normalizedUsage.metadata,
-        };
+        for await (const completed of run.session(() => frames.next())) {
+          turns += 1;
+          if (completed.text) yield {
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: completed.text }],
+            },
+          };
+          const normalizedUsage = codexUsage(completed.usage);
+          yield {
+            type: "result", subtype: "success", result: completed.text,
+            num_turns: turns,
+            usage: normalizedUsage.usage,
+            _north_usage: normalizedUsage.metadata,
+          };
+        }
         return;
       } catch (error) {
         if (error instanceof ManagedCodexPreThreadError)
           throw new ProviderRetrySafeError(error.message, { cause: error });
         throw error;
       } finally {
+        await frames.close().catch(() => { /* teardown owns the terminal error */ });
         this.managedRun = undefined;
       }
     }
+    const task = await initialPrompt(this.prompt);
+    const prompt = this.options.systemPrompt
+      ? `${this.options.systemPrompt}\n\n## Task\n${task}`
+      : task;
     const args = [
       ...codexGlobalArguments(this.options),
       "exec", ...codexConfigArguments(env), ...codexHarnessArguments(this.options),

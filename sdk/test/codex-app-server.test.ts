@@ -231,7 +231,15 @@ function setup(mode = "ok") {
     });
     const notify = (method: string, params: unknown) => send({ method, params });
     const threadId = "019f7abc-0000-7000-8000-000000000001";
-    const turnId = "019f7abc-0000-7000-8000-000000000002";
+    const turnIds = [
+      "019f7abc-0000-7000-8000-000000000002",
+      "019f7abc-0000-7000-8000-000000000003",
+      "019f7abc-0000-7000-8000-000000000004",
+    ];
+    let turnStarts = 0;
+    // The live turn id for the turn currently being served. Continuation turns
+    // reuse the same thread but MUST carry a distinct turn id.
+    let turnId = turnIds[0]!;
     const item = (id: string, type: string, extra: Record<string, unknown> = {}) => ({ id, type, ...extra });
     const lifecycle = (kind: "started" | "completed", value: any, at: number) => notify(
       `item/${kind}`,
@@ -452,6 +460,8 @@ function setup(mode = "ok") {
         return;
       }
       if (request.method === "turn/start") {
+        turnId = turnIds[Math.min(turnStarts, turnIds.length - 1)]!;
+        turnStarts += 1;
         result(request, { turn: turn(turnId, "inProgress") });
         queueMicrotask(emitRuntime);
         return;
@@ -525,6 +535,62 @@ test("one app-server proves authority and executes realistic shell/file/MCP traf
     threadId: "019f7abc-0000-7000-8000-000000000001",
     input: [{ type: "text", text: "perform managed work" }], effort: "high",
   });
+});
+
+test("a later North frame drives a same-thread continuation turn under re-proven authority", async () => {
+  const { options, requests } = setup();
+  const reduction = "reconcile the settled child lanes into the parent thread";
+  const later: Array<string | undefined> = [reduction];
+  const run = new ManagedCodexAppServerRun(options);
+  const settlements: Array<{ text: string; usage: unknown }> = [];
+  // First frame is the launch prompt; `nextInput` supplies exactly one later
+  // frame, then settles the session.
+  for await (const turnResult of run.session(async () => later.shift())) {
+    settlements.push(turnResult);
+  }
+  const expected = {
+    text: "managed answer",
+    usage: { input_tokens: 9, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1 },
+  };
+  // One terminal result per consumed frame.
+  expect(settlements).toEqual([expected, expected]);
+
+  // Exactly one provider thread, two turns bound to it.
+  expect(requests.filter(({ method }) => method === "thread/start")).toHaveLength(1);
+  const turnStarts = requests.filter(({ method }) => method === "turn/start");
+  expect(turnStarts).toHaveLength(2);
+  expect(turnStarts.map((request) => request.params.threadId)).toEqual([
+    "019f7abc-0000-7000-8000-000000000001",
+    "019f7abc-0000-7000-8000-000000000001",
+  ]);
+  // The continuation turn consumed the LATER North frame, not a replay of the
+  // launch prompt.
+  expect(turnStarts[0].params.input).toEqual([{ type: "text", text: "perform managed work" }]);
+  expect(turnStarts[1].params.input).toEqual([{ type: "text", text: reduction }]);
+
+  // The session initializes once but re-proves the exact authority surface on
+  // every turn: web-disabled config, hook set, and MCP tool grant are all
+  // re-read pre-turn and the config fingerprint is re-attested post-turn.
+  expect(requests.filter(({ method }) => method === "initialize")).toHaveLength(1);
+  expect(requests.filter(({ method }) => method === "config/read")).toHaveLength(5);
+  expect(requests.filter(({ method }) => method === "hooks/list")).toHaveLength(3);
+  expect(requests.filter(({ method }) => method === "mcpServerStatus/list")).toHaveLength(6);
+});
+
+test("a continuation turn that widens config authority fails closed", async () => {
+  // `fingerprint-mutation` mutates the sessionFlags layer version on the 2nd+
+  // config/read. The launch turn's pre-turn re-read (configReads>1) already
+  // trips it, so the very first turn fails and no continuation is served.
+  const { options, requests } = setup("fingerprint-mutation");
+  const run = new ManagedCodexAppServerRun(options);
+  let caught: unknown;
+  try {
+    for await (const _ of run.session(async () => "a later frame")) { /* unreachable */ }
+  } catch (error) { caught = error; }
+  expect(caught).toBeInstanceOf(Error);
+  expect((caught as Error).message).toBe("openai_provider_execution_failed");
+  // The authority regression is caught before a second turn can start.
+  expect(requests.filter(({ method }) => method === "turn/start").length).toBeLessThanOrEqual(1);
 });
 
 test("the production duplex supervisor carries RPC and bounds host-EOF cleanup", async () => {

@@ -138,6 +138,13 @@ export interface ManagedCodexResult {
   };
 }
 
+// A later North input frame for the same provider thread, or `undefined` to
+// settle the session after the current turn. The session drives one Codex turn
+// per resolved frame; every turn re-proves the exact managed authority surface
+// before it starts and again at its terminal settlement, so a continuation can
+// never widen capability (web stays disabled) mid-session.
+export type ManagedCodexNextInput = () => Promise<string | undefined>;
+
 export class ManagedCodexPreThreadError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -1198,7 +1205,25 @@ export class ManagedCodexAppServerRun {
     if (this.child) await closeProcess(this.child, this.rpc, this.control);
   }
 
+  // Single-turn entry point: run exactly one turn on a fresh thread and tear the
+  // session down. Preserved verbatim for the ~40 direct call sites and the
+  // non-continuation worker path.
   async execute(): Promise<ManagedCodexResult> {
+    const session = this.session(async () => undefined);
+    const first = await session.next();
+    if (first.done || !first.value)
+      throw new Error("openai_provider_execution_failed");
+    // Resume into the generator's finally so teardown (and any unclean-close
+    // failure) is observed exactly as the pre-continuation flow observed it.
+    await session.return(first.value);
+    return first.value;
+  }
+
+  // Same-thread continuation. Yields one terminal result per turn; after each
+  // turn the caller supplies the next North input frame (or `undefined` to
+  // settle). The provider thread, MCP wiring, and authority fingerprint are
+  // established once and re-proven per turn.
+  async *session(nextInput: ManagedCodexNextInput): AsyncGenerator<ManagedCodexResult> {
     let contract: LaunchContract;
     try { contract = managedCodexAppServerLaunch(this.options); }
     catch (error) {
@@ -1237,7 +1262,10 @@ export class ManagedCodexAppServerRun {
     const queuedNotifications: Array<{ method: string; value: unknown }> = [];
     let terminalResolve!: () => void;
     let terminalReject!: (error: Error) => void;
-    const terminal = new Promise<void>((resolveTerminal, rejectTerminal) => {
+    // Reassigned per turn: each continuation turn installs a fresh terminal
+    // barrier while `terminalResolve`/`terminalReject` (captured by the
+    // notification closures below by reference) always point at the live turn.
+    let terminal = new Promise<void>((resolveTerminal, rejectTerminal) => {
       terminalResolve = resolveTerminal;
       terminalReject = rejectTerminal;
     });
@@ -1322,7 +1350,10 @@ export class ManagedCodexAppServerRun {
       child, this.options.timeoutMs ?? RPC_TIMEOUT_MS, onNotification, control?.writeLine,
     );
     this.rpc = rpc;
-    const removeTerminal = rpc.onTerminal(terminalReject);
+    // Route an RPC-level terminal failure into whichever turn is currently
+    // waiting; the indirection is required so a defect during turn N rejects
+    // turn N, not the already-settled turn 1 barrier.
+    const removeTerminal = rpc.onTerminal((error) => terminalReject(error));
     const supervisor = supervised ? supervisorPreflightFailure(child) : {
       failure: new Promise<never>(() => {}), stop() {},
     };
@@ -1375,33 +1406,58 @@ export class ManagedCodexAppServerRun {
       if (runtimeState.hookRuns.size || queuedNotifications.length)
         throw new Error("Codex thread/start left unresolved lifecycle notifications");
 
-      const repeated = await rpc.request("config/read", { includeLayers: true, cwd: contract.cwd });
-      if (validateConfig(repeated, contract) !== fingerprint)
-        throw new Error("Codex config authority changed after thread/start");
-      validateHooks(await rpc.request("hooks/list", { cwds: [contract.cwd] }), contract.cwd);
-      await validateMcp(rpc, this.options.surface.northEnabledTools, threadId);
-      assertNoFilesystemAuthority(contract.codexHome);
+      // One turn per North input frame, on the same provider thread. The first
+      // frame is the launch prompt; later frames arrive from `nextInput`.
+      let input: string | undefined = this.options.prompt;
+      while (true) {
+        // Re-prove the exact authority surface before every turn: a stale or
+        // widened config, hook set, or MCP tool grant fails the turn closed
+        // rather than executing a continuation under changed capability.
+        const repeated = await rpc.request("config/read", { includeLayers: true, cwd: contract.cwd });
+        if (validateConfig(repeated, contract) !== fingerprint)
+          throw new Error("Codex config authority changed after thread/start");
+        validateHooks(await rpc.request("hooks/list", { cwds: [contract.cwd] }), contract.cwd);
+        await validateMcp(rpc, this.options.surface.northEnabledTools, threadId);
+        assertNoFilesystemAuthority(contract.codexHome);
 
-      const turnStart = record(await rpc.request("turn/start", {
-        threadId,
-        input: [{ type: "text", text: this.options.prompt }],
-        ...(this.options.effort ? { effort: this.options.effort } : {}),
-      }), "Codex turn/start response");
-      turnId = validateStartedTurn(turnStart);
-      runtimeState.turnId = turnId;
-      drainQueued(true);
-      await terminal;
-      if (!runtimeState.terminalSeen || !runtimeState.usage || runtimeState.hookRuns.size
-          || queuedNotifications.length)
-        throw new Error("Codex closed without exact terminal usage and lifecycle");
-      const terminalConfig = await rpc.request("config/read", {
-        includeLayers: true, cwd: contract.cwd,
-      });
-      if (validateConfig(terminalConfig, contract) !== fingerprint)
-        throw new Error("Codex config authority changed at terminal settlement");
-      rpc.assertHealthy();
-      protocolSucceeded = true;
-      return { text: runtimeState.text, usage: runtimeState.usage };
+        // Fresh terminal barrier and per-turn runtime accumulators. The closures
+        // read `terminalResolve`/`runtimeState` by reference, so reassigning here
+        // steers every subsequent notification at this turn.
+        runtimeState.text = "";
+        runtimeState.usage = undefined;
+        runtimeState.turnId = undefined;
+        runtimeState.terminalSeen = false;
+        terminal = new Promise<void>((resolveTerminal, rejectTerminal) => {
+          terminalResolve = resolveTerminal;
+          terminalReject = rejectTerminal;
+        });
+        void terminal.catch(() => {});
+        protocolSucceeded = false;
+
+        const turnStart = record(await rpc.request("turn/start", {
+          threadId,
+          input: [{ type: "text", text: input }],
+          ...(this.options.effort ? { effort: this.options.effort } : {}),
+        }), "Codex turn/start response");
+        turnId = validateStartedTurn(turnStart);
+        runtimeState.turnId = turnId;
+        drainQueued(true);
+        await terminal;
+        if (!runtimeState.terminalSeen || !runtimeState.usage || runtimeState.hookRuns.size
+            || queuedNotifications.length)
+          throw new Error("Codex closed without exact terminal usage and lifecycle");
+        const terminalConfig = await rpc.request("config/read", {
+          includeLayers: true, cwd: contract.cwd,
+        });
+        if (validateConfig(terminalConfig, contract) !== fingerprint)
+          throw new Error("Codex config authority changed at terminal settlement");
+        rpc.assertHealthy();
+        protocolSucceeded = true;
+        yield { text: runtimeState.text, usage: runtimeState.usage };
+
+        input = await nextInput();
+        if (input === undefined) break;
+      }
     } catch (error) {
       primaryFailed = true;
       if (!this.threadStarted)
