@@ -8,8 +8,8 @@
 // view is never emitted unless the cache has already returned an exact snapshot.
 //
 // Pure module — no fs. The file cache lives in bin/eso.js (crush/retrieve),
-// matching eso/index.js's no-side-effects rule. Borrows SmartCrusher's
-// selection (headroom): head fraction + tail fraction + change-points, capped.
+// matching eso/index.js's no-side-effects rule. Selection keeps head and tail
+// fractions plus change-points, subject to an item cap.
 
 import crypto from "node:crypto";
 import { isRecord } from "./index.js";
@@ -228,7 +228,7 @@ function evaluateCacheStability(observations) {
 }
 
 // Drop sentinels from a crushed view so callers iterating records don't trip
-// on the marker (mirrors headroom's strip_ccr_sentinels).
+// on marker entries.
 function strip(view) {
   return Array.isArray(view) ? view.filter((x) => !isSentinel(x)) : view;
 }
