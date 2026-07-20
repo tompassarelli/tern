@@ -39,6 +39,8 @@
     "live_input_epoch" "model" "effort"})
 (def projection-predicates #{"display_handle" "display_name"})
 (def route-predicates (into route-authority-predicates projection-predicates))
+(def retask-overlay-predicates #{"goal" "display_name"})
+(def route-generation-predicates (disj route-predicates "display_name"))
 (def identity-predicates
   (into route-authority-predicates
         #{"kind" "role" "composition_kind" "composition_id"
@@ -536,6 +538,94 @@
                  (get snapshot marker-predicate #{})))
          (catch Throwable _ false))))
 
+(defn committed-identity
+  "Return the exact committed identity map, or nil for a partial, malformed, or
+  multiply-valued generation. Terminal facts are deliberately orthogonal."
+  [snapshot]
+  (try
+    (singleton-projection!
+     snapshot (conj publish-predicates marker-predicate))
+    (let [identity (singleton-facts snapshot publish-predicates)]
+      (validate-publish! identity)
+      (when (= #{(identity-marker identity)}
+               (get snapshot marker-predicate #{}))
+        identity))
+    (catch Throwable _ nil)))
+
+(defn identity-matches-except?
+  [actual expected ignored]
+  (= (apply dissoc actual ignored)
+     (apply dissoc expected ignored)))
+
+(defn retask-drift?
+  [actual expected]
+  (not= (get actual "goal") (get expected "goal")))
+
+(defn effective-route-desired
+  "Rebase caller-owned route axes onto the graph's current retask overlay. Goal
+  is authoritative and independently mutable. display_name is a cross-derived
+  cache: update it from the caller only when goal did not move; otherwise keep
+  the retask writer's cache instead of restoring stale text."
+  [actual expected desired]
+  (let [retasked? (retask-drift? actual expected)]
+    (cond-> (assoc desired "goal" (get actual "goal"))
+      retasked? (assoc "display_name" (get actual "display_name")))))
+
+(defn route-mutation-predicates
+  [actual expected]
+  (cond-> route-generation-predicates
+    (not (retask-drift? actual expected)) (conj "display_name")))
+
+(declare values-compatible-with-transition?)
+
+(defn route-prefix-compatible?
+  "Recognize only a killed route prefix. Route publication never mutates the
+  retask-owned goal and preserves display_name when goal has advanced, so that
+  overlay remains recoverable even when the SDK carried a stale full identity."
+  [snapshot expected desired]
+  (let [actual (singleton-facts snapshot publish-predicates)
+        retasked? (retask-drift? actual expected)
+        mutation-predicates (route-mutation-predicates actual expected)
+        stable-predicates (apply disj publish-predicates mutation-predicates)
+        stable-expected (effective-route-desired actual expected expected)]
+    (and
+     (empty? (get snapshot marker-predicate #{}))
+     (empty? (exact-projection
+              snapshot (conj terminal-predicates terminal-marker-predicate)))
+     ;; Every non-route predicate remains exact. For a retasked generation this
+     ;; intentionally accepts its one nonblank goal/cache value, not the stale
+     ;; caller copy; the route writer never withdrew either value.
+     (every?
+      (fn [predicate]
+        (let [values (get snapshot predicate #{})
+              expected-value (get stable-expected predicate)]
+          (if expected-value
+            (= #{expected-value} values)
+            (empty? values))))
+      stable-predicates)
+     (or (not retasked?)
+         (and (not (str/blank? (get actual "goal")))
+              (not (str/blank? (get actual "display_name")))))
+     (values-compatible-with-transition?
+      snapshot expected desired mutation-predicates))))
+
+(defn replace-route-projection!
+  [port subject before expected desired]
+  (let [actual (singleton-facts before publish-predicates)
+        effective (effective-route-desired actual expected desired)
+        mutation-predicates (route-mutation-predicates actual expected)]
+    (retract-values! port subject marker-predicate
+                     (get before marker-predicate #{}))
+    (doseq [predicate mutation-predicates]
+      (retract-values! port subject predicate (get before predicate #{})))
+    (put-facts! port subject (select-keys effective mutation-predicates))
+    (verify-exact! port subject
+                   (select-keys effective mutation-predicates)
+                   mutation-predicates)
+    (let [identity (singleton-facts (facts-of port subject) publish-predicates)]
+      (validate-publish! identity)
+      (commit-marker! port subject identity))))
+
 (defn exact-committed-terminal?
   [subject snapshot desired]
   (and desired
@@ -628,11 +718,19 @@
 
     (fail! "unsupported recoverable managed identity operation"
            {:operation operation}))
-  (let [before (facts-of port subject)]
+  (let [before (facts-of port subject)
+        current (committed-identity before)
+        desired-committed?
+        (if (= "route" operation)
+          (and current
+               (identity-matches-except?
+                current desired retask-overlay-predicates))
+          (exact-committed-identity? before desired))]
     (cond
       ;; Lost acknowledgement after the marker committed: acknowledge without
-      ;; withdrawing it or touching a feed-visible generation.
-      (exact-committed-identity? before desired)
+      ;; withdrawing it or touching a feed-visible generation. A later retask is
+      ;; a legitimate successor overlay, not evidence that the route failed.
+      desired-committed?
       (committed-result operation-id "exact_replay")
 
       ;; A terminal generation is irreversible. An exact older route replay may
@@ -644,21 +742,45 @@
 
       ;; Ordinary first attempt or a retry after the caller's expected marker
       ;; remained intact.
-      (and expected (exact-committed-identity? before expected))
+      (and (= "publish" operation)
+           expected (exact-committed-identity? before expected))
       (do
         (replace-identity-projection! port subject desired)
         (committed-result operation-id))
 
+      ;; Retask owns goal/display_name independently. Rebase route axes onto a
+      ;; valid committed overlay rather than restoring the SDK's stale copy.
+      (and (= "route" operation)
+           current
+           (identity-matches-except?
+            current expected retask-overlay-predicates))
+      (do
+        (replace-route-projection! port subject before expected desired)
+        (committed-result operation-id
+                          (when (retask-drift? current expected)
+                            "rebased_retask_overlay")))
+
       ;; Fresh initial publication.
-      (and (nil? expected) (empty? (managed-projection before)))
+      (and (= "publish" operation)
+           (nil? expected) (empty? (managed-projection before)))
       (do
         (replace-identity-projection! port subject desired)
         (committed-result operation-id))
+
+      ;; A route rewrite touches only its owned projection. Non-route identity,
+      ;; including a concurrent retask overlay, stays durable across every
+      ;; killed prefix and supplies the exact rebase inputs on retry.
+      (and (= "route" operation)
+           (route-prefix-compatible? before expected desired))
+      (do
+        (replace-route-projection! port subject before expected desired)
+        (committed-result operation-id "recovered_killed_prefix"))
 
       ;; Crash after marker withdrawal and at any durable body prefix. The new
       ;; same-holder acquisition already rotated the fence epoch, so the killed
       ;; writer cannot resume; rebuild the complete desired state exactly.
-      (and (empty? (get before marker-predicate #{}))
+      (and (= "publish" operation)
+           (empty? (get before marker-predicate #{}))
            (empty? (exact-projection
                     before (conj terminal-predicates terminal-marker-predicate)))
            (values-compatible-with-transition?
@@ -669,8 +791,11 @@
 
       ;; A complete generation outside the caller's expected→desired edge is a
       ;; successor or another authority. Never overwrite it during recovery.
-      (seq (get before marker-predicate #{}))
+      current
       (unresolved-result "not_committed" operation-id "conflicting_generation")
+
+      (seq (get before marker-predicate #{}))
+      (unresolved-result "indeterminate" operation-id "invalid_identity_generation")
 
       :else
       (unresolved-result "indeterminate" operation-id "unrecognized_partial_generation"))))
@@ -690,7 +815,8 @@
   [port subject operation-id desired expected-identity]
   (validate-terminal! subject desired)
   (validate-reported-run! port subject desired)
-  (let [before (facts-of port subject)]
+  (let [before (facts-of port subject)
+        current (committed-identity before)]
     (cond
       (exact-committed-terminal? subject before desired)
       (committed-result operation-id "exact_replay")
@@ -698,7 +824,9 @@
       (valid-committed-terminal? subject before)
       (unresolved-result "not_committed" operation-id "conflicting_terminal")
 
-      (not (exact-committed-identity? before expected-identity))
+      (not (and current expected-identity
+                (identity-matches-except?
+                 current expected-identity retask-overlay-predicates)))
       (unresolved-result "indeterminate" operation-id "identity_generation_changed")
 
       (terminal-prefix-compatible? before desired)
