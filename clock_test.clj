@@ -72,10 +72,10 @@
    ["windowed totals match the date"              (contains? today-rows "@t1")]
    ["windowed totals exclude other days"          (empty? other-day)]])
 
-;; --- per-agent clocks + orphan close + wall-clock union merge (D-lane) --------
-;; Clocks became per-agent (clocked_by <id>), auto-clocked at dispatch, and the
-;; invoice view derives BOTH per-thread attribution and non-double-counted
-;; wall-clock. These fixtures pin the pure engine core of that change.
+;; --- orthogonal human billing + managed run telemetry ------------------------
+;; Human billing is one owner-scoped session. Historical user sessions remain
+;; compatible, while explicit managed actors stay available to audit/orphan
+;; tooling but never enter billed actuals or wall-clock totals.
 (def asserts2
   [;; two agents, concurrent OPEN sessions on different threads — neither blocks
    (asrt 100 "@ta" "title" "TA")
@@ -87,18 +87,34 @@
    ;; a legacy OPEN session (no clocked_by) reads as agent "user"
    (asrt 130 "@tl" "title" "TL")
    (asrt 131 "@sl" "session_of" "@tl") (asrt 132 "@sl" "start_time" "2026-07-14T09:10:00")
-   ;; an orphan-closed session: end_time + clock_orphaned -> closed, still billed
+   ;; a legacy managed-agent orphan: retained for audit, never billed
    (asrt 140 "@to" "title" "TO")
    (asrt 141 "@so" "session_of" "@to") (asrt 142 "@so" "start_time" "2026-07-14T08:00:00")
    (asrt 143 "@so" "end_time" "2026-07-14T08:30:00") (asrt 144 "@so" "clocked_by" "a3")
    (asrt 145 "@so" "clock_orphaned" "true")
-   ;; wall-clock: two OVERLAPPING closed sessions, different threads, SAME owner
-   (asrt 150 "@w1" "title" "W1") (asrt 151 "@w1" "owner" "acme")
-   (asrt 152 "@w2" "title" "W2") (asrt 153 "@w2" "owner" "acme")
+   ;; wall-clock: overlapping HUMAN sessions, same owner
+   (asrt 150 "@w1" "title" "W1") (asrt 151 "@w1" "owner" "acme") (asrt 152 "@w1" "rate" "120")
+   (asrt 153 "@w2" "title" "W2") (asrt 154 "@w2" "owner" "acme") (asrt 155 "@w2" "rate" "120")
    (asrt 160 "@sw1" "session_of" "@w1") (asrt 161 "@sw1" "start_time" "2026-07-14T09:00:00")
    (asrt 162 "@sw1" "end_time" "2026-07-14T10:00:00")
    (asrt 163 "@sw2" "session_of" "@w2") (asrt 164 "@sw2" "start_time" "2026-07-14T09:30:00")
-   (asrt 165 "@sw2" "end_time" "2026-07-14T10:30:00")])
+   (asrt 165 "@sw2" "end_time" "2026-07-14T10:30:00")
+   ;; owner-scoped session overlaps the legacy pair and carries a rate snapshot
+   (asrt 170 "@client" "owner" "acme") (asrt 171 "@client" "clocked_by" "user")
+   (asrt 172 "@client" "rate" "120") (asrt 173 "@client" "start_time" "2026-07-14T09:15:00")
+   (asrt 174 "@client" "end_time" "2026-07-14T10:15:00")
+   (asrt 175 "@client" "kind" "client_session")
+   ;; open owner-scoped human session, alongside legacy @sl
+   (asrt 180 "@client-open" "owner" "acme") (asrt 181 "@client-open" "clocked_by" "user")
+   (asrt 182 "@client-open" "rate" "120") (asrt 183 "@client-open" "start_time" "2026-07-14T11:00:00")
+   (asrt 184 "@client-open" "kind" "client_session")
+   ;; explicit agent time on an owned thread is excluded from billing
+   (asrt 190 "@agent-closed" "session_of" "@w1") (asrt 191 "@agent-closed" "clocked_by" "lane-x")
+   (asrt 192 "@agent-closed" "start_time" "2026-07-14T07:00:00")
+   (asrt 193 "@agent-closed" "end_time" "2026-07-14T09:00:00")
+   ;; missing and ambiguous owner-rate fixtures
+   (asrt 200 "@bad1" "title" "Bad1") (asrt 201 "@bad1" "owner" "amb") (asrt 202 "@bad1" "rate" "100")
+   (asrt 203 "@bad2" "title" "Bad2") (asrt 204 "@bad2" "owner" "amb") (asrt 205 "@bad2" "rate" "200")])
 (def idx2 (k/build-index (:facts (fold/fold asserts2))))
 
 (def checks2
@@ -117,12 +133,21 @@
    ;; open-sessions spans all agents; orphan-closed is excluded
    ["open-sessions = the 3 open ones"            (= (set (clk/open-sessions idx2)) #{"@sa" "@sb" "@sl"})]
    ["orphan-closed session is not open"          (not (contains? (set (clk/open-sessions idx2)) "@so"))]
-   ;; (f) orphan close stamps end_time + clock_orphaned: closed, flagged, still billed
-   ["orphaned session still billed (30m)"        (= (clk/actual-seconds idx2 "@to" iso->sec) 1800)]
+   ;; managed session remains readable but cannot leak into human billing
+   ["managed orphan is excluded from billed actual" (= (clk/actual-seconds idx2 "@to" iso->sec) 0)]
    ["clock_orphaned flag is readable"            (= (k/one-i idx2 "@so" "clock_orphaned") "true")]
-   ;; (e) wall-clock union: 09:00-10:00 ∪ 09:30-10:30 = 09:00-10:30 = 5400s, NOT 7200
+   ["explicit managed time is excluded from owned-thread actual"
+    (= (clk/actual-seconds idx2 "@w1" iso->sec) 3600)]
+   ["client session has direct owner"             (= (clk/session-owner idx2 "@client") "acme")]
+   ["human open set includes legacy and owner session"
+    (= (set (clk/open-human-sessions idx2)) #{"@sl" "@client-open"})]
+   ["multiple human opens are surfaced as invalid" (nil? (clk/running-human-session idx2))]
+   ["owner has one unambiguous live rate"          (= (clk/unique-owner-rate idx2 "acme") "120")]
+   ["missing owner rate refuses resolution"        (nil? (clk/unique-owner-rate idx2 "missing"))]
+   ["ambiguous owner rates refuse resolution"      (nil? (clk/unique-owner-rate idx2 "amb"))]
+   ;; wall-clock union: all human intervals still span 09:00-10:30 = 5400s
    ["wall-clock union merges the overlap (1.5h)" (= (clk/owner-wall-total idx2 "acme" iso->sec) 5400)]
-   ["attribution sums to 2h — the OTHER number"  (= (+ (clk/actual-seconds idx2 "@w1" iso->sec)
+   ["legacy human thread attribution sums to 2h" (= (+ (clk/actual-seconds idx2 "@w1" iso->sec)
                                                        (clk/actual-seconds idx2 "@w2" iso->sec)) 7200)]
    ["per-day wall-clock: one day at 1.5h"        (= (mapv :secs (clk/owner-wall-by-day idx2 "acme" iso->sec)) [5400])]])
 

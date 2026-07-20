@@ -84,18 +84,6 @@ beforeAll(() => {
 printf '%s\\n' "$*" >> "${log}"
 case "$*" in
   *test-terminal-aux-budget*agent_death*) sleep 5 ;;
-  "clock start thread-sync-construction")
-    : > "${dir}/sync-clock-open"
-    printf 'clocked in on thread-sync-construction at now  (session s1, agent %s)\\n' "$NORTH_AGENT_ID" ;;
-  "clock status")
-    if [ "$NORTH_AGENT_ID" = "test-sync-construction-failure" ]; then
-      if [ -e "${dir}/sync-clock-open" ]; then
-        printf 'clocked in on thread-sync-construction  Sync construction  (agent %s)\\n' "$NORTH_AGENT_ID"
-      else
-        printf 'not clocked in (agent %s)\\n' "$NORTH_AGENT_ID"
-      fi
-    fi ;;
-  "clock orphan test-sync-construction-failure") rm -f "${dir}/sync-clock-open" ;;
 esac
 exit 0
 `);
@@ -218,7 +206,7 @@ test("a lane that dies mid-stream records outcome=died ON the lane entity (repor
   expect(logged).toContain("tell @swarm agent_death"); // death path still fires
 });
 
-test("a synchronous provider-construction failure closes lifecycle state and the billable clock", async () => {
+test("a synchronous provider-construction failure records run telemetry without billing mutation", async () => {
   const { spawn } = await import("./support/spawn");
   writeFileSync(log, "");
 
@@ -232,10 +220,12 @@ test("a synchronous provider-construction failure closes lifecycle state and the
 
   expect(result).toBe("");
   const logged = readFileSync(log, "utf8");
-  expect(logged).toContain("clock start thread-sync-construction");
+  expect(logged).not.toContain("clock start thread-sync-construction");
   expect(logged).toContain("tell @swarm agent_death");
   expect(logged).toContain("tell agent:test-sync-construction-failure outcome died");
-  expect(logged).toContain("clock orphan test-sync-construction-failure");
+  expect(logged).toContain(" thread thread-sync-construction");
+  expect(logged).toContain(" duration_ms ");
+  expect(logged).not.toContain("clock orphan test-sync-construction-failure");
 });
 
 test("an Anthropic error terminal still records its authoritative usage", async () => {
@@ -358,15 +348,13 @@ test("an empty dispatch provider stream is a blocked provider error, never ran",
   );
 });
 
-test("SIGTERM during provider preflight waits for envelope, clock, and driver cleanup", async () => {
+test("SIGTERM during provider preflight waits for envelope and driver cleanup", async () => {
   const { dispatch } = await import("./support/dispatch");
   const host = fakeTerminationHost();
   const coordinator = new HostTerminationCoordinator(host.control as any);
   const order: string[] = [];
   let finishEnvelope!: () => void;
   const envelopeGate = new Promise<void>((resolve) => { finishEnvelope = resolve; });
-  let finishClock!: () => void;
-  const clockGate = new Promise<void>((resolve) => { finishClock = resolve; });
   let finishDriver!: () => void;
   const driverGate = new Promise<void>((resolve) => { finishDriver = resolve; });
   let codexPreflightCalls = 0;
@@ -382,8 +370,8 @@ test("SIGTERM during provider preflight waits for envelope, clock, and driver cl
     loadChildren: () => [],
     claimDriver: (() => ({ release: () => true })) as any,
     admitBillableClock: (() => ({
-      kind: "opened",
-      agentId: "test-signal-preflight-cleanup-agent",
+      kind: "verified",
+      client: "msa",
       threadId: "test-signal-preflight-cleanup",
     })) as any,
     admitResourceEnvelope: (async () => undefined) as any,
@@ -402,12 +390,6 @@ test("SIGTERM during provider preflight waits for envelope, clock, and driver cl
       await envelopeGate;
       order.push("envelope:end");
     }) as any,
-    clockStop: async () => {
-      order.push("clock:start");
-      await clockGate;
-      order.push("clock:error");
-      throw new Error("clock cleanup failed");
-    },
     releaseDriver: async () => {
       order.push("driver:start");
       await driverGate;
@@ -419,9 +401,6 @@ test("SIGTERM during provider preflight waits for envelope, clock, and driver cl
   await eventuallyTrue(() => order.includes("envelope:start"), "envelope cleanup start");
   expect(host.exitCodes).toEqual([]);
   finishEnvelope();
-  await eventuallyTrue(() => order.includes("clock:start"), "clock cleanup start");
-  expect(host.exitCodes).toEqual([]);
-  finishClock();
   await eventuallyTrue(() => order.includes("driver:start"), "driver cleanup start");
   expect(host.exitCodes).toEqual([]);
   finishDriver();
@@ -429,13 +408,11 @@ test("SIGTERM during provider preflight waits for envelope, clock, and driver cl
   expect(failure).toBeInstanceOf(AggregateError);
   expect((failure as AggregateError).errors.map((error: Error) => error.message)).toEqual([
     "host termination requested (SIGTERM)",
-    "clock cleanup failed",
     "driver cleanup failed",
   ]);
   expect(order).toEqual([
     "preflight",
     "envelope:start", "envelope:end",
-    "clock:start", "clock:error",
     "driver:start", "driver:error",
   ]);
   expect(codexPreflightCalls).toBe(0);
@@ -443,7 +420,7 @@ test("SIGTERM during provider preflight waits for envelope, clock, and driver cl
   expect(host.exitCodes).toEqual([143]);
 });
 
-test("a pre-publication exception still closes query and releases every outer owner", async () => {
+test("an outer cleanup exception still closes query and releases termination ownership", async () => {
   const { spawn } = await import("./support/spawn");
   const host = fakeTerminationHost();
   const coordinator = new HostTerminationCoordinator(host.control as any);
@@ -460,22 +437,18 @@ test("a pre-publication exception still closes query and releases every outer ow
     }),
     childSettlementReader: () => ({ kind: "settled", children: [] }),
     admitBillableClock: (() => ({
-      kind: "opened",
-      agentId: "test-pre-publication-throw",
+      kind: "verified",
+      client: "msa",
       threadId: "test-pre-publication-throw-thread",
     })) as any,
-    clockFinalize: (() => {
-      order.push("clock:finalize-error");
-      throw new Error("pre-publication clock failure");
+    completeResourceEnvelope: (async () => {
+      order.push("envelope:error");
+      throw new Error("envelope cleanup failure");
     }) as any,
-    completeResourceEnvelope: (async () => { order.push("envelope:complete"); }) as any,
-    clockStop: async () => { order.push("clock:stopped"); },
-  })).rejects.toThrow("pre-publication clock failure");
+  })).rejects.toThrow("envelope cleanup failure");
   expect(order).toEqual([
     "query:closed",
-    "clock:finalize-error",
-    "envelope:complete",
-    "clock:stopped",
+    "envelope:error",
   ]);
   expect(host.listenerCount()).toBe(0);
 });

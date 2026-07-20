@@ -166,7 +166,8 @@ north — your one card. Type a command to do the thing next to it.
     north capture "<thought>"          turn a thought into a thread
     north show <id>                    read one thread's facts
     north tell <id> <pred> <val>       assert a fact   (north retract … to remove)
-    north clock start|stop             log real time against a thread
+    north clock in <owner>|out         open/close one human client billing session
+    north clock start|stop             compatibility aliases for legacy thread sessions
     north clock audit                  commits-vs-clock coverage drift report
     north linear get|import|plan|sync  mechanical Linear bridge (sync is plan-only unless --apply)
 

@@ -1050,18 +1050,34 @@ actual work session — what an AI does when Tom starts *doing* something.
 
 ## Clock management
 
-Time tracking is **`north clock`** — fact-native, *in the graph*. There is
-**one time store**: a work session is a titleless entity
-(`session_of @thread` / `start_time` / `end_time`) that rolls up to the thread,
-so **estimate-vs-actual calibrates over time**. `los time` and the old JSON
-clock-in are both **gone**.
+Time has two orthogonal axes. Do not make either axis impersonate the other:
+
+1. **Human client billing** is one loose, owner-scoped session for Tom's working
+   context (`kind client_session` / `owner` / `clocked_by user` / `rate` /
+   `start_time` / `end_time`). It normally spans many tickets and many managed
+   lanes. Start it when client work begins; stop it only when the client context
+   actually changes.
+2. **Managed task timing** is one `kind run` telemetry entity per agent run,
+   carrying exact `thread`, `agent`, and `duration_ms`. Runs overlap freely and
+   preserve per-task estimation evidence. Managed lanes never start, stop, or
+   adopt the human billing clock; before client writes they only verify that the
+   matching human owner session is open.
+
+Both are fact-native and live in the graph, but only the human axis feeds
+invoices. Historical human `session_of @thread` rows remain readable and
+billable; an explicit non-user `clocked_by` is legacy agent timing and is
+audit-only. `los time` and the old JSON clock-in are gone.
 
 ```sh
-north clock start <thread-id>   # open a session (refuses if one's running)
-north clock stop                # close it, report the duration
-north clock status              # the running session + elapsed
+north clock in <owner>          # open the one human client session (e.g. msa)
+north clock out                 # close it and report the duration
+north clock status              # current client owner/session + elapsed
 north clock report              # est vs actual per thread + calibration %
 north clock today | week        # logged time per thread over a date window
+
+# Compatibility for historical/manual per-thread human calibration:
+north clock start <thread-id>
+north clock stop
 ```
 
 `actual` is *derived* (summed from sessions, never stored). `clock report`'s
@@ -1080,36 +1096,36 @@ north clock sync                        # push closed, billable sessions
 north clock projects | workspaces       # list Clockify projects/workspaces
 ```
 
-A session is **billable** iff its thread's `owner` is mapped to a Clockify
+A session is **billable** iff it is a human owner-scoped client session, or a
+compatible legacy human thread session, and that owner is mapped to a Clockify
 project (so `owner personal` is never billed). `sync` pushes closed, unsynced,
 billable sessions and writes the returned id back as a `clockify_id` fact, so
-it's idempotent. Mapping lives in `~/code/north/time/projects.json`; the API
-key comes from `$CLOCKIFY_SECRET_FILE` (wired by the wrapper). **Sync is
-on-demand only — never automatic** (it touches real client billing).
+it's idempotent. Mapping lives in `~/code/north/time/projects.json`; the API key
+comes from `$CLOCKIFY_SECRET_FILE` (wired by the wrapper). **Sync is on-demand
+only — never automatic** (it touches real client billing).
 
-This section is when an AI should *act* on the clock (`clock start`/`stop`).
+This section is when an AI should act on the human clock (`clock in`/`out`).
 
 1. **Clock is required for non-`personal` owners.** Whenever work is detected
-   against a thread whose `owner` is anything but `personal` (e.g. a client), a
-   session must be running on that thread (`clock start <id>`). If none is running
-   and Tom starts non-personal work, prompt before continuing. Billing is settled
-   later via `clock sync`.
-2. **One clock at a time.** A session represents undivided attention, not
-   attention-accounting. `clock start` refuses if one is already running.
-   Multitasking is a signal something is wrong, not a state to record faithfully.
-   To switch focus, `clock stop` then `clock start` the new thread.
+   against a client, a human session for that owner must be open (`clock in
+   <owner>`). If none is running and Tom starts client work, prompt before
+   continuing. Billing is settled later via `clock sync`.
+2. **One human client clock at a time; many run clocks.** The human session
+   represents client context, not a ticket or agent. Do not stop/start it as Tom
+   moves among tickets for the same client. Every managed run independently
+   records its exact task duration, and those run records may overlap.
 3. **`owner personal` is clock-optional.** Tom may track personal threads (a
    Beagle session, a writing block) for calibration but isn't required to. Offer
    once at the start of substantive personal work, then drop it.
 4. **Shift detection on signal, not on timer.** Re-evaluate the active session
-   when a different repo/cwd becomes the focal context, recent messages stop
-   referencing the active thread's domain, or Tom states a switch. High-confidence
-   shifts (different repo *and* explicit statement) switch with a notification, no
-   confirmation; ambiguous shifts ask. False positives cost more than false
-   negatives.
+   when a different client becomes the focal context, the conversation clearly
+   leaves client work, or Tom states a switch. Going off-topic may warrant a
+   warning, but ticket changes inside the same client do not. High-confidence
+   client shifts switch with a notification; ambiguous shifts ask.
 5. **Wall-clock counts while context is preserved.** AI generation waits, long
-   compiles, reading docs — all count toward the active thread as long as it's
-   still the focal context. A full context switch is a `clock stop` moment.
+   compiles, reading docs, and work across several tickets all count while the
+   client context remains active. A full client-context switch is a `clock out`
+   moment.
 6. **Clockify sync is on-demand.** `clock sync` runs when Tom asks. Never automatic.
 
 ---

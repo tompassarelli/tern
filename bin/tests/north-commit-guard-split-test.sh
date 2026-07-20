@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regression: the commit backstop must join thread ownership in coordination.log
-# to open clock sessions in telemetry.log, and must ignore a stale pre-split
-# facts.log whenever the canonical pair exists. The deny recipe's Linear lookup
-# is folded from that same pair.
+# to owner-scoped human sessions in telemetry.log, retain legacy user-session
+# compatibility, and ignore a stale pre-split facts.log whenever the canonical
+# pair exists.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -44,11 +44,13 @@ echo "== live split allows while stale monolith denies =="
   line 102 '@live-thread' linear FAKECLIENT-123
 } > "$STATE/coordination.log"
 {
-  line 103 '@live-session' session_of '@live-thread'
-  line 104 '@live-session' start_time '2026-07-16T12:00:00Z'
+  line 103 '@live-session' owner fakeclient
+  line 104 '@live-session' clocked_by user
+  line 105 '@live-session' start_time '2026-07-16T12:00:00Z'
+  line 106 '@live-session' kind client_session
 } > "$STATE/telemetry.log"
 
-CHECK_LABEL="split owner + telemetry session permit commit"
+CHECK_LABEL="owner-scoped human session permits commit"
 check run_guard
 
 echo "== mismatched retract does not clear the current singleton value =="
@@ -95,12 +97,10 @@ RC=$?
 set -e
 CHECK_LABEL="stale monolith open clock does not permit commit"
 check test "$RC" -eq 1
-CHECK_LABEL="deny recipe resolves Linear link from coordination.log"
-check grep -Fq 'clock start live-thread' <<< "$OUT"
-CHECK_LABEL="deny recipe does not use stale facts.log link"
-if grep -Fq 'clock start stale-thread' <<< "$OUT"; then bad "$CHECK_LABEL"; else ok "$CHECK_LABEL"; fi
-CHECK_LABEL="deny recipe ignores a retracted newer Linear link"
-if grep -Fq 'clock start retracted-thread' <<< "$OUT"; then bad "$CHECK_LABEL"; else ok "$CHECK_LABEL"; fi
+CHECK_LABEL="deny recipe uses one owner-scoped human clock-in"
+check grep -Fq 'clock in fakeclient' <<< "$OUT"
+CHECK_LABEL="deny recipe does not ask for ticket-level clock switching"
+if grep -Fq 'clock start' <<< "$OUT"; then bad "$CHECK_LABEL"; else ok "$CHECK_LABEL"; fi
 CHECK_LABEL="mismatched live split owner is reported"
 check grep -Fq "open owners: otherclient" <<< "$OUT"
 
@@ -113,6 +113,15 @@ rm -f "$STATE/coordination.log" "$STATE/telemetry.log"
 } > "$STATE/facts.log"
 CHECK_LABEL="legacy monolith permits commit only when split is absent"
 check run_guard
+
+echo "== explicit managed-agent legacy session never authorizes billing =="
+line 304 '@legacy-session' clocked_by lane-managed >> "$STATE/facts.log"
+set +e
+run_guard >/dev/null 2>&1
+MANAGED_RC=$?
+set -e
+CHECK_LABEL="managed-agent session is excluded from the human clock guard"
+check test "$MANAGED_RC" -eq 1
 
 echo
 echo "north-commit-guard-split-test: $PASS passed, $FAIL failed"

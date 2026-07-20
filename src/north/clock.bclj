@@ -1,12 +1,12 @@
 #lang beagle/clj
 (ns north.clock
-  "Fact-native time logging: a work session is an entity
+  "Fact-native time logging. A compatible thread session is an entity
      @<sessid>  session_of  @<thread>
      @<sessid>  start_time  <iso>
      @<sessid>  end_time    <iso>      (absent while the clock runs)
-   so actual effort rolls up to the thread and estimate-vs-actual calibrates
-   future estimates. Sessions are titleless, so they never appear in thread
-   projections or file exports — they live in the fact log and roll up here.
+   while a human client session instead carries kind=client_session + owner.
+   Managed task elapsed time is kind=run telemetry. Sessions are titleless, so
+   they never appear in thread projections or file exports.
    Pure: clock seconds come from an injected iso->sec; actual stays DERIVED,
    never stored, consistent with the no-stored-derived model (D6).")
 
@@ -14,12 +14,59 @@
 (require north.projections :as proj)
 (require clojure.string :as str)
 
-;; --- per-agent sessions (clocks are per-agent, not a global singleton) -------
-;; A session's clocked_by names the agent that opened it. Legacy sessions
-;; (pre-per-agent) carry none and are treated as clocked_by=user everywhere,
-;; so old logs read consistently under the new model.
+;; --- two orthogonal time axes -----------------------------------------------
+;; Human billing sessions are owner-scoped `kind=client_session` entities.
+;; Managed-agent task timing lives on kind=run telemetry instead. Historical
+;; thread sessions remain readable: no clocked_by means the human user, while
+;; an explicit non-user clocked_by is legacy agent timing and never billable.
 (defn clocked-by [idx :- k/Index sess :- String] :- String
   (let [a (k/one-i idx sess "clocked_by")] (if (some? a) a "user")))
+
+(defn client-session? [idx :- k/Index sess :- String] :- Bool
+  (and (= (k/one-i idx sess "kind") "client_session")
+       (and (= (clocked-by idx sess) "user")
+            (and (some? (k/one-i idx sess "owner"))
+                 (some? (k/one-i idx sess "start_time"))))))
+
+(defn legacy-human-session? [idx :- k/Index sess :- String] :- Bool
+  (and (= (clocked-by idx sess) "user")
+       (and (some? (k/one-i idx sess "session_of"))
+            (some? (k/one-i idx sess "start_time")))))
+
+(defn human-billing-session? [idx :- k/Index sess :- String] :- Bool
+  (or (client-session? idx sess) (legacy-human-session? idx sess)))
+
+(defn human-open? [idx :- k/Index sess :- String] :- Bool
+  (and (human-billing-session? idx sess)
+       (nil? (k/one-i idx sess "end_time"))))
+
+(defn open-human-sessions [idx :- k/Index] :- (Vec String)
+  (filterv (fn [s :- String] :- Bool (human-open? idx s)) (:subjects idx)))
+
+(defn running-human-session [idx :- k/Index] :- String?
+  (let [sessions (open-human-sessions idx)]
+    (if (= (count sessions) 1) (first sessions) nil)))
+
+(defn session-owner [idx :- k/Index sess :- String] :- String?
+  (if (client-session? idx sess)
+    (k/one-i idx sess "owner")
+    (let [te (k/one-i idx sess "session_of")]
+      (if (some? te) (k/one-i idx te "owner") nil))))
+
+(defn owner-rates [idx :- k/Index owner :- String] :- (Vec String)
+  (vec
+   (sort
+    (distinct
+     (reduce (fn [rates :- (Vec String) te :- String] :- (Vec String)
+               (let [o (k/one-i idx te "owner")
+                     rate (k/one-i idx te "rate")]
+                 (if (and (= o owner) (some? rate)) (conj rates rate) rates)))
+             []
+             (k/thread-ids-i idx))))))
+
+(defn unique-owner-rate [idx :- k/Index owner :- String] :- String?
+  (let [rates (owner-rates idx owner)]
+    (if (= (count rates) 1) (first rates) nil)))
 
 ;; an OPEN session: session_of + start_time, no end_time (the clock still runs).
 (defn open? [idx :- k/Index s :- String] :- Bool
@@ -32,10 +79,7 @@
 (defn open-sessions [idx :- k/Index] :- (Vec String)
   (filterv (fn [s :- String] :- Bool (open? idx s)) (:subjects idx)))
 
-;; the open session for THIS agent, or nil. Per-agent: another agent's open
-;; session is invisible here, so `clock start` never blocks across agents and
-;; `clock stop` closes only the caller's own. Legacy (clocked_by absent) matches
-;; agent "user".
+;; Historical per-agent selector retained for orphan cleanup and audit only.
 (defn running-session-for [idx :- k/Index agent :- String] :- String?
   (reduce (fn [found :- String? s :- String] :- String?
             (if (some? found)
@@ -51,7 +95,8 @@
                   st (k/one-i idx s "start_time")
                   en (k/one-i idx s "end_time")]
               (if (and (= so te)
-                       (and (some? st) (some? en)))
+                       (and (= (clocked-by idx s) "user")
+                            (and (some? st) (some? en))))
                 (+ acc (- (iso->sec en) (iso->sec st)))
                 acc)))
           0
@@ -91,7 +136,7 @@
 ;; caller, which holds the integration config; this stays pure over the graph.
 (defn syncable-sessions [idx :- k/Index] :- (Vec String)
   (filterv (fn [s :- String] :- Bool
-             (and (some? (k/one-i idx s "session_of"))
+             (and (human-billing-session? idx s)
                   (and (some? (k/one-i idx s "end_time"))
                        (nil? (k/one-i idx s "clockify_id")))))
            (:subjects idx)))
@@ -109,8 +154,9 @@
                   st (k/one-i idx s "start_time")
                   en (k/one-i idx s "end_time")]
               (if (and (= so te)
-                       (and (some? st)
-                            (and (some? en) (starts-with-any? st prefixes))))
+                       (and (= (clocked-by idx s) "user")
+                            (and (some? st)
+                                 (and (some? en) (starts-with-any? st prefixes)))))
                 (+ acc (- (iso->sec en) (iso->sec st)))
                 acc)))
           0
@@ -137,12 +183,12 @@
 ;; the tail without dropping the time.
 (defn owner-intervals [idx :- k/Index owner :- String iso->sec :- [String -> Int]] :- (Vec Iv)
   (reduce (fn [acc :- (Vec Iv) s :- String] :- (Vec Iv)
-            (let [thr (k/one-i idx s "session_of")
-                  st  (k/one-i idx s "start_time")
+            (let [st  (k/one-i idx s "start_time")
                   en  (k/one-i idx s "end_time")]
-              (if (and (some? thr) (some? st) (some? en))
-                (let [o (k/one-i idx thr "owner")]
-                  (if (and (some? o) (= o owner))
+              (if (and (human-billing-session? idx s)
+                       (and (some? st) (some? en)))
+                (let [o (session-owner idx s)]
+                  (if (= o owner)
                     (conj acc (->Iv (subs st 0 10) (iso->sec st) (iso->sec en)))
                     acc))
                 acc)))

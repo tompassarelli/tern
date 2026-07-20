@@ -23,7 +23,7 @@ Walk the seam as it actually is:
   `:validate`. That's the whole `POST /v1/rpc` contract. It runs **no North
   projections** — it relays bytes to Fram and relays the reply back.
 - But the real life verbs — `ready`, `blocked`, `next`, `plate`, `agenda`,
-  `leverage`, `show`, `needs-review`, `capture`, `clock start/stop/status/report`,
+  `leverage`, `show`, `needs-review`, `capture`, `clock in/out/status/report`,
   `presentation` — live in `north.main` (and the MCP server that wraps it),
   **not in the engine.** Reads *fold the tenant's `facts.log` locally* and
   derive lifecycle (`cmd-ready`, `cmd-plate`, etc. all do

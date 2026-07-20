@@ -19,6 +19,7 @@
    (k/->Fact "@topic-perf" "note" "a topic")
    (k/->Fact "@mine:1" "kind" "mine")   (k/->Fact "@mine:1" "note" "personal")
    (k/->Fact "@run-9" "kind" "run")     (k/->Fact "@run-9" "started_at" "t")
+   (k/->Fact "@client-clock" "kind" "client_session") (k/->Fact "@client-clock" "owner" "acme")
    (k/->Fact "@session:s1" "started_at" "t")   (k/->Fact "@session:s1" "agent" "cc")
    (k/->Fact "@depends_on" "cardinality" "single")  (k/->Fact "@depends_on" "acyclic" "true")
    (k/->Fact "@rate" "value_kind" "literal")
@@ -67,6 +68,7 @@
    ["prefix topic-  => topic"                       (= "topic" (kof "@topic-perf"))]
    ["kind mine      => mine"                        (= "mine" (kof "@mine:1"))]
    ["kind run folds => session-telemetry"           (= "session-telemetry" (kof "@run-9"))]
+   ["kind client_session stays billing-only"        (= "billing-session" (kof "@client-clock"))]
    ["prefix session: => session-telemetry"          (= "session-telemetry" (kof "@session:s1"))]
    ["schema-as-facts subject => predicate"          (= "predicate" (kof "@depends_on"))]
    ["unclassifiable => other"                       (= "other" (kof "@weird"))]
@@ -75,6 +77,7 @@
    ["census: 2 thread subjects"                     (= 2 (subj-of "thread"))]
    ["census: 2 concern subjects"                    (= 2 (subj-of "concern"))]
    ["census: 2 session-telemetry subjects"          (= 2 (subj-of "session-telemetry"))]
+   ["census: 1 billing-session subject"             (= 1 (subj-of "billing-session"))]
    ["census: 2 other subjects"                      (= 2 (subj-of "other"))]
    ["census sorted by fact count desc"              facts-desc?]
    ["predicate metadata surfaces depends_on"        (some #{"@depends_on"} pred-subs)]

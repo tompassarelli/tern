@@ -22,10 +22,7 @@ import {
   userAnchoredPath,
 } from "./identity";
 import { BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION } from "./bespoke-contract";
-import {
-  admitBillableClock, clockFinalize, clockStop,
-  type BillableClockAdmission,
-} from "./clock";
+import { admitBillableClock } from "./clock";
 import {
   formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider,
   selectProviderForExecution, ProviderRetrySafeError,
@@ -85,11 +82,6 @@ interface DispatchResult {
   result: string;
 }
 
-interface ManagedClockLease {
-  admission: BillableClockAdmission;
-  finalized: boolean;
-}
-
 export interface DispatchDependencies {
   /** Complete per-subtask request; programmatic callers never inherit ambient routing. */
   routingMetadata: RoutingRequest;
@@ -114,8 +106,6 @@ interface DispatchRuntime {
   admitResourceEnvelope?: typeof admitResourceEnvelope;
   completeResourceEnvelope?: typeof completeResourceEnvelope;
   admitBillableClock?: typeof admitBillableClock;
-  clockFinalize?: typeof clockFinalize;
-  clockStop?: (agentId: string) => void | Promise<void>;
   releaseDriver?: (
     driver: ReturnType<typeof claimDispatchDriver>,
   ) => boolean | Promise<boolean>;
@@ -177,12 +167,8 @@ async function runDispatch(
   deliveryRuntime?: DispatchRuntime["deliveryRuntime"],
   childSettlementReader: (agentId: string) => ChildSettlement = settleChildren,
   feedSubscriber: typeof subscribeFeed = subscribeFeed,
-  clockLease?: ManagedClockLease,
   termination: ManagedQueryTermination = new ManagedQueryTermination(),
-  preflightRuntime: Pick<
-    DispatchRuntime,
-    "refreshAccountUsages" | "clockFinalize"
-  > = {},
+  preflightRuntime: Pick<DispatchRuntime, "refreshAccountUsages"> = {},
 ): Promise<DispatchResult> {
   const runStartedAt = process.hrtime.bigint();
   const routingMetadata = hydratedMetadata;
@@ -667,12 +653,6 @@ async function runDispatch(
     );
   }
 
-  // Close only the exact clock positively opened by this dispatch preflight.
-  if (clockLease?.admission.kind === "opened") {
-    (preflightRuntime.clockFinalize ?? clockFinalize)(agentId, outcome);
-    clockLease.finalized = true;
-  }
-
   // Commit the lane's process/delivery terminal (SYNC, digest marker last)
   // before exit. Mirrors spawn.ts at the same reap-avoidance seam.
   refreshIdentityRoute();
@@ -852,22 +832,18 @@ export async function dispatch(
     driverOptions: injected.driverOptions,
   });
   const termination = new ManagedQueryTermination(injected.registerTermination);
-  let clockLease: ManagedClockLease | undefined;
   let driver: ReturnType<typeof claimDispatchDriver> | undefined;
   let admission: EnvelopeAdmission | undefined;
   let result!: DispatchResult;
   let failed = false;
   let primaryError: unknown;
   try {
-    clockLease = {
-      admission: (injected.admitBillableClock ?? admitBillableClock)({
-        agentId,
-        capabilities: gafferCapabilities(routingMetadata),
-        cwd: workingDirectory,
-        threadId,
-      }),
-      finalized: false,
-    };
+    (injected.admitBillableClock ?? admitBillableClock)({
+      agentId,
+      capabilities: gafferCapabilities(routingMetadata),
+      cwd: workingDirectory,
+      threadId,
+    });
     termination.throwIfTerminated();
     driver = (injected.claimDriver ?? claimDispatchDriver)(
       threadId, agentId, injected.driverOptions,
@@ -887,7 +863,6 @@ export async function dispatch(
       injected.deliveryRuntime,
       injected.childSettlementReader,
       injected.feedSubscriber ?? subscribeFeed,
-      clockLease,
       termination,
       injected,
     );
@@ -899,10 +874,6 @@ export async function dispatch(
   const cleanupErrors: unknown[] = [];
   try { await (injected.completeResourceEnvelope ?? completeResourceEnvelope)(admission); }
   catch (error) { cleanupErrors.push(error); }
-  try {
-    if (clockLease?.admission.kind === "opened" && !clockLease.finalized)
-      await (injected.clockStop ?? clockStop)(agentId);
-  } catch (error) { cleanupErrors.push(error); }
   try {
     const released = driver
       ? await (injected.releaseDriver ?? ((value) => value.release()))(driver)

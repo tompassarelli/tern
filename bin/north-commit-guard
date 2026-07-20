@@ -17,10 +17,10 @@
 # repo's own path (the segment after code/client/). No client name, path, or
 # code is baked in — this file is safe to commit to a public repo.
 #
-# An "open session" is read straight from the fram fact log: a subject with
-# session_of + start_time and NO end_time (retractions replayed to final
-# state). ALLOW iff ANY open session's thread has owner=<client> (multiple
-# concurrent open sessions are legal — per-agent clocks).
+# An "open human session" is read straight from the Fram fact log: a titleless
+# kind=client_session subject with owner + start_time and NO end_time. Legacy
+# user sessions (session_of + start_time, clocked_by absent/user) also remain
+# valid. Explicit managed-agent sessions never authorize billing.
 #
 # Deliberate bypasses: `git commit --no-verify`, or CLAUDE_NO_AUTHORING_HOOKS=1.
 # Persistent kill-switch: `north config guards off` (shared authoring-killswitch).
@@ -75,23 +75,18 @@ fi
 [ "${#LOGS[@]}" -gt 0 ] || exit 0                           # no corpus -> fail-open
 for log in "${LOGS[@]}"; do [ -r "$log" ] || exit 0; done  # unreadable configured log -> fail-open
 
-# The ticket is useful only for the deny recipe, but resolve it before the fold so
-# the same current-state pass can locate its linked thread across the split corpus.
-BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-TICKET="$(printf '%s' "$BRANCH" | grep -oiE "${CLIENT}-[0-9]+" | head -1 | tr '[:lower:]' '[:upper:]' || true)"
-
 # ---- Parse the log for an open session owned by <client>.
 # Prints one of:  ALLOW  |  DENY\t<owners-open-csv>\t<n_open>  |  FAILOPEN
-DECISION="$(python3 - "$CLIENT" "$TICKET" "${LOGS[@]}" <<'PY' 2>/dev/null || printf 'FAILOPEN'
+DECISION="$(python3 - "$CLIENT" "${LOGS[@]}" <<'PY' 2>/dev/null || printf 'FAILOPEN'
 import re, sys
-client, ticket, *logs = sys.argv[1:]
+client, *logs = sys.argv[1:]
 # Flat EDN maps, one per line: {:tx N :op "assert" :l "@s" :p "pred" :r "val" ...}
 tx_re  = re.compile(r':tx\s+(\d+)')
 op_re = re.compile(r':op\s+"([^"]*)"')
 l_re  = re.compile(r':l\s+"([^"]*)"')
 p_re  = re.compile(r':p\s+"([^"]*)"')
 r_re  = re.compile(r':r\s+"([^"]*)"')     # only string-valued :r (session_of/times/owner all are)
-TRACK = {"session_of", "start_time", "end_time", "owner", "linear"}
+TRACK = {"session_of", "start_time", "end_time", "owner", "kind", "clocked_by"}
 # Gather tracked ops from BOTH files, then apply them in global tx order. Subjects
 # are kind-routed today, but the merge remains correct if a predicate migrates.
 events = []
@@ -132,34 +127,34 @@ def value(subj, pred):
     v = state.get((subj, pred))
     return v[0] if v else None
 
-# Open sessions: session_of + start_time present, end_time NOT present.
-open_owners = []            # owners of every open session's thread (None if thread has no owner)
+# Open HUMAN sessions: new owner-scoped sessions plus compatible legacy user
+# sessions. Managed actors are a separate run-telemetry axis.
+open_owners = []
 allow = False
 seen = set()
 for (subj, pred) in list(state.keys()):
-    if pred != "session_of" or subj in seen:
+    if pred != "start_time" or subj in seen:
         continue
     seen.add(subj)
-    if not present(subj, "session_of") or not present(subj, "start_time"):
-        continue
     if present(subj, "end_time"):
         continue
-    thread = value(subj, "session_of")          # e.g. "@019f..."
-    owner = value(thread, "owner") if thread else None
+    actor = value(subj, "clocked_by") or "user"
+    if actor != "user":
+        continue
+    if value(subj, "kind") == "client_session":
+        owner = value(subj, "owner")
+    else:
+        thread = value(subj, "session_of")
+        owner = value(thread, "owner") if thread else None
     open_owners.append(owner or "?")
     if owner == client:
         allow = True
-
-linked = [(assert_tx, subj) for (subj, pred), (val, assert_tx) in state.items()
-          if pred == "linear" and val == ticket]
-linked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-ticket_thread = linked[0][1] if linked else ""
 
 if allow:
     print("ALLOW")
 else:
     owners = ",".join(sorted(set(open_owners))) if open_owners else ""
-    print("DENY\t%s\t%d\t%s" % (owners, len(open_owners), ticket_thread))
+    print("DENY\t%s\t%d" % (owners, len(open_owners)))
 PY
 )"
 
@@ -171,26 +166,16 @@ case "$DECISION" in
   *)        exit 0 ;;                                      # unknown shape -> fail-open
 esac
 
-# ---- REFUSE. Build the clock-in recipe from the branch-derived Linear ticket
-# and the CURRENT folded split-corpus link found above.
+# ---- REFUSE. The human clock is client-scoped, never ticket-scoped.
 OPEN_OWNERS="$(printf '%s' "$DECISION" | cut -f2)"
 N_OPEN="$(printf '%s' "$DECISION" | cut -f3)"
-TID="$(printf '%s' "$DECISION" | cut -f4)"
 
-if [ -n "$TICKET" ]; then
-  if [ -n "$TID" ]; then
-    HINT="Thread for $TICKET exists — clock in:  $NORTH clock start ${TID#@}"
-  else
-    HINT="No thread for $TICKET yet:  $NORTH capture \"$TICKET <title>\" $CLIENT   then   $NORTH clock start <id>"
-  fi
-else
-  HINT="Find/create the thread:  $NORTH ready  (or  $NORTH capture \"<title>\" $CLIENT ),  then  $NORTH clock start <id>"
-fi
+HINT="$NORTH clock in $CLIENT"
 
 if [ "${N_OPEN:-0}" != "0" ] && [ -n "$OPEN_OWNERS" ]; then
-  MISMATCH="Open clock(s) exist but none owned by '$CLIENT' (open owners: $OPEN_OWNERS)."
+  MISMATCH="A human client clock is open, but not for '$CLIENT' (open owners: $OPEN_OWNERS)."
 else
-  MISMATCH="No open north clock at all."
+  MISMATCH="No open human north client clock."
 fi
 
 # stderr so git surfaces it on the failed commit.

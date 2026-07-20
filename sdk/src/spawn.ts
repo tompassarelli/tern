@@ -30,10 +30,7 @@ import {
   decideChildTurnEnd, initialChildContinuationState, notifyEarlyExitChildren,
   settleChildren, type ChildSettlement,
 } from "./children";
-import {
-  admitBillableClock, clockFinalize, clockStop,
-  type BillableClockAdmission,
-} from "./clock";
+import { admitBillableClock } from "./clock";
 import {
   formatProviderAuthoritySurface, providerLiveInput, routedQuery, selectProvider,
   selectProviderForExecution,
@@ -87,7 +84,7 @@ export interface SpawnOptions {
   /** Equality-only compatibility alias; routingMetadata remains authoritative. */
   role?: string;
   posture?: string;
-  thread?: string; // exact work/evidence thread; also auto-clock like dispatch. Raw ad-hoc spawns omit it.
+  thread?: string; // exact work/evidence thread; managed runs verify the human client session separately.
   caveman?: "off" | "lite" | "full"; // per-spawn terse-output dial; overrides ambient AGENT_CAVEMAN
   coordinator?: string; // spawning coordinator handle -> gets a direct peer ping on death
   provider?: ProviderPreference;
@@ -114,8 +111,6 @@ interface SpawnRuntime {
   admitResourceEnvelope?: typeof admitResourceEnvelope;
   completeResourceEnvelope?: typeof completeResourceEnvelope;
   admitBillableClock?: typeof admitBillableClock;
-  clockFinalize?: typeof clockFinalize;
-  clockStop?: (agentId: string) => void | Promise<void>;
 }
 
 const SPAWN_OPTION_FIELDS = new Set([
@@ -142,11 +137,6 @@ function allowlistedSpawnOptions(value: SpawnOptions): SpawnOptions {
 
 export function createSpawnAgentId(now = Date.now(), uuid = randomUUID()): string {
   return `lane-${now.toString(36)}-${uuid}`;
-}
-
-interface ManagedClockLease {
-  admission: BillableClockAdmission;
-  finalized: boolean;
 }
 
 interface ManagedWorktreeLease {
@@ -189,7 +179,6 @@ async function runSpawn(
   judgmentGrade: JudgmentGradeSnapshot,
   strugglePolicy: StrugglePolicy,
   envelopeAdmission?: EnvelopeAdmission,
-  clockLease?: ManagedClockLease,
   injected: SpawnRuntime = {},
   termination: ManagedQueryTermination = new ManagedQueryTermination(),
   worktreeLease?: ManagedWorktreeLease,
@@ -678,12 +667,6 @@ async function runSpawn(
     );
   }
 
-  // Close only the exact clock positively opened by this run's preflight.
-  if (clockLease?.admission.kind === "opened") {
-    (injected.clockFinalize ?? clockFinalize)(agentId, outcome);
-    clockLease.finalized = true;
-  }
-
   // Salvage-gated worktree cleanup (only if this spawn provisioned one): remove
   // on a clean ran, KEEP + surface a worktree_orphaned fact on any
   // crash/cap/dirty tail. Fail-open.
@@ -881,21 +864,17 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     }
   }
   const termination = new ManagedQueryTermination(injected?.registerTermination);
-  let clockLease: ManagedClockLease | undefined;
   let admission: EnvelopeAdmission | undefined;
   let result!: string;
   let failed = false;
   let primaryError: unknown;
   try {
-    clockLease = {
-      admission: (injected?.admitBillableClock ?? admitBillableClock)({
-        agentId,
-        capabilities: gafferCapabilities(composed.routingMetadata),
-        cwd: process.cwd(),
-        threadId: composed.thread,
-      }),
-      finalized: false,
-    };
+    (injected?.admitBillableClock ?? admitBillableClock)({
+      agentId,
+      capabilities: gafferCapabilities(composed.routingMetadata),
+      cwd: process.cwd(),
+      threadId: composed.thread,
+    });
     termination.throwIfTerminated();
     admission = await (injected?.admitResourceEnvelope ?? admitResourceEnvelope)({
       agentId, tier: requestedTier, project: composed.project ?? context.project,
@@ -906,7 +885,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       console.warn(`[envelope] advisory: ${advisory}`);
     result = await runSpawn(
       composed, judgmentGrade, strugglePolicy,
-      admission, clockLease, injected, termination, worktreeLease,
+      admission, injected, termination, worktreeLease,
     );
   } catch (error) {
     failed = true;
@@ -919,10 +898,6 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   const cleanupErrors: unknown[] = [];
   try { await (injected?.completeResourceEnvelope ?? completeResourceEnvelope)(admission); }
   catch (error) { cleanupErrors.push(error); }
-  try {
-    if (clockLease?.admission.kind === "opened" && !clockLease.finalized)
-      await (injected?.clockStop ?? clockStop)(agentId);
-  } catch (error) { cleanupErrors.push(error); }
   finally {
     termination.cleanupSettled();
     termination.release();

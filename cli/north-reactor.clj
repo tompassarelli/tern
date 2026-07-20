@@ -247,11 +247,10 @@
                 :rules [{:head {:rel "row" :args [{:var "e"} {:var "driver"}]}
                          :body [{:rel "triple" :args [{:var "e"} "driver" {:var "driver"}]}]}]}})))
 
-;; Crash-honesty: a reaped lane may have left a clock session open (SDK death path
-;; never ran — hard kill). Close it via the SAME `north clock orphan` the SDK uses:
-;; stamps end_time at detection + clock_orphaned so a silent death never leaves a
-;; session running forever and skewing wall-clock. Idempotent (no-op if already
-;; closed); best-effort. north-bin path computed inline (its def is later in the file).
+;; Historical compatibility: a pre-run-telemetry lane may have left a legacy
+;; agent clock open. Close only that exact actor's legacy session. Current SDK
+;; lanes never open billing clocks; their elapsed time is kind=run telemetry.
+;; Idempotent and best-effort. north-bin is computed inline (its def is later).
 (defn orphan-clock! [h]
   (try
     (proc/shell {:out :string :err :string :continue true}

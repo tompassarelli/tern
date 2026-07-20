@@ -28,7 +28,21 @@
 (spit telemetry
       (str/join "\n" [(line 5 "@session" "session_of" "@work")
                        (line 6 "@session" "start_time" "2026-07-10T10:00:00Z")
-                       (line 7 "@session" "end_time" "2026-07-10T11:30:00Z")]))
+                       (line 7 "@session" "end_time" "2026-07-10T11:30:00Z")
+                       ;; Owner-scoped human session: its rate is snapshotted at
+                       ;; clock-in and it invoices independently of any ticket.
+                       (line 8 "@client-session" "owner" "fakeclient")
+                       (line 9 "@client-session" "clocked_by" "user")
+                       (line 10 "@client-session" "rate" "130")
+                       (line 11 "@client-session" "start_time" "2026-07-10T12:00:00Z")
+                       (line 12 "@client-session" "end_time" "2026-07-10T13:00:00Z")
+                       (line 13 "@client-session" "kind" "client_session")
+                       ;; Legacy managed-agent session on the same client thread:
+                       ;; useful task telemetry, never human invoice time.
+                       (line 14 "@agent-session" "session_of" "@work")
+                       (line 15 "@agent-session" "clocked_by" "lane-123")
+                       (line 16 "@agent-session" "start_time" "2026-07-10T13:00:00Z")
+                       (line 17 "@agent-session" "end_time" "2026-07-10T15:00:00Z")]))
 
 (defn run [bin & args]
   (apply p/shell {:out :string :err :string :continue true
@@ -38,13 +52,19 @@
 (println "billing split-corpus test")
 (let [r (run timelog "fakeclient")]
   (check "timelog exits successfully" (zero? (:exit r)))
-  (check "timelog joins session to thread" (str/includes? (:out r) "FAKE-7"))
-  (check "timelog totals 1.50 hours" (str/includes? (:err r) "1.50h"))
-  (check "timelog computes amount from coordination rate" (str/includes? (:out r) "180.00")))
+  (check "timelog preserves legacy human thread time" (str/includes? (:out r) "FAKE-7"))
+  (check "timelog emits owner-scoped client session" (str/includes? (:out r) "client-session"))
+  (check "timelog totals only 2.50 human hours" (str/includes? (:err r) "2.50h"))
+  (check "timelog computes amount from coordination rate" (str/includes? (:out r) "180.00"))
+  (check "timelog uses snapshotted client-session rate" (str/includes? (:out r) "130.00"))
+  (check "timelog excludes managed-agent session explicitly"
+         (str/includes? (:err r) "excluded 1 managed-agent session")))
 
 (let [r (run invoice "unbilled" "fakeclient")]
   (check "invoice selection exits successfully" (zero? (:exit r)))
-  (check "invoice selects canonical coordination thread" (str/includes? (:out r) "FAKE-7  Split corpus work")))
+  (check "invoice selects legacy human thread" (str/includes? (:out r) "FAKE-7  Split corpus work"))
+  (check "invoice selects owner-scoped client session" (str/includes? (:out r) "client-session  fakeclient client session"))
+  (check "invoice count excludes managed-agent session" (str/includes? (:out r) "human items: 2")))
 
 ;; A differently named explicit corpus must not infer a neighboring telemetry.log.
 (let [isolated (str root "/unrelated.log")]

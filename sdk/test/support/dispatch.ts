@@ -12,7 +12,7 @@ const RUNTIME_FIELDS = new Set([
   "deliveryRuntime", "childSettlementReader", "feedSubscriber",
   "registerTermination", "refreshAccountUsages", "refreshCodexEntitlements",
   "admitResourceEnvelope", "completeResourceEnvelope", "admitBillableClock",
-  "clockFinalize", "clockStop", "releaseDriver",
+  "releaseDriver",
 ]);
 
 function split(value: DispatchDependencies & Record<string, unknown>): {

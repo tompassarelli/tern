@@ -7,6 +7,38 @@
   (let [a (k/one-i idx sess "clocked_by")]
   (if (some? a) a "user")))
 
+(defn ^Boolean client-session? [idx ^String sess]
+  (and (= (k/one-i idx sess "kind") "client_session") (and (= (clocked-by idx sess) "user") (and (some? (k/one-i idx sess "owner")) (some? (k/one-i idx sess "start_time"))))))
+
+(defn ^Boolean legacy-human-session? [idx ^String sess]
+  (and (= (clocked-by idx sess) "user") (and (some? (k/one-i idx sess "session_of")) (some? (k/one-i idx sess "start_time")))))
+
+(defn ^Boolean human-billing-session? [idx ^String sess]
+  (or (client-session? idx sess) (legacy-human-session? idx sess)))
+
+(defn ^Boolean human-open? [idx ^String sess]
+  (and (human-billing-session? idx sess) (nil? (k/one-i idx sess "end_time"))))
+
+(defn open-human-sessions [idx]
+  (filterv (fn [s] (human-open? idx s)) (:subjects idx)))
+
+(defn running-human-session [idx]
+  (let [sessions (open-human-sessions idx)]
+  (if (= (count sessions) 1) (first sessions) nil)))
+
+(defn session-owner [idx ^String sess]
+  (if (client-session? idx sess) (k/one-i idx sess "owner") (let [te (k/one-i idx sess "session_of")]
+  (if (some? te) (k/one-i idx te "owner") nil))))
+
+(defn owner-rates [idx ^String owner]
+  (vec (sort (distinct (reduce (fn [rates te] (let [o (k/one-i idx te "owner")
+   rate (k/one-i idx te "rate")]
+  (if (and (= o owner) (some? rate)) (conj rates rate) rates))) [] (k/thread-ids-i idx))))))
+
+(defn unique-owner-rate [idx ^String owner]
+  (let [rates (owner-rates idx owner)]
+  (if (= (count rates) 1) (first rates) nil)))
+
 (defn ^Boolean open? [idx ^String s]
   (and (some? (k/one-i idx s "session_of")) (and (some? (k/one-i idx s "start_time")) (nil? (k/one-i idx s "end_time")))))
 
@@ -20,7 +52,7 @@
   (reduce (fn [acc s] (let [so (k/one-i idx s "session_of")
    st (k/one-i idx s "start_time")
    en (k/one-i idx s "end_time")]
-  (if (and (= so te) (and (some? st) (some? en))) (+ acc (- (iso->sec en) (iso->sec st))) acc))) 0 (:subjects idx)))
+  (if (and (= so te) (and (= (clocked-by idx s) "user") (and (some? st) (some? en)))) (+ acc (- (iso->sec en) (iso->sec st))) acc))) 0 (:subjects idx)))
 
 (defrecord Row [te est-h act-sec term])
 
@@ -56,7 +88,7 @@
   (->Calib pct (count done) est-sec act-sec)))
 
 (defn syncable-sessions [idx]
-  (filterv (fn [s] (and (some? (k/one-i idx s "session_of")) (and (some? (k/one-i idx s "end_time")) (nil? (k/one-i idx s "clockify_id"))))) (:subjects idx)))
+  (filterv (fn [s] (and (human-billing-session? idx s) (and (some? (k/one-i idx s "end_time")) (nil? (k/one-i idx s "clockify_id"))))) (:subjects idx)))
 
 (defn- ^Boolean starts-with-any? [^String s prefixes]
   (loop [ps prefixes]
@@ -66,7 +98,7 @@
   (reduce (fn [acc s] (let [so (k/one-i idx s "session_of")
    st (k/one-i idx s "start_time")
    en (k/one-i idx s "end_time")]
-  (if (and (= so te) (and (some? st) (and (some? en) (starts-with-any? st prefixes)))) (+ acc (- (iso->sec en) (iso->sec st))) acc))) 0 (:subjects idx)))
+  (if (and (= so te) (and (= (clocked-by idx s) "user") (and (some? st) (and (some? en) (starts-with-any? st prefixes))))) (+ acc (- (iso->sec en) (iso->sec st))) acc))) 0 (:subjects idx)))
 
 (defn logged-rows [idx prefixes iso->sec]
   (filterv (fn [r] (> (:act-sec r) 0)) (mapv (fn [te] (->Row te 0 (actual-seconds-in idx te prefixes iso->sec) (proj/terminal-i? idx te))) (k/thread-ids-i idx))))
@@ -80,11 +112,10 @@
 (defn iv-end [r] (:end r))
 
 (defn owner-intervals [idx ^String owner iso->sec]
-  (reduce (fn [acc s] (let [thr (k/one-i idx s "session_of")
-   st (k/one-i idx s "start_time")
+  (reduce (fn [acc s] (let [st (k/one-i idx s "start_time")
    en (k/one-i idx s "end_time")]
-  (if (and (some? thr) (some? st) (some? en)) (let [o (k/one-i idx thr "owner")]
-  (if (and (some? o) (= o owner)) (conj acc (->Iv (subs st 0 10) (iso->sec st) (iso->sec en))) acc)) acc))) [] (:subjects idx)))
+  (if (and (human-billing-session? idx s) (and (some? st) (some? en))) (let [o (session-owner idx s)]
+  (if (= o owner) (conj acc (->Iv (subs st 0 10) (iso->sec st) (iso->sec en))) acc)) acc))) [] (:subjects idx)))
 
 (defrecord Merge [open cs ce total])
 

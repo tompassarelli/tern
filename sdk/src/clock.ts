@@ -1,9 +1,7 @@
-// Per-agent billing clocks have two deliberately different reliability contracts.
-// Required client admission is synchronous and fail-closed before provider/identity
-// work: the branch ticket, North thread, owner, start acknowledgement, and exact
-// live readback must all agree. Terminal stop/orphan cleanup remains synchronous
-// best-effort: it must flush before exit but must never replace the run outcome.
-// Every command pins NORTH_AGENT_ID so parallel workers are attributed separately.
+// Managed task timing and human billing are orthogonal. A managed client lane
+// synchronously verifies the branch ticket, North thread, owner, and an already
+// open owner-scoped HUMAN client session before provider/identity work. It never
+// starts or stops billing time; each lane's elapsed time is existing run telemetry.
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { getThreadFacts, type Fact } from "./north-client";
@@ -16,15 +14,15 @@ const REPO = resolve(import.meta.dir, "..", "..");
 // NORTH_BIN override mirrors death.ts, so tests can point at a fake.
 const northBin = () => process.env.NORTH_BIN ?? `${REPO}/bin/north`;
 
-export type ClockAction = "start" | "stop" | "orphan";
 export type BillableClockPreflightCode =
   | "billable_thread_required"
   | "billable_ticket_required"
   | "billable_thread_owner_unavailable"
   | "billable_thread_owner_mismatch"
   | "billable_thread_linear_mismatch"
-  | "billable_clock_start_failed"
-  | "billable_clock_readback_failed";
+  | "billable_client_session_required"
+  | "billable_client_session_mismatch"
+  | "billable_client_session_readback_failed";
 
 export class BillableClockPreflightError extends Error {
   readonly preSideEffect = true;
@@ -38,9 +36,8 @@ export class BillableClockPreflightError extends Error {
 export type BillableClockAdmission =
   | { kind: "not-required" }
   | {
-      kind: "opened";
-      agentId: string;
-      client?: string;
+      kind: "verified";
+      client: string;
       threadId: string;
     };
 
@@ -52,33 +49,6 @@ export interface BillableClockRuntime {
   execute?: (
     command: { args: string[]; agentEnv?: string },
   ) => string;
-}
-
-// PURE: the north argv (+ the agent-id to pin as NORTH_AGENT_ID, if any) a clock
-// action issues. Split out like death.ts's deathCommands so the contract is testable
-// without shelling out. `start`/`stop` pin NORTH_AGENT_ID so the CLI resolves the
-// caller's identity; `orphan` names the agent EXPLICITLY in argv (a reaper closes on
-// behalf of a dead agent, so its own identity must not leak in via env).
-export function clockCommand(
-  action: ClockAction,
-  agentId: string,
-  thread?: string,
-): { args: string[]; agentEnv?: string } {
-  switch (action) {
-    case "start":
-      return { args: ["clock", "start", thread ?? ""], agentEnv: agentId };
-    case "stop":
-      return { args: ["clock", "stop"], agentEnv: agentId };
-    case "orphan":
-      return { args: ["clock", "orphan", agentId] };
-  }
-}
-
-// PURE: the terminal clock action for a finalized run — crash outcomes orphan-close
-// (flag the untrustworthy tail), everything else (clean or turn-capped)
-// closes normally so real time still bills.
-export function finalizeAction(outcome: string): ClockAction {
-  return outcome === "died" || outcome === "stalled" ? "orphan" : "stop";
 }
 
 function runNorthCapture(
@@ -93,14 +63,6 @@ function runNorthCapture(
       ? { ...process.env, NORTH_AGENT_ID: cmd.agentEnv }
       : process.env,
   });
-}
-
-function runNorth(cmd: { args: string[]; agentEnv?: string }): void {
-  try {
-    runNorthCapture(cmd);
-  } catch {
-    /* best-effort: never break the run on a clock write */
-  }
 }
 
 function defaultProjectRoot(cwd: string, gitExecutable: string): string {
@@ -135,29 +97,17 @@ export function clientTicketForBranch(
   return candidates.length === 1 ? candidates[0]![0].toUpperCase() : undefined;
 }
 
-function exactStartProof(output: string, threadId: string, agentId: string): boolean {
+function clientStatusOwner(output: string): string | undefined {
   const line = output.split(/\r?\n/, 1)[0] ?? "";
-  return line.startsWith(`clocked in on ${threadId} at `)
-    && line.endsWith(`, agent ${agentId})`);
-}
-
-function exactStatusProof(output: string, threadId: string, agentId: string): boolean {
-  const line = output.split(/\r?\n/, 1)[0] ?? "";
-  return line.startsWith(`clocked in on ${threadId}  `)
-    && line.endsWith(`  (agent ${agentId})`);
-}
-
-function exactAbsentStatusProof(output: string, agentId: string): boolean {
-  return (output.split(/\r?\n/, 1)[0] ?? "")
-    === `not clocked in (agent ${agentId})`;
+  const match = /^clocked in for client ([A-Za-z0-9][A-Za-z0-9._-]*)  \(session /.exec(line);
+  return match?.[1];
 }
 
 /**
- * Required pre-provider billing admission. Non-client or read-only work is
- * unchanged. A write-capable client lane must bind a same-owner thread, open
- * its own clock, and read that exact agent/thread session back before any model
- * or identity side effect. If readback fails after a successful start, close
- * only the clock this attempt opened before rejecting.
+ * Required pre-provider client-session admission. Non-client or read-only work
+ * is unchanged. A write-capable client lane binds the exact owner/Linear thread
+ * and verifies an independently opened human session for that owner. No billing
+ * mutation belongs to a managed lane.
  */
 export function admitBillableClock(
   input: {
@@ -222,89 +172,18 @@ export function admitBillableClock(
       throw new BillableClockPreflightError("billable_thread_linear_mismatch");
   }
 
+  if (!required) return { kind: "not-required" };
   const execute = runtime.execute ?? runNorthCapture;
-  const status = { args: ["clock", "status"], agentEnv: input.agentId };
+  const status = { args: ["clock", "status"], agentEnv: "user" };
   try {
-    if (!exactAbsentStatusProof(execute(status), input.agentId)) {
-      if (required)
-        throw new BillableClockPreflightError("billable_clock_readback_failed");
-      return { kind: "not-required" };
-    }
+    const owner = clientStatusOwner(execute(status));
+    if (!owner)
+      throw new BillableClockPreflightError("billable_client_session_required");
+    if (owner !== client)
+      throw new BillableClockPreflightError("billable_client_session_mismatch");
+    return { kind: "verified", client, threadId: input.threadId };
   } catch (error) {
     if (error instanceof BillableClockPreflightError) throw error;
-    if (required)
-      throw new BillableClockPreflightError("billable_clock_readback_failed");
-    return { kind: "not-required" };
+    throw new BillableClockPreflightError("billable_client_session_readback_failed");
   }
-  const start = clockCommand("start", input.agentId, input.threadId);
-  let started = false;
-  let ambiguousStart = false;
-  try {
-    const output = execute(start);
-    started = exactStartProof(output, input.threadId, input.agentId);
-    ambiguousStart = !started
-      && !/^(?:already clocked in|no such thread:)/.test(output);
-  } catch {
-    ambiguousStart = true;
-  }
-  if (!started) {
-    if (ambiguousStart) {
-      try {
-        const current = execute(status);
-        if (exactStatusProof(current, input.threadId, input.agentId))
-          execute(clockCommand("stop", input.agentId));
-      } catch {
-        // Without exact readback this attempt cannot safely claim or close a clock.
-      }
-    }
-    if (required)
-      throw new BillableClockPreflightError("billable_clock_start_failed");
-    return { kind: "not-required" };
-  }
-
-  try {
-    if (exactStatusProof(
-      execute(status),
-      input.threadId,
-      input.agentId,
-    )) {
-      return {
-        kind: "opened",
-        agentId: input.agentId,
-        ...(client ? { client } : {}),
-        threadId: input.threadId,
-      };
-    }
-  } catch {
-    // Cleanup below owns the clock this attempt positively started.
-  }
-  try { execute(clockCommand("stop", input.agentId)); } catch { /* best effort */ }
-  if (required)
-    throw new BillableClockPreflightError("billable_clock_readback_failed");
-  return { kind: "not-required" };
-}
-
-// Open a per-agent session on `thread`, clocked_by=agentId. The CLI denies only if
-// THIS agent already has an open session, so it never blocks across agents. `thread`
-// is the bare id (the CLI adds the @).
-export function clockStart(agentId: string, thread: string): void {
-  runNorth(clockCommand("start", agentId, thread));
-}
-
-// Close THIS agent's open session normally (clean exit / turn-cap — the time is real).
-export function clockStop(agentId: string): void {
-  runNorth(clockCommand("stop", agentId));
-}
-
-// Crash-honesty: close the agent's orphan session, stamping end_time at detection +
-// clock_orphaned so audits distrust the untimed tail without dropping the work. No-op
-// if the agent has no open session; idempotent, so a death path and a reaper may both
-// fire it.
-export function clockOrphan(agentId: string): void {
-  runNorth(clockCommand("orphan", agentId));
-}
-
-// The terminal clock action for a finalized run (see finalizeAction).
-export function clockFinalize(agentId: string, outcome: string): void {
-  runNorth(clockCommand(finalizeAction(outcome), agentId));
 }

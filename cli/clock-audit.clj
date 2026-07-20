@@ -6,8 +6,10 @@
 ;; every UNCOVERED commit. READ-ONLY — never writes a fact.
 ;;
 ;; Session fact model (see src/north/clock.bclj):
-;;   @<sess> session_of @<thread>   start_time <iso>   end_time <iso>   (end absent => open)
-;; Thread owner: the `owner` fact on the session's thread (e.g. "msa").
+;;   @<sess> kind client_session  owner <client>  clocked_by user
+;;           start_time <iso>  end_time <iso> (end absent => open)
+;; Legacy session_of rows remain coverage only when clocked_by is absent/user.
+;; Explicit managed-agent rows are task telemetry, never billing coverage.
 ;; Client of a repo: the path segment after /code/client/  (…/client/<client>/<repo>).
 ;; A commit is COVERED iff its author time falls within [start-15min, end+15min]
 ;; of ANY session whose thread owner equals the repo's client (grace: a commit
@@ -81,16 +83,19 @@
         one   (fn [s p] (k/one-i idx s p))]
     (->> (:subjects idx)
          (keep (fn [s]
-                 (let [so (one s "session_of") st (one s "start_time")]
-                   (when (and (some? so) (some? st))
-                     ;; owner lives on the thread subject, which is keyed WITH the
-                     ;; leading @ in the index — look it up on the raw ref, not stripped.
-                     (let []
-                       {:id       s
-                        :owner    (one so "owner")
-                        :start    (iso->epoch st)
-                        :end      (if-let [en (one s "end_time")] (iso->epoch en) (now-epoch))
-                        :orphaned (contains? #{"true" true} (one s "clock_orphaned"))})))))
+                 (let [so (one s "session_of")
+                       st (one s "start_time")
+                       actor (or (one s "clocked_by") "user")
+                       client? (= (one s "kind") "client_session")
+                       owner (if client? (one s "owner")
+                                 (when (some? so) (one so "owner")))]
+                   (when (and (= actor "user")
+                              (and (some? st) (some? owner)))
+                     {:id       s
+                      :owner    owner
+                      :start    (iso->epoch st)
+                      :end      (if-let [en (one s "end_time")] (iso->epoch en) (now-epoch))
+                      :orphaned (contains? #{"true" true} (one s "clock_orphaned"))}))))
          (into []))))
 
 ;; ---- git commits in the window ---------------------------------------------

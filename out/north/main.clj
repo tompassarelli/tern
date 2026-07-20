@@ -48,6 +48,7 @@
   (= ek "concern") "concern"
   (= ek "thread") "thread"
   (= ek "mine") "mine"
+  (= ek "client_session") "billing-session"
   (or (= ek "run") (or (= ek "session") (= ek "lane"))) "session-telemetry"
   :else ek))
 
@@ -585,14 +586,60 @@
   (if (not (str/blank? a)) a (let [b (fram.rt/getenv-or "AGENT_ID" "")]
   (if (not (str/blank? b)) b "user")))))
 
+(defn cmd-clock-in [^String log ^String owner]
+  (let [idx (live-idx log)
+   me (agent-id)
+   open (clk/open-human-sessions idx)
+   rates (clk/owner-rates idx owner)
+   rate (clk/unique-owner-rate idx owner)]
+  (cond
+  (not= me "user") (println (str "clock in refused for managed agent " me " — task timing is recorded as run telemetry"))
+  (str/blank? owner) (println "usage: clock in <owner>")
+  (not (empty? open)) (let [run (first open)
+   current (clk/session-owner idx run)]
+  (println (str "already clocked in for client " (if (some? current) current "?") " (session " (short-id run) ") — `clock out` first")))
+  (nil? rate) (if (empty? rates) (println (str "clock in refused: owner '" owner "' has no rate. Set the hourly rate on a client thread first: " "north tell <thread-id> rate <hourly-rate>")) (println (str "clock in refused: owner '" owner "' has ambiguous rates [" (str/join ", " rates) "]. Normalize its thread rates, then retry.")))
+  :else (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "client clock in was not recorded")) (let [sid (fresh-sid idx (fram.rt/now-id))
+   ssub (str "@" sid)
+   now (fram.rt/now-iso)
+   r1 (tell-retry port log "assert" ssub "owner" owner 5)
+   r2 (if (str/starts-with? r1 "ok:") (tell-retry port log "assert" ssub "clocked_by" "user" 5) "skipped: owner failed")
+   r3 (if (str/starts-with? r2 "ok:") (tell-retry port log "assert" ssub "rate" rate 5) "skipped: clocked_by failed")
+   r4 (if (str/starts-with? r3 "ok:") (tell-retry port log "assert" ssub "start_time" now 5) "skipped: rate failed")
+   r5 (if (str/starts-with? r4 "ok:") (tell-retry port log "assert" ssub "kind" "client_session" 5) "skipped: start_time failed")]
+  (if (and (str/starts-with? r1 "ok:") (and (str/starts-with? r2 "ok:") (and (str/starts-with? r3 "ok:") (and (str/starts-with? r4 "ok:") (str/starts-with? r5 "ok:"))))) (println (str "clocked in for client " owner " at " now "  (session " sid ", rate " rate "/h)")) (println (str "clock in FAILED to record (" r1 "/" r2 "/" r3 "/" r4 "/" r5 ") — retry")))))))))
+
+(defn cmd-clock-out [^String log]
+  (let [idx (live-idx log)
+   me (agent-id)
+   sessions (clk/open-human-sessions idx)]
+  (cond
+  (not= me "user") (println (str "clock out refused for managed agent " me " — human client time is owned by user"))
+  (empty? sessions) (println "not clocked in for a client")
+  (> (count sessions) 1) (println (str "invalid client clock state: " (count sessions) " human sessions open — inspect `north clock status`; no session was closed"))
+  :else (let [run (first sessions)
+   port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "still clocked in")) (let [now (fram.rt/now-iso)
+   st (k/one-i idx run "start_time")
+   owner (clk/session-owner idx run)
+   dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)
+   resp (tell-retry port log "assert" run "end_time" now 5)]
+  (if (str/starts-with? resp "ok:") (println (str "clocked out of client " (if (some? owner) owner "?") " — this session " (fmt-hm dur))) (println (str "clock out FAILED to record end_time (" resp ") — still clocked in, retry")))))))))
+
 (defn cmd-clock-start [^String log ^String id]
   (let [idx (live-idx log)
    te (str "@" id)
    me (agent-id)
-   run (clk/running-session-for idx me)]
+   open (clk/open-human-sessions idx)]
   (cond
+  (not= me "user") (println (str "clock start refused for managed agent " me " — task timing is recorded as run telemetry"))
   (nil? (k/one-i idx te "title")) (println (str "no such thread: " id))
-  (some? run) (println (str "already clocked in on " (short-id (session-thread idx run)) " (session " (short-id run) ", agent " me ") — `clock stop` first"))
+  (not (empty? open)) (let [run (first open)
+   owner (clk/session-owner idx run)]
+  (println (str "already clocked in for client " (if (some? owner) owner "?") " (session " (short-id run) ") — `clock stop` first")))
   :else (let [port (fram.rt/coord-port)
    coord-v (fram.rt/coord-version-for-log port log)]
   (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "clock start was not recorded")) (let [sid (fresh-sid idx (fram.rt/now-id))
@@ -604,19 +651,7 @@
   (if (and (str/starts-with? r1 "ok:") (and (str/starts-with? r2 "ok:") (str/starts-with? r3 "ok:"))) (println (str "clocked in on " id " at " now "  (session " sid ", agent " me ")")) (println (str "clock start FAILED to record (" r1 "/" r2 "/" r3 ") — retry")))))))))
 
 (defn cmd-clock-stop [^String log]
-  (let [idx (live-idx log)
-   me (agent-id)
-   run (clk/running-session-for idx me)]
-  (cond
-  (nil? run) (println (str "not clocked in (agent " me ")"))
-  :else (let [port (fram.rt/coord-port)
-   coord-v (fram.rt/coord-version-for-log port log)]
-  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "still clocked in")) (let [now (fram.rt/now-iso)
-   st (k/one-i idx run "start_time")
-   te (session-thread idx run)
-   dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)
-   resp (tell-retry port log "assert" run "end_time" now 5)]
-  (if (str/starts-with? resp "ok:") (println (str "clocked out of " (short-id te) " — this session " (fmt-hm dur))) (println (str "clock stop FAILED to record end_time (" resp ") — still clocked in, retry")))))))))
+  (cmd-clock-out log))
 
 (defn cmd-clock-orphan [^String log ^String agent]
   (let [idx (live-idx log)
@@ -633,21 +668,21 @@
 
 (defn cmd-clock-status [^String log]
   (let [idx (live-idx log)
-   me (agent-id)
-   run (clk/running-session-for idx me)
-   othern (let [n (count (clk/open-sessions idx))]
-  (if (some? run) (- n 1) n))]
-  (if (nil? run) (do
-  (println (str "not clocked in (agent " me ")"))
-  (if (> othern 0) (do
-  (println (str "  (" othern " other agent session(s) open)"))))) (let [now (fram.rt/now-iso)
+   sessions (clk/open-human-sessions idx)]
+  (cond
+  (empty? sessions) (println "not clocked in for a client")
+  (> (count sessions) 1) (println (str "invalid client clock state: " (count sessions) " human sessions open"))
+  :else (let [run (first sessions)
+   now (fram.rt/now-iso)
    st (k/one-i idx run "start_time")
+   owner (clk/session-owner idx run)
+   rate (k/one-i idx run "rate")
    te (session-thread idx run)
    dur (if (some? st) (- (fram.rt/iso-to-seconds now) (fram.rt/iso-to-seconds st)) 0)]
-  (println (str "clocked in on " (short-id te) "  " (trunc (title-of idx te) 40) "  (agent " me ")"))
-  (println (str "  since " (if (some? st) st "?") "  (" (fmt-hm dur) " elapsed)"))
-  (if (> othern 0) (do
-  (println (str "  + " othern " other agent session(s) open"))))))))
+  (println (str "clocked in for client " (if (some? owner) owner "?") "  (session " (short-id run) (if (some? rate) (str ", rate " rate "/h") "") ")"))
+  (if (not (= te "")) (do
+  (println (str "  legacy thread " (short-id te) "  " (trunc (title-of idx te) 40)))))
+  (println (str "  since " (if (some? st) st "?") "  (" (fmt-hm dur) " elapsed)"))))))
 
 (defn cmd-clock-report [^String log]
   (let [idx (live-idx log)
@@ -671,7 +706,7 @@
   (println (str "syncing " (count sessions) " session(s) to clockify (workspace " ws ")"))
   (doseq [s sessions]
   (let [te (session-thread idx s)
-   owner (let [o (k/one-i idx te "owner")]
+   owner (let [o (clk/session-owner idx s)]
   (if (some? o) o "personal"))
    proj (cf/project-for dir owner)
    st (k/one-i idx s "start_time")
@@ -679,9 +714,10 @@
   (cond
   (nil? proj) (println (str "  – skip " (short-id s) "  (owner '" owner "' unmapped — `clock map " owner " <project-id>`)"))
   (or (nil? st) (nil? en)) (println (str "  ! skip " (short-id s) "  (missing start/end)"))
-  :else (let [cid (cf/create-entry ws proj st en (title-of idx te))]
+  :else (let [description (if (= te "") (str owner " client session") (title-of idx te))
+   cid (cf/create-entry ws proj st en description)]
   (if (= cid "") (println (str "  ! " (short-id s) "  (clockify returned no id)")) (let [wb (tell-retry port log "assert" s "clockify_id" cid 5)]
-  (if (str/starts-with? wb "ok:") (println (str "  ✓ " (short-id te) "  " st " → " en "  (clockify " cid ")")) (println (str "  !! " (short-id s) " PUSHED to clockify (" cid ") but failed to record it (" wb ") — set manually to avoid a double-push: tell " (short-id s) " clockify_id " cid)))))))))
+  (if (str/starts-with? wb "ok:") (println (str "  ✓ " (if (= te "") (short-id s) (short-id te)) "  " st " → " en "  (clockify " cid ")")) (println (str "  !! " (short-id s) " PUSHED to clockify (" cid ") but failed to record it (" wb ") — set manually to avoid a double-push: tell " (short-id s) " clockify_id " cid)))))))))
   (println "done.")))))
 
 (defn- clock-window [^String log prefixes ^String label]
@@ -1000,7 +1036,7 @@
   (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
   (println "  vocabulary : schema (census by kind) · schema-seed (declare predicate metadata)")
   (println "  read/write : show · capture · tell · retract · validate   (untell = legacy alias of retract)")
-  (println "  time       : clock start|stop|status|report")
+  (println "  time       : clock in <owner>|out|status|report  (start/stop remain compatible)")
   (println "  agents     : dispatch · spawn")
   (println "  view       : presentation")
   (println "")
@@ -1098,6 +1134,7 @@
   (= kind "thread") "north capture -> src/north/main.bclj capture-facts (title, kind=thread, created_at, committed, …)"
   (= kind "concern") "concern declare -> cli/concern-cli.clj (put! kind=concern, intent, touches, reached)"
   (= kind "agent") "agent identity -> sdk/src/identity.ts writeIdentity + bin/north-on-spawn (tell agent:<id> kind/role/display_name)"
+  (= kind "billing-session") "human billing -> north clock in/out (src/north/main.bclj kind=client_session)"
   (= kind "session-telemetry") "run/session telemetry -> sdk/src/telemetry.ts recordRun (kind=run) + bin/north-on-spawn (kind=session) + cli/presence-cli.clj (session leases)"
   (= kind "msg") "mail + commands -> cli/msg-cli.clj (@msg: mail, @cmd: commands)"
   (= kind "mine") "personal notes -> cli/north-mine.clj (@mine:<stem> facts)"
@@ -1173,6 +1210,8 @@
   (= cmd "json") (cmd-json log (if (> (count args) 1) (nth args 1) "") (if (> (count args) 2) (nth args 2) "") (has-flag? args "--all"))
   (= cmd "clock") (let [sub (if (> (count args) 1) (nth args 1) "status")]
   (cond
+  (= sub "in") (if (>= (count args) 3) (cmd-clock-in log (nth args 2)) (println "usage: clock in <owner>"))
+  (= sub "out") (cmd-clock-out log)
   (= sub "start") (if (>= (count args) 3) (cmd-clock-start log (nth args 2)) (println "usage: clock start <thread-id>"))
   (= sub "stop") (cmd-clock-stop log)
   (= sub "orphan") (if (>= (count args) 3) (cmd-clock-orphan log (nth args 2)) (println "usage: clock orphan <agent-id>"))
@@ -1184,8 +1223,8 @@
   (= sub "map") (if (>= (count args) 4) (cf/cmd-map (fram.rt/time-dir) (nth args 2) (nth args 3)) (println "usage: clock map <owner> <project-id>"))
   (= sub "projects") (cf/cmd-projects)
   (= sub "workspaces") (cf/cmd-workspaces)
-  :else (println "usage: clock start <id> | stop | orphan <agent-id> | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
-  :else (println "north usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <start|stop|orphan|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)"))))
+  :else (println "usage: clock in <owner> | out | start <id> | stop | orphan <agent-id> | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
+  :else (println "north usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed [--dry-run|--execute] | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <in|out|start|stop|orphan|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)"))))
 
 (defn run-status [args ^String threads-dir ^String log]
   (if (and (not (empty? args)) (= (first args) "validate")) (cmd-validate log) (do

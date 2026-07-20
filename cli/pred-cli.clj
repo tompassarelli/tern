@@ -347,14 +347,14 @@
    ["reset_reason" "single" "literal" "operator-supplied reason for a resource-budget breaker reset"]
    ;; --- clock / billing (north-timelog, north-invoice, clock-audit; cardinality
    ;;     mirrors bin/north FRAM_SINGLE_VALUED for the executable fallback) ---
-   ["clocked_by"    "single" "literal" "session/agent handle that logged clock time against a thread"]
+   ["clocked_by"    "single" "literal" "clock actor; user is human billing, managed handles are legacy audit-only"]
    ["start_time"    "single" "literal" "clock session start instant"]
    ["end_time"      "single" "literal" "clock session end instant (absent ⇒ session still open)"]
    ["clock_orphaned" "single" "literal" "flag: a clock session was orphaned before a clean stop"]
    ["estimate_hours" "single" "literal" "estimated hours of work for a thread"]
    ["actual_hours"  "single" "literal" "reconciled actual billable hours for a thread"]
-   ["rate"          "single" "literal" "hourly billing rate applied to a thread's owner"]
-   ["invoice_id"    "single" "literal" "invoice a thread's billable work is stamped onto"]
+   ["rate"          "single" "literal" "hourly billing rate on a thread or snapshotted client session"]
+   ["invoice_id"    "single" "literal" "invoice a billable thread/session is stamped onto"]
    ["invoice_state" "single" "literal" "billing state: uninvoiced | invoice-sent | invoice-paid"]
    ["billing_note"  "multi"  "literal" "manual billing-reconciliation note attached to a thread"]
    ["clock_note"    "multi"  "literal" "clock-correction note attached to a thread"]
