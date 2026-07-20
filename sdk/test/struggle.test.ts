@@ -202,3 +202,38 @@ test("interleaved pre-tool narration does not reset or accelerate the stall cloc
   expect(observer.state.workTurns).toBe(6);
   expect(observer.state.turn).toBe(12); // 6 narration + 6 tool_use assistant messages
 });
+
+// Reconciles the independently accepted Headroom director regressions with the
+// newer work-turn-based observer on main. Distinct planning remains progress,
+// while lifecycle wait/reduction turns consume no work-turn budget at all.
+test("orchestrator planning and lifecycle waits do not false-fire no_progress", () => {
+  const observer = makeStruggleObserver(resolveStrugglePolicy("orchestrator", {}));
+  const planningTools = ["Read", "Grep", "mcp__north__show", "mcp__north__board"];
+  for (let turn = 1; turn <= 30; turn++) {
+    toolResult(
+      observer.state,
+      planningTools[turn % planningTools.length]!,
+      `planning-${turn}`,
+      false,
+      { query: turn },
+    );
+    expect(checkStruggle(observer.state)).toBeNull();
+  }
+  const workTurnsAfterPlanning = observer.state.workTurns;
+  for (let wait = 0; wait < 40; wait++) {
+    expect(observer.observe({
+      type: "assistant",
+      message: { content: [{ type: "text", text: `waiting for child ${wait}` }] },
+    })).toBeNull();
+  }
+  expect(observer.state.workTurns).toBe(workTurnsAfterPlanning);
+  expect(checkStruggle(observer.state)).toBeNull();
+});
+
+test("orchestrator unchanged polling remains an observable tool loop", () => {
+  const observer = makeStruggleObserver(resolveStrugglePolicy("orchestrator", {}));
+  for (let turn = 1; turn <= 3; turn++) {
+    toolResult(observer.state, "mcp__north__show", `poll-${turn}`, false, { id: "same" });
+  }
+  expect(checkStruggle(observer.state)).toBe("tool_loop");
+});
