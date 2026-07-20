@@ -10,11 +10,13 @@ shell_bars=(
   bin/tests/north-mark-delegated-test.sh
   bin/tests/identity-alias-test.sh
   bin/tests/native-identity-test.sh
+  cli/tests/north-coord-up-test.sh
   cli/tests/coord-log-fence-integration-test.sh
 )
 clojure_bars=(
   cli/tests/agent-identity-publication-integration-test.clj
   cli/tests/agents-cli-test.clj
+  cli/tests/dashboard-doctor-exit-test.clj
   cli/tests/live-feed-integration-test.clj
   cli/tests/map-contract-test.clj
   cli/tests/message-audience-integration-test.clj

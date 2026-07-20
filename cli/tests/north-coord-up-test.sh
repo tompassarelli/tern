@@ -8,10 +8,20 @@ TMP_ROOT="$(mktemp -d)"
 TMP="$TMP_ROOT/state with spaces"
 STATE="$TMP/state"
 FAKE_BIN="$TMP/fram-bin"
+FRAM_ROOT="$TMP/fram checkout"
 DAEMON_PID=
 LISTENER_PID=
 REAL_BB="$(command -v bb)"
 HOST_PATH="$PATH"
+
+write_fake_proc_stat() {
+  local path="$1" pid="$2" birth="$3"
+  {
+    printf '%s (north runtime test) S' "$pid"
+    for _ in $(seq 4 21); do printf ' 0'; done
+    printf ' %s 0\n' "$birth"
+  } >"$path"
+}
 
 cleanup() {
   if [[ -n "$DAEMON_PID" ]]; then
@@ -24,8 +34,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$FAKE_BIN" "$TMP/home/.local/state/north/threads"
+mkdir -p "$FAKE_BIN" "$FRAM_ROOT" "$TMP/home/.local/state/north/threads"
 : >"$TMP/home/.local/state/north/facts.log"
+printf 'tracked Fram source\n' >"$FRAM_ROOT/runtime.clj"
+git -C "$FRAM_ROOT" init -q
+git -C "$FRAM_ROOT" add runtime.clj
+git -C "$FRAM_ROOT" \
+  -c user.name='North Runtime Test' \
+  -c user.email='north-runtime@example.invalid' \
+  commit -qm 'fixture runtime'
+FRAM_REV="$(git -C "$FRAM_ROOT" rev-parse HEAD)"
+FRAM_TREE="$(git -C "$FRAM_ROOT" rev-parse 'HEAD^{tree}')"
 
 cat >"$FAKE_BIN/fram" <<'EOF'
 #!/usr/bin/env bash
@@ -60,7 +79,9 @@ printf '%s\n' \
   "selector=$NORTH_FRAM_RUNTIME" \
   "source=$FRAM_RUNTIME_SOURCE" \
   "rev=$FRAM_RUNTIME_REV" \
+  "tree=$FRAM_RUNTIME_TREE" \
   "daemon=$FRAM_RUNTIME_DAEMON" \
+  "owner=$FRAM_RUNTIME_OWNER_TOKEN" \
   >"$FRAM_TEST_STATE/runtime-identity"
 for packaged_name in FRAM_PACKAGED FRAM_JAVA FRAM_DAEMON_CLASSPATH_FILE FRAM_RESOLVE FRAM_PACKAGE_REV; do
   if [[ -n "${!packaged_name:-}" ]]; then
@@ -110,7 +131,7 @@ chmod +x "$FAKE_BIN/fram" "$FAKE_BIN/fram-daemon" "$FAKE_BIN/ss" "$FAKE_BIN/bb"
 common_env=(
   HOME="$TMP/home"
   XDG_STATE_HOME="$TMP/home/.local/state"
-  FRAM_HOME="$TMP/absent-runtime-root"
+  FRAM_HOME="$FRAM_ROOT"
   FRAM_BIN="$FAKE_BIN"
   FRAM_PORT=39871
   FRAM_LOG="$TMP/home/.local/state/north/facts.log"
@@ -120,6 +141,7 @@ common_env=(
   FRAM_DAEMON_CLASSPATH_FILE=/nix/store/stale-fram/daemon.classpath
   FRAM_RESOLVE=/nix/store/stale-fram/resolve.clj
   FRAM_PACKAGE_REV=stale-package-revision
+  FRAM_RUNTIME_REV=poisoned-ambient-revision
   NORTH_HOME=/nix/store/stale-north
   NORTH_PACKAGE_MODE=nix-store
   NORTH_COORD_PID_FILE="$STATE/published.pid"
@@ -143,20 +165,51 @@ DAEMON_PID="$(cat "$STATE/daemon-pid")"
 grep -q '^39871 .*/facts.log$' "$STATE/daemon-args"
 grep -q '^coordinator up on :39871$' "$TMP/start.out"
 grep -q '^selector=checkout$' "$STATE/runtime-identity"
-grep -q "^source=$TMP/absent-runtime-root$" "$STATE/runtime-identity"
-grep -q '^rev=unversioned$' "$STATE/runtime-identity"
+grep -q "^source=$FRAM_ROOT$" "$STATE/runtime-identity"
+grep -q "^rev=$FRAM_REV$" "$STATE/runtime-identity"
+grep -q "^tree=$FRAM_TREE$" "$STATE/runtime-identity"
 grep -q "^daemon=$FAKE_BIN/fram-daemon$" "$STATE/runtime-identity"
+grep -Eq '^owner=.+$' "$STATE/runtime-identity"
 [[ ! -e "$STATE/package-residue" ]]
 RUNTIME_RECORD="$TMP/home/.local/state/north/fram-daemon-39871.runtime"
 grep -q "^PID=$DAEMON_PID$" "$RUNTIME_RECORD"
-grep -q "^FRAM_RUNTIME_SOURCE=$TMP/absent-runtime-root$" "$RUNTIME_RECORD"
-grep -q '^FRAM_RUNTIME_REV=unversioned$' "$RUNTIME_RECORD"
+grep -Eq '^PID_BIRTH=(proc|ps):.+$' "$RUNTIME_RECORD"
+grep -Eq '^OWNER_TOKEN=.+$' "$RUNTIME_RECORD"
+grep -q "^FRAM_RUNTIME_SOURCE=$FRAM_ROOT$" "$RUNTIME_RECORD"
+grep -q "^FRAM_RUNTIME_REV=$FRAM_REV$" "$RUNTIME_RECORD"
+grep -q "^FRAM_RUNTIME_TREE=$FRAM_TREE$" "$RUNTIME_RECORD"
 
 env "${common_env[@]}" "$UP" --check-runtime >"$TMP/runtime-check.out"
 grep -q '^coordinator runtime identity OK on :39871' "$TMP/runtime-check.out"
 
+# A tracked mutation does not change HEAD; checkout health must still fail
+# closed while leaving the already-running coordinator untouched.
+printf 'tracked Fram source\nmutated at unchanged HEAD\n' >"$FRAM_ROOT/runtime.clj"
+if env "${common_env[@]}" "$UP" --check-runtime >"$TMP/dirty-runtime.out" 2>&1; then
+  echo "north-coord-up test: tracked-dirty checkout was accepted at unchanged HEAD" >&2
+  exit 1
+fi
+grep -q "refusing tracked-dirty Fram checkout at $FRAM_REV" "$TMP/dirty-runtime.out"
+kill -0 "$DAEMON_PID"
+printf 'tracked Fram source\n' >"$FRAM_ROOT/runtime.clj"
+git -C "$FRAM_ROOT" diff --quiet --no-ext-diff HEAD --
+
 env "${common_env[@]}" "$UP" >"$TMP/idempotent.out"
 grep -q '^coordinator already up on :39871' "$TMP/idempotent.out"
+
+# A matching owner token + PID + birth record authorizes replacement of the
+# exact direct child this launcher previously published.
+OLD_DAEMON_PID="$DAEMON_PID"
+env "${common_env[@]}" "$UP" --restart >"$TMP/owned-restart.out"
+DAEMON_PID="$(cat "$STATE/daemon-pid")"
+[[ "$DAEMON_PID" != "$OLD_DAEMON_PID" ]]
+if kill -0 "$OLD_DAEMON_PID" 2>/dev/null; then
+  echo "north-coord-up test: launcher-owned coordinator survived replacement" >&2
+  exit 1
+fi
+grep -q '^stopping coordinator on :39871$' "$TMP/owned-restart.out"
+grep -q '^coordinator up on :39871$' "$TMP/owned-restart.out"
+grep -q "^PID=$DAEMON_PID$" "$RUNTIME_RECORD"
 
 kill "$DAEMON_PID"
 for _ in $(seq 1 20); do
@@ -172,6 +225,11 @@ env "${common_env[@]}" NORTH_FRAM_RUNTIME=package "$UP" >"$TMP/package-start.out
 DAEMON_PID="$(cat "$STATE/daemon-pid")"
 grep -q '^selector=package$' "$STATE/runtime-identity"
 grep -q '^rev=stale-package-revision$' "$STATE/runtime-identity"
+grep -q '^tree=immutable:stale-package-revision$' "$STATE/runtime-identity"
+if grep -q 'poisoned-ambient-revision' "$STATE/runtime-identity"; then
+  echo "north-coord-up test: ambient FRAM_RUNTIME_REV overrode authoritative package revision" >&2
+  exit 1
+fi
 grep -q '^FRAM_PACKAGED$' "$STATE/package-residue"
 env "${common_env[@]}" NORTH_FRAM_RUNTIME=package "$UP" --check-runtime \
   >"$TMP/package-runtime-check.out"
@@ -211,10 +269,10 @@ grep -q 'coord-doctor: coordinator runtime identity UNHEALTHY.*stale-fram' \
 
 # A supervisor-owned listener is never signalled by the direct launcher. This
 # reproduces the Restart=always race that reclaimed :7977 with a stale package.
-printf 'FRAM_RUNTIME_SOURCE=%s\0FRAM_RUNTIME_REV=unversioned\0FRAM_RUNTIME_DAEMON=%s\0' \
-  "$TMP/absent-runtime-root" "$FAKE_BIN/fram-daemon" \
+printf 'FRAM_RUNTIME_SOURCE=%s\0FRAM_RUNTIME_REV=%s\0FRAM_RUNTIME_TREE=%s\0FRAM_RUNTIME_DAEMON=%s\0' \
+  "$FRAM_ROOT" "$FRAM_REV" "$FRAM_TREE" "$FAKE_BIN/fram-daemon" \
   >"$FAKE_PROC/$LISTENER_PID/environ"
-printf '0::/system.slice/north-coord.service\n' >"$FAKE_PROC/$LISTENER_PID/cgroup"
+printf '0::/system.slice/north-coord.service/subgroup\n' >"$FAKE_PROC/$LISTENER_PID/cgroup"
 rm -f "$STATE/daemon-pid"
 if env "${common_env[@]}" NORTH_PROC_ROOT="$FAKE_PROC" "$UP" --restart >"$TMP/supervised.out" 2>&1; then
   echo "north-coord-up test: direct restart accepted a supervisor-owned listener" >&2
@@ -223,6 +281,47 @@ fi
 grep -q 'owned by systemd unit north-coord.service.*refusing a direct restart' "$TMP/supervised.out"
 kill -0 "$LISTENER_PID"
 [[ ! -e "$STATE/daemon-pid" ]]
+
+# PID reuse cannot inherit a stale ownership record. Keep the PID field and
+# owner token identical while changing only the process birth identity.
+write_fake_proc_stat "$FAKE_PROC/$LISTENER_PID/stat" "$LISTENER_PID" 222
+printf 'FRAM_RUNTIME_SOURCE=%s\0FRAM_RUNTIME_REV=%s\0FRAM_RUNTIME_TREE=%s\0FRAM_RUNTIME_DAEMON=%s\0FRAM_RUNTIME_OWNER_TOKEN=owned-token\0' \
+  "$FRAM_ROOT" "$FRAM_REV" "$FRAM_TREE" "$FAKE_BIN/fram-daemon" \
+  >"$FAKE_PROC/$LISTENER_PID/environ"
+: >"$FAKE_PROC/$LISTENER_PID/cgroup"
+printf '%s\n' \
+  "PID=$LISTENER_PID" \
+  'PID_BIRTH=proc:111' \
+  'OWNER_TOKEN=owned-token' \
+  "FRAM_RUNTIME_SOURCE=$FRAM_ROOT" \
+  "FRAM_RUNTIME_REV=$FRAM_REV" \
+  "FRAM_RUNTIME_TREE=$FRAM_TREE" \
+  "FRAM_RUNTIME_DAEMON=$FAKE_BIN/fram-daemon" \
+  >"$RUNTIME_RECORD"
+if env "${common_env[@]}" NORTH_PROC_ROOT="$FAKE_PROC" "$UP" --restart >"$TMP/pid-reuse.out" 2>&1; then
+  echo "north-coord-up test: stale ownership record authorized a reused PID" >&2
+  exit 1
+fi
+grep -q 'refusing to signal an unowned coordinator.*pid/birth/token' "$TMP/pid-reuse.out"
+kill -0 "$LISTENER_PID"
+[[ ! -e "$STATE/daemon-pid" ]]
+
+# A launchd-style/otherwise unknown supervisor has no Linux cgroup unit to name,
+# but the platform-neutral ownership record still refuses it before signal.
+printf '0::/launchd/north-coordinator\n' >"$FAKE_PROC/$LISTENER_PID/cgroup"
+printf '%s\n' \
+  'PID=0' \
+  'PID_BIRTH=ps:unknown' \
+  'OWNER_TOKEN=unknown-owner' \
+  >"$RUNTIME_RECORD"
+if env "${common_env[@]}" NORTH_PROC_ROOT="$FAKE_PROC" "$UP" --restart >"$TMP/unknown-owner.out" 2>&1; then
+  echo "north-coord-up test: unknown supervisor listener was signalled" >&2
+  exit 1
+fi
+grep -q 'refusing to signal an unowned coordinator.*pid/birth/token' "$TMP/unknown-owner.out"
+kill -0 "$LISTENER_PID"
+[[ ! -e "$STATE/daemon-pid" ]]
+
 kill "$LISTENER_PID"
 wait "$LISTENER_PID" 2>/dev/null || true
 LISTENER_PID=
@@ -238,9 +337,16 @@ if env "${common_env[@]}" \
 fi
 grep -q 'refusing inherited Nix-store Fram.*NORTH_FRAM_RUNTIME=package' "$TMP/store-pin.out"
 
-# A same-log compatibility daemon is never "already up". Without explicit
-# restart it is refused; with restart North owns and replaces the identified
-# listener, then requires the new child to pass the strict probe.
+if env "${common_env[@]}" NORTH_FRAM_RUNTIME=package \
+  FRAM_PACKAGE_REV= FRAM_RUNTIME_REV= \
+  "$UP" --check-runtime >"$TMP/unknown-package.out" 2>&1; then
+  echo "north-coord-up test: mutable package seam with unknown provenance was accepted" >&2
+  exit 1
+fi
+grep -q 'package runtime provenance is unknown' "$TMP/unknown-package.out"
+
+# A same-log compatibility daemon is never "already up". Even an explicit
+# restart cannot signal it without a matching launcher ownership record.
 sleep 60 &
 LISTENER_PID=$!
 printf '%s\n' "$LISTENER_PID" >"$STATE/listener-pid"
@@ -252,24 +358,17 @@ fi
 grep -q 'does not enforce corpus fences.*north up --restart' "$TMP/compat.out"
 kill -0 "$LISTENER_PID"
 
-env "${common_env[@]}" "$UP" --restart >"$TMP/compat-restart.out"
-if kill -0 "$LISTENER_PID" 2>/dev/null; then
-  echo "north-coord-up test: compatibility listener survived explicit restart" >&2
+if env "${common_env[@]}" "$UP" --restart >"$TMP/compat-restart.out" 2>&1; then
+  echo "north-coord-up test: unowned compatibility listener was replaced" >&2
   exit 1
 fi
+grep -q 'refusing to signal an unowned coordinator' "$TMP/compat-restart.out"
+kill -0 "$LISTENER_PID"
+kill "$LISTENER_PID"
 wait "$LISTENER_PID" 2>/dev/null || true
 LISTENER_PID=
 rm -f "$STATE/listener-pid"
-DAEMON_PID="$(cat "$STATE/daemon-pid")"
-grep -q '^coordinator up on :39871$' "$TMP/compat-restart.out"
-
-kill "$DAEMON_PID"
-for _ in $(seq 1 20); do
-  [[ ! -e "$STATE/mode" ]] && break
-  sleep 0.1
-done
-DAEMON_PID=
-rm -f "$STATE/daemon-pid"
+rm -f "$STATE/mode"
 
 sleep 60 &
 LISTENER_PID=$!

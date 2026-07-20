@@ -486,7 +486,11 @@
       :missing (str (red "[ERR] ") " reactor heartbeat MISSING — reactor has not swept "
                     "(never started or stopped); start it: `north reactor &`"))))
 
+(def doctor-failed? (atom false))
+(defn mark-doctor-failed! [] (reset! doctor-failed? true))
+
 (defn cmd-doctor [_]
+  (reset! doctor-failed? false)
   (println (bold "north doctor"))
   ;; coordinator handshake — the engine-level safety verdict (tell/untell safe,
   ;; daemon state matches on-disk log). Ported north kept this as the session-start
@@ -496,15 +500,19 @@
   (let [{:keys [timeout timeout-ms workload ok out err error]} (coord-doctor-probe)]
     (cond
       timeout
-      (println (str "    " (red "[ERR] ") " coord-doctor exceeded its "
-                    timeout-ms "ms full-corpus budget ("
-                    (ceil-div (:bytes workload) MIB) " MiB, " (:files workload)
-                    " files) — probe incomplete; coordinator state was not inferred"))
+      (do
+        (mark-doctor-failed!)
+        (println (str "    " (red "[ERR] ") " coord-doctor exceeded its "
+                      timeout-ms "ms full-corpus budget ("
+                      (ceil-div (:bytes workload) MIB) " MiB, " (:files workload)
+                      " files) — probe incomplete; coordinator state was not inferred")))
 
       (not ok)
-      (println (str "    " (red "[ERR] ") " coord-doctor failed"
-                    (when (seq (str/trim (or error err "")))
-                      (str ": " (str/trim (or error err ""))))))
+      (do
+        (mark-doctor-failed!)
+        (println (str "    " (red "[ERR] ") " coord-doctor failed"
+                      (when (seq (str/trim (or error err "")))
+                        (str ": " (str/trim (or error err "")))))))
 
       :else
       (doseq [ln (remove str/blank? (str/split-lines (str (or out "") (or err ""))))]
@@ -514,11 +522,14 @@
     (println (bold "  daemons"))
     (doseq [[label k crit] [[(str PORT " facts (the coordinator — everything reads/writes here)") :north true]]]
       (let [up (get dh k)]
+        (when (and crit (not up)) (mark-doctor-failed!))
         (println (str "    " (if up (grn "[ok]  ") (if crit (red "[ERR] ") (ylw "[warn]")))
                       " " label " " (ok-x up))))))
   ;; reactor sweep liveness — see reactor-doctor-line.
   (println (bold "  reactor sweep"))
-  (println (str "    " (reactor-doctor-line PORT)))
+  (let [reactor-line (reactor-doctor-line PORT)]
+    (when (str/includes? reactor-line "[ERR]") (mark-doctor-failed!))
+    (println (str "    " reactor-line)))
   ;; health — lane activity + stale concerns from north health. LIVE (uncached, unlike
   ;; the dashboard's cached hot path) but with a budget that matches reality: `north
   ;; health` folds the whole log and takes ~21-24s, so the old 4s default always warned
@@ -560,8 +571,10 @@
   (let [fl (System/getenv "FRAM_LOG")]
     (cond
       (nil? fl) (println (str "    " (grn "[ok]  ") " FRAM_LOG unset (north sets facts.log)"))
-      (re-find #"(?i)claim" fl) (println (str "    " (red "[ERR] ") " FRAM_LOG points at claims-named path: " fl
-                                              " — rename to facts.log"))
+      (re-find #"(?i)claim" fl) (do
+                                   (mark-doctor-failed!)
+                                   (println (str "    " (red "[ERR] ") " FRAM_LOG points at claims-named path: " fl
+                                                 " — rename to facts.log")))
       :else (println (str "    " (grn "[ok]  ") " FRAM_LOG=" fl))))
   ;; guard hooks present
   (println (bold "  guard hooks"))
@@ -575,13 +588,14 @@
         (println (str "    " (if present (grn "[ok]  ") (ylw "[warn]"))
                       " " (format "%-22s" h)
                       (if present "file present" "not found")
-                      (when wired (dim "  · wired in settings.json"))))))))
+                      (when wired (dim "  · wired in settings.json")))))))
+  (not @doctor-failed?))
 
 ;; ---- dispatch ---------------------------------------------------------------
 (when-not (= (System/getenv "NORTH_DASHBOARD_LIB") "1")
   (let [[cmd & args] *command-line-args*]
     (case cmd
       (nil "dashboard") (cmd-dashboard args)
-      "doctor"          (cmd-doctor args)
+      "doctor"          (when-not (cmd-doctor args) (System/exit 1))
       (do (binding [*out* *err*] (println (red (str "dashboard-cli: unknown command: " cmd))))
           (System/exit 2)))))

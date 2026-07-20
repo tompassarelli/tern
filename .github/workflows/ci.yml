@@ -124,6 +124,7 @@ jobs:
           bb cli/tests/concern-code-response-test.clj
           bb cli/tests/context-replacement-test.clj
           bb cli/tests/coord-wire-boundary-test.clj
+          bb cli/tests/dashboard-doctor-exit-test.clj
           bb cli/tests/linear-helper-protocol-test.clj
           bash cli/tests/north-explicit-log-test.sh
           FRAM_TEST_CHECKOUT="$GITHUB_WORKSPACE/fram" \

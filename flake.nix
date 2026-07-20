@@ -635,11 +635,17 @@ assert specific["hookEventName"] == "PostToolUse"
 assert "package-hook-mail" in specific["additionalContext"]
 assert "ambient-PATH-free delivery" in specific["additionalContext"]
 PY
+            doctor_rc=0
             ${pkgs.coreutils}/bin/env -i \
               HOME="$smoke/home" PATH= NO_COLOR=1 \
               NORTH_PACKAGE_MODE=forged NORTH_PACKAGE_REV=forged FRAM_PACKAGE_REV=forged \
               NORTH_PORT="$coord_port" FRAM_PORT="$coord_port" FRAM_LOG="$coord_log" \
-              $out/bin/north doctor > "$smoke/doctor.out"
+              $out/bin/north doctor > "$smoke/doctor.out" || doctor_rc=$?
+            # The hermetic smoke deliberately has no reactor. Doctor must render
+            # every section and report that critical absence through exit 1.
+            test "$doctor_rc" -eq 1
+            grep -Fq '[ERR]  reactor heartbeat MISSING' "$smoke/doctor.out"
+            grep -Fq 'guard hooks' "$smoke/doctor.out"
             grep -Fq 'north  package rev ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")}' "$smoke/doctor.out"
             grep -Fq 'fram  package rev ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}' "$smoke/doctor.out"
             if grep -q forged "$smoke/doctor.out"; then

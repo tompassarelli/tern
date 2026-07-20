@@ -20,20 +20,20 @@ fi
 fram_home_input="${FRAM_HOME:-}"
 fram_bin_input="${FRAM_BIN:-}"
 runtime_selector="${NORTH_FRAM_RUNTIME:-auto}"
-case "$runtime_selector" in
-  auto)
-    if [[ "$script_north_home" == /nix/store/* ]]; then
-      runtime_selector=package
-    else
-      runtime_selector=checkout
-    fi
-    ;;
-  checkout|package) ;;
-  *)
-    echo "north up: NORTH_FRAM_RUNTIME must be checkout or package (got '$runtime_selector')" >&2
-    exit 2
-    ;;
-esac
+if [[ "$script_north_home" == /nix/store/* ]]; then
+  # The immutable packaged launcher is itself authoritative provenance. Ambient
+  # selector residue cannot turn its pinned store runtime into checkout mode.
+  runtime_selector=package
+else
+  case "$runtime_selector" in
+    auto) runtime_selector=checkout ;;
+    checkout|package) ;;
+    *)
+      echo "north up: NORTH_FRAM_RUNTIME must be checkout or package (got '$runtime_selector')" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 if [[ "$runtime_selector" == checkout ]]; then
   if [[ -n "$fram_home_input" && "$fram_home_input" == /nix/store/* ]] ||
@@ -115,24 +115,42 @@ canonical_path() {
 runtime_source="$(canonical_path "$FRAM_HOME")"
 runtime_daemon="$(canonical_path "$daemon")"
 runtime_rev=
-if [[ "$runtime_selector" == checkout ]] && command -v git >/dev/null 2>&1; then
-  runtime_rev="$(git -C "$FRAM_HOME" rev-parse --verify HEAD 2>/dev/null || true)"
+runtime_tree=
+if [[ "$runtime_selector" == checkout ]]; then
+  if ! command -v git >/dev/null 2>&1 ||
+     ! runtime_rev="$(git -C "$FRAM_HOME" rev-parse --verify HEAD 2>/dev/null)" ||
+     ! runtime_tree="$(git -C "$FRAM_HOME" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)"; then
+    echo "north up: checkout mode requires a versioned Fram Git checkout: $FRAM_HOME" >&2
+    exit 2
+  fi
+  if ! git -C "$FRAM_HOME" diff --quiet --no-ext-diff HEAD --; then
+    echo "north up: refusing tracked-dirty Fram checkout at $runtime_rev; commit or restore tracked source before coordinator launch/health" >&2
+    exit 2
+  fi
+else
+  # FRAM_PACKAGE_REV is the package wrapper's authoritative pin. Ambient
+  # FRAM_RUNTIME_REV is only a fallback for an explicitly selected custom
+  # package seam whose wrapper predates the package-revision contract.
+  runtime_rev="${FRAM_PACKAGE_REV:-${FRAM_RUNTIME_REV:-}}"
 fi
-if [[ -z "$runtime_rev" && "$runtime_selector" == package ]]; then
-  runtime_rev="${FRAM_RUNTIME_REV:-${FRAM_PACKAGE_REV:-}}"
-fi
-if [[ -z "$runtime_rev" && "$runtime_selector" == package ]]; then
+if [[ -z "$runtime_rev" && "$runtime_source" == /nix/store/* ]]; then
   # The canonical store root is immutable and content-addressed. Keep the
   # revision field non-empty even when an older package wrapper did not export
   # FRAM_PACKAGE_REV.
-  runtime_rev="store:$(basename "$runtime_source")"
+  store_object="${runtime_source#/nix/store/}"
+  runtime_rev="store:${store_object%%/*}"
 fi
-runtime_rev="${runtime_rev:-unversioned}"
+if [[ -z "$runtime_rev" ]]; then
+  echo "north up: package runtime provenance is unknown for $runtime_source; set authoritative FRAM_PACKAGE_REV" >&2
+  exit 2
+fi
+runtime_tree="${runtime_tree:-immutable:$runtime_rev}"
 
 export NORTH_FRAM_RUNTIME="$runtime_selector"
 export FRAM_HOME FRAM_BIN
 export FRAM_RUNTIME_SOURCE="$runtime_source"
 export FRAM_RUNTIME_REV="$runtime_rev"
+export FRAM_RUNTIME_TREE="$runtime_tree"
 export FRAM_RUNTIME_DAEMON="$runtime_daemon"
 
 doctor_output=
@@ -177,72 +195,145 @@ listener_pids() {
 proc_root="${NORTH_PROC_ROOT:-/proc}"
 listener_supervisor=
 listener_identity_error=
+listener_ownership_error=
+owned_listener_pid=
 
-proc_env_value() {
-  local pid="$1" name="$2" value recorded_pid
+process_env_value() {
+  local pid="$1" name="$2"
   if [[ -r "$proc_root/$pid/environ" ]]; then
-    value="$(
-      tr '\0' '\n' <"$proc_root/$pid/environ" \
-        | sed -n "s/^${name}=//p" \
-        | head -n 1
-    )"
-    if [[ -n "$value" ]]; then
-      printf '%s\n' "$value"
-      return 0
-    fi
+    tr '\0' '\n' <"$proc_root/$pid/environ" \
+      | sed -n "s/^${name}=//p" \
+      | head -n 1
+    return
   fi
+  return 1
+}
 
-  # macOS has no /proc. A launcher-owned, PID-bound identity record is the
-  # portable fallback; Linux still prefers the process environment itself.
+runtime_record_value() {
+  local name="$1"
   [[ -r "$runtime_identity_file" ]] || return 1
-  recorded_pid="$(sed -n 's/^PID=//p' "$runtime_identity_file" | head -n 1)"
-  [[ "$recorded_pid" == "$pid" ]] || return 1
   sed -n "s/^${name}=//p" "$runtime_identity_file" | head -n 1
 }
 
+pid_birth_token() {
+  local pid="$1" stat_line remainder start_time ps_start
+  if [[ -r "$proc_root/$pid/stat" ]]; then
+    stat_line="$(<"$proc_root/$pid/stat")"
+    remainder="${stat_line##*) }"
+    start_time="$(awk '{print $20}' <<<"$remainder")"
+    if [[ "$start_time" =~ ^[0-9]+$ ]]; then
+      printf 'proc:%s\n' "$start_time"
+      return 0
+    fi
+  fi
+  ps_start="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+  if [[ -n "$ps_start" ]]; then
+    printf 'ps:%s\n' "$ps_start"
+    return 0
+  fi
+  return 1
+}
+
+runtime_record_matches_pid_birth() {
+  local pid="$1" recorded_pid recorded_birth current_birth
+  recorded_pid="$(runtime_record_value PID || true)"
+  recorded_birth="$(runtime_record_value PID_BIRTH || true)"
+  current_birth="$(pid_birth_token "$pid" || true)"
+  [[ -n "$recorded_pid" && "$recorded_pid" == "$pid" &&
+     -n "$recorded_birth" && "$recorded_birth" == "$current_birth" ]]
+}
+
+runtime_identity_value() {
+  local pid="$1" name="$2" value
+  value="$(process_env_value "$pid" "$name" || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  # macOS has no /proc. A launcher-owned, PID-bound identity record is the
+  # portable fallback. PID alone is never authority: the record must also match
+  # the process birth identity so PID reuse cannot inherit runtime trust.
+  runtime_record_matches_pid_birth "$pid" || return 1
+  runtime_record_value "$name"
+}
+
+mint_owner_token() {
+  local token=
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    token="$(</proc/sys/kernel/random/uuid)"
+  elif command -v uuidgen >/dev/null 2>&1; then
+    token="$(uuidgen)"
+  else
+    token="$(date +%s%N 2>/dev/null || date +%s)-$$-$RANDOM-$RANDOM"
+  fi
+  [[ -n "$token" ]] || return 1
+  printf '%s\n' "$token"
+}
+
 publish_runtime_identity() {
-  local pid="$1" identity_tmp="$runtime_identity_file.tmp.$$"
+  local pid="$1" birth="$2" owner_token="$3"
+  local identity_tmp="$runtime_identity_file.tmp.$$"
   mkdir -p "$(dirname "$runtime_identity_file")"
   (umask 077; printf '%s\n' \
     "PID=$pid" \
+    "PID_BIRTH=$birth" \
+    "OWNER_TOKEN=$owner_token" \
     "FRAM_RUNTIME_SOURCE=$runtime_source" \
     "FRAM_RUNTIME_REV=$runtime_rev" \
+    "FRAM_RUNTIME_TREE=$runtime_tree" \
     "FRAM_RUNTIME_DAEMON=$runtime_daemon" \
     >"$identity_tmp")
   mv -f "$identity_tmp" "$runtime_identity_file"
 }
 
 supervisor_for_pid() {
-  local pid="$1" cgroup unit
+  local pid="$1" cgroup component
+  local -a cgroup_components
   [[ -r "$proc_root/$pid/cgroup" ]] || return 1
   while IFS= read -r cgroup; do
-    unit="$(sed -n 's#.*[/\:]\([^/\:]*\.service\)\(?:/.*\)\?$#\1#p' <<<"$cgroup")"
-    if [[ -n "$unit" ]]; then
-      printf '%s\n' "$unit"
+    IFS=/ read -r -a cgroup_components <<<"${cgroup#*::}"
+    for component in "${cgroup_components[@]}"; do
+      [[ "$component" == *.service ]] || continue
+      # user@.service is the delegated per-user manager enclosing ordinary
+      # scopes and direct children; it does not supervise those processes.
+      # A later concrete .service component, if present, is still authoritative.
+      [[ "$component" == user@*.service ]] && continue
+      printf '%s\n' "$component"
       return 0
-    fi
+    done
   done <"$proc_root/$pid/cgroup"
   return 1
 }
 
 runtime_identity_matches_pid() {
-  local pid="$1" running_source running_rev running_daemon
-  running_source="$(proc_env_value "$pid" FRAM_RUNTIME_SOURCE || true)"
-  running_rev="$(proc_env_value "$pid" FRAM_RUNTIME_REV || true)"
-  running_daemon="$(proc_env_value "$pid" FRAM_RUNTIME_DAEMON || true)"
+  local pid="$1" running_source running_rev running_tree running_daemon
+  local running_head derived_tree
+  running_source="$(runtime_identity_value "$pid" FRAM_RUNTIME_SOURCE || true)"
+  running_rev="$(runtime_identity_value "$pid" FRAM_RUNTIME_REV || true)"
+  running_tree="$(runtime_identity_value "$pid" FRAM_RUNTIME_TREE || true)"
+  running_daemon="$(runtime_identity_value "$pid" FRAM_RUNTIME_DAEMON || true)"
 
   # Diagnose pre-identity-contract coordinators precisely instead of collapsing
   # them into a generic unknown verdict.
-  [[ -n "$running_source" ]] || running_source="$(proc_env_value "$pid" FRAM_HOME || true)"
-  [[ -n "$running_rev" ]] || running_rev="$(proc_env_value "$pid" FRAM_PACKAGE_REV || true)"
+  [[ -n "$running_source" ]] || running_source="$(runtime_identity_value "$pid" FRAM_HOME || true)"
+  [[ -n "$running_rev" ]] || running_rev="$(runtime_identity_value "$pid" FRAM_PACKAGE_REV || true)"
 
   if [[ -z "$running_source" || -z "$running_rev" ]]; then
     listener_identity_error="PID $pid does not expose FRAM_RUNTIME_SOURCE and FRAM_RUNTIME_REV"
     return 1
   fi
   running_source="$(canonical_path "$running_source")"
-  if [[ "$running_source" != "$runtime_source" || "$running_rev" != "$runtime_rev" ]]; then
-    listener_identity_error="PID $pid runs Fram source=$running_source rev=$running_rev; desired source=$runtime_source rev=$runtime_rev"
+  if [[ "$runtime_selector" == checkout && -z "$running_tree" ]] &&
+     running_head="$(git -C "$running_source" rev-parse --verify HEAD 2>/dev/null)" &&
+     [[ "$running_head" == "$running_rev" ]] &&
+     git -C "$running_source" diff --quiet --no-ext-diff HEAD --; then
+    derived_tree="$(git -C "$running_source" rev-parse --verify 'HEAD^{tree}' 2>/dev/null || true)"
+    running_tree="$derived_tree"
+  fi
+  if [[ "$running_source" != "$runtime_source" || "$running_rev" != "$runtime_rev" ||
+        ( "$runtime_selector" == checkout && "$running_tree" != "$runtime_tree" ) ]]; then
+    listener_identity_error="PID $pid runs Fram source=$running_source rev=$running_rev tree=${running_tree:-unknown}; desired source=$runtime_source rev=$runtime_rev tree=$runtime_tree"
     return 1
   fi
   if [[ -n "$running_daemon" ]]; then
@@ -251,6 +342,40 @@ runtime_identity_matches_pid() {
       listener_identity_error="PID $pid runs Fram executable=$running_daemon; desired executable=$runtime_daemon"
       return 1
     fi
+  fi
+  return 0
+}
+
+launcher_owns_listener() {
+  local pids="$1" pid count=0 recorded_pid recorded_birth current_birth
+  local recorded_owner running_owner
+  listener_ownership_error=
+  owned_listener_pid=
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    count=$((count + 1))
+    owned_listener_pid="$pid"
+  done <<<"$pids"
+  if [[ "$count" -ne 1 ]]; then
+    listener_ownership_error="expected exactly one listener PID, observed $count"
+    return 1
+  fi
+
+  recorded_pid="$(runtime_record_value PID || true)"
+  recorded_birth="$(runtime_record_value PID_BIRTH || true)"
+  recorded_owner="$(runtime_record_value OWNER_TOKEN || true)"
+  current_birth="$(pid_birth_token "$owned_listener_pid" || true)"
+  if [[ -z "$recorded_pid" || "$recorded_pid" != "$owned_listener_pid" ||
+        -z "$recorded_birth" || "$recorded_birth" != "$current_birth" ||
+        -z "$recorded_owner" ]]; then
+    listener_ownership_error="listener PID $owned_listener_pid has no matching launcher ownership record (pid/birth/token)"
+    return 1
+  fi
+
+  running_owner="$(process_env_value "$owned_listener_pid" FRAM_RUNTIME_OWNER_TOKEN || true)"
+  if [[ -r "$proc_root/$owned_listener_pid/environ" && "$running_owner" != "$recorded_owner" ]]; then
+    listener_ownership_error="listener PID $owned_listener_pid owner token does not match its launcher record"
+    return 1
   fi
   return 0
 }
@@ -356,16 +481,26 @@ if [[ "$restart" -eq 1 && "$same_log" -eq 1 ]]; then
     exit 1
   fi
 
+  if ! launcher_owns_listener "$before_pids"; then
+    echo "north up: refusing to signal an unowned coordinator — $listener_ownership_error" >&2
+    if [[ "$identity_matches" -ne 1 ]]; then
+      echo "north up: coordinator runtime identity mismatch — $listener_identity_error" >&2
+    fi
+    exit 1
+  fi
+
   after_pids="$(listener_pids)"
   if [[ "$before_pids" != "$after_pids" ]]; then
     echo "north up: listener on :$FRAM_PORT changed during the health check; refusing restart" >&2
     exit 1
   fi
+  if ! launcher_owns_listener "$after_pids"; then
+    echo "north up: listener ownership changed during the health check; refusing restart — $listener_ownership_error" >&2
+    exit 1
+  fi
 
   echo "stopping coordinator on :$FRAM_PORT"
-  while IFS= read -r pid; do
-    [[ -z "$pid" ]] || kill "$pid"
-  done <<<"$before_pids"
+  kill "$owned_listener_pid"
 
   for _ in $(seq 1 40); do
     [[ -z "$(listener_pids)" ]] && break
@@ -382,6 +517,8 @@ mkdir -p "$(dirname "$FRAM_LOG")" "$(dirname "$diagnostic_log")"
 
 echo "starting coordinator on :$FRAM_PORT  (log: $FRAM_LOG)"
 export FRAM_SNAPSHOT_BOOT="${FRAM_SNAPSHOT_BOOT:-1}"
+launcher_owner_token="$(mint_owner_token)"
+export FRAM_RUNTIME_OWNER_TOKEN="$launcher_owner_token"
 nohup "$daemon" "$FRAM_PORT" "$FRAM_LOG" \
   </dev/null >"$diagnostic_log" 2>&1 &
 daemon_pid=$!
@@ -409,7 +546,13 @@ for _ in $(seq 1 120); do
       done < <(listener_pids)
     fi
     if [[ "$listener_owned" -eq 1 ]] && spawned_identity_matches_pid "$daemon_pid"; then
-      publish_runtime_identity "$daemon_pid"
+      daemon_birth="$(pid_birth_token "$daemon_pid" || true)"
+      if [[ -z "$daemon_birth" ]]; then
+        kill "$daemon_pid" 2>/dev/null || true
+        echo "north up: coordinator PID birth identity is unavailable; refusing an unverifiable launch" >&2
+        exit 1
+      fi
+      publish_runtime_identity "$daemon_pid" "$daemon_birth" "$launcher_owner_token"
       echo "coordinator up on :$FRAM_PORT"
       exit 0
     fi
