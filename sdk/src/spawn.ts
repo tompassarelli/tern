@@ -795,7 +795,13 @@ async function runSpawn(
     publicationBudget.notificationTimeout(),
   );
   const struggleSnapshot = struggle.snapshot();
+  // Include turns + result size on the completion line. The banner-only stdout
+  // .log is the artifact operators skim; without a work signal here a lane that
+  // ran dozens of turns reads as identical to a zero-turn no-op (the 2026-07-21
+  // "instant-DOA" misdiagnosis, where 33-47-turn process=ran lanes were reported
+  // as dead because their work lives in the .stream.jsonl transcript, not stdout).
   console.log(`[spawn] @agent:${agentId} complete (process=${outcome}, delivery=${terminal.deliveryOutcome}` +
+    `, turns=${numTurns ?? "?"}, result=${result.length}b` +
     `${struggleSnapshot.triggers.length ? `, struggle: ${struggleSnapshot.triggers.join(",")}` : ""})`);
   return result;
 }
