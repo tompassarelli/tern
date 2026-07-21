@@ -42,7 +42,7 @@
   {:id (str "@concern-1700000000000-kea" i) :agent (str "@kea" i)
    :repo "kea" :intent "kea work"
    :maturity (if retired? "building" "likely-to-land")
-   :classification cls :online false :retired retired?})
+   :classification cls :online false :retired retired? :touches ["kea/a.clj"]})
 (def kea-fixture
   (json/generate-string
    {:version 1
@@ -77,6 +77,79 @@
 (check "well-formed empty projection is not an error"
        (= [] (:concerns (parse-concern-projection
                          (json/generate-string {:version 1 :concerns []})))))
+
+;; ---- adversarial ROW validation: a consumer that accepts a row it did not fully
+;; validate is a silent-corruption vector. Every rejected category below must FAIL
+;; CLOSED to {:err ...} — no row is silently dropped, coerced, or passed through.
+;; Base is a single fully-valid live row; each case mutates exactly one thing.
+(def valid-row
+  {:id "@concern-1700000000000-a" :agent "@a" :repo "north" :intent "work"
+   :maturity "building" :classification "stale" :online false :retired false
+   :touches ["north/x.clj"]})
+(defn one-row [r] (json/generate-string {:version 1 :concerns [r]}))
+(defn rejects? [label r]
+  (check label (boolean (:err (parse-concern-projection (one-row r))))))
+(defn accepts? [label r]
+  (check label (nil? (:err (parse-concern-projection (one-row r))))))
+
+;; sanity: the base row is accepted, so every rejection below isolates its mutation
+(accepts? "baseline valid row is accepted" valid-row)
+
+;; missing keys — one per required field (agent is nullable, tested separately)
+(doseq [k [:id :repo :intent :maturity :classification :online :retired :touches]]
+  (rejects? (str "missing key " k " fails closed") (dissoc valid-row k)))
+(rejects? "missing key :agent fails closed" (dissoc valid-row :agent))
+
+;; extra key
+(rejects? "extra/unknown key fails closed" (assoc valid-row :EVIL "injected"))
+
+;; wrong types
+(rejects? "non-string :id (null) fails closed"       (assoc valid-row :id nil))
+(rejects? "empty-string :id fails closed"            (assoc valid-row :id ""))
+(rejects? "numeric :id fails closed"                 (assoc valid-row :id 42))
+(rejects? "non-string :repo fails closed"            (assoc valid-row :repo 7))
+(rejects? "non-string :intent fails closed"          (assoc valid-row :intent 7))
+(rejects? "string :online (\"yes\") fails closed"    (assoc valid-row :online "yes"))
+(rejects? "string :retired (\"false\") fails closed" (assoc valid-row :retired "false"))
+(rejects? "non-vector :touches fails closed"         (assoc valid-row :touches "north/x.clj"))
+(rejects? "non-string-element :touches fails closed" (assoc valid-row :touches [1 2]))
+
+;; nullable :agent is the ONLY field allowed to be null (agent-less concerns)
+(accepts? "null :agent is accepted (agent-less concern)" (assoc valid-row :agent nil))
+
+;; unknown enum values
+(rejects? "unknown :maturity fails closed"       (assoc valid-row :maturity "banana"))
+(rejects? "unknown :classification fails closed" (assoc valid-row :classification "banana"
+                                                        ;; keep it type-valid so classification is what's rejected
+                                                        ))
+
+;; contradictory rows: classification must equal expected(retired,online,maturity)
+(rejects? "retired:true but classification:live is contradictory"
+          (assoc valid-row :retired true :classification "live"))
+(rejects? "online:true but classification:orphaned is contradictory"
+          (assoc valid-row :online true :classification "orphaned"))
+(rejects? "online:true but classification:stale is contradictory"
+          (assoc valid-row :online true :classification "stale"))
+(rejects? "lapsed likely-to-land labeled stale is contradictory"
+          (assoc valid-row :maturity "likely-to-land" :classification "stale"))
+(rejects? "lapsed building labeled orphaned is contradictory"
+          (assoc valid-row :maturity "building" :classification "orphaned"))
+(rejects? "retired:false but classification:retired is contradictory"
+          (assoc valid-row :retired false :classification "retired"))
+
+;; consistent variants of every classification are accepted (the invariant is exact,
+;; not merely restrictive)
+(accepts? "consistent live row (online:true) accepted"
+          (assoc valid-row :online true :classification "live"))
+(accepts? "consistent orphaned row (lapsed likely-to-land) accepted"
+          (assoc valid-row :maturity "likely-to-land" :classification "orphaned"))
+(accepts? "consistent retired row accepted"
+          (assoc valid-row :retired true :classification "retired"))
+
+;; a corrupt RETIRED row still fails the whole payload — validation precedes the
+;; retired-row drop, so a bad retired row cannot slip through by being excluded
+(rejects? "corrupt retired row fails closed before it is dropped"
+          (assoc valid-row :retired true :classification "retired" :online "nope"))
 
 (let [failed (remove second @checks)]
   (println (str "dashboard concern projection: " (- (count @checks) (count failed))

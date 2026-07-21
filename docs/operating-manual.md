@@ -979,16 +979,23 @@ or is needed:
    `driver`/`lead` reassignment, or an explicit offer fact) — handoff is a
    transitive act between a giver and a receiver, not a broadcast into the
    void.
-4. **Recipient reads, acknowledges, and claims or declines.** The recipient
-   reads the indexed frame and records an explicit acknowledgment —
-   claiming the work (e.g. taking `driver`) or declining it. Silence is not
-   acknowledgment.
+4. **Recipient reads, and either claims or declines.** The recipient reads the
+   indexed frame and records an explicit response. **Only a positive claim** —
+   adopting the work (e.g. taking `driver`) — completes the handoff. A
+   **decline** is a valid, recorded acknowledgment, but it merely **closes the
+   offer** and returns the work to orphaned; it transfers no responsibility.
+   Silence is not acknowledgment, and — like a decline — never completes a
+   transfer.
 
-**Completion criterion.** A handoff is *complete* only once the recipient's
-acknowledgment or adoption is recorded. A distilled, indexed frame that has
-been offered but not yet accepted is **handoff-ready**, not handed off —
-the distinction matters because a prepared frame with no acceptance leaves
-the work exactly as orphaned as before, just better documented.
+**Completion criterion.** A handoff is *complete* only when the recipient
+**positively adopts/claims** the work and that claim is recorded (e.g. takes
+`driver`/`lead`). Acknowledgment alone does not complete it: a **decline** is a
+valid acknowledgment that **closes the offer** and leaves the work exactly as
+**orphaned** as before — it never transfers responsibility and never completes a
+handoff. A distilled, indexed frame that has been offered but not yet adopted —
+whether still unanswered or explicitly declined — is **handoff-ready**, not
+handed off; a prepared frame with no adoption leaves the work orphaned, just
+better documented.
 
 This procedure is distinct from other legitimate uses of "handoff" elsewhere
 in this manual describing an explicit, structural transfer of control —

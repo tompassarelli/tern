@@ -219,12 +219,69 @@
 ;; misrender concern counts.
 (def concern-projection-version 1)
 
+;; The EXACT contract concern-cli's `projection-row` emits: the full key set, the
+;; closed maturity/classification vocabularies, and the semantic invariant tying
+;; classification to (retired, online, maturity). A machine consumer that accepts a
+;; row it did not fully validate is a silent-corruption vector, so the consumer
+;; re-checks every field and REJECTS the whole payload on any deviation — missing,
+;; extra, wrong-type, unknown-value, or contradictory. `:agent` is the one nullable
+;; field: agent-less concerns render live with a null agent (concern-cli).
+(def ^:private concern-row-keys
+  #{:id :agent :repo :intent :maturity :classification :online :retired :touches})
+(def ^:private concern-maturities #{"exploring" "building" "likely-to-land" "landed"})
+(def ^:private concern-classifications #{"live" "stale" "orphaned" "retired"})
+
+(defn- expected-classification
+  "The class concern-cli's `classification-of` MUST have emitted for a row's
+   (retired, online, maturity) triple. Retired wins, then online⇒live, then a
+   lapsed likely-to-land is orphaned, else stale. Recomputing it lets the consumer
+   reject any row whose declared class contradicts its own fields."
+  [{:keys [retired online maturity]}]
+  (cond
+    retired                       "retired"
+    online                        "live"
+    (= maturity "likely-to-land") "orphaned"
+    :else                         "stale"))
+
+(defn- validate-concern-row
+  "nil if the row exactly matches the producer contract, else a human error string.
+   Rejects missing/extra keys, wrong value types, unknown maturity/classification,
+   and a classification inconsistent with (retired, online, maturity)."
+  [c]
+  (let [{:keys [id agent repo intent maturity classification online retired touches]} c]
+    (cond
+      (not (map? c))                             (str "row not an object: " (pr-str c))
+      (not= (set (keys c)) concern-row-keys)
+      (str "row key set " (pr-str (vec (sort (map name (keys c)))))
+           " ≠ " (pr-str (vec (sort (map name concern-row-keys)))))
+      (not (and (string? id) (seq id)))          (str "row :id not a non-empty string: " (pr-str id))
+      (not (or (nil? agent) (string? agent)))    (str "row :agent not string-or-null: " (pr-str agent))
+      (not (string? repo))                       (str "row :repo not a string: " (pr-str repo))
+      (not (string? intent))                     (str "row :intent not a string: " (pr-str intent))
+      (not (contains? concern-maturities maturity))
+      (str "row :maturity not one of " (pr-str (vec (sort concern-maturities))) ": " (pr-str maturity))
+      (not (contains? concern-classifications classification))
+      (str "row :classification not one of " (pr-str (vec (sort concern-classifications))) ": " (pr-str classification))
+      (not (boolean? online))                    (str "row :online not a boolean: " (pr-str online))
+      (not (boolean? retired))                   (str "row :retired not a boolean: " (pr-str retired))
+      (not (and (vector? touches) (every? string? touches)))
+      (str "row :touches not a vector of strings: " (pr-str touches))
+      (not= classification (expected-classification c))
+      (str "row :classification " (pr-str classification) " contradicts retired="
+           retired " online=" online " maturity=" (pr-str maturity)
+           " (expected " (pr-str (expected-classification c)) ")")
+      :else nil)))
+
 (defn parse-concern-projection
   "Strictly consume the versioned concern machine projection. Returns
    {:concerns [{:id :status :repo :classification} ...]} of the NON-retired,
-   active-by-repository rows, or {:err ...} on a malformed or wrong-version payload.
-   Retired (abandoned-stale) rows are excluded here so every downstream count and
-   by-repo grouping is over active concerns only."
+   active-by-repository rows, or {:err ...} on ANY deviation from the contract:
+   a malformed/wrong-version envelope, OR any row that fails `validate-concern-row`
+   (missing/extra key, wrong type, unknown maturity/classification, or a class
+   contradicting its own fields). Every row is validated BEFORE retired rows are
+   dropped, so a corrupt retired row still fails the whole payload closed. Retired
+   (abandoned-stale) rows are then excluded so downstream counts/grouping are over
+   active concerns only."
   [text]
   (let [parsed (try (json/parse-string (str text) true)
                     (catch Exception _ ::unparseable))]
@@ -235,13 +292,25 @@
       {:err (str "concern projection version mismatch (want "
                  concern-projection-version ", got " (pr-str (:version parsed)) ")")}
       (not (vector? (:concerns parsed))) {:err "concern projection concerns not a list"}
-      (not (every? map? (:concerns parsed))) {:err "concern projection row malformed"}
+      (not (every? map? (:concerns parsed))) {:err "concern projection row not an object"}
       :else
-      {:concerns
-       (->> (:concerns parsed)
-            (remove :retired)
-            (mapv (fn [c] {:id (:id c) :status (:maturity c)
-                           :repo (:repo c) :classification (:classification c)})))})))
+      (if-let [bad (some validate-concern-row (:concerns parsed))]
+        {:err (str "concern projection " bad)}
+        {:concerns
+         (->> (:concerns parsed)
+              (remove :retired)
+              (mapv (fn [c] {:id (:id c) :status (:maturity c)
+                             :repo (:repo c) :classification (:classification c)})))}))))
+
+(defn fetch-concern-projection
+  "Shell `concern list-json` once and strictly parse it — {:concerns ...} on success
+   or {:err ...} on an unavailable probe / malformed payload. UNCACHED: the caller
+   owns caching (the dashboard hot path caches; `doctor` reads it live)."
+  []
+  (let [r (run [(str NORTH "/bin/concern") "list-json"] :timeout 30000)]
+    (if (or (:timeout r) (not (:ok r)))
+      {:err "concern probe unavailable"}
+      (parse-concern-projection (:out r)))))
 
 (defn concern-rows
   "Active concerns grouped by repo. CACHED 90s. `concern list-json` runs the same
@@ -254,11 +323,21 @@
    returns fresh and retries next run (fail closed, never cache a bad projection)."
   []
   (or (cache-get "concerns.edn" 90000)
-      (let [r (run [(str NORTH "/bin/concern") "list-json"] :timeout 30000)]
-        (if (or (:timeout r) (not (:ok r)))
-          {:err "concern probe unavailable"}
-          (let [parsed (parse-concern-projection (:out r))]
-            (if (:err parsed) parsed (cache-put! "concerns.edn" parsed)))))))
+      (let [parsed (fetch-concern-projection)]
+        (if (:err parsed) parsed (cache-put! "concerns.edn" parsed)))))
+
+(defn concern-summary
+  "Coarse active/stale concern counts for the health pane, derived from the SAME
+   structured machine projection the by-repo pane consumes — NEVER scraped from
+   `north health` rendered text. `:active` is every non-retired row (parse already
+   dropped retired), `:stale` those the projection classified stale. An {:err ...}
+   projection passes straight through so the pane fails closed, not silently zeroed."
+  [concern-projection-result]
+  (if (:err concern-projection-result)
+    concern-projection-result
+    {:active (count (:concerns concern-projection-result))
+     :stale  (count (filter #(= "stale" (:classification %))
+                            (:concerns concern-projection-result)))}))
 
 ;; ---- board / ready counts ---------------------------------------------------
 (defn board-counts []
@@ -328,20 +407,19 @@
        :else        {:err "unavailable"}))))
 
 (defn parse-health
-  "Extract key signals from north-health output: lanes ran/died (24h) + STALE concern count.
-   Matches on leading label word so spacing/counts can vary freely."
+  "Extract LANE signals from north-health output: lanes ran/died (24h). Matches on
+   the leading label word so spacing/counts can vary freely. Concern counts are NOT
+   scraped here — they derive from the structured `concern list-json` projection via
+   `concern-summary`, so no dashboard count depends on human-rendered health text."
   [{:keys [raw err]}]
   (if err
     {:err err}
-    (let [lines   (str/split-lines (or raw ""))
-          find-ln (fn [label]
-                    (some #(when (re-find (re-pattern (str "(?i)^\\s*" label "\\b")) %) %) lines))
-          lanes-ln    (find-ln "lanes")
-          concerns-ln (find-ln "concerns")]
-      {:lanes-ran-24h   (some-> (re-find #"24h\s+(\d+)\s+ran" (or lanes-ln "")) second parse-long)
-       :lanes-died-24h  (some-> (re-find #"24h\s+\d+\s+ran\s+·\s+(\d+)\s+died" (or lanes-ln "")) second parse-long)
-       :concerns-active (some-> (re-find #"(\d+)\s+active" (or concerns-ln "")) second parse-long)
-       :concerns-stale  (some-> (re-find #"(\d+)\s+STALE" (or concerns-ln "")) second parse-long)})))
+    (let [lines    (str/split-lines (or raw ""))
+          find-ln  (fn [label]
+                     (some #(when (re-find (re-pattern (str "(?i)^\\s*" label "\\b")) %) %) lines))
+          lanes-ln (find-ln "lanes")]
+      {:lanes-ran-24h  (some-> (re-find #"24h\s+(\d+)\s+ran" (or lanes-ln "")) second parse-long)
+       :lanes-died-24h (some-> (re-find #"24h\s+\d+\s+ran\s+·\s+(\d+)\s+died" (or lanes-ln "")) second parse-long)})))
 
 (defn dashboard-health
   "Health for the dashboard hot path: cached 300s (slow-moving 24h aggregates +
@@ -469,15 +547,23 @@
     (println (bold "daemons"))
     (println (str "  " PORT " facts " (ok-x (:north dh))))
     (println)
-    ;; health — north health condensed (lanes ran/died + STALE concerns)
-    (println (bold "health") (dim "» north health"))
-    (if (:err health)
-      (println (str "  " (dim (str "north health " (if (= (:err health) "timed out") "(timed out)" "(unavailable)")))))
-      (let [{:keys [lanes-ran-24h lanes-died-24h concerns-active concerns-stale]} health
-            died-part (when lanes-died-24h (str " · " (if (pos? lanes-died-24h) (ylw (str lanes-died-24h " died")) (str lanes-died-24h " died"))))
-            stale-part (when (and concerns-stale (pos? concerns-stale)) (str " · " (ylw (str concerns-stale " STALE"))))]
-        (println (str "  lanes   24h  " (or lanes-ran-24h "?") " ran" died-part
-                      "     concerns  " (or concerns-active "?") " active" stale-part))))
+    ;; health — lanes ran/died from north health; concern counts from the SAME
+    ;; structured projection the by-repo pane consumes (never scraped from render).
+    ;; The two halves fail independently: a north-health timeout still shows concerns.
+    (println (bold "health") (dim "» north health · concern projection"))
+    (let [cs          (concern-summary cr)
+          concerns-part (if (:err cs)
+                          (str "     concerns  " (dim "(unavailable)"))
+                          (let [stale (:stale cs)]
+                            (str "     concerns  " (:active cs) " active"
+                                 (when (pos? stale) (str " · " (ylw (str stale " STALE")))))))]
+      (if (:err health)
+        (println (str "  " (dim (str "lanes (north health "
+                                     (if (= (:err health) "timed out") "timed out" "unavailable") ")"))
+                      concerns-part))
+        (let [{:keys [lanes-ran-24h lanes-died-24h]} health
+              died-part (when lanes-died-24h (str " · " (if (pos? lanes-died-24h) (ylw (str lanes-died-24h " died")) (str lanes-died-24h " died"))))]
+          (println (str "  lanes   24h  " (or lanes-ran-24h "?") " ran" died-part concerns-part)))))
     (println)
     ;; profile — how much of the stack is active in this directory
     (println (bold "profile"))
@@ -564,16 +650,19 @@
   ;; fold beats reporting a false timeout on a healthy coordinator.
   (println (bold "  health"))
   (echo-cmd (str NORTH "/bin/north") "health")
-  (let [h (parse-health (north-health 30000))]
+  (let [h  (parse-health (north-health 30000))
+        cs (concern-summary (fetch-concern-projection))    ; LIVE (uncached) structured projection, never scraped
+        concerns-part (if (:err cs)
+                        "   concerns  (unavailable)"
+                        (str "   concerns  " (:active cs) " active"
+                             (when (pos? (:stale cs)) (str " · " (:stale cs) " STALE concerns"))))]
     (if (:err h)
-      (println (str "    " (ylw "[warn] ") " north health " (:err h)))
-      (let [{:keys [lanes-ran-24h lanes-died-24h concerns-active concerns-stale]} h
-            died-part  (when lanes-died-24h (str " · " lanes-died-24h " died"))
-            stale-part (when (and concerns-stale (pos? concerns-stale))
-                         (str " · " concerns-stale " STALE concerns"))]
+      (println (str "    " (ylw "[warn] ") " north health " (:err h) concerns-part))
+      (let [{:keys [lanes-ran-24h lanes-died-24h]} h
+            died-part (when lanes-died-24h (str " · " lanes-died-24h " died"))]
         (println (str "    " (grn "[ok]  ") " "
                       (or lanes-ran-24h "?") " ran" died-part " (24h)"
-                      "   concerns  " (or concerns-active "?") " active" stale-part)))))
+                      concerns-part)))))
   ;; Runtime source identity (north + fram). A package revision identifies the
   ;; installed closure; a checkout HEAD is only source context, not proof that a
   ;; separately installed store path contains that tree.
