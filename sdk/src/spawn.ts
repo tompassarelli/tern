@@ -53,7 +53,7 @@ import {
   assertCoordinationAuthority, assertManagedChildTopology,
 } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
-import { classifyExecutionTerminal } from "./execution-outcome";
+import { classifyExecutionTerminal, EMPTY_RESULT_OUTCOME, isEmptyResultTerminal } from "./execution-outcome";
 import { ManagedLiveInputRoute } from "./live-input-route";
 import {
   notifyTerminalSettlement, TerminalPublicationBudget, type TerminalNotification,
@@ -532,6 +532,23 @@ async function runSpawn(
     // A clean iterator close is transport completion, not provider success.
     // Only an explicit terminal result may establish process=ran.
     outcome = "provider_error";
+  }
+  if (isEmptyResultTerminal(outcome, result)) {
+    // A provider success terminal with empty result (0b) is a DEGENERATE
+    // completion, not a delivery (thread 019f8300): opus-high extended-thinking
+    // turns that hit the output-token ceiling truncate before committing any
+    // final text — the last assistant block is an unanswered tool_use or a
+    // terminal thinking block — yet the SDK still yields subtype=success/
+    // result="". Recording it as process=ran read as a clean no-op. Make it a
+    // distinct LOUD terminal so a zero-deliverable lane never masquerades as
+    // AGENT COMPLETE.
+    outcome = EMPTY_RESULT_OUTCOME;
+    const turns = typeof resultMsg?.num_turns === "number" ? `${resultMsg.num_turns} turns` : "unknown turns";
+    terminalSignal = {
+      subject: "AGENT EMPTY RESULT",
+      detail: `provider success terminal with empty result (0b) after ${turns} — no deliverable text committed (likely output-token ceiling hit mid extended-thinking/tool_use)`,
+    };
+    console.error(`[empty-result] @agent:${agentId} provider success terminal carried 0b result — recording process=ran_empty (loud, non-clean)`);
   }
   if (stallAborted) {
     // 2N of silence: make the stall TERMINAL + VISIBLE. Interrupt the hung query, record

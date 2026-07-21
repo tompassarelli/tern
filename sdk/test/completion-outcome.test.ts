@@ -348,6 +348,74 @@ test("an empty dispatch provider stream is a blocked provider error, never ran",
   );
 });
 
+test("a spawn success terminal with an empty result is a LOUD ran_empty, never a clean ran (thread 019f8300)", async () => {
+  const { spawn } = await import("./support/spawn");
+  writeFileSync(log, "");
+
+  // The opus-high death shape: a real provider terminal (subtype success, NOT an
+  // error/turn-cap) whose result text is empty — the final turn hit the
+  // output-token ceiling mid extended-thinking/tool_use and committed no text.
+  // Recording this as process=ran read as a clean AGENT COMPLETE no-op.
+  const emptyTerminalQuery: any = () => ({
+    interrupt: async () => {},
+    async *[Symbol.asyncIterator]() {
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: "" }] } };
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } };
+      yield { type: "result", subtype: "success", result: "", duration_ms: 1, num_turns: 35 };
+    },
+  });
+
+  const result = await spawn({
+    prompt: "runs long then returns nothing", agentId: "test-empty-result-spawn",
+    role: "integrator", routingMetadata: presetRequest("integrator"),
+    coordinator: TEST_COORDINATOR, queryFn: emptyTerminalQuery,
+  });
+  expect(result).toBe("");
+
+  const lines = await settledRunLines("test-empty-result-spawn");
+  expect(lines.some((line) => line.endsWith(" process_outcome ran_empty"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+  expect(lines.some((line) => line.endsWith(" delivery_outcome blocked"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" delivery_reason provider_terminal_empty_result"))).toBe(true);
+
+  const logged = readFileSync(log, "utf8");
+  expect(logged).toContain("tell agent:test-empty-result-spawn process_outcome ran_empty");
+  // LOUD: a distinct subject, never the AGENT COMPLETE masquerade.
+  expect(logged).toContain(`send test-empty-result-spawn ${TEST_COORDINATOR} AGENT EMPTY RESULT`);
+  expect(logged.includes(`send test-empty-result-spawn ${TEST_COORDINATOR} AGENT COMPLETE`)).toBe(false);
+});
+
+test("a dispatch success terminal with an empty result is a LOUD ran_empty, never a clean ran", async () => {
+  const { dispatch } = await import("./support/dispatch");
+  writeFileSync(log, "");
+  const agentId = "test-empty-result-dispatch";
+
+  await dispatch(`thread-${agentId}`, {
+    agentId,
+    routingMetadata: presetRequest("integrator"),
+    claimDriver: (() => ({ release() {} })) as any,
+    queryFn: () => (async function* () {
+      yield { type: "result", subtype: "success", result: "", duration_ms: 1, num_turns: 40 };
+    })(),
+    loadThreadFacts: () => [
+      { predicate: "title", value: "Empty result dispatch terminal" },
+      { predicate: "planned", value: "true" },
+      { predicate: "atomic", value: "true" },
+    ],
+    loadChildren: () => [],
+  });
+
+  const lines = await settledRunLines(agentId, "num_turns 40");
+  expect(lines.some((line) => line.endsWith(" process_outcome ran_empty"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+  expect(lines.some((line) => line.endsWith(" delivery_outcome blocked"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" delivery_reason provider_terminal_empty_result"))).toBe(true);
+
+  const logged = readFileSync(log, "utf8");
+  expect(logged).toContain(`send ${agentId} ${TEST_COORDINATOR} AGENT EMPTY RESULT`);
+  expect(logged.includes(`send ${agentId} ${TEST_COORDINATOR} AGENT COMPLETE`)).toBe(false);
+});
+
 test("SIGTERM during provider preflight waits for envelope and driver cleanup", async () => {
   const { dispatch } = await import("./support/dispatch");
   const host = fakeTerminationHost();

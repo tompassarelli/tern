@@ -13,9 +13,26 @@ export interface ExecutionTerminal {
   deliveryProof?: DeliveryProof;
 }
 
+/**
+ * A provider "success" terminal whose result text is empty (0b) is a DEGENERATE
+ * completion, not a delivery. Opus-high extended-thinking turns that exhaust the
+ * output-token ceiling truncate before committing any final text (the final
+ * assistant block is an unanswered tool_use or a terminal thinking block), yet
+ * the SDK still yields subtype=success/result="". Recording that as process=ran
+ * makes a zero-deliverable lane read as a clean completion (thread 019f8300).
+ * This distinct outcome makes the empty terminal LOUD and non-clean.
+ */
+export const EMPTY_RESULT_OUTCOME = "ran_empty";
+
+/** True when a provider success terminal carried no committed deliverable text. */
+export function isEmptyResultTerminal(outcome: string, result: string): boolean {
+  return outcome === "ran" && result.trim() === "";
+}
+
 const BLOCKED_REASON: Record<string, string> = {
   blocked_preflight: "execution_preflight_blocked",
   blocked_spend_guard: "spend_guard_budget_incomplete",
+  ran_empty: "provider_terminal_empty_result",
   provider_error: "provider_terminal_error",
   died: "provider_process_died",
   stalled: "provider_process_stalled",

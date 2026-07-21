@@ -48,7 +48,7 @@ import {
   assertCoordinationAuthority, assertManagedChildTopology,
 } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
-import { classifyExecutionTerminal } from "./execution-outcome";
+import { classifyExecutionTerminal, EMPTY_RESULT_OUTCOME, isEmptyResultTerminal } from "./execution-outcome";
 import {
   notifyTerminalSettlement, TerminalPublicationBudget, type TerminalNotification,
 } from "./terminal-notification";
@@ -542,6 +542,21 @@ async function runDispatch(
       // Iterator completion without an explicit provider terminal is not a
       // successful execution, even when the transport itself closed cleanly.
       outcome = "provider_error";
+    }
+    if (isEmptyResultTerminal(outcome, result)) {
+      // A provider success terminal with empty result (0b) is a DEGENERATE
+      // completion, not a delivery (thread 019f8300): opus-high extended-thinking
+      // turns that hit the output-token ceiling truncate before committing any
+      // final text, yet the SDK still yields subtype=success/result="". Make it
+      // a distinct LOUD terminal so a zero-deliverable lane never masquerades as
+      // AGENT COMPLETE.
+      outcome = EMPTY_RESULT_OUTCOME;
+      const turns = typeof resultMsg?.num_turns === "number" ? `${resultMsg.num_turns} turns` : "unknown turns";
+      terminalSignal = {
+        subject: "AGENT EMPTY RESULT",
+        detail: `provider success terminal with empty result (0b) after ${turns} — no deliverable text committed (likely output-token ceiling hit mid extended-thinking/tool_use)`,
+      };
+      console.error(`[empty-result] @agent:${agentId} provider success terminal carried 0b result — recording process=ran_empty (loud, non-clean)`);
     }
     if (stallAborted) {
       // 2N of silence: interrupt the hung query, mark outcome=stalled, and fire the death

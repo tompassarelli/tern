@@ -62,6 +62,7 @@ export class TerminalPublicationBudget {
 function defaultSubject(outcome: string, terminal: ExecutionTerminal): string {
   if (outcome === "died" || outcome === "stalled") return "AGENT DEATH";
   if (outcome === "max_turns" || outcome === "capped") return "TURN CAP";
+  if (outcome === "ran_empty") return "AGENT EMPTY RESULT";
   return terminal.deliveryOutcome === "blocked" ? "AGENT BLOCKED" : "AGENT COMPLETE";
 }
 
