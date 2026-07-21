@@ -36,16 +36,15 @@ operator works — adapt the wrapper to your own setup.
 - **[docs/hosting.md](docs/hosting.md)** — the three modes (self-host single box,
   self-host remote, multi-tenant SaaS), the instance-per-tenant model, security,
   ops, and the roadmap.
-- **[deploy/](deploy/)** — `Dockerfile`, `docker-compose.example.yml`, systemd
-  units, and the authenticated **[gateway](deploy/gateway/)** (bearer token →
-  tenant → that tenant's coordinator) with `provision.sh` + an integration test.
+- **[deploy/](deploy/)** — `docker-compose.example.yml`, systemd units, and the
+  authenticated **[gateway](deploy/gateway/)** (bearer token → tenant → that
+  tenant's coordinator) with `provision.sh` + an integration test. The one
+  runtime image (`Dockerfile`, bb + Fram + North) lives at the repo root.
 
 ## Docs
 
-- **`docs/HANDOFF.md`** — current project state: what's done & verified, what's
-  pending (sequenced), the open decisions, and the engine↔app seam. Start here.
 - `docs/operating-manual.md` — the working manual: thread model, fact format,
-  derived lifecycle, the CLI surface, and session behavior.
+  derived lifecycle, the CLI surface, and session behavior. Start here.
 - `docs/fact-native-redesign.md` — the design record for the fact-native model.
 - `docs/PROPOSAL.md` — the original vision and architecture.
 
