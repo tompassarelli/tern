@@ -78,6 +78,19 @@
        (= [] (:concerns (parse-concern-projection
                          (json/generate-string {:version 1 :concerns []})))))
 
+;; ---- adversarial ENVELOPE validation: the top-level object must have EXACTLY
+;; :version and :concerns — no missing, no extra — same fail-closed discipline
+;; as row validation.
+(check "extra top-level envelope field fails closed"
+       (boolean (:err (parse-concern-projection
+                       (json/generate-string {:version 1 :concerns [] :unexpected true})))))
+(check "missing :version envelope field fails closed"
+       (boolean (:err (parse-concern-projection
+                       (json/generate-string {:concerns []})))))
+(check "missing :concerns envelope field fails closed"
+       (boolean (:err (parse-concern-projection
+                       (json/generate-string {:version 1})))))
+
 ;; ---- adversarial ROW validation: a consumer that accepts a row it did not fully
 ;; validate is a silent-corruption vector. Every rejected category below must FAIL
 ;; CLOSED to {:err ...} — no row is silently dropped, coerced, or passed through.

@@ -228,6 +228,10 @@
 ;; field: agent-less concerns render live with a null agent (concern-cli).
 (def ^:private concern-row-keys
   #{:id :agent :repo :intent :maturity :classification :online :retired :touches})
+;; The full top-level envelope contract: exactly `:version` and `:concerns`, no
+;; more, no less. A payload with an extra top-level field is as much a silent-
+;; corruption vector as an extra row field, so it's rejected the same way.
+(def ^:private concern-envelope-keys #{:version :concerns})
 (def ^:private concern-maturities #{"exploring" "building" "likely-to-land" "landed"})
 (def ^:private concern-classifications #{"live" "stale" "orphaned" "retired"})
 
@@ -288,6 +292,10 @@
     (cond
       (= parsed ::unparseable)          {:err "concern projection unparseable"}
       (not (map? parsed))               {:err "concern projection not an object"}
+      (not= (set (keys parsed)) concern-envelope-keys)
+      {:err (str "concern projection envelope key set "
+                 (pr-str (vec (sort (map name (keys parsed)))))
+                 " ≠ " (pr-str (vec (sort (map name concern-envelope-keys)))))}
       (not= (:version parsed) concern-projection-version)
       {:err (str "concern projection version mismatch (want "
                  concern-projection-version ", got " (pr-str (:version parsed)) ")")}
