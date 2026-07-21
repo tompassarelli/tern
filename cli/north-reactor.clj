@@ -584,6 +584,171 @@
     (Thread/sleep 1000)               ; brief backoff, then reconnect (survives a bounce)
     (recur)))
 
+;; ---- BOUNDED ONE-SHOT LIFECYCLE --------------------------------------------
+;; The user timer invokes sweep-once every five minutes. Individual coordinator
+;; reads are bounded, but a sweep performs many of them; summing those per-call
+;; bounds allowed one oneshot to stay activating for more than twenty minutes.
+;; Keep the aggregate deadline below the timer cadence and serialize all entry
+;; paths with an OS lock. A coordinator bounce is retryable and ultimately
+;; DEFERRED (the next timer tick is the retry), while a code/configuration defect
+;; remains a nonzero terminal failure.
+(def MAX-SWEEP-TIMEOUT-MS (* 4 60 1000))
+(def DEFAULT-SWEEP-RETRY-MS 250)
+
+(defn positive-ms
+  [name default maximum]
+  (let [raw (System/getenv name)
+        value (try
+                (Long/parseLong (or raw (str default)))
+                (catch Throwable _ -1))]
+    (when-not (<= 1 value maximum)
+      (throw (ex-info (str name " must be between 1 and " maximum " milliseconds")
+                      {:type :invalid-sweep-lifecycle-setting
+                       :name name :value raw :maximum maximum})))
+    value))
+
+(defn sweep-lock-path []
+  (or (System/getenv "NORTH_REACTOR_SWEEP_LOCK_PATH")
+      (when-let [runtime-dir (System/getenv "XDG_RUNTIME_DIR")]
+        (.getPath (io/file runtime-dir "north-reactor-sweep.lock")))
+      (.getPath (io/file (System/getProperty "user.home")
+                         ".cache" "north" "reactor-sweep.lock"))))
+
+(def retryable-coordinator-types
+  #{:coordinator-response-timeout
+    :coordinator-response-closed
+    :coordinator-response-truncated})
+
+(defn throwable-chain [throwable]
+  (take-while some? (iterate #(.getCause ^Throwable %) throwable)))
+
+(defn retryable-coordinator-error? [throwable]
+  (boolean
+   (some (fn [cause]
+           (or (instance? java.net.ConnectException cause)
+               (instance? java.net.SocketTimeoutException cause)
+               (instance? java.net.SocketException cause)
+               (instance? java.io.EOFException cause)
+               (contains? retryable-coordinator-types (:type (ex-data cause)))))
+         (throwable-chain throwable))))
+
+(defn concise-error [throwable]
+  (let [root (last (throwable-chain throwable))]
+    (str (.getSimpleName (class root))
+         (when-let [message (.getMessage ^Throwable root)]
+           (str ": " message)))))
+
+(defn remaining-ms [deadline-ns]
+  (max 0 (long (/ (- deadline-ns (System/nanoTime)) 1000000))))
+
+(defn run-sweep-attempt!
+  "Run one attempt without allowing it past deadline-ns. The promise avoids
+   ExecutionException wrapping and lets the caller classify the original cause."
+  [dry? deadline-ns]
+  (let [result (promise)
+        task (future
+               (try
+                 (deliver result {:status :completed :summary (sweep! dry?)})
+                 (catch Throwable throwable
+                   (deliver result {:status :error :error throwable}))))
+        remaining (remaining-ms deadline-ns)
+        observed (if (pos? remaining)
+                   (deref result remaining ::deadline)
+                   ::deadline)]
+    (if (= ::deadline observed)
+      (do (future-cancel task) {:status :deadline})
+      observed)))
+
+(defn run-bounded-sweep!
+  [dry? timeout-ms retry-ms]
+  (let [started-ns (System/nanoTime)
+        deadline-ns (+ started-ns (* 1000000 timeout-ms))]
+    (loop [attempt 1]
+      (let [{:keys [status error] :as observed}
+            (run-sweep-attempt! dry? deadline-ns)]
+        (cond
+          (= :completed status)
+          (assoc observed :attempts attempt
+                          :elapsed-ms (long (/ (- (System/nanoTime) started-ns) 1000000)))
+
+          (= :deadline status)
+          {:status :deadline :attempts attempt :timeout-ms timeout-ms}
+
+          (not (retryable-coordinator-error? error))
+          {:status :failed :attempts attempt :error error}
+
+          (<= (remaining-ms deadline-ns) retry-ms)
+          {:status :unavailable :attempts attempt :timeout-ms timeout-ms :error error}
+
+          :else
+          (let [backoff-ms (min 5000
+                                (remaining-ms deadline-ns)
+                                (* retry-ms (bit-shift-left 1 (min 4 (dec attempt)))))]
+            (when (or (= 1 attempt) (zero? (mod attempt 10)))
+              (println (str "[sweep] coordinator unavailable (" (concise-error error)
+                            "); retrying in " backoff-ms "ms (attempt " attempt ")"))
+              (flush))
+            (Thread/sleep backoff-ms)
+            (recur (inc attempt))))))))
+
+(defn with-sweep-lock [f]
+  (let [path (sweep-lock-path)
+        file (io/file path)]
+    (when-let [parent (.getParentFile file)] (.mkdirs parent))
+    (with-open [random-access (java.io.RandomAccessFile. file "rw")
+                channel (.getChannel random-access)]
+      (let [lock (.tryLock channel)]
+        (if-not lock
+          {:status :already-running :lock path}
+          ;; Closing the channel releases the lock. Babashka intentionally does
+          ;; not expose FileLock.release, so keep ownership scoped by with-open.
+          (f))))))
+
+(defn sweep-once-exit-code []
+  (try
+    (let [timeout-ms (positive-ms "NORTH_REACTOR_SWEEP_TIMEOUT_MS"
+                                  MAX-SWEEP-TIMEOUT-MS MAX-SWEEP-TIMEOUT-MS)
+          retry-ms (positive-ms "NORTH_REACTOR_SWEEP_RETRY_MS"
+                                (min DEFAULT-SWEEP-RETRY-MS timeout-ms) timeout-ms)
+          result (with-sweep-lock
+                   #(run-bounded-sweep! dry-run? timeout-ms retry-ms))]
+      (cond
+        (= :completed (:status result))
+        (do (println (str "[sweep] terminal=completed attempts=" (:attempts result)
+                          " elapsed_ms=" (:elapsed-ms result)))
+            (flush)
+            0)
+
+        (= :already-running (:status result))
+        (do (println (str "[sweep] terminal=deferred reason=already-running"
+                          " action=wait-for-current-sweep lock=" (:lock result)))
+            (flush)
+            0)
+
+        (contains? #{:deadline :unavailable} (:status result))
+        (do (println (str "[sweep] terminal=deferred reason=" (name (:status result))
+                          " timeout_ms=" timeout-ms
+                          " attempts=" (:attempts result)
+                          (when-let [error (:error result)]
+                            (str " last_error=\"" (concise-error error) "\""))
+                          " action=retry-on-next-scheduled-run"))
+            (flush)
+            0)
+
+        :else
+        (do (binding [*out* *err*]
+              (println (str "[sweep] terminal=failed attempts=" (:attempts result)
+                            " error=\"" (concise-error (:error result)) "\""
+                            " action=inspect-north-reactor-journal"))
+              (flush))
+            1)))
+    (catch Throwable throwable
+      (binding [*out* *err*]
+        (println (str "[sweep] terminal=failed error=\"" (concise-error throwable) "\""
+                      " action=check-sweep-lifecycle-configuration"))
+        (flush))
+      1)))
+
 (if sweep-verb?
-  (do (sweep! dry-run?) (System/exit 0))
+  (System/exit (sweep-once-exit-code))
   (-main))

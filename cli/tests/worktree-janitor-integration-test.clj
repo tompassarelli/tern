@@ -241,6 +241,8 @@
             dirty-before (tree-snapshot (:path dirty))
             environment {"HOME" (.getCanonicalPath home)
                          "NORTH_REACTOR_HEARTBEAT" (.getCanonicalPath heartbeat)
+                         "NORTH_REACTOR_SWEEP_LOCK_PATH"
+                         (.getCanonicalPath (io/file tmp "reactor-sweep.lock"))
                          "NORTH_AGENT_LOGS_DIR" (.getCanonicalPath agent-logs)
                          "NORTH_GIT_BIN" (.getCanonicalPath git-wrapper)
                          "REAL_GIT" (str/trim (:out (proc/shell {:out :string} "which" "git")))

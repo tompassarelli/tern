@@ -108,6 +108,7 @@ jobs:
           bb -cp "$CP" staleness_test.clj
           bb reap_test.clj      # reactor reap verdict (daemon-free; guards the @run-join false positive)
           bb cli/tests/reactor-heartbeat-test.clj   # durable last-sweep heartbeat + doctor stale/missing verdict (daemon-free)
+          bb cli/tests/reactor-sweep-lifecycle-test.clj  # bounded one-shot, reconnect, and single-flight lock
           bb cli/tests/worktree-janitor-integration-test.clj  # real Git + isolated coordinator, production sweep-once twice
           # Generate the exact imported corpus and require the lifecycle bar's
           # terminal PASS marker so a missing/wrong log can never skip green.
