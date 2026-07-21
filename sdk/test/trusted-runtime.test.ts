@@ -11,10 +11,68 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { trustedGitExecutable, trustedNorthBabashkaExecutable } from "../src/trusted-runtime";
+import {
+  trustedGitExecutable, trustedManagedCodexExecutable, trustedNorthBabashkaExecutable,
+} from "../src/trusted-runtime";
 
 const STORE_GIT = /^\/nix\/store\/[0-9a-z]{32}-git(?:-[^/]+)?\/bin\/git$/;
 const STORE_BB = /^\/nix\/store\/[0-9a-z]{32}-babashka(?:-[^/]+)?\/bin\/bb$/;
+const STORE_CODEX = /^\/nix\/store\/[0-9a-z]{32}-[^/]*codex[^/]*\/bin\/codex$/;
+
+function realStoreCodex(): string {
+  const candidates = [
+    process.env.NORTH_MANAGED_CODEX_BIN,
+    "/run/current-system/sw/bin/codex",
+    `${process.env.HOME}/.nix-profile/bin/codex`,
+    "/etc/profiles/per-user/" + (process.env.USER ?? "") + "/bin/codex",
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const real = realpathSync(candidate);
+      if (STORE_CODEX.test(real)) return real;
+    } catch {
+      // keep looking
+    }
+  }
+  throw new Error("test host exposes no canonical /nix/store Codex");
+}
+
+describe("trustedManagedCodexExecutable — exact wrapper-pinned provider identity", () => {
+  const codex = realStoreCodex();
+  const env = { ...process.env };
+  let scratch: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "trusted-managed-codex-"));
+  });
+  afterEach(() => {
+    process.env = { ...env };
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  test("accepts the immutable wrapper pin even when the interactive Codex shim resolves elsewhere", () => {
+    const interactiveBin = join(scratch, ".local", "bin");
+    mkdirSync(interactiveBin, { recursive: true });
+    const interactive = join(interactiveBin, "codex");
+    writeFileSync(interactive, "#!/bin/sh\necho interactive\n");
+    chmodSync(interactive, 0o755);
+    process.env.PATH = interactiveBin;
+    process.env.NORTH_MANAGED_CODEX_BIN = codex;
+    expect(trustedManagedCodexExecutable()).toBe(codex);
+    expect(realpathSync(interactive)).not.toBe(codex);
+  });
+
+  test("rejects writable and absent managed executable pins", () => {
+    const shim = join(scratch, "codex");
+    writeFileSync(shim, "#!/bin/sh\nexit 0\n");
+    chmodSync(shim, 0o755);
+    expect(() => trustedManagedCodexExecutable([shim]))
+      .toThrow("trusted Nix-store Codex executable unavailable");
+    expect(() => trustedManagedCodexExecutable([join(scratch, "absent")]))
+      .toThrow("trusted Nix-store Codex executable unavailable");
+  });
+});
 
 // A genuine canonical /nix/store git present on this host. Tests that need a real
 // store target (symlink chains, positive canonical acceptance) build atop it,

@@ -33,11 +33,19 @@ import {
   MANAGED_CODEX_DISABLED_FEATURES, MANAGED_CODEX_ENABLED_FEATURES,
   ManagedCodexAppServerRun, ManagedCodexPreThreadError,
 } from "./codex-app-server";
+import {
+  prepareManagedCodexHome, type PreparedManagedCodexHome,
+} from "./managed-codex-home";
 import { CODEX_SUPERVISOR_STATUS_PREFIX } from "./codex-supervisor-protocol";
 
 type ManagedCommandResolver = () => string;
 
-const managedCommandReceipts = new WeakMap<object, string>();
+interface ManagedCodexLaunchReceipt {
+  command: string;
+  home: PreparedManagedCodexHome;
+}
+
+const managedLaunchReceipts = new WeakMap<object, ManagedCodexLaunchReceipt>();
 
 function resolveManagedCommand(resolver: ManagedCommandResolver): string {
   try {
@@ -52,19 +60,19 @@ function resolveManagedCommand(resolver: ManagedCommandResolver): string {
   }
 }
 
-function recordManagedCommand(options: unknown, resolved: string): void {
+function recordManagedLaunch(options: unknown, receipt: ManagedCodexLaunchReceipt): void {
   if ((typeof options !== "object" && typeof options !== "function") || options === null)
     throw new ProviderRetrySafeError("openai_managed_command_receipt_unavailable");
-  managedCommandReceipts.set(options as object, resolved);
+  managedLaunchReceipts.set(options as object, receipt);
 }
 
-function takeManagedCommand(options: unknown): string | undefined {
+function takeManagedLaunch(options: unknown): ManagedCodexLaunchReceipt | undefined {
   if ((typeof options !== "object" && typeof options !== "function") || options === null)
     return undefined;
   const key = options as object;
-  const resolved = managedCommandReceipts.get(key);
-  managedCommandReceipts.delete(key);
-  return resolved;
+  const receipt = managedLaunchReceipts.get(key);
+  managedLaunchReceipts.delete(key);
+  return receipt;
 }
 const CODEX_SUPERVISOR = resolve(import.meta.dir, "codex-supervisor.ts");
 
@@ -166,15 +174,27 @@ export function assertCodexGlobalAgentsForEnvironment(
 function managedCodexTargetEnvironment(
   options: any,
   target: RoutingTarget | undefined,
-): NodeJS.ProcessEnv {
-  let env: NodeJS.ProcessEnv;
+): PreparedManagedCodexHome {
+  let accountEnv: NodeJS.ProcessEnv;
   try {
-    env = providerEnvironmentForTarget("openai", target, { env: options.env });
+    accountEnv = providerEnvironmentForTarget("openai", target, { env: options.env });
   } catch (cause) {
     throw new ProviderRetrySafeError("openai_target_environment_invalid", { cause });
   }
-  assertCodexGlobalAgentsForEnvironment(env, managedDeveloperInstructions(options));
-  return env;
+  const developerInstructions = managedDeveloperInstructions(options);
+  assertCodexGlobalAgentsForEnvironment(accountEnv, developerInstructions);
+  let prepared: PreparedManagedCodexHome;
+  try { prepared = prepareManagedCodexHome(accountEnv); }
+  catch (cause) {
+    throw new ProviderRetrySafeError("openai_managed_home_preparation_failed", { cause });
+  }
+  try {
+    assertCodexGlobalAgentsForEnvironment(prepared.env, developerInstructions);
+    return prepared;
+  } catch (error) {
+    prepared.dispose();
+    throw error;
+  }
 }
 
 function managedCodexAuthorityArguments(
@@ -252,9 +272,14 @@ async function admitOpenAIWithManagedHooksProbe(
   // receipt closes the async admit -> synchronous query seam without repeating
   // trusted-path resolution after onRoute.
   const resolvedCommand = resolveManagedCommand(resolveCommand);
-  managedCodexTargetEnvironment(options, target);
-  await admitExecution("openai", capabilities, options?.cwd ?? process.cwd(), options, target);
-  recordManagedCommand(options, resolvedCommand);
+  const prepared = managedCodexTargetEnvironment(options, target);
+  try {
+    await admitExecution("openai", capabilities, options?.cwd ?? process.cwd(), options, target);
+    recordManagedLaunch(options, { command: resolvedCommand, home: prepared });
+  } catch (error) {
+    prepared.dispose();
+    throw error;
+  }
 }
 
 export async function admitOpenAI(options: any, target?: RoutingTarget): Promise<void> {
@@ -743,7 +768,7 @@ class CodexQuery implements AgentQuery {
     private admitted = false,
     private assertManagedHooks: ManagedHooksProbe = assertInstalledManagedCodexHooks,
     private resolveManagedCommand: ManagedCommandResolver = trustedManagedCodexExecutable,
-    private admittedManagedCommand?: string,
+    private admittedManagedLaunch?: ManagedCodexLaunchReceipt,
   ) {}
 
   supportsInFlightEscalation(): boolean { return false; }
@@ -781,52 +806,54 @@ class CodexQuery implements AgentQuery {
       this.options, this.target, this.assertManagedHooks, this.resolveManagedCommand,
     );
     const managed = this.options?.northCapabilities !== undefined;
-    // Repeat the root-managed hook proof at the final pre-spawn seam. This
-    // closes the filesystem race between routed admission and Codex startup.
-    if (managed) this.assertManagedHooks();
-    const env = managed
-      ? managedCodexTargetEnvironment(this.options, this.target)
-      : providerEnvironmentForTarget("openai", this.target, { env: this.options.env });
-    const managedCommand = managed
-      ? this.admittedManagedCommand ?? takeManagedCommand(this.options)
+    const managedLaunch = managed
+      ? this.admittedManagedLaunch ?? takeManagedLaunch(this.options)
       : undefined;
-    this.admittedManagedCommand = undefined;
-    if (managed && !managedCommand)
+    this.admittedManagedLaunch = undefined;
+    if (managed && !managedLaunch)
       throw new ProviderRetrySafeError("openai_managed_command_receipt_unavailable");
     if (managed) {
-      const surface = compileProviderAuthoritySurface(
-        "openai", this.options,
-      ) as OpenAIAuthoritySurface;
-      const model = modelForCodex(this.options.model);
-      if (!model)
-        throw new ProviderRetrySafeError("openai_exact_model_resolution_missing");
-      const north = this.options.mcpServers.north;
-      // The launch prompt is the first North frame; later frames (an
-      // orchestrator's post-settlement reduction directive, a live steer) are
-      // consumed as additional turns on the SAME provider thread. A string
-      // prompt or a channel that closes after one frame stays single-turn.
-      const frames = promptFrames(this.prompt);
-      const launchPrompt = await frames.first();
-      const run = new ManagedCodexAppServerRun({
-        command: managedCommand!,
-        env,
-        cwd: this.options.cwd ?? process.cwd(),
-        prompt: launchPrompt,
-        model,
-        effort: this.options.effort,
-        developerInstructions: managedDeveloperInstructions(this.options),
-        surface,
-        north: {
-          command: north.command,
-          args: north.args,
-          env: managedNorthMcpEnvironment(north.env),
-        },
-        onActivity: () => renewHarnessPresence(this.options),
-      });
-      this.managedRun = run;
-      let turns = 0;
+      let frames: PromptFrames | undefined;
       try {
-        for await (const completed of run.session(() => frames.next())) {
+        // Repeat both root-managed hook and pristine-home proof at the final
+        // pre-spawn seam. The prepared home is the exact one admitted before
+        // route publication; interactive account config is never consulted.
+        this.assertManagedHooks();
+        assertCodexGlobalAgentsForEnvironment(
+          managedLaunch!.home.env, managedDeveloperInstructions(this.options),
+        );
+        const surface = compileProviderAuthoritySurface(
+          "openai", this.options,
+        ) as OpenAIAuthoritySurface;
+        const model = modelForCodex(this.options.model);
+        if (!model)
+          throw new ProviderRetrySafeError("openai_exact_model_resolution_missing");
+        const north = this.options.mcpServers.north;
+        // The launch prompt is the first North frame; later frames (an
+        // orchestrator's post-settlement reduction directive, a live steer) are
+        // consumed as additional turns on the SAME provider thread. A string
+        // prompt or a channel that closes after one frame stays single-turn.
+        frames = promptFrames(this.prompt);
+        const launchPrompt = await frames.first();
+        const run = new ManagedCodexAppServerRun({
+          command: managedLaunch!.command,
+          env: managedLaunch!.home.env,
+          cwd: this.options.cwd ?? process.cwd(),
+          prompt: launchPrompt,
+          model,
+          effort: this.options.effort,
+          developerInstructions: managedDeveloperInstructions(this.options),
+          surface,
+          north: {
+            command: north.command,
+            args: north.args,
+            env: managedNorthMcpEnvironment(north.env),
+          },
+          onActivity: () => renewHarnessPresence(this.options),
+        });
+        this.managedRun = run;
+        let turns = 0;
+        for await (const completed of run.session(() => frames!.next())) {
           turns += 1;
           if (completed.text) yield {
             type: "assistant",
@@ -849,10 +876,12 @@ class CodexQuery implements AgentQuery {
           throw new ProviderRetrySafeError(error.message, { cause: error });
         throw error;
       } finally {
-        await frames.close().catch(() => { /* teardown owns the terminal error */ });
+        await frames?.close().catch(() => { /* teardown owns the terminal error */ });
         this.managedRun = undefined;
+        managedLaunch!.home.dispose();
       }
     }
+    const env = providerEnvironmentForTarget("openai", this.target, { env: this.options.env });
     const task = await initialPrompt(this.prompt);
     const prompt = this.options.systemPrompt
       ? `${this.options.systemPrompt}\n\n## Task\n${task}`
@@ -1001,7 +1030,7 @@ export function internalOpenAIProviderWithManagedHooksProbeForTest(
         admitted,
         assertManagedHooks,
         resolveCommand,
-        admitted ? takeManagedCommand(options) : undefined,
+        admitted ? takeManagedLaunch(options) : undefined,
       );
     },
   };
