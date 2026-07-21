@@ -8,7 +8,7 @@ import { balancedAllocationEstimates } from "../src/provider-routing";
 import { RATE_LIMIT_WARNING_TTL_MS } from "../src/resource-policy";
 import { consumeExecutionAdmission, markExecutionAdmission } from "../src/execution-admission";
 import type { AgentProvider, ProviderAvailability, ProviderId, ResourcePolicy } from "../src/providers/types";
-import { resolveTier } from "../src/providers/catalog";
+import { ProviderCatalogFileCache, resolveTier } from "../src/providers/catalog";
 import { anthropicProvider, normalizeAnthropicQueryDiagnostics } from "../src/providers/anthropic";
 import { codexHarnessArguments, openaiProvider } from "../src/providers/openai";
 import {
@@ -257,9 +257,10 @@ test("balanced rendezvous is uniform for short target ids and honors weight rati
   });
   const sample = (targetWeights: Record<string, number>) => {
     const counts = { a: 0, b: 0, c: 0 };
+    const allocationPolicy = makePolicy(targetWeights);
     for (let index = 0; index < 30_000; index++)
       counts[selectProviderFromAvailability(
-        "auto", availability, makePolicy(targetWeights), "standard", `k-${index}`, "medium",
+        "auto", availability, allocationPolicy, "standard", `k-${index}`, "medium",
       ).target as keyof typeof counts]++;
     return counts;
   };
@@ -270,6 +271,51 @@ test("balanced rendezvous is uniform for short target ids and honors weight rati
   expect(weighted.b / 30_000).toBeWithin(0.31, 0.355);
   expect(weighted.c / 30_000).toBeWithin(0.475, 0.525);
 }, 15_000);
+
+test("provider catalog cache reuses a stable snapshot and invalidates a same-path change", () => {
+  let version = 1n;
+  let reads = 0;
+  const identity = () => ({
+    dev: 1n, ino: version, size: version, mtimeNs: version, ctimeNs: version,
+  });
+  const cache = new ProviderCatalogFileCache<{ value: string }>({
+    identity,
+    read: () => {
+      reads++;
+      return JSON.stringify({ value: `v${version}` });
+    },
+  });
+  const load = () => cache.load("/same/provider.json", JSON.parse);
+
+  expect(load()).toEqual({ value: "v1" });
+  expect(load()).toEqual({ value: "v1" });
+  expect(reads).toBe(1);
+
+  version = 2n;
+  expect(load()).toEqual({ value: "v2" });
+  expect(reads).toBe(2);
+});
+
+test("provider catalog cache fails closed when the file changes throughout both reads", () => {
+  const versions = [1n, 2n, 2n, 3n];
+  let identityCalls = 0;
+  let reads = 0;
+  const cache = new ProviderCatalogFileCache<{ value: string }>({
+    identity: () => {
+      const version = versions[identityCalls++]!;
+      return { dev: 1n, ino: version, size: version, mtimeNs: version, ctimeNs: version };
+    },
+    read: () => {
+      reads++;
+      return JSON.stringify({ value: `attempt-${reads}` });
+    },
+  });
+
+  expect(() => cache.load("/changing/provider.json", JSON.parse))
+    .toThrow("Gaffer provider catalog changed while reading /changing/provider.json");
+  expect(identityCalls).toBe(4);
+  expect(reads).toBe(2);
+});
 
 test("balanced allocation uses each account's observed numeric headroom", () => {
   const resetsAt = "2099-01-01T00:00:00Z";

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import type { ProviderId } from "./types";
 import type { ReasoningLevel, RoutingTier } from "../routing-metadata";
@@ -40,17 +40,93 @@ interface ProviderCatalog {
   tiers: Record<SemanticTier, ProviderTier>;
 }
 
+export interface CatalogFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+interface CachedProviderCatalog<T> {
+  identity: CatalogFileIdentity;
+  value: T;
+}
+
+export interface ProviderCatalogFileReader {
+  identity(path: string): CatalogFileIdentity;
+  read(path: string): string;
+}
+
+function catalogFileIdentity(path: string): CatalogFileIdentity {
+  const stats = statSync(path, { bigint: true });
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+  };
+}
+
+function sameCatalogFile(
+  left: CatalogFileIdentity,
+  right: CatalogFileIdentity,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+const nodeCatalogFileReader: ProviderCatalogFileReader = {
+  identity: catalogFileIdentity,
+  read: (path) => readFileSync(path, "utf8"),
+};
+
+/** @internal Exported for deterministic cache-boundary tests, not the SDK barrel. */
+export class ProviderCatalogFileCache<T> {
+  readonly #entries = new Map<string, CachedProviderCatalog<T>>();
+
+  constructor(
+    private readonly reader: ProviderCatalogFileReader = nodeCatalogFileReader,
+    private readonly attempts = 2,
+  ) {}
+
+  load(path: string, parse: (source: string) => T): T {
+    for (let attempt = 0; attempt < this.attempts; attempt++) {
+      const before = this.reader.identity(path);
+      const cached = this.#entries.get(path);
+      if (cached && sameCatalogFile(cached.identity, before)) return cached.value;
+
+      const source = this.reader.read(path);
+      const after = this.reader.identity(path);
+      if (!sameCatalogFile(before, after)) continue;
+
+      const value = parse(source);
+      this.#entries.set(path, { identity: after, value });
+      return value;
+    }
+    throw new Error(`Gaffer provider catalog changed while reading ${path}`);
+  }
+}
+
+const providerCatalogCache = new ProviderCatalogFileCache<ProviderCatalog>();
+
 function gafferHome(): string {
   return resolve(process.env.GAFFER_HOME ?? `${process.env.HOME}/code/gaffer`);
 }
 
 function providerCatalog(provider: ProviderId): ProviderCatalog {
   const path = resolve(gafferHome(), "providers", `${provider}.json`);
-  const catalog = JSON.parse(readFileSync(path, "utf8")) as ProviderCatalog;
-  if (catalog.provider !== provider || !catalog.tiers || !catalog.modelAliases
-      || !catalog.models || !catalog.modelDeltas)
-    throw new Error(`invalid Gaffer provider catalog for ${provider} at ${path}`);
-  return catalog;
+  return providerCatalogCache.load(path, (source) => {
+    const catalog = JSON.parse(source) as ProviderCatalog;
+    if (catalog.provider !== provider || !catalog.tiers || !catalog.modelAliases
+        || !catalog.models || !catalog.modelDeltas)
+      throw new Error(`invalid Gaffer provider catalog for ${provider} at ${path}`);
+    return catalog;
+  });
 }
 
 /** Resolve a provider-local family alias to the exact catalog model ID. */
