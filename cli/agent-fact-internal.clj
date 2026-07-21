@@ -538,7 +538,8 @@
       (fail! "managed terminal presence withdrawal was not acknowledged"
              {:subject subject :resource presence-resource})))
   (when thread
-    (let [driver subject
+    (let [agent-id (subs subject (count "@agent:"))
+          driver (str "@" agent-id)
           current (set (north.coord/many port thread "driver"))]
       (when (contains? current driver)
         (checked! (north.coord/retract-with-fence!

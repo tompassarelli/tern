@@ -211,7 +211,8 @@
 
 (defn apply-terminal-lifecycle-prefix!
   [port subject thread terminal operations prefix-count]
-  (let [agent-id (subs subject (count "@agent:"))]
+  (let [agent-id (subs subject (count "@agent:"))
+        driver (str "@" agent-id)]
     (doseq [[operation predicate value] (take prefix-count operations)]
       (case operation
         :put (north.coord/append! port subject predicate value)
@@ -220,7 +221,7 @@
          port {:op :release-lease :res (str "session:" agent-id)
                :holder agent-id})
         :release-driver
-        (north.coord/retract! port thread "driver" subject)
+        (north.coord/retract! port thread "driver" driver)
         :marker
         (north.coord/append!
          port subject "terminal_manifest_sha256"
@@ -1144,7 +1145,11 @@
           operation-id "00000000-0000-4000-8000-000000000140"
           _identity (seed-identity! port subject preset)
           _title (north.coord/append! port thread "title" "blocked preflight cleanup")
-          _driver (north.coord/append! port thread "driver" subject)
+          initial-claim
+          (proc/shell {:out :string :err :string :continue true
+                       :extra-env {"FRAM_LOG" @test-log}}
+                      "bb" (str root "/cli/acquire-cli.clj") (str port)
+                      "claim" thread agent-id)
           presence (north.coord/send-op
                     port {:op :acquire-lease :res (str "session:" agent-id)
                           :holder agent-id :ttl-ms 1800000})
@@ -1154,6 +1159,9 @@
            (:port proxy) "terminal" subject (json/generate-string terminal)
            holder operation-id nil preset thread)
           after (scalar-facts (entity-facts port subject))
+          ;; This harness invokes only the managed terminal writer: there is no
+          ;; dispatch outer-finally release available to make the assertion pass.
+          driver-after-terminal (north.coord/resolved port thread "driver")
           claim
           (proc/shell {:out :string :err :string :continue true
                        :extra-env {"FRAM_LOG" @test-log}}
@@ -1177,7 +1185,7 @@
                     (when (and (= :retract-with-fence (:op request))
                                (= thread (:te request))
                                (= "driver" (:p request))
-                               (= subject (:r request)))
+                               (= (str "@" agent-id) (:r request)))
                       index))
                   requests))
           marker-index
@@ -1188,12 +1196,14 @@
                                (= "terminal_manifest_sha256" (:p request)))
                       index))
                   requests))]
-      (check "blocked preflight terminal closes presence and releases its exact driver before acknowledgement"
+      (check "terminal commit without an outer finally closes presence and releases the production driver before acknowledgement"
              (and (:ok presence)
+                  (zero? (:exit initial-claim))
                   (= "committed" (get-in terminal-result [:result :status]))
                   (= (north.terminal-projection/terminal-manifest-sha256 terminal)
                      (get after "terminal_manifest_sha256"))
                   (nil? (north.coord/lease-of port (str "session:" agent-id)))
+                  (nil? driver-after-terminal)
                   (zero? (:exit claim))))
       (check "terminal marker is the final lifecycle publication after presence and driver cleanup"
              (and (integer? presence-index)
@@ -1234,7 +1244,11 @@
                    thread (str "@managed-terminal-cleanup-thread-" prefix)
                    _identity (seed-identity! port subject preset)
                    _title (north.coord/append! port thread "title" "cleanup prefix")
-                   _driver (north.coord/append! port thread "driver" subject)
+                   initial-claim
+                   (proc/shell {:out :string :err :string :continue true
+                                :extra-env {"FRAM_LOG" @test-log}}
+                               "bb" (str root "/cli/acquire-cli.clj") (str port)
+                               "claim" thread agent-id)
                    _presence
                    (north.coord/send-op
                     port {:op :acquire-lease :res (str "session:" agent-id)
@@ -1249,6 +1263,7 @@
                     (str (java.util.UUID/randomUUID)) nil preset thread)
                    stored (scalar-facts (entity-facts port subject))]
                {:recovered recovered
+                :initial-claim (:exit initial-claim)
                 :exact (= (north.terminal-projection/terminal-manifest-sha256 terminal)
                           (get stored "terminal_manifest_sha256"))
                 :presence (north.coord/lease-of port (str "session:" agent-id))
@@ -1257,6 +1272,7 @@
       (check "every killed terminal-cleanup durable prefix recovers terminal, presence, and driver exactly"
              (every?
               #(and (zero? (get-in % [:recovered :exit]))
+                    (zero? (:initial-claim %))
                     (= "committed" (get-in % [:recovered :result :status]))
                     (:exact %)
                     (nil? (:presence %))
