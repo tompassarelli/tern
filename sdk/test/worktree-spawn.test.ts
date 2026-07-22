@@ -13,6 +13,11 @@ import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import type {
+  WorktreeAllocationEvent,
+  WorktreeAllocationRegistration,
+} from "../src/worktree";
+import { ProviderRetrySafeError } from "../src/providers";
 
 let dir: string;      // fake-north sandbox
 let log: string;      // fake-north invocation log
@@ -146,12 +151,18 @@ test("OPT-IN (worktree:true) => real worktree, cwd inside it, payload appended, 
   const sink: { options?: any } = {};
   const agentId = "wt-on-1";
   const expectedPath = `/tmp/${require("node:path").basename(repo)}-lane-${agentId}`;
+  const registrations: WorktreeAllocationRegistration[] = [];
+  const events: WorktreeAllocationEvent[] = [];
 
   const result = await spawn({
     prompt: "trivial worktree lane", agentId, worktree: true,
     routingMetadata: presetRequest("integrator"),
     queryFn: capturingQuery(sink),
     feedSubscriber: () => readySubscription(),
+    worktreeAllocationWriter: {
+      register: (registration: WorktreeAllocationRegistration) => registrations.push(registration),
+      event: (_subject: string, event: WorktreeAllocationEvent) => events.push(event),
+    },
   });
   process.chdir(origCwd);
 
@@ -168,6 +179,22 @@ test("OPT-IN (worktree:true) => real worktree, cwd inside it, payload appended, 
   const logged = readFileSync(log, "utf8");
   expect(logged).toContain(`tell agent:${agentId} worktree ${expectedPath}`);
   expect(logged).toContain(`tell agent:${agentId} branch lane-${agentId}`);
+  expect(registrations).toHaveLength(1);
+  expect(registrations[0]).toMatchObject({
+    worktree: expectedPath,
+    durableRef: `refs/heads/lane-${agentId}`,
+    repositoryLayout: "standalone",
+    agent: `@agent:${agentId}`,
+    thread: "@thread:ad-hoc",
+    concern: "@concern:unattributed",
+  });
+  expect(events.map(({ type }) => type)).toEqual([
+    "provisioned", "authority-profiled", "released",
+  ]);
+  expect(events[1].providerAuthorityProfile).toMatchObject({
+    phase: "resolved",
+    authMode: expect.stringMatching(/^(ambient|isolated)$/),
+  });
   // Clean `ran` => the worktree + its branch were removed inline (salvage gate: remove case).
   expect(existsSync(expectedPath)).toBe(false);
   const branches = execFileSync("git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" });
@@ -226,9 +253,108 @@ test("explicit worktree provisioning failure aborts before provider, admission, 
   expect(existsSync(expectedPath)).toBe(false);
   expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe(sharedBytes);
   expect(execFileSync("git", ["-C", repo, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
-  // NORTH_BIN captures every identity/run writer invocation. Exact byte equality
-  // proves the failed isolated spawn published neither.
-  expect(existsSync(log) ? readFileSync(log, "utf8") : "").toBe(beforeLog);
+  // Physical registration is now the one intentional pre-Git side effect. The
+  // collision leaves an append-only planned -> failed -> absent history, while
+  // every provider/admission/identity/run writer remains unreachable.
+  const afterLog = existsSync(log) ? readFileSync(log, "utf8") : "";
+  const delta = afterLog.slice(beforeLog.length).trim().split("\n");
+  expect(delta).toHaveLength(3);
+  expect(delta[0]).toContain("worktree-allocation-internal.clj 59999 register");
+  expect(delta[1]).toContain('"type":"provision-failed"');
+  expect(delta[1]).toContain('"code":"durable_ref_collision"');
+  expect(delta[1]).toContain('"resourceState":"absent"');
+  expect(delta[2]).toContain('"type":"rolled-back"');
+  expect(delta.every((line) => line.startsWith("bb "))).toBe(true);
+  expect(delta.join("\n")).not.toContain("must never reach provider execution");
 
   execFileSync("git", ["-C", repo, "branch", "-d", "--", branch]);
+});
+
+test("pre-provider admission failure rolls back the physical resource and records exact absence", async () => {
+  const { spawn } = await import("./support/spawn");
+  const agentId = "wt-admission-fail-1";
+  const expectedPath = `/tmp/${require("node:path").basename(repo)}-lane-${agentId}`;
+  const registrations: WorktreeAllocationRegistration[] = [];
+  const events: WorktreeAllocationEvent[] = [];
+  let providerQueries = 0;
+  process.chdir(repo);
+  let thrown: unknown;
+  try {
+    await spawn({
+      prompt: "admission must roll back before provider",
+      agentId,
+      worktree: true,
+      routingMetadata: presetRequest("integrator"),
+      queryFn: () => {
+        providerQueries++;
+        return capturingQuery({})({ options: {} });
+      },
+      feedSubscriber: () => readySubscription(),
+      worktreeAllocationWriter: {
+        register: (registration: WorktreeAllocationRegistration) => registrations.push(registration),
+        event: (_subject: string, event: WorktreeAllocationEvent) => events.push(event),
+      },
+      admitBillableClock: () => { throw new Error("injected_clock_admission_failure"); },
+      completeResourceEnvelope: async () => {},
+    });
+  } catch (error) {
+    thrown = error;
+  } finally {
+    process.chdir(origCwd);
+  }
+
+  expect(String(thrown)).toContain("injected_clock_admission_failure");
+  expect(providerQueries).toBe(0);
+  expect(registrations).toHaveLength(1);
+  expect(events.map(({ type }) => type)).toEqual(["provisioned", "rolled-back"]);
+  expect(events.at(-1)).toMatchObject({ type: "rolled-back", resourceState: "absent" });
+  expect(existsSync(expectedPath)).toBe(false);
+  expect(execFileSync(
+    "git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" },
+  ).trim()).toBe("");
+});
+
+test("typed provider preflight refusal preserves a queryable quarantine with exact recovery", async () => {
+  const { spawn } = await import("./support/spawn");
+  const agentId = "wt-provider-preflight-fail-1";
+  const expectedPath = `/tmp/${require("node:path").basename(repo)}-lane-${agentId}`;
+  const events: WorktreeAllocationEvent[] = [];
+  process.chdir(repo);
+  try {
+    const result = await spawn({
+      prompt: "typed retry-safe provider preflight refusal",
+      agentId,
+      worktree: true,
+      routingMetadata: presetRequest("integrator"),
+      queryFn: () => (async function* () {
+        throw new ProviderRetrySafeError("injected_provider_admission_refusal");
+      })(),
+      feedSubscriber: () => readySubscription(),
+      worktreeAllocationWriter: {
+        register: () => {},
+        event: (_subject: string, event: WorktreeAllocationEvent) => events.push(event),
+      },
+    });
+    expect(result).toBe("");
+  } finally {
+    process.chdir(origCwd);
+  }
+
+  expect(events.map(({ type }) => type)).toEqual([
+    "provisioned", "authority-profiled", "quarantined",
+  ]);
+  expect(events.at(-1)).toMatchObject({
+    type: "quarantined",
+    resourceState: "quarantined",
+    error: { code: "provider_preflight_refused", phase: "provider_admission" },
+    recovery: {
+      action: "inspect-and-salvage",
+      resource: expectedPath,
+      durableRef: `refs/heads/lane-${agentId}`,
+    },
+  });
+  expect(existsSync(expectedPath)).toBe(true);
+
+  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", expectedPath]);
+  execFileSync("git", ["-C", repo, "branch", "-D", `lane-${agentId}`]);
 });

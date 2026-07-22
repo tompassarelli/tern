@@ -20,7 +20,7 @@ describe("branch + path naming", () => {
   test("path is /tmp/<repo-basename>-lane-<agentId>", () => {
     expect(worktreePath("sdk-abc123", "/home/tom/code/kea")).toBe("/tmp/kea-lane-sdk-abc123");
   });
-  test("path keys off the repo basename, not the full path (no cross-repo collision)", () => {
+  test("path keys off distinct repo basenames", () => {
     const a = worktreePath("x", "/home/tom/code/north");
     const b = worktreePath("x", "/other/place/kea");
     expect(a).toBe("/tmp/north-lane-x");

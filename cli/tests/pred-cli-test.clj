@@ -149,7 +149,10 @@
     ["cli/schema-migrate.clj" "retract!" "predicate"]
     ["cli/spend-breaker.clj" "retract!" "p"]
     ["cli/spend-cli.clj" "append!" "p"]
-    ["cli/spend-cli.clj" "put!" "p"]})
+    ["cli/spend-cli.clj" "put!" "p"]
+    ["cli/worktree-allocation-internal.clj" "append!" "marker-predicate"]
+    ["cli/worktree-allocation-internal.clj" "append!" "predicate"]
+    ["cli/worktree-allocation-internal.clj" "retract!" "predicate"]})
 
 ;; Fixed SDK fact constructors are audited instead of their variable transport
 ;; loops. A variable p in recordRun is not permission to omit a runFacts tuple.

@@ -25,6 +25,7 @@ clojure_bars=(
   cli/tests/routing-report-test.clj
   cli/tests/spawn-process-integration-test.clj
   cli/tests/peer-command-integration-test.clj
+  cli/tests/worktree-allocation-integration-test.clj
   cli/tests/worktree-janitor-integration-test.clj
 )
 

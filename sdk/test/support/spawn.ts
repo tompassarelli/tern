@@ -11,6 +11,7 @@ const RUNTIME_FIELDS = new Set([
   "childSettlementReader", "feedSubscriber",
   "registerTermination", "refreshAccountUsages", "refreshCodexEntitlements",
   "admitResourceEnvelope", "completeResourceEnvelope", "admitBillableClock",
+  "worktreeAllocationWriter",
 ]);
 
 function prepared(value: SpawnOptions & Record<string, unknown>): SpawnOptions {

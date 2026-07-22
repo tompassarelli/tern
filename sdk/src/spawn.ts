@@ -7,7 +7,11 @@ import {
   type Effort, type HarnessCompositionEvidence,
 } from "./harness";
 import {
-  provisionWorktree, rollbackProvisionedWorktree, worktreeFinalize, worktreePayload,
+  provisionWorktree, recordWorktreeAuthorityProfile, recordWorktreeRunRotation,
+  resolvedWorktreeAuthorityProfile, rollbackProvisionedWorktree,
+  worktreeFinalize, worktreePayload,
+  type ProvisionedWorktree, type WorktreeAllocationWriter,
+  type WorktreeTerminalFailure,
 } from "./worktree";
 import { normalizeUsage } from "./usage";
 import { classifyTurnProvenance, newRunId, recordRun } from "./telemetry";
@@ -90,6 +94,7 @@ export interface SpawnOptions {
   role?: string;
   posture?: string;
   thread?: string; // exact work/evidence thread; managed runs verify the human client session separately.
+  concern?: string; // exact physical-allocation concern owner; absent is explicitly unattributed.
   caveman?: "off" | "lite" | "full"; // request override for the fork-backed response strategy
   coordinator?: string; // spawning coordinator handle -> gets a direct peer ping on death
   provider?: ProviderPreference;
@@ -120,11 +125,12 @@ interface SpawnRuntime {
   admitResourceEnvelope?: typeof admitResourceEnvelope;
   completeResourceEnvelope?: typeof completeResourceEnvelope;
   admitBillableClock?: typeof admitBillableClock;
+  worktreeAllocationWriter?: WorktreeAllocationWriter;
 }
 
 const SPAWN_OPTION_FIELDS = new Set([
   "prompt", "agentId", "model", "effort", "tools", "systemPrompt", "maxTurns",
-  "role", "posture", "thread", "caveman", "coordinator", "provider",
+  "role", "posture", "thread", "concern", "caveman", "coordinator", "provider",
   "target", "tier", "routingMetadata", "project", "sessionId", "worktree", "setupCmd",
   "routingAssessment", "pinEvidence",
 ]);
@@ -149,10 +155,7 @@ export function createSpawnAgentId(now = Date.now(), uuid = randomUUID()): strin
   return `lane-${now.toString(36)}-${uuid}`;
 }
 
-interface ManagedWorktreeLease {
-  path: string;
-  branch: string;
-  repoRoot: string;
+interface ManagedWorktreeLease extends ProvisionedWorktree {
   finalized: boolean;
 }
 
@@ -226,7 +229,9 @@ async function runSpawn(
   const requested = { provider: opts.provider, target: opts.target,
     tier: opts.tier, model: opts.model, effort: opts.effort };
   const agentId = opts.agentId ?? createSpawnAgentId();
-  let runId = newRunId(agentId);
+  const repoRoot = worktreeLease?.repoRoot ?? process.cwd();
+  const wt = worktreeLease;
+  let runId = worktreeLease?.allocation.runId ?? newRunId(agentId);
   const runContext = opts.thread
     ? newDeliveryRunContext(runId, opts.thread, agentId)
     : undefined;
@@ -270,6 +275,14 @@ async function runSpawn(
     }
   }
   termination.throwIfTerminated();
+  if (wt && injected.queryFn) {
+    // An injected provider owns its boundary and never enters routedQuery's
+    // attempt hook, so publish its selected authority at the same pre-query seam.
+    recordWorktreeAuthorityProfile(
+      wt.allocation,
+      resolvedWorktreeAuthorityProfile(routing),
+    );
+  }
   const resolved = resolveTier(routing.provider, requestedTier, opts.model, opts.effort);
   opts.model = resolved.model;
   opts.effort = resolved.effort;
@@ -277,8 +290,6 @@ async function runSpawn(
   // env relabel this child as an alias or a different role.
   const identityRole = routingMetadata.role!;
   const composition = routingMetadata.composition!;
-  const repoRoot = worktreeLease?.repoRoot ?? process.cwd();
-  const wt = worktreeLease;
   const identityBase = {
     kind: "lane" as const,
     role: identityRole,
@@ -345,6 +356,7 @@ async function runSpawn(
   // set alongside `outcome` in the catch below and carried onto @run so the
   // real underlying failure survives past the banner-only stdout log.
   let preflightCause: string | undefined;
+  let worktreeTerminalFailure: WorktreeTerminalFailure | undefined;
   const terminalMessages: any[] = [];
   const end = (oc: string) => { outcome = oc; try { ch.end(); } catch { /* already closed */ } };
 
@@ -369,6 +381,14 @@ async function runSpawn(
       });
       admittedRoute = { provider: authority.provider, evidence, authority };
       console.log(`[spawn] effective authority: ${formatProviderAuthoritySurface(authority)}`);
+    },
+    (decision) => {
+      if (wt) {
+        recordWorktreeAuthorityProfile(
+          wt.allocation,
+          resolvedWorktreeAuthorityProfile(decision),
+        );
+      }
     },
   ));
   let queryCloseError: unknown;
@@ -415,6 +435,7 @@ async function runSpawn(
     } catch {
       const abandonedRunId = runId;
       runId = newRunId(agentId);
+      if (wt) recordWorktreeRunRotation(wt.allocation, runId);
       console.error(
         `[delivery] @${abandonedRunId} reservation unavailable; rotating telemetry to @${runId} and leaving delivery unverified`,
       );
@@ -607,12 +628,20 @@ async function runSpawn(
   } catch (err) {
     if (err instanceof ResourceEnvelopeExceededError) {
       outcome = "resource_envelope_exceeded";
+      worktreeTerminalFailure = {
+        code: "resource_envelope_retry_refused",
+        phase: "provider_preflight",
+      };
       console.error(`[envelope] @agent:${agentId} ${err.message}`);
     } else if (err instanceof ProviderRetrySafeError) {
       // A spend-guard refusal carries its own terminal outcome; every other
       // retry-safe preflight block stays blocked_preflight.
       const carried = (err as { processOutcome?: unknown }).processOutcome;
       outcome = typeof carried === "string" ? carried : "blocked_preflight";
+      worktreeTerminalFailure = {
+        code: "provider_preflight_refused",
+        phase: "provider_admission",
+      };
       preflightCause = causeChain(err);
       console.error(`[${outcome}] @agent:${agentId} ${preflightCause}`);
     } else {
@@ -729,7 +758,7 @@ async function runSpawn(
   // on a clean ran, KEEP + surface a worktree_orphaned fact on any
   // crash/cap/dirty tail. Fail-open.
   if (wt) {
-    worktreeFinalize(agentId, outcome, { path: wt.path, branch: wt.branch, repoRoot });
+    worktreeFinalize(agentId, outcome, wt, worktreeTerminalFailure);
     wt.finalized = true;
   }
 
@@ -753,6 +782,14 @@ async function runSpawn(
       }
       if (!runState?.reservationValid) {
         runId = newRunId(agentId);
+        if (wt) {
+          try { recordWorktreeRunRotation(wt.allocation, runId); }
+          catch (error) {
+            console.error(
+              `[worktree] ${wt.allocation.subject} could not record terminal run rotation: ${String(error)}`,
+            );
+          }
+        }
         deliveryReservationReady = false;
         console.error(
           `[delivery] @${reservedRunId} reservation invalid at finalize; rotating telemetry to @${runId} and leaving delivery unverified`,
@@ -1007,12 +1044,19 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   let worktreeLease: ManagedWorktreeLease | undefined;
   if (composed.worktree ?? process.env.AGENT_WORKTREE === "1") {
     const repoRoot = process.cwd();
+    const allocationRunId = newRunId(agentId);
     try {
       const provisioned = provisionWorktree(agentId, {
         repoRoot,
         setupCmd: composed.setupCmd ?? process.env.AGENT_SETUP_CMD,
+        runId: allocationRunId,
+        thread: composed.thread,
+        concern: composed.concern ?? process.env.NORTH_CONCERN_ID,
+        provider: composed.provider,
+        target: composed.target,
+        writer: injected.worktreeAllocationWriter,
       });
-      worktreeLease = { ...provisioned, repoRoot, finalized: false };
+      worktreeLease = { ...provisioned, finalized: false };
       console.log(
         `[spawn] @agent:${agentId} worktree ${provisioned.path} on ${provisioned.branch}`,
       );
@@ -1064,8 +1108,9 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     termination.release();
   }
   if (worktreeLease && !worktreeLease.finalized) {
-    rollbackProvisionedWorktree(agentId, worktreeLease);
-    worktreeLease.finalized = true;
+    try { rollbackProvisionedWorktree(agentId, worktreeLease); }
+    catch (error) { cleanupErrors.push(error); }
+    finally { worktreeLease.finalized = true; }
   }
   const errors = failed ? [primaryError, ...cleanupErrors] : cleanupErrors;
   if (errors.length === 1) throw errors[0];
