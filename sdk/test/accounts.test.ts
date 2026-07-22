@@ -533,6 +533,8 @@ test("subscription targets deny hostile provider transports while preserving ord
     CODEX_HOME: "/tmp/hostile-codex",
     CODEX_SQLITE_HOME: "/tmp/hostile-sqlite",
     CODEX_PROFILE: "hostile",
+    AGENT_ROUTING_ASSESSMENT: '{"sensitive":"admission-only"}',
+    NORTH_ROUTING_PIN_EVIDENCE: '{"sensitive":"admission-only"}',
   } satisfies NodeJS.ProcessEnv;
   const forbidden = Object.keys(hostile).filter((key) => ![
     "HOME", "PATH", "TERM", "NORTH_TRACE", "NORTH_MKFIFO_BIN", "NORTH_MANAGED_CODEX_BIN",

@@ -84,6 +84,27 @@ case "$evt" in
   SessionStart|SubagentStart|SubagentSessionStart) ;;
   *) exit 0 ;;
 esac
+
+# Freeze the dispatch topology that was in force when this provider-native
+# actor began. Report-time config is mutable context, never historical proof.
+dispatch_mode_at_start="north"
+harness_state="${NORTH_HARNESS_STATE:-$HOME/.local/state/north/harness.conf}"
+legacy_harness_state="${NORTH_LEGACY_HARNESS_STATE:-$HOME/.claude/my-config.state}"
+if [ -f "$harness_state" ]; then
+  dispatch_source="$harness_state"
+elif [ -f "$legacy_harness_state" ]; then
+  dispatch_source="$legacy_harness_state"
+else
+  dispatch_source=""
+fi
+if [ -n "$dispatch_source" ]; then
+  observed_dispatch="$(awk -F= '$1 == "dispatch" { value=$2 } END { print value }' "$dispatch_source" 2>/dev/null || true)"
+  case "$observed_dispatch" in
+    north|warn|native) dispatch_mode_at_start="$observed_dispatch" ;;
+    "") ;;
+    *) dispatch_mode_at_start="unknown" ;;
+  esac
+fi
 # SubagentStart carries a provider-owned `agent_id`; on Codex its session_id is
 # explicitly the PARENT session. Keying presence/cache by that parent would
 # collapse every native subagent onto one row. Prefer the actor id when present.
@@ -100,6 +121,19 @@ fi
 [ -n "$identity_sid" ] || exit 0
 identity_key="$("$ACTOR_KEY" "$identity_kind" "$identity_sid" 2>/dev/null || true)"
 [ "${#identity_key}" -eq 64 ] || exit 0
+case "$evt" in
+  SubagentStart|SubagentSessionStart)
+    native_actor_kind="subagent"
+    native_depth="1"
+    native_parent_actor_key="$("$ACTOR_KEY" session "$sid" 2>/dev/null || true)"
+    [ "${#native_parent_actor_key}" -eq 64 ] || native_parent_actor_key="unobserved"
+    ;;
+  *)
+    native_actor_kind="root"
+    native_depth="0"
+    native_parent_actor_key=""
+    ;;
+esac
 pin="${NORTH_AGENT_ID:-}"
 if [ -n "$pin" ]; then
   pin_validation="$("$ACTOR_KEY" managed "$pin" 2>/dev/null || true)"
@@ -243,17 +277,34 @@ schedule_spawn_maintenance() {
       NORTH_NATIVE_MODEL="$MODEL_OBS" \
       NORTH_NATIVE_EFFORT="$EFFORT_OBS" \
       NORTH_NATIVE_DISPLAY="$DISPLAY_HANDLE" \
+      NORTH_NATIVE_ACTOR_KIND="$native_actor_kind" \
+      NORTH_NATIVE_DEPTH="$native_depth" \
+      NORTH_NATIVE_DISPATCH_MODE_AT_START="$dispatch_mode_at_start" \
+      NORTH_NATIVE_PARENT_ACTOR_KEY="$native_parent_actor_key" \
       bb -e '
         (load-file (str (System/getenv "NORTH_HOME") "/cli/coord.clj"))
         (let [port (Integer/parseInt (System/getenv "NORTH_NATIVE_PORT"))
               subject (System/getenv "NORTH_NATIVE_SUBJECT")
-              facts [["kind" "session"]
+              base-facts [["kind" "session"]
                      ["repo" (System/getenv "NORTH_NATIVE_REPO")]
                      ["provider" (System/getenv "NORTH_NATIVE_PROVIDER")]
                      ["model" (System/getenv "NORTH_NATIVE_MODEL")]
                      ["effort" (System/getenv "NORTH_NATIVE_EFFORT")]
+                     ["execution_source" "provider-native"]
+                     ["execution_transport" "provider-hook"]
+                     ["provider_session_persistence" "unknown"]
+                     ["thread_provenance" "unknown"]
+                     ["turn_provenance" "unknown"]
+                     ["native_actor_kind" (System/getenv "NORTH_NATIVE_ACTOR_KIND")]
+                     ["native_depth" (System/getenv "NORTH_NATIVE_DEPTH")]
+                     ["dispatch_mode_at_start"
+                      (System/getenv "NORTH_NATIVE_DISPATCH_MODE_AT_START")]
                      ["display_handle" (System/getenv "NORTH_NATIVE_DISPLAY")]
                      ["display_name" (System/getenv "NORTH_NATIVE_DISPLAY")]]
+              facts (cond-> base-facts
+                      (seq (System/getenv "NORTH_NATIVE_PARENT_ACTOR_KEY"))
+                      (conj ["native_parent_actor_key"
+                             (System/getenv "NORTH_NATIVE_PARENT_ACTOR_KEY")]))
               results (mapv (fn [[p r]] (north.coord/put! port subject p r)) facts)]
           (when (some :reject results) (System/exit 1)))' >/dev/null 2>&1 &
     projection_pid=$!

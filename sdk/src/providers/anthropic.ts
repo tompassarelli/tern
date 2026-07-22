@@ -86,6 +86,7 @@ function normalizedAnthropicMessage(message: any): any {
 export function normalizeAnthropicQueryDiagnostics(source: AgentQuery): AgentQuery {
   const failed = () => new Error("anthropic_provider_execution_failed");
   return {
+    executionTransport: source.executionTransport ?? "anthropic-agent-sdk",
     interrupt: source.interrupt && (async () => {
       try { await source.interrupt!(); } catch { throw failed(); }
     }),
@@ -292,6 +293,7 @@ export function createAnthropicQuery(
         rawQuery = runtime.query({ prompt: args.prompt, options });
         source = runtime.observe(
           normalizeAnthropicQueryDiagnostics({
+            executionTransport: "anthropic-agent-sdk",
             interrupt: () => rawQuery!.interrupt(),
             close: async () => {
               try { await disposeAnthropicSdkQuery(rawQuery, lifecycle, ownedAbort); }
@@ -316,6 +318,7 @@ export function createAnthropicQuery(
     return initialization;
   };
   return {
+    executionTransport: "anthropic-agent-sdk",
     interrupt: async () => { await (await initialize()).interrupt?.(); },
     close: () => closePromise ??= (async () => {
       closed = true;

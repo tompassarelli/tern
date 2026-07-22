@@ -859,3 +859,136 @@
                       (str/includes? (:caveat repro) "late-appended or backfilled"))))))
   (finally
     (doseq [file (reverse (file-seq tmp3))] (io/delete-file file true)))))
+
+(let [tmp4 (.toFile (java.nio.file.Files/createTempDirectory
+                     "north-routing-economics" (make-array java.nio.file.attribute.FileAttribute 0)))
+      coord4 (io/file tmp4 "coordination.log")
+      telem4 (io/file tmp4 "telemetry.log")
+      harness4 (io/file tmp4 "harness.conf")
+      policy4 (io/file tmp4 "routing-policy.json")
+      accounts4 (io/file tmp4 "accounts")
+      env4 {"FRAM_LOG" (.getPath coord4) "FRAM_TELEMETRY_LOG" (.getPath telem4)
+            "NORTH_HARNESS_STATE" (.getPath harness4)
+            "NORTH_ROUTING_POLICY" (.getPath policy4)
+            "NORTH_ACCOUNTS_ROOT" (.getPath accounts4)}]
+  (try
+    (spit harness4 "dispatch=north\n")
+    (spit policy4 (json/generate-string
+                   {"version" 1
+                    "targets" [{"id" "claude-a" "provider" "anthropic"}
+                               {"id" "claude-b" "provider" "anthropic"}
+                               {"id" "codex-a" "provider" "openai"}
+                               {"id" "codex-b" "provider" "openai"}
+                               {"id" "codex-c" "provider" "openai"}]}))
+    (let [codex-dir (io/file accounts4 "openai/codex-a/sessions/2026/07/22")]
+      (.mkdirs codex-dir)
+      (spit (io/file codex-dir "turns.jsonl")
+            (apply str
+                   (for [i (range 11)
+                         row [{"timestamp" (format "2026-07-22T06:00:%02dZ" (* i 2))
+                               "type" "turn_context"
+                               "payload" {"turn_id" (str "turn-" i)
+                                          "model" "gpt-5.6-sol" "effort" "ultra"}}
+                              {"timestamp" (format "2026-07-22T06:00:%02dZ" (inc (* i 2)))
+                               "type" "event_msg"
+                               "payload" {"type" "token_count"
+                                          "info" {"total_token_usage" {"total_tokens" (* 10 (inc i))}
+                                                  "last_token_usage" {"total_tokens" 10}}}}]]
+                     (str (json/generate-string row) "\n")))))
+    (doseq [i (range 11)]
+      (let [entity (str "@run:economics-" i)
+            pin-status (cond (< i 3) "current" (= i 10) "legacy-missing" :else "none")]
+        (doseq [[p r] [["kind" "run"] ["agent" (str "economics-lane-" i)]
+                       ["thread" "thread-economics"] ["provider" "openai"]
+                       ["provider_target" "codex-a"] ["model" "gpt-5.6-sol"]
+                       ["effort" "high"] ["tokens" "1000"]
+                       ["at" (format "2026-07-22T06:10:%02dZ" i)] ["outcome" "ran"]
+                       ["applied_routing_tier" "senior"]
+                       ["routing_admission_receipt_version" "1"]
+                       ["routing_assessment_status" "recorded"]
+                       ["routing_assessment_policy" "minimum-sufficient-v1"]
+                       ["routing_derived_tier" "standard"] ["routing_derived_reasoning" "medium"]
+                       ["routing_selected_tier" "senior"] ["routing_selected_reasoning" "high"]
+                       ["routing_exception_code" "unmodeled-risk"]
+                       ["routing_pin_evidence_status" pin-status]
+                       ["execution_source" "north-managed"]
+                       ["execution_transport" "codex-app-server"]
+                       ["provider_session_persistence" "unknown"] ["thread_provenance" "exact"]
+                       ["turn_provenance" "provider-terminal"]]]
+          (fact telem4 entity p r))))
+    (doseq [[p r] [["kind" "session"] ["provider" "openai"] ["model" "gpt-5.6-sol"]
+                   ["effort" "ultra"] ["native_actor_kind" "subagent"] ["native_depth" "1"]
+                   ["dispatch_mode_at_start" "north"]
+                   ["execution_source" "provider-native"] ["execution_transport" "provider-hook"]
+                   ["provider_session_persistence" "unknown"]]]
+      (fact telem4 "@agent:native-economics" p r))
+    (doseq [[p r] [["kind" "session"] ["provider" "openai"] ["model" "gpt-5.6-sol"]
+                   ["effort" "unobserved"] ["native_actor_kind" "unknown"]
+                   ["execution_source" "provider-native"] ["execution_transport" "provider-hook"]
+                   ["provider_session_persistence" "unknown"]]]
+      (fact telem4 "@agent:native-legacy" p r))
+    (doseq [[p r] [["agent" "native-economics"] ["session_id" "native-economics"]
+                   ["started_at" "2026-07-22T07:00:00Z"]]]
+      (fact telem4 "@session:native-economics" p r))
+    (doseq [[p r] [["agent" "native-legacy"] ["session_id" "native-legacy"]
+                   ["started_at" "2026-07-22T07:30:00Z"]]]
+      (fact telem4 "@session:native-legacy" p r))
+    (let [result (proc/shell {:out :string :err :string :extra-env env4}
+                             "bb" (str root "/cli/routing-report.clj")
+                             "report" "economics" "--json" "--window" "24h" "--slice" "12h"
+                             "--now" "2026-07-22T12:00:00Z")
+          report (json/parse-string (str/trim (:out result)) true)
+          cumulative (:cumulative report)
+          codes (set (map :code (:alerts cumulative)))
+          human (:out (proc/shell {:out :string :err :string :extra-env env4}
+                                   "bb" (str root "/cli/routing-report.clj")
+                                   "report" "economics" "--window" "24h" "--slice" "12h"
+                                   "--now" "2026-07-22T12:00:00Z"))]
+      (check "economics report exits successfully" (zero? (:exit result)))
+      (check "economics report exposes premium, promotion, pin, and assessment evidence"
+             (and (= 100.0 (get-in cumulative [:managed :premiumTokenSharePercent]))
+                  (= 100.0 (get-in cumulative [:managed :promotions :percent]))
+                  (= 3 (get-in cumulative [:managed :pins :current]))
+                  (= 1 (get-in cumulative [:managed :pins :legacyCompatibleMissing]))
+                  (= 0 (get-in cumulative [:managed :pins :legacyUnknown]))
+                  (= 100.0 (get-in cumulative [:managed :assessmentCoverage :percentOfCurrent]))
+                  (= 11 (get-in cumulative [:managed :provenanceCoverage :complete]))))
+      (check "economics alerts have stable alert-only codes"
+             (every? codes ["ROUTING_PREMIUM_TOKEN_SHARE_HIGH"
+                            "ROUTING_PROMOTION_SHARE_HIGH"
+                            "ROUTING_EXACT_PIN_SHARE_HIGH"
+                            "ROUTING_LEGACY_PIN_EVIDENCE_MISSING"
+                            "OPENAI_PROVIDER_OWNED_HIGH_EFFORT_TOKEN_SHARE_HIGH"
+                            "OPENAI_PROVIDER_OWNED_ULTRA_TOKENS_OBSERVED"
+                            "NATIVE_DESCENDANTS_UNDER_NORTH_DISPATCH"]))
+      (check "economics ratios become cannot-determine below the sample and coverage gates"
+             (let [older (first (:intervals report))
+                   finding (some #(when (= "ROUTING_PREMIUM_TOKEN_SHARE_INSUFFICIENT_EVIDENCE"
+                                          (:code %)) %)
+                                 (:findings older))]
+               (and (= "cannot-determine" (:status finding))
+                    (= 10 (:minimumEligibleRuns finding))
+                    (= 80.0 (:minimumEvidenceCoveragePercent finding))
+                    (not (some #{"ROUTING_PREMIUM_TOKEN_SHARE_HIGH"}
+                               (map :code (:alerts older)))))))
+      (check "economics composes the bounded five-account model-effort ledger"
+             (and (= 5 (count (get-in cumulative [:usage :accounts])))
+                  (= 5 (count (get-in cumulative [:usage :accountObserved :accounts])))
+                  (= "ultra" (get-in cumulative [:usage :accountObserved :accounts 2
+                                                  :breakdown 0 :effort]))))
+      (check "native economics exposes root/subagent/depth without guessing legacy rows"
+             (and (= "north" (get-in cumulative [:native :currentDispatchModeContext]))
+                  (= 1 (get-in cumulative [:native :subagentSessions]))
+                  (= 1 (get-in cumulative [:native :unknownActorKind]))
+                  (= 1 (get-in cumulative [:native :sessionsByDepth :1]))
+                  (= 1 (get-in cumulative [:native :sessionsByDepth :unknown]))))
+      (check "human economics output includes all account/model/effort ledgers without stale nulls"
+             (and (str/includes? human "ACCOUNT LEDGER")
+                  (every? #(str/includes? human %) ["claude-a" "claude-b" "codex-a"
+                                                    "codex-b" "codex-c"])
+                  (str/includes? human "gpt-5.6-sol")
+                  (str/includes? human "/ ultra")
+                  (not (str/includes? human "native-high=null"))
+                  (not (str/includes? human "native-ultra=null")))))
+  (finally
+    (doseq [file (reverse (file-seq tmp4))] (io/delete-file file true)))))

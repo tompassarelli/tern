@@ -200,6 +200,7 @@
 (def driver-cli (str root "/cli/acquire-cli.clj"))
 (def north-port (or (System/getenv "NORTH_PORT") "7977"))
 (def route-preflight (str sdk-dir "/mcp-route-preflight.ts"))
+(def routing-economics-preflight (str sdk-dir "/routing-economics-preflight-cli.ts"))
 (def struggle-policy-cli (str sdk-dir "/struggle.ts"))
 (def gaffer-staffing-path
   (or (System/getenv "GAFFER_STAFFING_CATALOG")
@@ -265,6 +266,57 @@
    :domainRequirements {:type "array" :uniqueItems true :items {:type "string" :minLength 1} :description "Expertise/context the brief or adapter must supply; metadata alone loads nothing"}
    :topology {:type "string" :enum topology-values :description "Lane's coordination position; fixed by stock templates and explicit for bespoke compositions"}
    :composition composition-schema})
+(def assessment-signal-schema
+  {:type "object"
+   :properties {:decisionOwnership {:type "string" :enum ["none" "bounded" "cross-boundary" "system-shaping" "open-solution-class"]}
+                :seamScope {:type "string" :enum ["none" "established" "consequential" "system-wide"]}
+                :errorExposure {:type "string" :enum ["contained-reversible" "material-recoverable" "high-or-hard-to-reverse"]}
+                :oracleStrength {:type "string" :enum ["not-applicable" "objective-local" "objective-end-to-end" "partial" "judgment-only"]}
+                :foundationalImpact {:type "string" :enum ["none" "implementation-only" "invariant-decision-owned"]}
+                :dependencyShape {:type "string" :enum ["atomic-cohesive" "deterministic-workflow" "parallel-breadth" "dynamic-decomposition" "tightly-coupled-sequential"]}
+                :reasoningShape {:type "string" :enum ["deterministic" "bounded-branching" "multi-hypothesis" "system-synthesis" "exceptional"]}}
+   :required ["decisionOwnership" "seamScope" "errorExposure" "oracleStrength"
+              "foundationalImpact" "dependencyShape" "reasoningShape"]
+   :additionalProperties false})
+(def routing-assessment-schema
+  {:type "object"
+   :properties {:$schema {:type "string" :minLength 1}
+                :version {:const "minimum-sufficient-v1"}
+                :signals assessment-signal-schema
+                :derived {:type "object"
+                          :properties {:minimumTier {:type "string" :enum tier-values}
+                                       :minimumReasoning {:type "string" :enum reasoning-values}
+                                       :ruleCodes non-empty-strings-schema}
+                          :required ["minimumTier" "minimumReasoning" "ruleCodes"]
+                          :additionalProperties false}
+                :selected {:type "object"
+                           :properties {:tier {:type "string" :enum tier-values}
+                                        :reasoning {:type "string" :enum reasoning-values}}
+                           :required ["tier" "reasoning"]
+                           :additionalProperties false}
+                :exception {:type "object"
+                            :properties {:code {:type "string" :enum ["explicit-human-floor" "recent-lower-tier-failure" "calibration-experiment" "unmodeled-risk"]}
+                                         :detail {:type "string" :minLength 1}}
+                            :required ["code" "detail"]
+                            :additionalProperties false}
+                :exceptionalDeliberation {:type "string" :minLength 1}}
+   :required ["version" "signals" "derived" "selected"]
+   :additionalProperties false})
+(def routing-pin-evidence-schema
+  {:type "object"
+   :properties {:policyVersion {:const "north-routing-pin-v1"}
+                :issuedAt {:type "string" :format "date-time"}
+                :expiresAt {:type "string" :format "date-time"}
+                :reasonCode {:type "string" :enum ["explicit-human-request" "provider-recovery" "capability-requirement" "calibration-experiment"]}
+                :detail {:type "string" :minLength 1}
+                :pins {:type "array" :minItems 1 :maxItems 3 :uniqueItems true
+                       :items {:type "object"
+                               :properties {:kind {:type "string" :enum ["provider" "account" "model"]}
+                                            :value {:type "string" :minLength 1}}
+                               :required ["kind" "value"]
+                               :additionalProperties false}}}
+   :required ["policyVersion" "issuedAt" "expiresAt" "reasonCode" "detail" "pins"]
+   :additionalProperties false})
 
 (def sdk-tools
   [{:name "dispatch"
@@ -285,6 +337,8 @@
                           :reasoning {:type "string" :enum reasoning-values :description "Provider-neutral deliberation; independent of role and tier"}
                           :posture {:type "string" :enum posture-values}
                           :composition (:composition routing-properties)
+                          :routingAssessment routing-assessment-schema
+                          :pinEvidence routing-pin-evidence-schema
                           :model {:type "string" :minLength 1 :description "Provider model override; normally omit and let the semantic tier resolve it"}
                           :effort {:type "string" :enum reasoning-values :description "Compatibility alias for reasoning"}
                           :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
@@ -308,6 +362,8 @@
                           :reasoning {:type "string" :enum reasoning-values :description "Provider-neutral deliberation; independent of role and tier"}
                           :posture {:type "string" :enum posture-values}
                           :composition (:composition routing-properties)
+                          :routingAssessment routing-assessment-schema
+                          :pinEvidence routing-pin-evidence-schema
                           :model {:type "string" :minLength 1 :description "Provider model override; normally omit and let the semantic tier resolve it"}
                           :effort {:type "string" :enum reasoning-values :description "Compatibility alias for reasoning"}
                           :provider {:type "string" :enum ["auto" "anthropic" "openai"] :description "Agent provider (default auto)"}
@@ -475,9 +531,11 @@
 
 (def sdk-argument-keys
   {"dispatch" #{"id" "model" "effort" "reasoning" "role" "posture" "provider" "target" "tier"
-                 "coordinator" "taskGrade" "domainRequirements" "topology" "composition"}
+                 "coordinator" "taskGrade" "domainRequirements" "topology" "composition"
+                 "routingAssessment" "pinEvidence"}
    "spawn" #{"prompt" "model" "effort" "reasoning" "role" "posture" "provider" "target" "tier"
-              "caveman" "coordinator" "taskGrade" "domainRequirements" "topology" "composition"}})
+              "caveman" "coordinator" "taskGrade" "domainRequirements" "topology" "composition"
+              "routingAssessment" "pinEvidence"}})
 
 (def routing-override-fields
   #{"taskGrade" "domainRequirements" "tier" "reasoning" "posture"})
@@ -701,6 +759,25 @@
         (let [message (str/trim (str err (when (and (seq err) (seq out)) "\n") out))]
           (if (str/blank? message) "exact routing target preflight failed" message))))))
 
+(defn preflight-routing-economics [args]
+  ;; This is the single canonical admission seam shared with execution. Gaffer
+  ;; derives and validates the sidecar inside the SDK; the MCP edge does not
+  ;; carry a weaker copy that could claim a driver before detecting tampering.
+  (let [payload (cond-> {"routingMetadata" (select-keys args managed-routing-fields)}
+                  (contains? args "routingAssessment")
+                  (assoc "routingAssessment" (get args "routingAssessment"))
+                  (contains? args "pinEvidence")
+                  (assoc "pinEvidence" (get args "pinEvidence"))
+                  (contains? args "provider") (assoc "provider" (get args "provider"))
+                  (contains? args "target") (assoc "target" (get args "target"))
+                  (contains? args "model") (assoc "model" (get args "model")))
+        {:keys [out err exit]}
+        (proc/sh {:in (json/generate-string payload)}
+                 policy-bun "run" routing-economics-preflight)]
+    (when-not (zero? exit)
+      (let [message (str/trim (str err (when (and (seq err) (seq out)) "\n") out))]
+        (if (str/blank? message) "routing economics preflight failed" message)))))
+
 (defn preflight-struggle-policy [args]
   ;; The MCP edge always invokes the same resolver as execution. Its exact JSON
   ;; becomes a one-shot child witness, so defaults and overrides alike cannot
@@ -719,6 +796,8 @@
       {:content [{:type "text" :text problem}] :isError true}
       (if-let [problem (invalid-routing nm args)]
       {:content [{:type "text" :text problem}] :isError true}
+      (if-let [problem (preflight-routing-economics args)]
+        {:content [{:type "text" :text problem}] :isError true}
       (if-let [problem (preflight-exact-target args)]
         {:content [{:type "text" :text problem}] :isError true}
         (let [struggle-preflight (preflight-struggle-policy args)]
@@ -745,6 +824,8 @@
             domains (get args "domainRequirements")
             topology (get args "topology")
             composition (get args "composition")
+            routing-assessment (get args "routingAssessment")
+            pin-evidence (get args "pinEvidence")
             agent-id (create-mcp-agent-id id)
             cmd-env (cond-> (assoc env
                               "AGENT_ID" agent-id
@@ -761,6 +842,8 @@
                       domains     (assoc "AGENT_DOMAIN_REQUIREMENTS" (json/generate-string domains))
                       topology    (assoc "AGENT_TOPOLOGY" topology)
                       composition (assoc "AGENT_COMPOSITION" (json/generate-string composition))
+                      routing-assessment (assoc "AGENT_ROUTING_ASSESSMENT" (json/generate-string routing-assessment))
+                      pin-evidence (assoc "NORTH_ROUTING_PIN_EVIDENCE" (json/generate-string pin-evidence))
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (if-let [problem (claim-driver-problem id agent-id)]
           {:content [{:type "text" :text problem}] :isError true}
@@ -801,6 +884,8 @@
             domains (get args "domainRequirements")
             topology (get args "topology")
             composition (get args "composition")
+            routing-assessment (get args "routingAssessment")
+            pin-evidence (get args "pinEvidence")
             caveman (get args "caveman")
             worktree (get args "worktree")
             setup-cmd (get args "setupCmd")
@@ -818,6 +903,8 @@
                       domains     (assoc "AGENT_DOMAIN_REQUIREMENTS" (json/generate-string domains))
                       topology    (assoc "AGENT_TOPOLOGY" topology)
                       composition (assoc "AGENT_COMPOSITION" (json/generate-string composition))
+                      routing-assessment (assoc "AGENT_ROUTING_ASSESSMENT" (json/generate-string routing-assessment))
+                      pin-evidence (assoc "NORTH_ROUTING_PIN_EVIDENCE" (json/generate-string pin-evidence))
                       caveman     (assoc "AGENT_CAVEMAN" caveman)
                       worktree    (assoc "AGENT_WORKTREE" "1")
                       setup-cmd   (assoc "AGENT_SETUP_CMD" setup-cmd)
@@ -838,7 +925,7 @@
                :isError true}))
             (catch Exception _
               {:content [{:type "text" :text "could not start an ad-hoc agent"}]
-               :isError true}))))))))))))
+               :isError true})))))))))))))
 
 ;; `untell` is an accepted legacy alias for `retract` — route it to the same tool.
 (def tool-aliases {"untell" "retract"})

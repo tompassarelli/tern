@@ -28,8 +28,26 @@ const bespokeOrchestratorContract = JSON.stringify({
   doneWhen: ["all worker results are reconciled"], report: "integrated verdict",
 });
 
+function pinEvidence(...pins: Array<{ kind: "provider" | "account" | "model"; value: string }>): string {
+  const issuedAt = new Date();
+  return JSON.stringify({
+    policyVersion: "north-routing-pin-v1",
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: new Date(issuedAt.getTime() + 60 * 60 * 1000).toISOString(),
+    reasonCode: "explicit-human-request",
+    detail: "agents CLI routing fixture",
+    pins,
+  });
+}
+
+function providerPin(provider: string): string[] {
+  return ["--pin-evidence", pinEvidence({ kind: "provider", value: provider })];
+}
+
 function dry(role: string, provider: string, ...extra: string[]): string {
-  const result = spawnSync("bb", [cli, "spawn", role, "probe", "--provider", provider, "--dry-run", ...extra], {
+  const result = spawnSync("bb", [
+    cli, "spawn", role, "probe", "--provider", provider, ...providerPin(provider), "--dry-run", ...extra,
+  ], {
     encoding: "utf8", env: { ...process.env, NO_COLOR: "1", GAFFER_HOME: gaffer,
       GAFFER_STAFFING_CATALOG: resolve(gaffer, "staffing/catalog.json") },
   });
@@ -62,7 +80,8 @@ test("CLI dry preview uses the exact topology policy selected for execution", ()
   );
 
   const overridden = spawnSync("bb", [
-    cli, "spawn", "director", "probe", "--provider", "anthropic", "--dry-run",
+    cli, "spawn", "director", "probe", "--provider", "anthropic",
+    ...providerPin("anthropic"), "--dry-run",
   ], {
     encoding: "utf8",
     env: {
@@ -85,7 +104,8 @@ test("CLI dry preview uses the exact topology policy selected for execution", ()
   expect(overridden.stdout).not.toContain("NORTH_STRUGGLE_POLICY_EXPECTED");
 
   const invalid = spawnSync("bb", [
-    cli, "spawn", "integrator", "probe", "--provider", "openai", "--dry-run",
+    cli, "spawn", "integrator", "probe", "--provider", "openai",
+    ...providerPin("openai"), "--dry-run",
   ], {
     encoding: "utf8",
     env: {
@@ -208,7 +228,12 @@ test("composite preview and execution share pinned-provider admission before sid
       for (const executionArgs of [["--dry-run"], []]) {
         const result = spawnSync("bb", [
           cli, ...request,
-          "--provider", "openai", "--target", "codex-work", ...executionArgs,
+          "--provider", "openai", "--target", "codex-work",
+          "--pin-evidence", pinEvidence(
+            { kind: "provider", value: "openai" },
+            { kind: "account", value: "codex-work" },
+          ),
+          ...executionArgs,
         ], { encoding: "utf8", env });
         expect(result.status).toBe(1);
         const document = JSON.parse(result.stdout.trim());
@@ -239,7 +264,12 @@ test("composite preview and execution share pinned-provider admission before sid
 
     const anthropic = spawnSync("bb", [
       cli, "delegate", "coordinate this", "--composite",
-      "--provider", "anthropic", "--target", "claude-work", "--dry-run",
+      "--provider", "anthropic", "--target", "claude-work",
+      "--pin-evidence", pinEvidence(
+        { kind: "provider", value: "anthropic" },
+        { kind: "account", value: "claude-work" },
+      ),
+      "--dry-run",
     ], { encoding: "utf8", env });
     expect(anthropic.status).toBe(0);
     expect(anthropic.stdout).toContain("# gaffer dials for role director");

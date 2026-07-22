@@ -16,6 +16,15 @@ import { runFacts } from "../src/telemetry";
 const north = resolve(import.meta.dir, "../..");
 const gaffer = process.env.GAFFER_HOME ?? resolve(north, "../gaffer");
 const cli = resolve(north, "cli/agents-cli.clj");
+const pinIssuedAt = new Date();
+const openaiPinEvidence = JSON.stringify({
+  policyVersion: "north-routing-pin-v1",
+  issuedAt: pinIssuedAt.toISOString(),
+  expiresAt: new Date(pinIssuedAt.getTime() + 60 * 60 * 1000).toISOString(),
+  reasonCode: "explicit-human-request",
+  detail: "bespoke contract fingerprint fixture",
+  pins: [{ kind: "provider", value: "openai" }],
+});
 
 const contract = {
   responsibility: "évidence\ntrace",
@@ -132,6 +141,7 @@ test("Clojure dry-run fingerprint is byte-identical and its UI is contract-redac
   const rationale = "PRIVATE RATIONALE CANARY";
   const result = spawnSync("bb", [
     cli, "spawn", "migration-forensics", "probe", "--provider", "openai", "--nearest", "analyst",
+    "--pin-evidence", openaiPinEvidence,
     "--rationale", rationale, "--contract", JSON.stringify(semanticallyEquivalent),
     "--no-promotion-candidate", "--dry-run",
   ], {
@@ -164,6 +174,7 @@ test("CLI forwards the canonical contract to the child behind the redacted displ
                   north.spawn-process/await-startup
                   (fn [& _] {:status :completed :handle "probe" :outcome "ran"})]
       (cmd-spawn ["migration-forensics" "probe" "--provider" "openai"
+                  "--pin-evidence" ${JSON.stringify(openaiPinEvidence)}
                   "--nearest" "analyst" "--rationale" "private rationale"
                   "--contract" ${JSON.stringify(JSON.stringify(semanticallyEquivalent))}
                   "--no-promotion-candidate"])

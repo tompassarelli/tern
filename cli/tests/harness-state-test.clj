@@ -40,6 +40,12 @@
         :else (do (Thread/sleep 10) (recur (inc attempt)))))))
 
 (try
+  (let [config-source (slurp (str root "/cli/config-cli.clj"))]
+    (check "guard help limits the switch to authoring guards"
+           (and (str/includes? config-source "authoring guards OFF; dispatch topology unchanged")
+                (not (str/includes? config-source "ALL GUARDS OFF"))))
+    (check "guard help names dispatch as the independent topology axis"
+           (str/includes? config-source "`north config\n   dispatch` owns that independent axis")))
   (io/make-parents legacy)
   (spit legacy "dispatch=warn\nguards=off\n")
   (check "legacy state is a read-only fallback while canonical is absent"

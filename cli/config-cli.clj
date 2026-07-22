@@ -91,9 +91,9 @@
   (let [env (System/getenv "CLAUDE_NO_AUTHORING_HOOKS")]
     (cond
       (#{"0" "false"} env) "env force-live — guards LIVE (state ignored this session)"
-      (and env (not (str/blank? env))) "ENGAGED via env (this session) — ALL GUARDS OFF"
+      (and env (not (str/blank? env))) "ENGAGED via env (this session) — authoring guards OFF; dispatch topology unchanged"
       :else (if (= "off" (get' "guards" ""))
-              "ENGAGED via state — ALL GUARDS OFF (north config guards on restores)"
+              "ENGAGED via state — authoring guards OFF; dispatch topology unchanged (north config guards on restores)"
               "off — guards LIVE"))))
 
 (defn today []
@@ -437,7 +437,7 @@
  5  GUARDS     authoring-guard hooks           kill-switch: " (effective-ks) "
     " (wired "agent-spawn-guard") " agent-spawn-guard   " (wired "code-upstream-guard") " upstream:graph   " (wired "firn-guard") " firn
     " (wired "tripwire-guard") " tripwire            " (wired "racket-build-guard") " racket-build      " (wired "beagle-session-start") " beagle-session
-    [live]   flip all → north config guards on|off   (persists, all sessions)
+    [live]   flip authoring guards → north config guards on|off   (persists, all sessions; dispatch remains independent)
     [launch] one session → CLAUDE_NO_AUTHORING_HOOKS=1 claude   (launch ONLY — mid-session flip impossible; per-command prefix does nothing; 0/false forces guards live)
 
  6  ROUTING    provider targets + entitlement envelopes
@@ -521,10 +521,11 @@
    [launch] env override — single session, launch ONLY; mid-session flip
    impossible; per-command env prefix does nothing (claude reads it at
    start, then frozen for the session):
-     CLAUDE_NO_AUTHORING_HOOKS=1 claude     all guards OFF this session
+     CLAUDE_NO_AUTHORING_HOOKS=1 claude     authoring guards OFF this session; dispatch unchanged
      CLAUDE_NO_AUTHORING_HOOKS=0 claude     force-live (state ignored)
    Any non-empty value other than 0/false kills guards; 0 or false forces
-   them live. Env beats state. Semantics live in the shared lib sourced by
+   them live. This never changes native-vs-North agent topology; `north config
+   dispatch` owns that independent axis. Env beats state. Semantics live in the shared lib sourced by
    every guard hook AND by this verb:
      ~/.claude/hooks/lib/authoring-killswitch.sh
 

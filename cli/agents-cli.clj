@@ -28,6 +28,8 @@
 (def STRUGGLE-POLICY-CLI (str NORTH "/sdk/src/struggle.ts"))
 (def PROVIDER-CAPABILITY-ADMISSION-CLI
   (str NORTH "/sdk/src/provider-capability-admission-cli.ts"))
+(def ROUTING-ECONOMICS-PREFLIGHT-CLI
+  (str NORTH "/sdk/src/routing-economics-preflight-cli.ts"))
 (def POLICY-BUN (or (System/getenv "NORTH_POLICY_BUN") "bun"))
 (def PROVIDER-CAPABILITY-ADMISSION-SCHEMA
   "north:provider-capability-admission:v1")
@@ -863,7 +865,9 @@
    "--domain" :domain "--topology" :topology "--tier" :tier "--reasoning" :reasoning
    "--deliberation" :reasoning "--posture" :posture "--composition" :composition
    "--rationale" :rationale "--nearest" :nearest "--contract" :contract
-   "--override-reason" :overrideReason})
+   "--override-reason" :overrideReason "--model" :model
+   "--assessment" :assessment "--routing-assessment" :assessment
+   "--pin-evidence" :pinEvidence})
 
 (defn cmd-spawn-help []
   (let [roles (sort (keys (or (gaffer-routing) {})))]
@@ -896,6 +900,10 @@
     (println "Routing and control:")
     (println "  --provider auto|anthropic|openai   provider preference (default auto)")
     (println "  --target ACCOUNT                  exact account pin; unavailable means no fallback")
+    (println "  --model MODEL                     exact model pin")
+    (println "  --assessment JSON|@file           canonical Gaffer selection-assessment sidecar")
+    (println "  --pin-evidence JSON|@file         typed reason + <=24h expiry for provider/account/model pins")
+    (println "  New explicit pins fail closed without --pin-evidence; reasoning=max requires --assessment.")
     (println "  --domain D[,D...]                 repeatable domain requirement")
     (println "  --reasoning low|medium|high|xhigh|max  (--deliberation is an alias)")
     (println "  --notify PEER                     completion/stall notifications")
@@ -936,6 +944,31 @@
         (json/parse-string source true))
       (catch Exception e
         (println (red (str label " must be valid JSON or @file: " (.getMessage e))))
+        (System/exit 1)))))
+
+(defn- preflight-routing-economics!
+  [routing-metadata routing-assessment pin-evidence provider target model]
+  (let [payload (cond-> {:routingMetadata routing-metadata}
+                  routing-assessment (assoc :routingAssessment routing-assessment)
+                  pin-evidence (assoc :pinEvidence pin-evidence)
+                  provider (assoc :provider provider)
+                  target (assoc :target target)
+                  model (assoc :model model))
+        result (run [POLICY-BUN "run" ROUTING-ECONOMICS-PREFLIGHT-CLI]
+                    :timeout 10000 :in (json/generate-string payload))]
+    (when-not (:ok result)
+      (let [message (str/trim (str (:err result)
+                                   (when (and (seq (:err result)) (seq (:out result))) "\n")
+                                   (:out result)))]
+        (println (red (if (seq message) message "routing economics preflight failed")))
+        (System/exit 1)))
+    (try
+      (let [receipt (json/parse-string (str/trim (:out result)) true)]
+        (when-not (= 1 (:version receipt))
+          (throw (ex-info "missing immutable admission receipt" {})))
+        receipt)
+      (catch Exception _
+        (println (red "routing economics preflight returned an invalid admission receipt"))
         (System/exit 1)))))
 
 (defn- resolved-spawn-topology
@@ -1051,13 +1084,16 @@
 
 (defn cmd-spawn [args]
   (north.topology-authority/require-coordination! "spawn")
-  (let [{:keys [dry? notify provider target taskGrade domains topology tier reasoning posture composition
-                rationale nearest contract overrideReason promotion-specified? promotionCandidate positionals]}
+  (let [{:keys [dry? notify provider target model taskGrade domains topology tier reasoning posture composition
+                assessment pinEvidence rationale nearest contract overrideReason
+                promotion-specified? promotionCandidate positionals]}
         (parse-spawn-args args)
         [invoked-role prompt & extra] positionals
         catalog (gaffer-catalog)
         dt (or (gaffer-routing) {})
         raw-supplied-composition (parse-json-input "--composition" composition)
+        routing-assessment (parse-json-input "--assessment" assessment)
+        pin-evidence (parse-json-input "--pin-evidence" pinEvidence)
         override-reason-conflict
         (and (= "preset" (:kind raw-supplied-composition))
              overrideReason
@@ -1141,7 +1177,7 @@
         contract-fields (when (map? (:contract selected-composition)) (set (keys (:contract selected-composition))))]
     (cond
       (or (nil? invoked-role) (nil? prompt) (seq extra))
-      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--task-grade G] [--domain D] [--topology T] [--tier T] [--reasoning R] [--posture P] [--override-reason WHY] [--composition JSON|@file] [--rationale WHY] [--nearest PRESET] [--contract JSON|@file] [--promotion-candidate|--no-promotion-candidate] [--provider P] [--target ACCOUNT] [--notify PEER] [--dry-run]")
+      (do (println (red "usage:") "north spawn <role> \"<prompt>\" [--task-grade G] [--domain D] [--topology T] [--tier T] [--reasoning R] [--posture P] [--override-reason WHY] [--composition JSON|@file] [--assessment JSON|@file] [--rationale WHY] [--nearest PRESET] [--contract JSON|@file] [--promotion-candidate|--no-promotion-candidate] [--provider P] [--target ACCOUNT] [--model MODEL] [--pin-evidence JSON|@file] [--notify PEER] [--dry-run]")
           (println "unknown roles are first-class bespoke compositions: rationale and structured contract are required; --nearest is optional and promotion defaults false")
           (println "roles:" (str/join " " (sort (keys dt)))))
       (#{"orchestrator" "worker"} invoked-role)
@@ -1244,24 +1280,34 @@
       capability-problem
       (do (println (red capability-problem)) (System/exit 1))
       :else
-      (do
-        (require-pinned-provider-capabilities!
-         provider target normalized-selected-capabilities)
-        (let [struggle-policy (resolve-struggle-policy! selected-topology)
-            model (:model base) synthetic-effort (:effort base) synthetic-reasoning (:reasoning base)
-            gaffer-preset (:gaffer-preset base) semantic (:semantic base)
-            delegate-binding (when *delegate-request*
-                               (resolve-delegate-thread! *delegate-request* dry?))
-            effective-prompt (if delegate-binding
-                               (delegate-brief *delegate-request* delegate-binding)
-                               prompt)
-            canonical-contract (when bespoke?
+      (let [canonical-contract (when bespoke?
                                  (canonical-bespoke-contract (:contract selected-composition)))
             contract-sha256 (when canonical-contract
                               (bespoke-contract-sha256 (:contract selected-composition)))
             spawn-composition (if bespoke?
                                 (assoc selected-composition :contract canonical-contract)
                                 selected-composition)
+            routing-metadata {:role selected-role :taskGrade selected-grade
+                              :domainRequirements selected-domains :topology selected-topology
+                              :tier selected-tier :reasoning selected-reasoning
+                              :posture selected-posture :composition spawn-composition}
+            _receipt (preflight-routing-economics!
+                      routing-metadata routing-assessment pin-evidence provider target model)
+            _capabilities (require-pinned-provider-capabilities!
+                           provider target normalized-selected-capabilities)
+            struggle-policy (resolve-struggle-policy! selected-topology)
+            catalog-model (:model base)
+            effective-model (or model
+                                (when (and (not (:semantic base))
+                                           (not (:gaffer-preset base)))
+                                  catalog-model))
+            synthetic-effort (:effort base) synthetic-reasoning (:reasoning base)
+            gaffer-preset (:gaffer-preset base) semantic (:semantic base)
+            delegate-binding (when *delegate-request*
+                               (resolve-delegate-thread! *delegate-request* dry?))
+            effective-prompt (if delegate-binding
+                               (delegate-brief *delegate-request* delegate-binding)
+                               prompt)
             aid (north.spawn-process/create-agent-id "lane")
             env (cond-> {"AGENT_ID" aid
                          "NORTH_STRUGGLE_POLICY_EXPECTED" (:canonical struggle-policy)}
@@ -1273,10 +1319,12 @@
                   selected-role (assoc "AGENT_ROLE" selected-role)
                   selected-posture (assoc "AGENT_POSTURE" selected-posture)
                   spawn-composition (assoc "AGENT_COMPOSITION" (json/generate-string spawn-composition))
-                  (and (not semantic) (not gaffer-preset) model) (assoc "AGENT_MODEL" model)
+                  effective-model (assoc "AGENT_MODEL" effective-model)
                   selected-reasoning (assoc "AGENT_REASONING" selected-reasoning "AGENT_EFFORT" selected-reasoning)
                   provider (assoc "AGENT_PROVIDER" provider)
                   target (assoc "AGENT_TARGET" target)
+                  routing-assessment (assoc "AGENT_ROUTING_ASSESSMENT" (json/generate-string routing-assessment))
+                  pin-evidence (assoc "NORTH_ROUTING_PIN_EVIDENCE" (json/generate-string pin-evidence))
                   notify (assoc "AGENT_COORDINATOR" notify)
                   delegate-binding (assoc "NORTH_DELEGATE_THREAD_ID" (:id delegate-binding)))
             immediate-coordinator (or notify (System/getenv "AGENT_ID")
@@ -1285,10 +1333,12 @@
                        (into {} (System/getenv)) immediate-coordinator env)
             spawn-ts (str NORTH "/sdk/src/spawn.ts")
             display-env (cond-> (dissoc env "NORTH_STRUGGLE_POLICY_EXPECTED")
-                          bespoke? (assoc "AGENT_COMPOSITION" "REDACTED_BESPOKE_CONTRACT"))
+                          bespoke? (assoc "AGENT_COMPOSITION" "REDACTED_BESPOKE_CONTRACT")
+                          routing-assessment (assoc "AGENT_ROUTING_ASSESSMENT" "RECORDED")
+                          pin-evidence (assoc "NORTH_ROUTING_PIN_EVIDENCE" "RECORDED"))
             envs (str/join " " (map (fn [[k v]] (str k "=" v)) (sort display-env)))
             dry-route (dry-resolved-route provider selected-tier
-                                          (when (and (not semantic) (not gaffer-preset)) model)
+                                          effective-model
                                           selected-reasoning)
             fallback-base (into {} (remove (comp nil? val)
                                            {"kind" "lane" "role" selected-role
@@ -1381,7 +1431,7 @@
                 (do
                   (binding [*out* *err*]
                     (println (red (north.spawn-process/failure-message startup))))
-                  (System/exit 1)))))))))))
+                  (System/exit 1))))))))))
 
 ;; delegate = the ONE handoff verb. The intelligent intake boundary must classify
 ;; dependency shape explicitly: one terminal Gaffer role for atomic work, or a

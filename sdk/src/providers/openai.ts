@@ -771,6 +771,10 @@ class CodexQuery implements AgentQuery {
     private admittedManagedLaunch?: ManagedCodexLaunchReceipt,
   ) {}
 
+  get executionTransport(): "codex-app-server" | "codex-cli" {
+    return this.options?.northCapabilities !== undefined ? "codex-app-server" : "codex-cli";
+  }
+
   supportsInFlightEscalation(): boolean { return false; }
 
   async interrupt(): Promise<void> {

@@ -141,6 +141,7 @@ north — your one card. Type a command to do the thing next to it.
     north templates                    Gaffer's reusable stock templates and routing defaults
     north routing report performance  current managed evidence  (--all = legacy/incomplete history)
     north routing report usage        provider work usage (never dollars / API credits)
+    north routing report economics    bounded routing-cost signals + alert-only policy findings
     north routing report promotions   bespoke patterns for stock-template review
     north routing report calibration  run-local judgment/struggle detector cohorts
     north schema                       the fact vocabulary in use
@@ -170,6 +171,8 @@ north — your one card. Type a command to do the thing next to it.
       --taskGrade/--domain              independently override stock staffing axes
       --topology                        bespoke compositions only; stock topology is fixed
       --tier/--reasoning/--posture      capability, deliberation, and posture
+      --assessment JSON|@file           canonical Gaffer selection sidecar (required for max)
+      --pin-evidence JSON|@file         typed reason + <=24h expiry for any exact pin
       --rationale "why"                 required for a bespoke role
     (agents dispatch via MCP)          in-harness agents call mcp__north__dispatch / spawn
 

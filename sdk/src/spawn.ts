@@ -10,7 +10,7 @@ import {
   provisionWorktree, rollbackProvisionedWorktree, worktreeFinalize, worktreePayload,
 } from "./worktree";
 import { normalizeUsage } from "./usage";
-import { newRunId, recordRun } from "./telemetry";
+import { classifyTurnProvenance, newRunId, recordRun } from "./telemetry";
 import { causeChain, deathReason, notifyDeath } from "./death";
 import { inputChannel, subscribeFeed } from "./coordination";
 import {
@@ -56,6 +56,10 @@ import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal, EMPTY_RESULT_OUTCOME, isEmptyResultTerminal } from "./execution-outcome";
 import { ManagedLiveInputRoute } from "./live-input-route";
 import {
+  admitRoutingEconomics, type AdmittedRoutingEconomics,
+  type RoutingAssessment, type RoutingPinEvidence,
+} from "./routing-economics";
+import {
   notifyTerminalSettlement, TerminalPublicationBudget, type TerminalNotification,
 } from "./terminal-notification";
 import { assessThreadDelivery, type DeliveryAssessment } from "./delivery-verification";
@@ -91,6 +95,10 @@ export interface SpawnOptions {
   target?: string;
   tier?: SemanticTier;
   routingMetadata: RoutingRequest;
+  /** Gaffer-owned minimum-sufficient assessment; separate from the eight-field request. */
+  routingAssessment?: RoutingAssessment;
+  /** North-owned evidence for explicit provider/account/model pins. */
+  pinEvidence?: RoutingPinEvidence;
   project?: string;
   sessionId?: string;
   worktree?: boolean; // OPT-IN: provision an isolated per-lane git worktree (own index+tree); default OFF => zero behavior change
@@ -117,6 +125,7 @@ const SPAWN_OPTION_FIELDS = new Set([
   "prompt", "agentId", "model", "effort", "tools", "systemPrompt", "maxTurns",
   "role", "posture", "thread", "caveman", "coordinator", "provider",
   "target", "tier", "routingMetadata", "project", "sessionId", "worktree", "setupCmd",
+  "routingAssessment", "pinEvidence",
 ]);
 
 function allowlistedSpawnOptions(value: SpawnOptions): SpawnOptions {
@@ -146,7 +155,15 @@ interface ManagedWorktreeLease {
   finalized: boolean;
 }
 
-function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetadata: RoutingRequest } {
+// Only the executable bootstrap can classify selectors inherited from a
+// serialized pre-evidence envelope as legacy. Programmatic callers cannot opt
+// themselves into the compatibility warning path.
+let bootstrapLegacyPinCompatibilityGranted = false;
+
+function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & {
+  routingMetadata: RoutingRequest;
+  routingEconomics: AdmittedRoutingEconomics;
+} {
   const routingMetadata = admitRoutingRequest(
     opts.routingMetadata ?? {}, "managed North spawn",
   );
@@ -164,9 +181,22 @@ function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetada
       );
     }
   }
+  const routingEconomics = admitRoutingEconomics({
+    request: routingMetadata,
+    routingAssessment: opts.routingAssessment,
+    pinEvidence: opts.pinEvidence,
+    provider: opts.provider,
+    target: opts.target,
+    model: opts.model,
+    allowLegacyMissingPinEvidence: bootstrapLegacyPinCompatibilityGranted,
+    surface: "managed North spawn routing economics",
+  });
   return {
     ...opts,
     routingMetadata,
+    routingAssessment: routingEconomics.assessment,
+    pinEvidence: routingEconomics.pinEvidence,
+    routingEconomics,
     role: routingMetadata.role,
     tier: routingMetadata.tier,
     effort: routingMetadata.reasoning as Effort | undefined,
@@ -175,7 +205,10 @@ function composeSpawnOptions(opts: SpawnOptions): SpawnOptions & { routingMetada
 }
 
 async function runSpawn(
-  opts: SpawnOptions & { routingMetadata: RoutingRequest },
+  opts: SpawnOptions & {
+    routingMetadata: RoutingRequest;
+    routingEconomics: AdmittedRoutingEconomics;
+  },
   judgmentGrade: JudgmentGradeSnapshot,
   strugglePolicy: StrugglePolicy,
   envelopeAdmission?: EnvelopeAdmission,
@@ -337,6 +370,7 @@ async function runSpawn(
     },
   ));
   let queryCloseError: unknown;
+  let activeExecutionQuery: AgentQuery | undefined;
 
   // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
   // (OOM SIGKILL / parent SIGTERM / idle Transport-closed) readMessages() THROWS exitError
@@ -418,6 +452,7 @@ async function runSpawn(
     prompt: ch.stream(),
     options: agentOptions,
   });
+  activeExecutionQuery = activeQuery;
   termination.attachQuery(activeQuery);
   const watched = withStallWatchdog((activeQuery as AsyncIterable<any>)[Symbol.asyncIterator](), {
     stallMs: window,
@@ -784,6 +819,16 @@ async function runSpawn(
     envelopeRetries: envelopeAdmission?.retries,
     envelopeAdvisories: envelopeAdmission?.advisories,
     routingMetadata,
+    routingAssessment: opts.routingEconomics.assessment,
+    routingAdmissionReceipt: opts.routingEconomics.receipt,
+    routingPinEvidence: opts.routingEconomics.pinEvidence,
+    executionSource: "north-managed",
+    executionTransport: activeExecutionQuery?.executionTransport
+      ?? (routing.provider === "anthropic" ? "anthropic-agent-sdk" : undefined),
+    providerSessionPersistence: "unknown",
+    northSessionId: opts.sessionId,
+    threadProvenance: opts.thread ? "exact" : "ad-hoc",
+    turnProvenance: classifyTurnProvenance(resultMsg, terminal.processOutcome),
     promptComposition: admittedRoute?.evidence ?? injectedCompositionEvidence,
     effectiveAuthority: admittedRoute?.authority,
     tokenUsage,
@@ -868,6 +913,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   // Pin the generated id so admission, telemetry, and the provider run name the
   // same lane. Admission completes before entitlement refresh or provider query.
   composed.agentId = agentId;
+  composed.sessionId = composed.sessionId ?? context.sessionId;
   // Explicit isolation is an admission requirement, not a preference. Provision
   // before clocks, resource reservations, provider probes, stream/identity facts,
   // run reservations, or the provider query. A failure rejects this spawn and can
@@ -954,6 +1000,7 @@ if (import.meta.main) {
   // Caller authority was enforced by the invoking adapter before it composed
   // this process's env with the child identity — see bootstrapAuthorityGranted.
   bootstrapAuthorityGranted = true;
+  bootstrapLegacyPinCompatibilityGranted = true;
   const prompt = process.argv.slice(2).join(" ");
   if (!prompt) {
     console.error("usage: bun run src/spawn.ts <prompt>");
@@ -982,6 +1029,10 @@ if (import.meta.main) {
     thread: delegateThread,
     coordinator: process.env.AGENT_COORDINATOR,
     routingMetadata: routingRequestFromEnv("managed North spawn bootstrap"),
+    routingAssessment: process.env.AGENT_ROUTING_ASSESSMENT
+      ? JSON.parse(process.env.AGENT_ROUTING_ASSESSMENT) : undefined,
+    pinEvidence: process.env.NORTH_ROUTING_PIN_EVIDENCE
+      ? JSON.parse(process.env.NORTH_ROUTING_PIN_EVIDENCE) : undefined,
   })
     .then((result) => console.log(result))
     .catch((err) => {
