@@ -4,8 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
-  assertCoordinationAuthority, assertManagedChildTopology,
-  TopologyAuthorityError, TopologyDepthError,
+  assertCoordinationAuthority, TopologyAuthorityError,
 } from "../src/topology-authority";
 import { sendPeerCommand, validatePeerCommandArgs } from "../src/harness";
 import { presetRequest } from "./routing-fixtures";
@@ -100,73 +99,6 @@ test("authority is ambient only for top-level sessions and otherwise fail-closed
   }
 });
 
-test("managed depth permits top-level orchestration and orchestrator workers only", () => {
-  expect(() =>
-    assertManagedChildTopology("spawn", "orchestrator", undefined)
-  ).not.toThrow();
-  expect(() =>
-    assertManagedChildTopology("spawn", "worker", "orchestrator")
-  ).not.toThrow();
-  let error: unknown;
-  try {
-    assertManagedChildTopology("spawn", "orchestrator", "orchestrator");
-  } catch (caught) {
-    error = caught;
-  }
-  expect(error).toBeInstanceOf(TopologyDepthError);
-  expect(error).toMatchObject({
-    code: "NORTH_TOPOLOGY_DEPTH_DENIED",
-    operation: "spawn",
-    callerTopology: "orchestrator",
-    childTopology: "orchestrator",
-    preSideEffect: true,
-  });
-});
-
-test("raw SDK spawn and dispatch enforce the composed child topology before side effects", async () => {
-  process.env.AGENT_TOPOLOGY = "orchestrator";
-  let providerCalls = 0;
-  let driverCalls = 0;
-  const { spawn } = await import("./support/spawn");
-  await expect(spawn({
-    prompt: "must remain two tiers",
-    role: "director",
-    routingMetadata: presetRequest("director"),
-    queryFn: () => {
-      providerCalls++;
-      return { async *[Symbol.asyncIterator]() {} } as any;
-    },
-  })).rejects.toMatchObject({
-    code: "NORTH_TOPOLOGY_DEPTH_DENIED",
-    operation: "spawn",
-    preSideEffect: true,
-  });
-
-  const { dispatch } = await import("./support/dispatch");
-  await expect(dispatch("depth-cap-thread", {
-    routingMetadata: presetRequest("director"),
-    loadThreadFacts: () => [
-      { predicate: "title", value: "Depth cap" },
-      { predicate: "repo", value: resolve(import.meta.dir, "../..") },
-    ],
-    loadChildren: () => [],
-    claimDriver: (() => {
-      driverCalls++;
-      return { release() {} };
-    }) as any,
-    queryFn: () => {
-      providerCalls++;
-      return { async *[Symbol.asyncIterator]() {} } as any;
-    },
-  })).rejects.toMatchObject({
-    code: "NORTH_TOPOLOGY_DEPTH_DENIED",
-    operation: "dispatch",
-    preSideEffect: true,
-  });
-  expect(providerCalls).toBe(0);
-  expect(driverCalls).toBe(0);
-});
-
 test("raw SDK spawn and dispatch reject workers before admission, driver, or provider boundaries", async () => {
   const previous = process.env.AGENT_TOPOLOGY;
   const previousIdentityRedirect = process.env.NORTH_IDENTITY_TEST_REDIRECT;
@@ -226,6 +158,52 @@ test("raw SDK spawn and dispatch reject workers before admission, driver, or pro
     else process.env.NORTH_BIN = previousNorthBin;
     if (previousNorthPort === undefined) delete process.env.NORTH_PORT;
     else process.env.NORTH_PORT = previousNorthPort;
+  }
+});
+
+test("raw recursive SDK spawn requires an exact fresh child thread binding before admission", async () => {
+  const previous = {
+    topology: process.env.AGENT_TOPOLOGY,
+    thread: process.env.NORTH_THREAD_ID,
+    run: process.env.NORTH_RUN_ID,
+    capability: process.env.NORTH_RUN_CAPABILITY,
+  };
+  process.env.AGENT_TOPOLOGY = "orchestrator";
+  process.env.NORTH_THREAD_ID = "parent-thread";
+  process.env.NORTH_RUN_ID = "run-parent";
+  process.env.NORTH_RUN_CAPABILITY = "cap-parent";
+  try {
+    const { spawn } = await import("./support/spawn");
+    const request = {
+      prompt: "recursive probe",
+      routingMetadata: presetRequest("verifier"),
+      admitBillableClock: () => {
+        throw new Error("admission must not run");
+      },
+    };
+    await expect(spawn(request)).rejects.toMatchObject({
+      code: "NORTH_RECURSIVE_CHILD_BINDING_REQUIRED",
+      preSideEffect: true,
+    });
+    await expect(spawn({
+      ...request,
+      thread: "parent-thread",
+      loadThreadFacts: () => [],
+    })).rejects.toThrow("cannot reuse the parent thread");
+    await expect(spawn({
+      ...request,
+      thread: "child-thread",
+      loadThreadFacts: () => [{ predicate: "part_of", value: "@other-thread" }],
+    })).rejects.toThrow("exactly one child part_of link");
+  } finally {
+    if (previous.topology === undefined) delete process.env.AGENT_TOPOLOGY;
+    else process.env.AGENT_TOPOLOGY = previous.topology;
+    if (previous.thread === undefined) delete process.env.NORTH_THREAD_ID;
+    else process.env.NORTH_THREAD_ID = previous.thread;
+    if (previous.run === undefined) delete process.env.NORTH_RUN_ID;
+    else process.env.NORTH_RUN_ID = previous.run;
+    if (previous.capability === undefined) delete process.env.NORTH_RUN_CAPABILITY;
+    else process.env.NORTH_RUN_CAPABILITY = previous.capability;
   }
 });
 

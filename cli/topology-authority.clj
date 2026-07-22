@@ -22,18 +22,6 @@
       (str "coordination authority denied: " operation
            " requires orchestrator topology; current topology is " topology))))
 
-(defn managed-child-topology-problem
-  "A top-level caller may create the one orchestrator tier. A managed
-  orchestrator may create terminal workers only; allowing another orchestrator
-  would silently grow a third tier. Worker callers are rejected separately by
-  require-coordination!/authority-problem before routing is composed."
-  [operation effective-child-topology]
-  (when (and (= "orchestrator" (current-topology))
-             (= "orchestrator" effective-child-topology))
-    (str "coordination depth denied: " operation
-         " from an orchestrator may create worker topology only; "
-         "managed depth stops at orchestrator -> worker")))
-
 (defn require-coordination! [operation]
   (when-let [problem (authority-problem operation)]
     (throw (ex-info problem
@@ -41,17 +29,6 @@
                      :north/error :topology-authority-denied
                      :operation operation
                      :topology (current-topology)
-                     :pre-side-effect true}))))
-
-(defn require-managed-child-topology! [operation effective-child-topology]
-  (when-let [problem
-             (managed-child-topology-problem operation effective-child-topology)]
-    (throw (ex-info problem
-                    {::denied true
-                     :north/error :topology-depth-denied
-                     :operation operation
-                     :caller-topology (current-topology)
-                     :child-topology effective-child-topology
                      :pre-side-effect true}))))
 
 (defn require-self-agent!

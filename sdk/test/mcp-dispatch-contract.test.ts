@@ -75,10 +75,6 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
     AGENT_COMPOSITION: "{\"kind\":\"ambient\"}",
     AGENT_TASK_GRADE: "novice",
     AGENT_DOMAIN_REQUIREMENTS: "[\"ambient\"]",
-    AGENT_TOPOLOGY: "orchestrator",
-    NORTH_RUN_ID: "run-parent",
-    NORTH_THREAD_ID: "thread-parent",
-    NORTH_RUN_CAPABILITY: "parent-capability",
     NORTH_STRUGGLE_POLICY_EXPECTED: "ambient-policy-must-not-leak",
   });
   configure(home, env);
@@ -606,7 +602,7 @@ test("raw MCP rejects non-contract Gaffer fields and verifier-as-topology before
   }
 });
 
-test("managed MCP launch depth stops at orchestrator to worker for every composition shape", () => {
+test("managed MCP admits recursive orchestrator shapes but requires an exact parent reservation", () => {
   const north = resolve(import.meta.dir, "../..");
   const orchestratorContract = {
     responsibility: "coordinate a bounded migration",
@@ -622,8 +618,9 @@ test("managed MCP launch depth stops at orchestrator to worker for every composi
     {
       ...presetRequest("director"),
       tier: "senior",
+      reasoning: "high",
       composition: {
-        kind: "preset", id: "director", overrides: ["tier"],
+        kind: "preset", id: "director", overrides: ["tier", "reasoning"],
         overrideReason: "bounded coordination does not require frontier tier",
       },
     },
@@ -648,7 +645,7 @@ test("managed MCP launch depth stops at orchestrator to worker for every composi
   for (const name of ["spawn", "dispatch"]) {
     for (const shape of shapes) {
       const arguments_ = name === "spawn"
-        ? { prompt: "must remain two tiers", ...shape }
+        ? { prompt: "managed recursive orchestration", ...shape }
         : { id: "depth-cap-thread", ...shape };
       const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
         input: `${JSON.stringify({
@@ -666,8 +663,11 @@ test("managed MCP launch depth stops at orchestrator to worker for every composi
       expect(result.status).toBe(0);
       const response = JSON.parse(result.stdout.trim());
       expect(response.result.isError).toBe(true);
+      expect(response.result.content[0].text).not.toContain("coordination depth denied");
       expect(response.result.content[0].text).toContain(
-        `coordination depth denied: ${name} from an orchestrator may create worker topology only`,
+        name === "spawn"
+          ? "exact parent run/thread reservation"
+          : "could not establish the active driver",
       );
     }
   }

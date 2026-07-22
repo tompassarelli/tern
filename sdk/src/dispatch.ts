@@ -44,9 +44,7 @@ import {
   admitResourceEnvelope, completeResourceEnvelope, envelopeContextFromEnv,
   reserveResourceEnvelopeRetry, ResourceEnvelopeExceededError, type EnvelopeAdmission,
 } from "./resource-envelopes";
-import {
-  assertCoordinationAuthority, assertManagedChildTopology,
-} from "./topology-authority";
+import { assertCoordinationAuthority } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal, EMPTY_RESULT_OUTCOME, isEmptyResultTerminal } from "./execution-outcome";
 import {
@@ -854,11 +852,6 @@ export async function dispatch(
     allowLegacyMissingPinEvidence: bootstrapLegacyPinCompatibilityGranted,
     surface: "managed North dispatch routing economics",
   });
-  if (!bootstrapAuthorityGranted) {
-    assertManagedChildTopology(
-      "dispatch", routingMetadata.topology, callerTopology,
-    );
-  }
   // The detector policy is an admission input: reject malformed overrides before
   // any graph claim, clock, resource envelope, or provider-selection side effect.
   const strugglePolicy = resolveStrugglePolicy(routingMetadata.topology!);

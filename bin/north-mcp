@@ -425,6 +425,31 @@
       (not-empty (get env "AGENT_ID"))
       (not-empty (get env "NORTH_AGENT_ID"))))
 
+(declare canonical-north-thread-id)
+
+(defn bind-recursive-child-thread [prompt parent-env]
+  (when (= "orchestrator" (north.topology-authority/current-topology))
+    (let [{:keys [out err exit]}
+          (proc/sh {:env parent-env}
+                   "bb" (str root "/cli/agents-cli.clj")
+                   "bind-child-thread" prompt)
+          parsed (when (zero? exit)
+                   (try (json/parse-string (str/trim out))
+                        (catch Exception _ nil)))
+          thread (get parsed "thread")
+          parent (get parsed "parent")]
+      (when-not (and (= #{"parent" "thread"} (set (keys parsed)))
+                     (canonical-north-thread-id thread)
+                     (canonical-north-thread-id parent))
+        (throw (ex-info
+                (or (not-empty (str/trim
+                                (str out (when-not (str/blank? err)
+                                           (str "\n" err)))))
+                    "recursive child thread binding unavailable")
+                {:north/error :recursive-child-thread-unavailable
+                 :pre-side-effect true})))
+      {:thread thread :parent parent})))
+
 ;; A child request owns every managed routing axis. Starting from the parent
 ;; process environment without removing these lets a director's composition or
 ;; account pin contaminate a role-only worker request. Capture coordinator
@@ -629,9 +654,6 @@
         preset (get gaffer-presets-by-name canonical-role)
         effective-capabilities (if known-role? (get preset "capabilities") contract-capabilities)
         effective-topology topology
-        depth-problem
-        (north.topology-authority/managed-child-topology-problem
-         nm effective-topology)
         capability-problem (when (and effective-topology (sequential? effective-capabilities))
                              (topology-capability-problem effective-topology effective-capabilities))
         base-posture (or (get preset "posture") (get-in gaffer-staffing ["defaults" "posture"]))
@@ -675,7 +697,6 @@
       (and role known-role? (not= topology (get preset "topology")))
       (str "stock-template topology is fixed at '" (get preset "topology")
            "'; use a bespoke composition for '" topology "'")
-      depth-problem depth-problem
       (not (some #{tier} tier-values)) "invalid tier"
       (not (some #{reasoning} reasoning-values)) "invalid reasoning"
       route-problem route-problem
@@ -890,6 +911,7 @@
             worktree (get args "worktree")
             setup-cmd (get args "setupCmd")
             agent-id (create-mcp-agent-id "spawn")
+            recursive-binding (bind-recursive-child-thread prompt parent-env)
             cmd-env (cond-> (assoc env "AGENT_ID" agent-id)
                       model       (assoc "AGENT_MODEL" model)
                       reasoning   (assoc "AGENT_REASONING" reasoning "AGENT_EFFORT" reasoning)
@@ -908,6 +930,9 @@
                       caveman     (assoc "AGENT_CAVEMAN" caveman)
                       worktree    (assoc "AGENT_WORKTREE" "1")
                       setup-cmd   (assoc "AGENT_SETUP_CMD" setup-cmd)
+                      recursive-binding
+                      (assoc "NORTH_DELEGATE_THREAD_ID"
+                             (:thread recursive-binding))
                       coordinator (assoc "AGENT_COORDINATOR" coordinator))]
         (try
           (let [log (io/file (str (get parent-env "HOME") "/.local/state/north/agents/" agent-id ".log"))
@@ -915,6 +940,9 @@
                 startup (await-sdk-startup process agent-id log)
                 suffix (str (when model (str " model=" model))
                             (when target (str " target=" target))
+                            (when recursive-binding
+                              (str " thread=@" (:thread recursive-binding)
+                                   " part_of=@" (:parent recursive-binding)))
                             (when coordinator (str " coordinator=" coordinator)))]
             (if (startup-success? startup)
               {:content [{:type "text"
@@ -985,7 +1013,11 @@
 
 (defn call-tool [nm args]
   (if-let [st (find-sdk-tool nm)]
-    (call-sdk nm (or args {}))
+    (try
+      (call-sdk nm (or args {}))
+      (catch Exception error
+        {:content [{:type "text" :text (bound-tool-error (.getMessage error))}]
+         :isError true}))
     (if-let [t (find-tool nm)]
       (let [arguments (or args {})]
         (if-let [problem (when-let [argument-problem (:argument-problem t)]

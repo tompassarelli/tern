@@ -1080,7 +1080,7 @@
       :else nil)))
 
 (def ^:dynamic *delegate-request* nil)
-(declare resolve-delegate-thread! delegate-brief)
+(declare resolve-delegate-thread! resolve-recursive-child-thread! delegate-brief)
 
 (defn cmd-spawn [args]
   (north.topology-authority/require-coordination! "spawn")
@@ -1126,9 +1126,6 @@
         selected-grade (or taskGrade preset-grade)
         selected-tier (or tier preset-tier)
         selected-topology (or topology preset-topology)
-        depth-problem
-        (north.topology-authority/managed-child-topology-problem
-         "spawn" selected-topology)
         selected-role (if bespoke? invoked-role (or preset-role invoked-role))
         selected-posture (or posture preset-posture (:posture (:defaults catalog)))
         selected-reasoning (or reasoning preset-deliberation)
@@ -1230,8 +1227,6 @@
       (do (println (red (str "invalid taskGrade: " selected-grade))) (System/exit 1))
       (not (some #{selected-topology} (get-in catalog [:vocabulary :topologies])))
       (do (println (red (str "invalid topology: " selected-topology))) (System/exit 1))
-      depth-problem
-      (do (println (red depth-problem)) (System/exit 1))
       (not (some #{selected-tier} (get-in catalog [:vocabulary :semanticTiers])))
       (do (println (red (str "invalid tier: " selected-tier))) (System/exit 1))
       (not (some #{selected-reasoning} (get-in catalog [:vocabulary :deliberations])))
@@ -1303,8 +1298,13 @@
                                   catalog-model))
             synthetic-effort (:effort base) synthetic-reasoning (:reasoning base)
             gaffer-preset (:gaffer-preset base) semantic (:semantic base)
-            delegate-binding (when *delegate-request*
-                               (resolve-delegate-thread! *delegate-request* dry?))
+            delegate-binding (cond
+                               *delegate-request*
+                               (resolve-delegate-thread! *delegate-request* dry?)
+
+                               (= "orchestrator"
+                                  (north.topology-authority/current-topology))
+                               (resolve-recursive-child-thread! prompt dry?))
             effective-prompt (if delegate-binding
                                (delegate-brief *delegate-request* delegate-binding)
                                prompt)
@@ -1595,6 +1595,51 @@
             (delegate-die "captured delegate thread failed exact title/commit readback"))
           (assoc thread :source :captured))))))
 
+(defn- capture-recursive-child-thread! [task parent]
+  (let [captured (capture-delegate-thread! task)
+        child (:id captured)
+        linked (run [NORTH-CLI "tell" child "part_of" parent] :timeout 10000)]
+    (when-not (:ok linked)
+      ;; The provider has not started. Preserve the failed capture as an honest
+      ;; terminal coordination artifact instead of leaving an unattached task.
+      (run [NORTH-CLI "tell" child "abandoned"
+            "recursive child binding failed before provider execution"]
+           :timeout 10000)
+      (delegate-die (str "North could not link recursive child @" child
+                         " part_of @" parent)))
+    (let [verified (read-delegate-thread! child)
+          parents (->> (:facts verified)
+                       (filter #(= "part_of" (:predicate %)))
+                       (map :value)
+                       set)]
+      (when-not (= #{(str "@" parent)} parents)
+        (run [NORTH-CLI "tell" child "abandoned"
+              "recursive child link failed exact readback before provider execution"]
+             :timeout 10000)
+        (delegate-die (str "recursive child @" child
+                           " did not read back exact parent @" parent)))
+      (assoc verified :source :recursive-child :parent parent))))
+
+(defn resolve-recursive-child-thread! [task dry?]
+  (let [{:keys [kind thread residue?]} (managed-thread-binding)]
+    (when-not (= kind :complete)
+      (when residue?
+        (binding [*out* *err*]
+          (println (ylw "recursive spawn found unverified parent run residue"))))
+      (delegate-die
+       "recursive orchestrator spawn requires its exact parent run/thread reservation"))
+    (if dry?
+      {:id "recursive-child-on-execution"
+       :title (delegate-thread-title task)
+       :facts [{:predicate "title" :value (delegate-thread-title task)}
+               {:predicate "committed" :value "dry-run"}
+               {:predicate "part_of" :value (str "@" thread)}]
+       :committed? true
+       :done-when []
+       :source :dry-recursive-child
+       :parent thread}
+      (capture-recursive-child-thread! task thread))))
+
 (defn resolve-delegate-thread!
   [{:keys [task explicit-thread]} dry?]
   (cond
@@ -1604,7 +1649,9 @@
     :else
     (let [{:keys [kind thread residue?]} (managed-thread-binding)]
       (case kind
-        :complete (assoc (read-delegate-thread! thread) :source :inherited)
+        :complete (if dry?
+                    (resolve-recursive-child-thread! task true)
+                    (capture-recursive-child-thread! task thread))
         :none (do
                 (when residue?
                   (binding [*out* *err*]
@@ -1619,6 +1666,13 @@
                    :done-when []
                    :source :dry-capture}
                   (capture-delegate-thread! task)))))))
+
+(defn cmd-bind-child-thread [[task & extra]]
+  (north.topology-authority/require-coordination! "bind recursive child thread")
+  (when (or (nil? task) (seq extra))
+    (delegate-die "internal bind-child-thread requires exactly one task argument"))
+  (let [{:keys [id parent]} (resolve-recursive-child-thread! task false)]
+    (println (json/generate-string {:thread id :parent parent}))))
 
 (defn- parse-delegate-args [args]
   (let [task (first args)]
@@ -1850,6 +1904,116 @@
         (do (println (red "retask failed"))
             (println (str/trim (str (:out result) (:err result)))))))))
 
+;; ---- structured scope-overrun canary ---------------------------------------
+
+(def scope-escalation-schema "north.scope-escalation/v1")
+
+(defn parse-scope-escalation-args [args]
+  (loop [xs args parsed {:seams [] :decomposition []}]
+    (if-let [x (first xs)]
+      (let [value (second xs)]
+        (when (or (nil? value) (str/starts-with? value "--"))
+          (throw (ex-info (str x " requires a non-empty value") {:usage true})))
+        (case x
+          "--summary" (recur (nnext xs) (assoc parsed :summary value))
+          "--checkpoint" (recur (nnext xs) (assoc parsed :checkpoint value))
+          "--seam" (recur (nnext xs) (update parsed :seams conj value))
+          "--propose" (recur (nnext xs) (update parsed :decomposition conj value))
+          "--budget-signal" (recur (nnext xs) (assoc parsed :budgetSignal value))
+          "--no-progress" (recur (nnext xs) (assoc parsed :noProgress value))
+          (throw (ex-info (str "unknown escalate option: " x) {:usage true}))))
+      (do
+        (when-not (and (known (:summary parsed))
+                       (known (:checkpoint parsed))
+                       (seq (:decomposition parsed)))
+          (throw (ex-info
+                  "needs-replan requires --summary, --checkpoint, and at least one --propose"
+                  {:usage true})))
+        parsed))))
+
+(defn supervisor-route
+  "Return the first live agent in the immediate-parent chain. Never skips to an
+  unrelated global role, and never mutates the reporter's authority."
+  [start live? parent-of]
+  (loop [candidate (known start) seen #{}]
+    (cond
+      (nil? candidate) nil
+      (contains? seen candidate) nil
+      (live? candidate) candidate
+      :else (recur (parent-of candidate) (conj seen candidate)))))
+
+(defn- bare-agent [value]
+  (some-> value str (str/replace-first #"^@?(?:agent:)?" "") known))
+
+(defn cmd-escalate [args]
+  (let [[kind & options] args]
+    (when-not (= kind "needs-replan")
+      (throw (ex-info
+              "usage: north escalate needs-replan --summary <text> --checkpoint <text> --propose <piece> [--seam <new seam>] [--budget-signal <signal>] [--no-progress <signal>]"
+              {:usage true})))
+    (let [parsed (parse-scope-escalation-args options)
+          reporter (bare-agent (or (System/getenv "AGENT_ID")
+                                   (System/getenv "NORTH_AGENT_ID")))
+          run-id (known (System/getenv "NORTH_RUN_ID"))
+          thread-id (some-> (System/getenv "NORTH_THREAD_ID")
+                            (str/replace-first #"^@" "") known)
+          capability (known (System/getenv "NORTH_RUN_CAPABILITY"))
+          topology (known (System/getenv "AGENT_TOPOLOGY"))
+          _ (when-not (and reporter run-id thread-id capability
+                           (contains? #{"worker" "orchestrator"} topology))
+              (throw (ex-info
+                      "scope escalation requires a complete managed run identity"
+                      {:north/error :scope-escalation-unbound})))
+          port (Integer/parseInt PORT)
+          parent-of (fn [agent]
+                      (bare-agent
+                       (or (north.coord/resolved port (str "@agent:" agent) "coordinator")
+                           (north.coord/resolved port (str "@agent:" agent) "supervisor"))))
+          live? (fn [agent]
+                  (let [lease (north.coord/lease-of port (str "session:" agent))]
+                    (and lease (> (:exp lease) (System/currentTimeMillis)))))
+          immediate (or (bare-agent (System/getenv "AGENT_COORDINATOR"))
+                        (parent-of reporter))
+          target (supervisor-route immediate live? parent-of)
+          emitted-at (str (java.time.Instant/now))
+          payload (cond-> {:schema scope-escalation-schema
+                           :kind "scope-overrun"
+                           :disposition "needs-replan"
+                           :reporter reporter
+                           :run run-id
+                           :thread thread-id
+                           :topology topology
+                           :immediateParent immediate
+                           :routedSupervisor target
+                           :summary (:summary parsed)
+                           :checkpoint (:checkpoint parsed)
+                           :newSeams (:seams parsed)
+                           :proposedDecomposition (:decomposition parsed)
+                           :emittedAt emitted-at}
+                    (:budgetSignal parsed) (assoc :budgetSignal (:budgetSignal parsed))
+                    (:noProgress parsed) (assoc :noProgress (:noProgress parsed)))
+          encoded (json/generate-string payload)]
+      ;; Persist before delivery. If every supervisor is absent, the checkpoint
+      ;; remains discoverable and the worker fails safe instead of broadening.
+      (north.coord/append! port (str "@" thread-id) "scope_escalation" encoded)
+      (if-not target
+        (do
+          (binding [*out* *err*]
+            (println (red "scope escalation checkpointed, but no live supervisor exists; stop and await supervision")))
+          3)
+        (let [message (run ["bb" (str NORTH "/cli/msg-cli.clj") PORT "send"
+                            reporter target "NEEDS REPLAN" encoded]
+                           :timeout 5000)]
+          (if (:ok message)
+            (do
+              (println (grn "scope escalation checkpointed and routed")
+                       (str "@agent:" target))
+              0)
+            (do
+              (binding [*out* *err*]
+                (println (red "scope escalation checkpointed, but supervisor delivery failed; stop and await supervision")))
+              3)))))))
+
 ;; ---- dispatch ------------------------------------------------------------------
 (when-not (or (= (System/getenv "NORTH_AGENTS_LIB") "1")
               (= (System/getProperty "north.agents.lib") "1"))
@@ -1862,6 +2026,7 @@
                     (cmd-spawn-help)
                     (cmd-spawn args))
         "delegate" (cmd-delegate args)
+        "bind-child-thread" (cmd-bind-child-thread args)
         ;; delegation unified to ONE verb; request/fork/req teach, don't alias.
         "request" (do (println "renamed: north delegate") (System/exit 1))
         "fork"    (do (println "renamed: north delegate") (System/exit 1))
@@ -1870,10 +2035,13 @@
         "steer"   (let [status (cmd-tell-agent args)]
                     (when (pos? status) (System/exit status)))
         "retask"  (cmd-retask args)
-        (do (println "usage: north {agents|templates|spawn|delegate|watch|steer|retask} ...")
+        "escalate" (let [status (cmd-escalate args)]
+                     (when (pos? status) (System/exit status)))
+        (do (println "usage: north {agents|templates|spawn|delegate|watch|steer|retask|escalate} ...")
             (System/exit 1)))
       (catch clojure.lang.ExceptionInfo error
-        (if (north.topology-authority/denial? error)
+        (if (or (north.topology-authority/denial? error)
+                (:usage (ex-data error)))
           (do (binding [*out* *err*] (println (red (.getMessage error))))
-              (System/exit 1))
+              (System/exit (if (:usage (ex-data error)) 2 1)))
           (throw error))))))

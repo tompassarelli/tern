@@ -23,23 +23,6 @@ export class TopologyAuthorityError extends Error {
   }
 }
 
-export class TopologyDepthError extends Error {
-  readonly code = "NORTH_TOPOLOGY_DEPTH_DENIED";
-  readonly preSideEffect = true;
-
-  constructor(
-    readonly operation: string,
-    readonly callerTopology: string,
-    readonly childTopology: string,
-  ) {
-    super(
-      `coordination depth denied: ${operation} from an orchestrator may create ` +
-      "worker topology only; managed depth stops at orchestrator -> worker",
-    );
-    this.name = "TopologyDepthError";
-  }
-}
-
 export function assertCoordinationAuthority(
   operation: string,
   topology = process.env.AGENT_TOPOLOGY,
@@ -47,15 +30,4 @@ export function assertCoordinationAuthority(
   const declared = topology?.trim();
   if (!declared || declared === "orchestrator") return;
   throw new TopologyAuthorityError(operation, declared);
-}
-
-export function assertManagedChildTopology(
-  operation: string,
-  childTopology: string | undefined,
-  callerTopology = process.env.AGENT_TOPOLOGY,
-): void {
-  const caller = callerTopology?.trim();
-  if (caller === "orchestrator" && childTopology === "orchestrator") {
-    throw new TopologyDepthError(operation, caller, childTopology);
-  }
 }

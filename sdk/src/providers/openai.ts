@@ -85,8 +85,8 @@ export function codexHarnessArguments(options: any): string[] {
   if (surface) return managedCodexAuthorityArguments(options, surface);
   const args: string[] = [];
   if (["Agent", "Task", "Workflow"].some((tool) => denied.has(tool))) {
-    // North is the canonical two-tier spawn surface; native Codex subagents would
-    // create an unobserved third authority path even for orchestrators.
+    // North is the canonical managed spawn surface; native Codex subagents would
+    // bypass per-child lifecycle, routing, budget, and telemetry contracts.
     args.push("--disable", "multi_agent");
   }
   if (denied.has("mcp__north__spawn") || denied.has("mcp__north__dispatch")) {

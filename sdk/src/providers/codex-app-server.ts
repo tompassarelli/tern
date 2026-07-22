@@ -291,10 +291,9 @@ export function managedCodexAppServerLaunch(
         enabled_tools: options.surface.northEnabledTools,
       },
     },
-    web_search: options.surface.web === "disabled" ? "disabled" : undefined,
+    web_search: options.surface.web,
     features,
   };
-  if (expectedSessionConfig.web_search === undefined) delete expectedSessionConfig.web_search;
 
   const args = [
     ...codexConfigArguments(options.env),
@@ -307,7 +306,7 @@ export function managedCodexAppServerLaunch(
     "-c", "mcp_servers.north.enabled=true",
     "-c", "mcp_servers.north.required=true",
     "-c", `mcp_servers.north.enabled_tools=${JSON.stringify(options.surface.northEnabledTools)}`,
-    ...(options.surface.web === "disabled" ? ["-c", 'web_search="disabled"'] : []),
+    "-c", `web_search=${JSON.stringify(options.surface.web)}`,
     ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
     ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),
     "app-server", "--stdio", "--strict-config",

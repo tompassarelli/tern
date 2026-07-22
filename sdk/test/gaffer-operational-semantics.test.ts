@@ -109,7 +109,7 @@ test("topology controls prompt and tools with positive-only orchestration author
     self: "worker-topology", provider: "openai", model: "gpt-5.6-sol",
     presenceRegistrar: false, routingMetadata: preset("integrator"),
   }) as any;
-  expect(worker.systemPrompt).toContain("TOPOLOGY: WORKER (two-tier law)");
+  expect(worker.systemPrompt).toContain("TOPOLOGY: WORKER");
   expect(worker.allowedTools).not.toContain("Agent");
   expect(worker.allowedTools).not.toContain("mcp__north__spawn");
   expect(worker.disallowedTools).toContain("mcp__north__dispatch");
@@ -127,7 +127,7 @@ test("topology controls prompt and tools with positive-only orchestration author
     presenceRegistrar: false,
     routingMetadata: preset("director"),
   }) as any;
-  expect(orchestrator.systemPrompt).toContain("TOPOLOGY: ORCHESTRATOR (two-tier law)");
+  expect(orchestrator.systemPrompt).toContain("TOPOLOGY: ORCHESTRATOR");
   expect(orchestrator.allowedTools).toContain("mcp__north__spawn");
   expect(orchestrator.allowedTools).toContain("mcp__north-peer__command_peer");
   expect(orchestrator.disallowedTools).toContain("Agent");
@@ -192,8 +192,10 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   expect(director.allowedTools).toContain(READONLY_SHELL_TOOL);
   expect(director.allowedTools).not.toContain("Bash");
   expect(codexGlobalArguments(director)).toEqual([]);
-  expect(() => codexHarnessArguments(director))
-    .toThrow("openai_adapter_orchestrator_authority_unavailable");
+  expect(codexHarnessArguments(director)).toEqual(managedCodexPreview);
+  const directorSurface = compileProviderAuthoritySurface("openai", director);
+  expect(directorSurface.northEnabledTools).toEqual(expect.arrayContaining(["spawn", "dispatch"]));
+  expect(directorSurface.web).toBe("cached");
   expect(director.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
 
   const integrator = harnessOptions({

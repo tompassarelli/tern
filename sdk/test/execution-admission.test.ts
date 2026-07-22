@@ -14,27 +14,17 @@ const directorCapabilities = [
   "filesystem.read", "filesystem.search", "shell.readonly", "web", "coordination",
 ] as const;
 
-test("a pinned OpenAI orchestrator is blocked before a provider turn", () => {
-  try {
-    admitPinnedProvider("openai", directorCapabilities);
-    throw new Error("expected preflight block");
-  } catch (error) {
-    expect(error).toMatchObject({
-      code: "blocked_preflight",
-      processOutcome: "blocked_preflight",
-      retrySafeBeforeAcceptance: true,
-    });
-  }
+test("a pinned OpenAI orchestrator is admitted to the managed North surface", () => {
+  expect(() => admitPinnedProvider("openai", directorCapabilities)).not.toThrow();
 });
 
-test("OpenAI web authority is rejected when pinned and remains auto-routable", () => {
+test("OpenAI cached web authority is admitted for pinned and automatic routes", () => {
   const webCapabilities = [
     "filesystem.read", "filesystem.search", "shell.readonly", "web",
   ] as const;
   expect(() => admitPinnedProvider("auto", webCapabilities)).not.toThrow();
   expect(() => admitPinnedProvider(undefined, webCapabilities)).not.toThrow();
-  expect(() => admitPinnedProvider("openai", webCapabilities))
-    .toThrow("openai_adapter_web_capability_unproven");
+  expect(() => admitPinnedProvider("openai", webCapabilities)).not.toThrow();
 });
 
 test("every managed lane requires a live North coordinator before a provider turn", async () => {
