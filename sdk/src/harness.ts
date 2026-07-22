@@ -1563,6 +1563,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     NORTH_RUN_CAPABILITY: _inheritedCapability,
     NORTH_MANAGED_LANE: _inheritedManagedLane,
     NORTH_CODEX_BIN: _inheritedCodexOverride,
+    NORTH_BIN: _inheritedNorthBin,
     // Never let a parent's pinned dials leak into a child's bootstrap: every
     // managed spawn re-resolves model/effort from its Gaffer tier, but a
     // tier-less import.meta.main bootstrap reads process.env.AGENT_MODEL, so an
@@ -1572,8 +1573,16 @@ export function harnessOptions(o: HarnessOpts): Options {
     AGENT_TIER: _inheritedTier,
     ...ambientEnv
   } = process.env;
+  const managedNorthBinDir = dirname(ENGINE);
   const childEnv = Object.freeze({
     ...ambientEnv,
+    // Provider subprocesses and their shells share the same relocatable North
+    // package authority as MCP. A system-generation `north` must never outrank
+    // the package that admitted this lane.
+    NORTH_BIN: ENGINE,
+    PATH: ambientEnv.PATH
+      ? `${managedNorthBinDir}${delimiter}${ambientEnv.PATH}`
+      : managedNorthBinDir,
     AGENT_ID: o.self,
     AGENT_TOPOLOGY: enforcementTopology,
     // Sealed authority marker consumed by the system-managed Codex lifecycle

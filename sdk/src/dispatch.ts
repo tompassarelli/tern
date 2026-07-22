@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getThreadFacts, getChildren, normalizeNorthEntityId } from "./north-client";
-import { derivePosture, buildPrompt } from "./posture";
+import { deriveManagedDispatchPosture, buildPrompt } from "./posture";
 import { StreamWriter } from "./stream-writer";
 import {
   harnessCompositionEvidence, harnessOptions, renewHarnessPresence, DEFAULT_SYSTEM_PROMPT,
@@ -202,7 +202,9 @@ async function runDispatch(
 
   const children = hydratedChildren ?? getChildren(threadId);
   const hasChildren = children.length > 0;
-  const posture = derivePosture(facts, hasChildren);
+  const posture = deriveManagedDispatchPosture(
+    facts, hasChildren, routingMetadata.topology,
+  );
 
   // Done-bars: a committed thread with no done_when has no machine-checkable exit criterion —
   // the worker will define its own as first act (see buildPrompt). Warn so the gap is visible.
@@ -921,7 +923,9 @@ export async function dispatch(
   if (!facts.length) throw new Error(`Thread @${threadId} not found or has no facts`);
   const judgmentGrade = judgmentGradeFromThreadFacts(facts);
   const children = (injected.loadChildren ?? getChildren)(threadId);
-  const preflight = derivePosture(facts, children.length > 0);
+  const preflight = deriveManagedDispatchPosture(
+    facts, children.length > 0, routingMetadata.topology,
+  );
   if (preflight.hasOutcome) {
     const preclaimed = injected.driverOptions?.preclaimed
       ?? process.env.NORTH_DISPATCH_DRIVER_PRECLAIMED === "1";

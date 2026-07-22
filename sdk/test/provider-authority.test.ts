@@ -3,7 +3,7 @@ import {
   chmodSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   applyHarnessRoute,
@@ -42,6 +42,7 @@ const envKeys = [
   "FRAM_LOG", "FRAM_TELEMETRY_LOG",
   "FRAM_THREADS", "UNRELATED_SECRET_CANARY", "GAFFER_HOME", "NORTH_MANAGED_LANE",
   "NORTH_CODEX_BIN", "NORTH_MANAGED_CODEX_BIN",
+  "NORTH_BIN", "PATH",
 ] as const;
 const inheritedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
 
@@ -220,6 +221,26 @@ test("managed-lane marker is explicit, sealed, and never inherited or sent to No
 
   const laundered = { ...options, env: { ...options.env, NORTH_MANAGED_LANE: "0" } };
   expect(hasCanonicalHarnessAuthority(laundered, "openai")).toBe(false);
+});
+
+test("managed provider shells resolve North from the admitted package before ambient system paths", () => {
+  process.env.NORTH_BIN = "/run/current-system/sw/bin/north";
+  process.env.PATH = "/run/current-system/sw/bin:/usr/bin";
+  const expectedNorth = join(north, "bin/north");
+  const expectedBin = join(north, "bin");
+
+  for (const provider of ["anthropic", "openai"] as const) {
+    const options = designer(provider, `${provider}-exact-north-bin`);
+    expect(options.env.NORTH_BIN).toBe(expectedNorth);
+    expect(options.env.PATH.split(delimiter)[0]).toBe(expectedBin);
+    const resolved = spawnSync("/bin/sh", ["-c", "command -v north"], {
+      encoding: "utf8",
+      env: options.env,
+    });
+    expect(resolved.status).toBe(0);
+    expect(resolved.stdout.trim()).toBe(expectedNorth);
+    expect(hasCanonicalHarnessAuthority(options, provider)).toBe(true);
+  }
 });
 
 test("both providers receive the exact custom North and Fram instance selectors without ambient secrets", () => {

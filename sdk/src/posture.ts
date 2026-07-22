@@ -1,4 +1,5 @@
 import type { Fact } from "./north-client";
+import type { Topology } from "./routing-metadata";
 
 export interface Posture {
   planned: boolean;
@@ -39,6 +40,26 @@ export function derivePosture(
     // done_when is multi-valued — every fact is one completion criterion, order preserved.
     doneWhen: facts.filter((c) => c.predicate === "done_when").map((c) => c.value),
   };
+}
+
+// Managed routing topology and North's thread lifecycle are separate axes.
+// A committed worker leaf is accepted executable work even when older graph
+// producers did not materialize planned/atomic facts. An orchestrator still
+// receives the lifecycle-derived planning posture, while a worker can never
+// own a composite thread.
+export function deriveManagedDispatchPosture(
+  facts: Fact[],
+  hasChildren: boolean,
+  topology: Topology,
+): Posture {
+  const posture = derivePosture(facts, hasChildren);
+  if (topology === "worker" && hasChildren) {
+    throw new Error("managed worker dispatch requires a leaf thread without children");
+  }
+  if (topology === "worker" && posture.committed) {
+    return { ...posture, planned: true, atomic: true };
+  }
+  return posture;
 }
 
 // Build the dynamic prompt injected into the agent based on thread posture.
@@ -103,9 +124,9 @@ function doneBars(threadId: string, posture: Posture): string {
     return [
       "",
       "DONE-BARS — this thread is done ONLY when each bar below has evidence (probe run + result observed). " +
-        "Cite evidence per bar in your report; record with " +
-        "`north evidence record \"<exact bar below>\" \"<observed result>\"`. " +
-        "The command binds evidence to this exact managed run; a plain thread bar_evidence fact is review text, not delivery proof:",
+        "Cite evidence per bar in your report; record with the managed North MCP " +
+        "`evidence_record` tool (`mcp__north__evidence_record`) using the exact bar and observed result. " +
+        "The tool invocation binds evidence to this exact managed run; a plain thread bar_evidence fact is review text, not delivery proof:",
       ...posture.doneWhen.map((bar, i) => `${i + 1}. ${bar}`),
     ].join("\n");
   }
@@ -113,7 +134,8 @@ function doneBars(threadId: string, posture: Posture): string {
     return [
       "",
       "This thread has NO done-bar. FIRST ACT: define your own — " +
-        `\`tell ${threadId} done_when "<probe + expected result>"\` — before executing.`,
+        "use the managed North MCP `tell` tool (`mcp__north__tell`) with " +
+        `id \`${threadId}\`, predicate \`done_when\`, and value \`<probe + expected result>\` — before executing.`,
     ].join("\n");
   }
   return "";

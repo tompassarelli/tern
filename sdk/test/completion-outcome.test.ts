@@ -982,6 +982,37 @@ test("an MCP-preclaimed terminal thread verifies and safely releases before retu
   });
 });
 
+test("dispatch rejects a worker composite before clocks, claims, envelopes, or query construction", async () => {
+  const { dispatch } = await import("./support/dispatch");
+  const sideEffects: string[] = [];
+
+  await expect(dispatch("test-worker-composite-preflight", {
+    agentId: "test-worker-composite-preflight-agent",
+    routingMetadata: presetRequest("integrator"),
+    loadThreadFacts: () => [
+      { predicate: "title", value: "Worker cannot own a composite" },
+      { predicate: "committed", value: "2026-07-23" },
+      { predicate: "done_when", value: "dispatch rejects before execution" },
+    ],
+    loadChildren: () => ["test-worker-composite-child"],
+    admitBillableClock: (() => { sideEffects.push("clock"); }) as any,
+    claimDriver: (() => {
+      sideEffects.push("claim");
+      return { release: () => true };
+    }) as any,
+    admitResourceEnvelope: (async () => {
+      sideEffects.push("envelope");
+      return undefined;
+    }) as any,
+    queryFn: (() => {
+      sideEffects.push("query");
+      return (async function* () {})();
+    }) as any,
+  })).rejects.toThrow("managed worker dispatch requires a leaf thread without children");
+
+  expect(sideEffects).toEqual([]);
+});
+
 test("dispatch rejects malformed and injection-shaped ids before every read boundary", async () => {
   const { dispatch } = await import("./support/dispatch");
   for (const invalid of [
