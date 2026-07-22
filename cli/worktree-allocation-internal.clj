@@ -250,6 +250,23 @@
    (canonical-json (get registration "providerAuthorityProfile"))
    "worktree_allocation_event" (canonical-json (get registration "event"))))
 
+(defn reservation-subject [registration]
+  (str "@worktree-reservation:"
+       (sha256 (str allocation-version "\u0000"
+                    (get registration "repositoryIdentity") "\u0000"
+                    (get registration "worktree") "\u0000"
+                    (get registration "durableRef")))))
+
+(defn reservation-facts [registration]
+  (sorted-map
+   "kind" "worktree_reservation"
+   "worktree_repository_identity" (get registration "repositoryIdentity")
+   "worktree" (get registration "worktree")
+   "worktree_durable_ref" (get registration "durableRef")
+   "worktree_allocation_nonce" (get registration "allocationNonce")
+   ;; The canonical lease contains the exact holder and remains content-free.
+   "worktree_allocation_lease" (canonical-json (get registration "lease"))))
+
 (defn facts-of [port subject]
   (into {} (map (fn [predicate] [predicate (set (north.coord/many port subject predicate))]))
         all-predicates))
@@ -269,11 +286,60 @@
     (checked! (north.coord/retract! port subject predicate value)
               [:rollback subject predicate value])))
 
+(defn clear-reservation! [port subject desired]
+  ;; A losing concurrent claimant must never retract the winner's shared path/
+  ;; ref facts. Only the nonce owner may clear its exact reservation prefix.
+  (when (= #{(get desired "worktree_allocation_nonce")}
+           (get (facts-of port subject) "worktree_allocation_nonce"))
+    (doseq [[predicate value] desired]
+      (checked! (north.coord/retract! port subject predicate value)
+                [:reservation-rollback subject predicate value]))))
+
+(defn acquire-reservation! [port registration]
+  (let [subject (reservation-subject registration)
+        desired (reservation-facts registration)
+        nonce (get desired "worktree_allocation_nonce")
+        before (facts-of port subject)]
+    (cond
+      (= desired (into (sorted-map)
+                       (map (fn [[predicate values]] [predicate (first values)]))
+                       (filter (fn [[predicate values]]
+                                 (and (contains? (set (keys desired)) predicate)
+                                      (= 1 (count values)))) before)))
+      subject
+
+      (some seq (vals before))
+      (fail! "physical worktree identity is already reserved"
+             {:reservation subject
+              :owner (first (get before "worktree_allocation_nonce"))})
+
+      :else
+      (try
+        (checked!
+         (north.coord/assert-after-read!
+          port subject "worktree_allocation_nonce" nonce
+          (fn []
+            (when (some seq (vals (facts-of port subject)))
+              (fail! "physical worktree identity became reserved" {:reservation subject}))))
+         [:reserve subject])
+        (doseq [[predicate value] (dissoc desired "worktree_allocation_nonce")]
+          (checked! (north.coord/append! port subject predicate value)
+                    [:reserve subject predicate]))
+        (when-not (every? (fn [[predicate value]]
+                            (= #{value} (get (facts-of port subject) predicate)))
+                          desired)
+          (fail! "physical worktree reservation readback differs" {:reservation subject}))
+        subject
+        (catch Exception error
+          (clear-reservation! port subject desired)
+          (throw error))))))
+
 (defn register! [port registration]
   (let [subject (get registration "subject")
         desired (registration-facts registration)
         marker (sha256 (apply str (map (fn [[p v]] (str p "\u0000" v "\n")) desired)))
-        before (facts-of port subject)]
+        before (facts-of port subject)
+        reservation (acquire-reservation! port registration)]
     (cond
       (committed-registration? before desired marker)
       {:ok true :subject subject :manifest marker :result "exact-replay"}
@@ -308,6 +374,7 @@
             (clear-desired! port subject desired marker)
             (when (some seq (vals (facts-of port subject)))
               (fail! "allocation registration rollback left a visible prefix" {}))
+            (clear-reservation! port reservation (reservation-facts registration))
             (catch Exception rollback
               (throw (ex-info "allocation registration failed and rollback is indeterminate"
                               {:subject subject} rollback))))

@@ -156,6 +156,28 @@
                   (= #{"worktree_allocation"}
                      (get (facts-of port (get third-registration "subject")) "kind")))))
 
+    (let [same-left (registration "66666666-6666-4666-8666-666666666666" "6")
+          same-right (registration "77777777-7777-4777-8777-777777777777" "6")
+          left (proc/process {:out :string :err :string
+                              :extra-env {"FRAM_LOG" (.getCanonicalPath log)}}
+                             "bb" writer-path (str port) "register"
+                             (json/generate-string same-left))
+          right (proc/process {:out :string :err :string
+                               :extra-env {"FRAM_LOG" (.getCanonicalPath log)}}
+                              "bb" writer-path (str port) "register"
+                              (json/generate-string same-right))
+          results [@left @right]
+          winner (if (zero? (:exit (first results))) same-left same-right)
+          loser (if (= winner same-left) same-right same-left)
+          reservation-snapshot (facts-of port (reservation-subject winner))]
+      (check "same-identity concurrent registration admits one nonce before Git"
+             (and (= [0 1] (sort (map :exit results)))
+                  (= #{(get winner "allocationNonce")}
+                     (get reservation-snapshot "worktree_allocation_nonce"))
+                  (= #{"worktree_allocation"}
+                     (get (facts-of port (get winner "subject")) "kind"))
+                  (every? empty? (vals (facts-of port (get loser "subject")))))))
+
     (let [failed-registration
           (registration "55555555-5555-4555-8555-555555555555" "5")
           subject (get failed-registration "subject")

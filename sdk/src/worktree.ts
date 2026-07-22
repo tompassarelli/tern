@@ -247,10 +247,12 @@ export function recordWorktreeRunRotation(
   allocation: ManagedWorktreeAllocation,
   runId: string,
 ): void {
-  allocation.runId = runId;
   writeAllocationEvent(allocation, "run-rotated", allocation.state, {
     run: exactEntity(runId, "(unavailable)"),
   });
+  // The graph acknowledgement is the identity boundary. A rejected write must
+  // leave every later event on the prior, durably-known run.
+  allocation.runId = runId;
 }
 
 export function worktreeNorthExecutable(
@@ -437,25 +439,19 @@ function allocationRecovery(
   return { action, resource: path, durableRef: allocation.durableRef };
 }
 
-function bestEffortRemoveOwnedResource(
-  agentId: string,
-  loc: { path: string; repoRoot: string },
-  ownership: { pathPreexisted: boolean; refPreexisted: boolean },
-): boolean {
-  if (!ownership.pathPreexisted && existsSync(loc.path)) {
-    try { git(removeArgs(agentId, loc.repoRoot).worktree); } catch { /* inspected below */ }
-  }
-  if (!ownership.refPreexisted && refExists(loc.repoRoot, `refs/heads/${worktreeBranch(agentId)}`)) {
-    try { git(removeArgs(agentId, loc.repoRoot).branch); } catch { /* inspected below */ }
-  }
-  return (ownership.pathPreexisted || !existsSync(loc.path))
-    && (ownership.refPreexisted || !refExists(loc.repoRoot, `refs/heads/${worktreeBranch(agentId)}`));
+function tryPublishQuarantine(
+  allocation: ManagedWorktreeAllocation,
+  extra: Partial<WorktreeAllocationEvent>,
+): void {
+  try { writeAllocationEvent(allocation, "quarantined", "quarantined", extra); }
+  catch { /* registration remains the durable pre-Git identity; never delete on uncertainty */ }
 }
 
 // FAIL LOUD. `git worktree add`; then, if a setupCmd was given, run it in the fresh worktree
 // (the generic repo-setup hook — bun install, env copy, etc., supplied by the caller). Any
-// failure THROWS so spawn can decide (it must never silently drop into the shared tree). On a
-// setup failure we best-effort remove the half-baked worktree first, so a throw doesn't strand it.
+// failure THROWS so spawn can decide (it must never silently drop into the shared tree).
+// Once Git has created any physical identity, this phase never reclaims it automatically:
+// uncertainty is quarantined for an explicit later recovery decision.
 export function provisionWorktree(
   agentId: string,
   opts: { repoRoot: string; setupCmd?: string } & WorktreeAllocationOwnership,
@@ -466,12 +462,12 @@ export function provisionWorktree(
   const repoRoot = registration.sourceRoot;
   const path = registration.worktree;
   const branch = worktreeBranch(agentId);
-  const ownership = {
-    pathPreexisted: existsSync(path),
-    refPreexisted: refExists(repoRoot, allocation.durableRef),
-  };
-  let phase = "git_provision";
+  let phase = "physical_preflight";
   try {
+    if (existsSync(path)) throw new Error("derived worktree path is already occupied");
+    if (refExists(repoRoot, allocation.durableRef))
+      throw new Error("derived durable ref is already occupied");
+    phase = "git_provision";
     git(provisionArgs(agentId, repoRoot, allocation.baseOid));
     phase = "head_observation";
     allocation.headOid = oid(path, "HEAD");
@@ -483,34 +479,34 @@ export function provisionWorktree(
     }
     return { path, branch, repoRoot, allocation };
   } catch (error) {
-    const absent = bestEffortRemoveOwnedResource(agentId, { path, repoRoot }, ownership);
+    const resourcePresent = existsSync(path) || refExists(repoRoot, allocation.durableRef);
     const code = phase === "setup"
       ? "setup_failed"
       : phase === "allocation_publication"
         ? "allocation_publication_failed"
         : phase === "head_observation"
           ? "head_observation_failed"
-        : ownership.pathPreexisted
+        : phase === "physical_preflight" && existsSync(path)
           ? "worktree_path_collision"
-          : ownership.refPreexisted
+          : phase === "physical_preflight"
             ? "durable_ref_collision"
             : "git_worktree_add_failed";
-    if (absent) {
+    if (!resourcePresent) {
       writeAllocationEvent(allocation, "provision-failed", "absent", {
         error: { code, phase },
         recovery: allocationRecovery(allocation, path, "none"),
       });
       writeAllocationEvent(allocation, "rolled-back", "absent");
     } else {
-      writeAllocationEvent(allocation, "quarantined", "quarantined", {
-        error: { code: "provision_rollback_refused", phase },
+      tryPublishQuarantine(allocation, {
+        error: { code, phase },
         recovery: allocationRecovery(allocation, path, "inspect-and-salvage"),
       });
-      tellOrphaned(agentId, path, "worktree provisioning rollback refused — inspect allocation ledger");
+      tellOrphaned(agentId, path, "worktree provisioning failed after physical identity appeared — inspect; never auto-delete");
     }
     throw new Error(
       `worktree ${phase} failed for @agent:${agentId}; allocation=${allocation.subject}; `
-      + `resource=${absent ? "absent" : "quarantined"}`,
+      + `resource=${resourcePresent ? "quarantined" : "absent"}`,
       { cause: error },
     );
   }
@@ -526,48 +522,23 @@ function worktreeDirty(path: string): boolean | null {
   }
 }
 
-// A worktree can be provisioned successfully and then lose a later admission
-// race before runSpawn owns it. Reclaim that unused clean tree without force;
-// keep and surface anything dirty or unreadable. Provisioning failures never
-// reach this function, so they still produce zero identity/run writes.
+// A post-provision admission failure never proves that deleting the physical
+// resource is safe. Preserve it under its pre-Git registration and publish the
+// strongest quarantine observation the coordinator will acknowledge.
 export function rollbackProvisionedWorktree(
   agentId: string,
   loc: ProvisionedWorktree,
 ): void {
   const dirty = worktreeDirty(loc.path);
-  if (dirty === null) {
-    writeAllocationEvent(loc.allocation, "quarantined", "quarantined", {
-      error: { code: "git_status_unavailable", phase: "admission_rollback" },
-      recovery: allocationRecovery(loc.allocation, loc.path, "inspect-and-salvage"),
-    });
-    tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; inspect allocation ledger");
-    return;
-  }
-  if (dirty) {
-    writeAllocationEvent(loc.allocation, "quarantined", "quarantined", {
-      error: { code: "worktree_dirty", phase: "admission_rollback" },
-      recovery: allocationRecovery(loc.allocation, loc.path, "inspect-and-salvage"),
-    });
-    tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; inspect allocation ledger");
-    return;
-  }
-  const rm = removeArgs(agentId, loc.repoRoot);
-  try {
-    git(rm.worktree);
-    git(rm.branch);
-  } catch {
-    // Inspect exact postcondition below: branch deletion can fail after the
-    // path was removed, and that durable ref still belongs to the allocation.
-  }
-  if (!existsSync(loc.path) && !refExists(loc.repoRoot, loc.allocation.durableRef)) {
-    writeAllocationEvent(loc.allocation, "rolled-back", "absent");
-  } else {
-    writeAllocationEvent(loc.allocation, "quarantined", "quarantined", {
-      error: { code: "nonforce_cleanup_refused", phase: "admission_rollback" },
-      recovery: allocationRecovery(loc.allocation, loc.path, "remove-if-clean"),
-    });
-    tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; inspect allocation ledger");
-  }
+  const code = dirty === null ? "git_status_unavailable"
+    : dirty ? "worktree_dirty" : "admission_aborted";
+  tryPublishQuarantine(loc.allocation, {
+    error: { code, phase: "admission_rollback" },
+    recovery: allocationRecovery(
+      loc.allocation, loc.path, dirty === false ? "remove-if-clean" : "inspect-and-salvage",
+    ),
+  });
+  tellOrphaned(agentId, loc.path, "spawn aborted before provider execution; preserved for explicit recovery");
 }
 
 // Surface a kept worktree as a durable, queryable fact so the sweep + a human can salvage it.
@@ -578,9 +549,8 @@ function tellOrphaned(agentId: string, path: string, reason: string): void {
   } catch { /* best-effort */ }
 }
 
-// FAIL OPEN. Compute dirtiness, apply the salvage-gated decision: remove (clean `ran`) or
-// keep + surface a `worktree_orphaned` fact (everything else). Never throws out of a
-// finalizing lane — mirrors clockFinalize / notifyDeath.
+// FAIL OPEN and preserve-only. Even a clean successful lane is not reclaimed by
+// the provider process; landing/recovery owns that later explicit decision.
 export function worktreeFinalize(
   agentId: string,
   outcome: string,
@@ -590,7 +560,7 @@ export function worktreeFinalize(
   try {
     const dirty = worktreeDirty(loc.path);
     if (dirty === null) {
-      writeAllocationEvent(loc.allocation, "quarantined", "quarantined", {
+      tryPublishQuarantine(loc.allocation, {
         error: { code: "git_status_unavailable", phase: "finalize" },
         recovery: allocationRecovery(loc.allocation, loc.path, "inspect-and-salvage"),
       });
@@ -601,37 +571,23 @@ export function worktreeFinalize(
     // registration's base/head pair remains the provisioning snapshot.
     loc.allocation.headOid = oid(loc.path, "HEAD");
     const decision = worktreeCleanupDecision(outcome, dirty);
-    if (decision === "remove") {
-      const rm = removeArgs(agentId, loc.repoRoot);
-      try {
-        git(rm.worktree);
-        git(rm.branch);
-      } catch {
-        // Exact postcondition below handles a path-only or ref-only remainder.
-      }
-      if (!existsSync(loc.path) && !refExists(loc.repoRoot, loc.allocation.durableRef)) {
-        writeAllocationEvent(loc.allocation, "released", "absent");
-      } else {
-        writeAllocationEvent(loc.allocation, "quarantined", "quarantined", {
-          error: { code: "nonforce_cleanup_refused", phase: "finalize" },
-          recovery: allocationRecovery(loc.allocation, loc.path, "remove-if-clean"),
-        });
-        tellOrphaned(agentId, loc.path, "clean-exit cleanup refused — inspect allocation ledger");
-      }
-    } else {
-      const reason = decision === "keep-clean-exit"
-        ? "outcome=ran but tree dirty — uncommitted changes on clean exit (reporting anomaly)"
-        : `outcome=${outcome} — mid-work stop; salvage before reaping`;
-      writeAllocationEvent(loc.allocation, "quarantined", "quarantined", {
-        error: {
-          code: terminalFailure?.code
-            ?? (decision === "keep-clean-exit" ? "clean_exit_dirty" : "salvage_required"),
-          phase: terminalFailure?.phase ?? "finalize",
-        },
-        recovery: allocationRecovery(loc.allocation, loc.path, "inspect-and-salvage"),
-      });
-      tellOrphaned(agentId, loc.path, reason);
-    }
+    const reason = decision === "remove"
+      ? "clean terminal preserved for explicit landing/reclamation"
+      : decision === "keep-clean-exit"
+        ? "outcome=ran but tree dirty — inspect before recovery"
+        : `outcome=${outcome} — salvage before recovery`;
+    tryPublishQuarantine(loc.allocation, {
+      error: {
+        code: terminalFailure?.code
+          ?? (decision === "remove" ? "manual_reclamation_required"
+            : decision === "keep-clean-exit" ? "clean_exit_dirty" : "salvage_required"),
+        phase: terminalFailure?.phase ?? "finalize",
+      },
+      recovery: allocationRecovery(
+        loc.allocation, loc.path, decision === "remove" ? "remove-if-clean" : "inspect-and-salvage",
+      ),
+    });
+    tellOrphaned(agentId, loc.path, reason);
   } catch {
     // Provider execution already completed; preserve the historical fail-open
     // terminal contract. The static committed allocation remains queryable.

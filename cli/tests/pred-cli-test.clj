@@ -353,6 +353,11 @@
               (= "content-sealed audit marker for a planned snapshot restoration; paired assert/retract preserves raw provenance without a live graph fact"
                  (:doc restore-checkpoint)))))
 
+(check "worktree ownership sentinels are honest literals"
+       (every? #(= {:card "single" :kind "literal"}
+                    (select-keys (registry %) [:card :kind]))
+               ["worktree_allocation_thread" "worktree_allocation_concern"]))
+
 (let [missing (set/difference emitted-predicates registry-names)]
   (check "all fixed cross-language fact emitters are registered"
          (empty? missing)

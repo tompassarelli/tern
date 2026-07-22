@@ -103,8 +103,14 @@ describe("physical allocation registration", () => {
     ]);
 
     worktreeFinalize(id, "ran", { ...lease });
-    expect(capture.events.at(-1)?.event.type).toBe("released");
-    expect(existsSync(lease.path)).toBe(false);
+    expect(capture.events.at(-1)?.event).toMatchObject({
+      type: "quarantined",
+      resourceState: "quarantined",
+      error: { code: "manual_reclamation_required", phase: "finalize" },
+    });
+    expect(existsSync(lease.path)).toBe(true);
+    git(repo, "worktree", "remove", "--force", lease.path);
+    git(repo, "branch", "-D", lease.branch);
   });
 
   test("linked source retains physical common-dir identity while naming the exact linked root", () => {
@@ -121,6 +127,8 @@ describe("physical allocation registration", () => {
     expect(registration.repositoryIdentity).toStartWith("north:git-common-dir-sha256:v1:");
 
     worktreeFinalize(id, "ran", { ...lease });
+    git(repo, "worktree", "remove", "--force", lease.path);
+    git(repo, "branch", "-D", lease.branch);
     git(repo, "worktree", "remove", source);
     git(repo, "branch", "-d", `linked-source-${process.pid}`);
   });
@@ -148,6 +156,10 @@ describe("physical allocation registration", () => {
 
     worktreeFinalize(leftId, "ran", { ...leftLease });
     worktreeFinalize(rightId, "ran", { ...rightLease });
+    for (const lease of [leftLease, rightLease]) {
+      git(repo, "worktree", "remove", "--force", lease.path);
+      git(repo, "branch", "-D", lease.branch);
+    }
   });
 });
 
@@ -178,7 +190,7 @@ describe("atomic failure and recovery", () => {
       "provision-failed", "rolled-back",
     ]);
     expect(capture.events[0].event.error).toEqual({
-      code: "durable_ref_collision", phase: "git_provision",
+      code: "durable_ref_collision", phase: "physical_preflight",
     });
     expect(capture.events[0].event.recovery?.action).toBe("none");
     expect(git(repo, "branch", "--list", branch)).toContain(branch);
@@ -187,17 +199,21 @@ describe("atomic failure and recovery", () => {
     git(repo, "branch", "-d", branch);
   });
 
-  test("pre-provider admission rollback removes a clean resource and records absence", () => {
+  test("pre-provider admission rollback preserves a clean resource for manual reclamation", () => {
     const capture: Capture = { registrations: [], events: [] };
     const id = `admission-rollback-${process.pid}`;
     const lease = provisionWorktree(id, { repoRoot: repo, ...ownership(id, capture) });
     rollbackProvisionedWorktree(id, lease);
 
     expect(capture.events.at(-1)?.event).toMatchObject({
-      type: "rolled-back", resourceState: "absent",
+      type: "quarantined",
+      resourceState: "quarantined",
+      error: { code: "admission_aborted", phase: "admission_rollback" },
     });
-    expect(existsSync(lease.path)).toBe(false);
-    expect(git(repo, "branch", "--list", lease.branch)).toBe("");
+    expect(existsSync(lease.path)).toBe(true);
+    expect(git(repo, "branch", "--list", lease.branch)).toContain(lease.branch);
+    git(repo, "worktree", "remove", "--force", lease.path);
+    git(repo, "branch", "-D", lease.branch);
   });
 
   test("dirty pre-provider rollback preserves and queryably quarantines with machine recovery", () => {

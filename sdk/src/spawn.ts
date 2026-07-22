@@ -1015,6 +1015,16 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       composed, callerTopology, injected.loadThreadFacts ?? getThreadFacts,
     );
   }
+  const requestedCapabilities = gafferCapabilities(composed.routingMetadata);
+  const requestsMutation = requestedCapabilities.includes("filesystem.write")
+    || requestedCapabilities.includes("shell");
+  const requestsRegisteredWorkspace = composed.worktree
+    ?? process.env.AGENT_WORKTREE === "1";
+  if (requestsMutation && !requestsRegisteredWorkspace) {
+    throw new Error(
+      "managed mutation requires a registered worktree allocation; canonical checkout mutation denied",
+    );
+  }
   // Resolve the exact observer policy and immutable dispatcher grade before
   // clock/resource/provider side effects. Thread-backed spawns snapshot the
   // admission projection; raw ad-hoc work is explicitly unavailable.

@@ -118,25 +118,26 @@ afterAll(() => {
   try { rmSync(dir, { recursive: true, force: true }); } catch {}
 });
 
-test("DEFAULT (no worktree) => no cwd, no payload, no worktree fact, no /tmp tree — byte-identical", async () => {
+test("managed authoring without a registered worktree fails closed before canonical mutation", async () => {
   const { spawn } = await import("./support/spawn");
   const sink: { options?: any } = {};
   const agentId = "wt-off-1";
-  const result = await spawn({
+  let providerQueries = 0;
+  let thrown: unknown;
+  try { await spawn({
     prompt: "trivial default lane", agentId,
     routingMetadata: presetRequest("integrator"),
-    queryFn: capturingQuery(sink),
+    queryFn: (args: any) => {
+      providerQueries++;
+      return capturingQuery(sink)(args);
+    },
     feedSubscriber: () => readySubscription(),
-  });
+  }); } catch (error) { thrown = error; }
 
-  expect(typeof result).toBe("string");
-  // The core guarantee: default off => cwd is the shared tree (process.cwd()),
-  // never a provisioned worktree.
-  expect(sink.options).toBeDefined();
-  expect(sink.options.cwd).toBe(process.cwd());
-  // No isolation payload appended to the system prompt.
-  expect(sink.options.systemPrompt).not.toContain("Worktree isolation");
-  expect(sink.options.systemPrompt).not.toContain("ISOLATED");
+  expect(String(thrown)).toContain("managed mutation requires a registered worktree allocation");
+  expect(String(thrown)).toContain("canonical checkout mutation denied");
+  expect(providerQueries).toBe(0);
+  expect(sink.options).toBeUndefined();
   // No worktree/branch fact was ever written for this lane.
   const logged = existsSync(log) ? readFileSync(log, "utf8") : "";
   expect(logged).not.toContain(`tell agent:${agentId} worktree`);
