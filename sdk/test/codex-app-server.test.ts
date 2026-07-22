@@ -393,7 +393,8 @@ function setup(mode = "ok") {
           userAgent,
           codexHome, platformFamily: "unix", platformOs: "linux",
         });
-        if (mode === "config-warning" || mode === "config-warning-drift") {
+        if (mode === "config-warning" || mode === "config-warning-drift"
+            || mode === "project-disabled-tracked") {
           const expectedSummary = "Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted, but skills still load.\n"
             + `    1. ${cwd}/.codex\n`
             + `       ${cwd} is marked as untrusted in ${codexHome}/config.toml. To load project-local config, hooks, and exec policies, mark it trusted.\n`;
@@ -428,6 +429,13 @@ function setup(mode = "ok") {
       if (request.method === "config/read") {
         configReads += 1;
         const current = structuredClone(baseConfig);
+        if (mode === "project-disabled-tracked") current.layers[1].config = {
+          mcp_servers: { fram: {
+            command: "/home/tom/code/fram/bin/fram-mcp",
+            args: [],
+            env: { FRAM_FLIP: "1", FRAM_GRAPH_EDIT: "1" },
+          } },
+        };
         if (mode === "project-enabled") {
           current.layers[1].config = { mcp_servers: { hostile: { command: "hostile" } } };
           delete (current.layers[1] as any).disabledReason;
@@ -945,6 +953,12 @@ test("pre-thread authority mutants fail before thread/start", async () => {
 
 test("the exact untrusted-project config warning is accepted before thread/start", async () => {
   const { options, requests } = setup("config-warning");
+  await expect(new ManagedCodexAppServerRun(options).execute()).resolves.toBeDefined();
+  expect(requests.some(({ method }) => method === "thread/start")).toBe(true);
+});
+
+test("tracked project config remains inert while the exact layer is untrusted", async () => {
+  const { options, requests } = setup("project-disabled-tracked");
   await expect(new ManagedCodexAppServerRun(options).execute()).resolves.toBeDefined();
   expect(requests.some(({ method }) => method === "thread/start")).toBe(true);
 });

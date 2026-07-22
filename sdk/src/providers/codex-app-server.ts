@@ -26,6 +26,9 @@ const MAX_INVENTORY_PAGES = 32;
 const MAX_MCP_SERVERS = 64;
 const MAX_ID_BYTES = 512;
 const MAX_QUEUED_NOTIFICATIONS = 256;
+const MAX_DISABLED_PROJECT_CONFIG_BYTES = 64 * 1024;
+const MAX_DISABLED_PROJECT_CONFIG_DEPTH = 16;
+const MAX_DISABLED_PROJECT_CONFIG_NODES = 2_048;
 const MANAGED_CODEX_VERSION = "0.144.4";
 const SUPERVISOR_FRAME_PREFIX = "NORTH_CODEX_RPC 1 ";
 
@@ -592,6 +595,20 @@ function configFingerprint(response: unknown): string {
   })));
 }
 
+function validateDisabledProjectConfig(value: JsonObject): void {
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== "string")
+    throw new Error("Codex disabled project layer is not JSON-serializable");
+  parseStrictJson(serialized, "Codex disabled project layer", {
+    maxBytes: MAX_DISABLED_PROJECT_CONFIG_BYTES,
+    maxDepth: MAX_DISABLED_PROJECT_CONFIG_DEPTH,
+    maxNodes: MAX_DISABLED_PROJECT_CONFIG_NODES,
+  });
+  const allowed = new Set(["mcp_servers", "hooks", "exec_policy"]);
+  if (Object.keys(value).some((key) => !allowed.has(key)))
+    throw new Error("Codex disabled project config widened authority");
+}
+
 function validateConfig(
   response: unknown,
   contract: LaunchContract,
@@ -611,9 +628,14 @@ function validateConfig(
     if (type === "sessionFlags") {
       exact(layerConfig, contract.expectedSessionConfig, "Codex session authority layer");
     } else if (type === "project") {
-      exact(layerConfig, {}, "Codex project layer");
-      if (typeof layer.disabledReason !== "string" || !layer.disabledReason)
+      onlyKeys(layer, ["name", "version", "config", "disabledReason"], "Codex project layer");
+      onlyKeys(name, ["type", "dotCodexFolder"], "Codex project layer name");
+      if (layer.disabledReason !== "untrusted")
         throw new Error("Codex project layer is not disabled");
+      validateDisabledProjectConfig(layerConfig);
+      if (boundedString(name.dotCodexFolder, "Codex project layer folder", 4_096)
+          !== join(contract.projectRoot, ".codex"))
+        throw new Error("Codex project layer names an invalid config folder");
     } else if (type === "user") {
       exact(layerConfig, {}, "Codex user layer");
       if (name.profile !== null || name.file !== resolve(contract.codexHome, "config.toml"))
