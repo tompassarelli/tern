@@ -30,14 +30,43 @@
   (if (client-session? idx sess) (k/one-i idx sess "owner") (let [te (k/one-i idx sess "session_of")]
   (if (some? te) (k/one-i idx te "owner") nil))))
 
-(defn owner-rates [idx ^String owner]
-  (vec (sort (distinct (reduce (fn [rates te] (let [o (k/one-i idx te "owner")
-   rate (k/one-i idx te "rate")]
-  (if (and (= o owner) (some? rate)) (conj rates rate) rates))) [] (k/thread-ids-i idx))))))
+(def ^String CLIENT-RATE-KIND "client_rate_config")
 
-(defn unique-owner-rate [idx ^String owner]
-  (let [rates (owner-rates idx owner)]
-  (if (= (count rates) 1) (first rates) nil)))
+(defn ^String client-rate-subject [^String owner]
+  (str "@client-rate:" owner))
+
+(defn ^Boolean positive-rate? [^String rate]
+  (let [parsed (parse-double rate)]
+  (and (some? (re-matches #"[0-9]+(?:\.[0-9]+)?" rate)) (and (some? parsed) (> parsed 0.0)))))
+
+(defn client-rate-configs [idx ^String owner]
+  (filterv (fn [subject] (and (= (k/one-i idx subject "kind") CLIENT-RATE-KIND) (= (k/one-i idx subject "owner") owner))) (:subjects idx)))
+
+(defrecord ClientRateAuthority [status subject rate configs])
+
+(defn clientrateauthority-status [r] (:status r))
+
+(defn clientrateauthority-subject [r] (:subject r))
+
+(defn clientrateauthority-rate [r] (:rate r))
+
+(defn clientrateauthority-configs [r] (:configs r))
+
+(defn ^ClientRateAuthority client-rate-authority [idx ^String owner]
+  (let [expected (client-rate-subject owner)
+   configs (client-rate-configs idx owner)
+   n (count configs)]
+  (cond
+  (= n 0) (->ClientRateAuthority "missing" expected "" 0)
+  (> n 1) (->ClientRateAuthority "duplicate" expected "" n)
+  :else (let [subject (first configs)
+   rates (vec (sort (distinct (k/many-i idx subject "rate"))))]
+  (cond
+  (not= subject expected) (->ClientRateAuthority "noncanonical" subject "" 1)
+  (empty? rates) (->ClientRateAuthority "missing-rate" subject "" 1)
+  (> (count rates) 1) (->ClientRateAuthority "ambiguous-rate" subject (str/join ", " rates) 1)
+  (not (positive-rate? (first rates))) (->ClientRateAuthority "invalid-rate" subject (first rates) 1)
+  :else (->ClientRateAuthority "ok" subject (first rates) 1))))))
 
 (defn ^Boolean open? [idx ^String s]
   (and (some? (k/one-i idx s "session_of")) (and (some? (k/one-i idx s "start_time")) (nil? (k/one-i idx s "end_time")))))

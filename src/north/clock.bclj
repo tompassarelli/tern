@@ -53,20 +53,51 @@
     (let [te (k/one-i idx sess "session_of")]
       (if (some? te) (k/one-i idx te "owner") nil))))
 
-(defn owner-rates [idx :- k/Index owner :- String] :- (Vec String)
-  (vec
-   (sort
-    (distinct
-     (reduce (fn [rates :- (Vec String) te :- String] :- (Vec String)
-               (let [o (k/one-i idx te "owner")
-                     rate (k/one-i idx te "rate")]
-                 (if (and (= o owner) (some? rate)) (conj rates rate) rates)))
-             []
-             (k/thread-ids-i idx))))))
+;; Live client billing has one deliberately boring authority. Thread `rate`
+;; facts are historical invoice/routing metadata and MUST NOT configure the
+;; human clock. `north clock rate` creates the canonical subject; the lookup
+;; still scans kind+owner so duplicate or hand-authored impostors fail closed.
+(def ^:private CLIENT-RATE-KIND :- String "client_rate_config")
 
-(defn unique-owner-rate [idx :- k/Index owner :- String] :- String?
-  (let [rates (owner-rates idx owner)]
-    (if (= (count rates) 1) (first rates) nil)))
+(defn client-rate-subject [owner :- String] :- String
+  (str "@client-rate:" owner))
+
+(defn positive-rate? [rate :- String] :- Bool
+  (let [parsed (parse-double rate)]
+    (and (some? (re-matches #"[0-9]+(?:\.[0-9]+)?" rate))
+         (and (some? parsed) (> parsed 0.0)))))
+
+(defn client-rate-configs [idx :- k/Index owner :- String] :- (Vec String)
+  (filterv
+   (fn [subject :- String] :- Bool
+     (and (= (k/one-i idx subject "kind") CLIENT-RATE-KIND)
+          (= (k/one-i idx subject "owner") owner)))
+   (:subjects idx)))
+
+(defrecord ClientRateAuthority
+  [status :- String subject :- String rate :- String configs :- Int])
+
+(defn client-rate-authority [idx :- k/Index owner :- String] :- ClientRateAuthority
+  (let [expected (client-rate-subject owner)
+        configs (client-rate-configs idx owner)
+        n (count configs)]
+    (cond
+      [(= n 0) (->ClientRateAuthority "missing" expected "" 0)]
+      [(> n 1) (->ClientRateAuthority "duplicate" expected "" n)]
+      [:else
+       (let [subject (first configs)
+             rates (vec (sort (distinct (k/many-i idx subject "rate"))))]
+         (cond
+           [(not= subject expected)
+            (->ClientRateAuthority "noncanonical" subject "" 1)]
+           [(empty? rates)
+            (->ClientRateAuthority "missing-rate" subject "" 1)]
+           [(> (count rates) 1)
+            (->ClientRateAuthority "ambiguous-rate" subject (str/join ", " rates) 1)]
+           [(not (positive-rate? (first rates)))
+            (->ClientRateAuthority "invalid-rate" subject (first rates) 1)]
+           [:else
+            (->ClientRateAuthority "ok" subject (first rates) 1)]))])))
 
 ;; an OPEN session: session_of + start_time, no end_time (the clock still runs).
 (defn open? [idx :- k/Index s :- String] :- Bool

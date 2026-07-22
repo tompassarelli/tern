@@ -655,19 +655,54 @@
   (if (not (str/blank? a)) a (let [b (fram.rt/getenv-or "AGENT_ID" "")]
   (if (not (str/blank? b)) b "user")))))
 
+(defn- ^String client-rate-problem [^String owner authority]
+  (let [status (:status authority)]
+  (cond
+  (= status "missing") (str "owner '" owner "' has no client billing rate configuration. Configure it once: north clock rate " owner " <positive-hourly-rate>")
+  (= status "duplicate") (str "owner '" owner "' has " (:configs authority) " client billing rate configurations; exactly one is required")
+  (= status "noncanonical") (str "owner '" owner "' has a noncanonical client billing rate configuration at " (short-id (:subject authority)) " (expected " (short-id (clk/client-rate-subject owner)) ")")
+  (= status "missing-rate") (str "owner '" owner "' has a client billing rate configuration with no rate")
+  (= status "ambiguous-rate") (str "owner '" owner "' has ambiguous client billing rates [" (:rate authority) "]")
+  (= status "invalid-rate") (str "owner '" owner "' has invalid client billing rate '" (:rate authority) "'; rate must be a positive number")
+  :else "client billing rate configuration is invalid")))
+
+(defn cmd-clock-rate [^String log ^String owner ^String new-rate]
+  (let [idx (live-idx log)
+   me (agent-id)
+   authority (clk/client-rate-authority idx owner)
+   subject (clk/client-rate-subject owner)
+   subject-kind (k/one-i idx subject "kind")
+   subject-owner (k/one-i idx subject "owner")]
+  (cond
+  (not= me "user") (println (str "clock rate refused for managed agent " me " — client billing configuration is owned by user"))
+  (str/blank? owner) (println "usage: clock rate <owner> [positive-hourly-rate]")
+  (str/blank? new-rate) (if (= (:status authority) "ok") (println (str "client " owner " billing rate: " (:rate authority) "/h  (" (short-id (:subject authority)) ")")) (println (str "clock rate unavailable: " (client-rate-problem owner authority))))
+  (not (clk/positive-rate? new-rate)) (println (str "clock rate refused: '" new-rate "' is not a positive numeric hourly rate"))
+  (> (:configs authority) 1) (println (str "clock rate refused: " (client-rate-problem owner authority)))
+  (= (:status authority) "noncanonical") (println (str "clock rate refused: " (client-rate-problem owner authority)))
+  (= (:status authority) "ambiguous-rate") (println (str "clock rate refused: " (client-rate-problem owner authority)))
+  (and (some? subject-kind) (not (= subject-kind "client_rate_config"))) (println (str "clock rate refused: canonical subject " (short-id subject) " is already kind=" subject-kind))
+  (and (some? subject-owner) (not (= subject-owner owner))) (println (str "clock rate refused: canonical subject " (short-id subject) " is already owned by " subject-owner))
+  :else (let [port (fram.rt/coord-port)
+   coord-v (fram.rt/coord-version-for-log port log)]
+  (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "client billing rate was not recorded")) (let [r1 (tell-retry port log "assert" subject "owner" owner 5)
+   r2 (if (str/starts-with? r1 "ok:") (tell-retry port log "assert" subject "rate" new-rate 5) "skipped: owner failed")
+   r3 (if (str/starts-with? r2 "ok:") (tell-retry port log "assert" subject "kind" "client_rate_config" 5) "skipped: rate failed")]
+  (if (and (str/starts-with? r1 "ok:") (and (str/starts-with? r2 "ok:") (str/starts-with? r3 "ok:"))) (println (str "client " owner " billing rate configured at " new-rate "/h  (" (short-id subject) ")")) (println (str "clock rate FAILED to record (" r1 "/" r2 "/" r3 ") — retry")))))))))
+
 (defn cmd-clock-in [^String log ^String owner]
   (let [idx (live-idx log)
    me (agent-id)
    open (clk/open-human-sessions idx)
-   rates (clk/owner-rates idx owner)
-   rate (clk/unique-owner-rate idx owner)]
+   authority (clk/client-rate-authority idx owner)
+   rate (:rate authority)]
   (cond
   (not= me "user") (println (str "clock in refused for managed agent " me " — task timing is recorded as run telemetry"))
   (str/blank? owner) (println "usage: clock in <owner>")
   (not (empty? open)) (let [run (first open)
    current (clk/session-owner idx run)]
   (println (str "already clocked in for client " (if (some? current) current "?") " (session " (short-id run) ") — `clock out` first")))
-  (nil? rate) (if (empty? rates) (println (str "clock in refused: owner '" owner "' has no rate. Set the hourly rate on a client thread first: " "north tell <thread-id> rate <hourly-rate>")) (println (str "clock in refused: owner '" owner "' has ambiguous rates [" (str/join ", " rates) "]. Normalize its thread rates, then retry.")))
+  (not= (:status authority) "ok") (println (str "clock in refused: " (client-rate-problem owner authority)))
   :else (let [port (fram.rt/coord-port)
    coord-v (fram.rt/coord-version-for-log port log)]
   (if (< coord-v 0) (println (coordinator-failure-message coord-v port log "client clock in was not recorded")) (let [sid (fresh-sid idx (fram.rt/now-id))
@@ -1069,7 +1104,7 @@
   (println "  work queue : ready · next · board · blocked · agenda · leverage · needs-review")
   (println "  vocabulary : schema (census by kind) · predicate (executable metadata) · schema-migrate (cutover/audit)")
   (println "  read/write : show · capture · tell · retract · validate   (untell = legacy alias of retract)")
-  (println "  time       : clock in <owner>|out|status|report  (start/stop remain compatible)")
+  (println "  time       : clock rate <owner> [rate] · in <owner>|out|status|report  (start/stop remain compatible)")
   (println "  agents     : dispatch · spawn")
   (println "  view       : presentation")
   (println "")
@@ -1244,6 +1279,7 @@
   (= cmd "clock") (let [sub (if (> (count args) 1) (nth args 1) "status")]
   (cond
   (= sub "in") (if (>= (count args) 3) (cmd-clock-in log (nth args 2)) (println "usage: clock in <owner>"))
+  (= sub "rate") (if (>= (count args) 3) (cmd-clock-rate log (nth args 2) (if (>= (count args) 4) (nth args 3) "")) (println "usage: clock rate <owner> [positive-hourly-rate]"))
   (= sub "out") (cmd-clock-out log)
   (= sub "start") (if (>= (count args) 3) (cmd-clock-start log (nth args 2)) (println "usage: clock start <thread-id>"))
   (= sub "stop") (cmd-clock-stop log)
@@ -1256,8 +1292,8 @@
   (= sub "map") (if (>= (count args) 4) (cf/cmd-map (fram.rt/time-dir) (nth args 2) (nth args 3)) (println "usage: clock map <owner> <project-id>"))
   (= sub "projects") (cf/cmd-projects)
   (= sub "workspaces") (cf/cmd-workspaces)
-  :else (println "usage: clock in <owner> | out | start <id> | stop | orphan <agent-id> | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
-  :else (println "north usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed (retired; use schema-migrate) | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <in|out|start|stop|orphan|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)"))))
+  :else (println "usage: clock rate <owner> [rate] | in <owner> | out | start <id> | stop | orphan <agent-id> | status | report | today | week | sync | map <owner> <project-id> | projects | workspaces")))
+  :else (println "north usage: capture <title> [owner] | ready [--all] | blocked | leverage | next | agenda | board [--all] | schema | needs-review | audit | resolve <@handle|@id> | validate | schema-seed (retired; use schema-migrate) | tools | doctor | heal | boot | listen <agent-id> | json <...> | clock <rate|in|out|start|stop|orphan|status|report|today|week|sync|map|projects|workspaces>   (board/ready default to a curated top slice; --all for the full dump. engine verbs import/export/show/set/tell/retract/merge route to fram; untell = legacy alias of retract)"))))
 
 (defn run-status [args ^String threads-dir ^String log]
   (cond
