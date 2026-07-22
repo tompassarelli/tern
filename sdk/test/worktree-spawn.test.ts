@@ -256,16 +256,19 @@ test("explicit worktree provisioning failure aborts before provider, admission, 
   expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe(sharedBytes);
   expect(execFileSync("git", ["-C", repo, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
   // Physical registration is now the one intentional pre-Git side effect. The
-  // collision leaves an append-only planned -> failed -> absent history, while
-  // every provider/admission/identity/run writer remains unreachable.
+  // collision leaves an append-only planned -> quarantined history plus an
+  // explicit orphan-recovery fact, while provider/admission/run remain unreachable.
   const afterLog = existsSync(log) ? readFileSync(log, "utf8") : "";
   const delta = afterLog.slice(beforeLog.length).trim().split("\n");
-  expect(delta).toHaveLength(2);
+  expect(delta).toHaveLength(3);
   expect(delta[0]).toContain("worktree-allocation-internal.clj 59999 register");
   expect(delta[1]).toContain('"type":"quarantined"');
   expect(delta[1]).toContain('"code":"durable_ref_collision"');
   expect(delta[1]).toContain('"resourceState":"quarantined"');
-  expect(delta.every((line) => line.startsWith("bb "))).toBe(true);
+  expect(delta.slice(0, 2).every((line) => line.startsWith("bb "))).toBe(true);
+  expect(delta[2]).toBe(
+    `tell agent:${agentId} worktree_orphaned ${expectedPath} | worktree provisioning failed after physical identity appeared — inspect; never auto-delete`,
+  );
   expect(delta.join("\n")).not.toContain("must never reach provider execution");
 
   execFileSync("git", ["-C", repo, "branch", "-d", "--", branch]);
