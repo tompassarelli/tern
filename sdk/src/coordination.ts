@@ -21,6 +21,7 @@ const DEFAULT_ADMISSION_TIMEOUT_MS = 8_000;
 const LIVE_FEED_ACK_TIMEOUT_MS = 10_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 45_000;
 const DEFAULT_STOP_KILL_MS = 1_000;
+const DEFAULT_STOP_REAP_MS = 5_000;
 const DEFAULT_DEDUPE_IDS = 4_096;
 const MAX_ID_BYTES = 512;
 const MAX_SENDER_BYTES = 1_024;
@@ -73,8 +74,18 @@ export class LiveFeedStartupTimeoutError extends Error {
   }
 }
 
+export class LiveFeedReapTimeoutError extends Error {
+  readonly code = "NORTH_LIVE_FEED_REAP_TIMEOUT";
+
+  constructor(readonly timeoutMs: number) {
+    super("North live feed did not reap after bounded termination");
+    this.name = "LiveFeedReapTimeoutError";
+  }
+}
+
 export interface FeedSubscription {
-  (): void;
+  /** Stop once and resolve only after the direct feed child is reaped. */
+  (): Promise<void>;
   /** Resolves only after the coordinator subscription is armed and start is admitted. */
   readonly ready: Promise<void>;
   /**
@@ -111,6 +122,7 @@ export interface SubscriptionRuntime {
   admissionTimeoutMs?: number;
   drainTimeoutMs?: number;
   stopKillMs?: number;
+  stopReapMs?: number;
   dedupeIds?: number;
 }
 
@@ -564,11 +576,16 @@ function subscribeFeedMode(
     "drainTimeoutMs",
   );
   const stopKillMs = positiveInteger(runtime.stopKillMs ?? DEFAULT_STOP_KILL_MS, "stopKillMs");
+  const stopReapMs = positiveInteger(runtime.stopReapMs ?? DEFAULT_STOP_REAP_MS, "stopReapMs");
+  if (stopReapMs <= stopKillMs)
+    throw new Error("stopReapMs must be greater than stopKillMs");
   const admittedIds = new BoundedRememberedIds(runtime.dedupeIds ?? DEFAULT_DEDUPE_IDS);
   let stopped = false;
   let current: ChildProcess | null = null;
+  let currentSettlement: Promise<void> | null = null;
   let retryTimer: unknown = null;
   let stopKillTimer: unknown = null;
+  let stopReapTimer: unknown = null;
   let startupTimer: unknown = null;
   let cancelCurrentReadyTimer: (() => void) | null = null;
   let cancelCurrentAdmission: (() => void) | null = null;
@@ -596,6 +613,31 @@ function subscribeFeedMode(
   // Existing stop-only callers need not install a rejection handler. Awaiters
   // still observe the original promise's typed stop-before-ready rejection.
   void readiness.catch(() => {});
+  let stopSettled = false;
+  let resolveStop!: () => void;
+  let rejectStop!: (error: Error) => void;
+  const stopSettlement = new Promise<void>((resolve, reject) => {
+    resolveStop = resolve;
+    rejectStop = reject;
+  });
+  // Automatic startup-timeout termination has no caller waiting on stop().
+  // A later explicit stop still receives this original settlement promise.
+  void stopSettlement.catch(() => {});
+
+  const settleStop = (error?: Error) => {
+    if (stopSettled) return;
+    stopSettled = true;
+    if (stopKillTimer !== null) {
+      cancel(stopKillTimer);
+      stopKillTimer = null;
+    }
+    if (stopReapTimer !== null) {
+      cancel(stopReapTimer);
+      stopReapTimer = null;
+    }
+    if (error) rejectStop(error);
+    else resolveStop();
+  };
 
   const armDrainDeadline = () => {
     if (drainTimer !== null) cancel(drainTimer);
@@ -634,6 +676,12 @@ function subscribeFeedMode(
       return;
     }
     current = child;
+    let childSettled = false;
+    let resolveChildSettlement!: () => void;
+    const childSettlement = new Promise<void>((resolve) => {
+      resolveChildSettlement = resolve;
+    });
+    currentSettlement = childSettlement;
     child.stdin?.on("error", () => { /* close/replay is the recovery path */ });
     const lines = new LiveFeedLines(maxFrameBytes);
     let ready = false;
@@ -844,7 +892,19 @@ function subscribeFeedMode(
         cancel(stopKillTimer);
         stopKillTimer = null;
       }
+      if (stopReapTimer !== null) {
+        cancel(stopReapTimer);
+        stopReapTimer = null;
+      }
       void processing.then(() => {
+        if (!childSettled) {
+          childSettled = true;
+          resolveChildSettlement();
+        }
+        if (stopped) {
+          settleStop();
+          return;
+        }
         if (recoveryScheduled) return;
         recoveryScheduled = true;
         if (stopped) return;
@@ -861,8 +921,8 @@ function subscribeFeedMode(
     });
   };
 
-  const terminate = (readinessError: Error) => {
-    if (stopped) return;
+  const terminate = (readinessError: Error): Promise<void> => {
+    if (stopped) return stopSettlement;
     stopped = true;
     armed = false;
     if (!readinessSettled) {
@@ -889,17 +949,32 @@ function subscribeFeedMode(
       rejectDrain(readinessError);
     }
     const child = current;
-    if (!child) return;
-    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    const childSettlement = currentSettlement;
+    if (childSettlement === null) {
+      settleStop();
+      return stopSettlement;
+    }
+    void childSettlement.then(() => settleStop());
+    if (!child) return stopSettlement;
+    try { child.stdin?.end(); } catch { /* termination signal remains authoritative */ }
+    try { child.kill("SIGTERM"); } catch { /* close/settlement decides the outcome */ }
     stopKillTimer = schedule(() => {
       stopKillTimer = null;
-      if (current !== child) return;
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      if (stopSettled || current !== child) return;
+      try { child.kill("SIGKILL"); } catch { /* reap deadline decides the outcome */ }
     }, stopKillMs);
+    stopReapTimer = schedule(() => {
+      stopReapTimer = null;
+      if (stopSettled) return;
+      try { child.stdin?.destroy(); } catch { /* release local process handles */ }
+      try { child.stdout?.destroy(); } catch { /* release local process handles */ }
+      try { child.stderr?.destroy(); } catch { /* release local process handles */ }
+      try { child.unref(); } catch { /* release what the runtime exposes */ }
+      settleStop(new LiveFeedReapTimeoutError(stopReapMs));
+    }, stopReapMs);
+    return stopSettlement;
   };
-  const stop = (() => {
-    terminate(new LiveFeedStoppedBeforeReadyError());
-  }) as FeedSubscription;
+  const stop = (() => terminate(new LiveFeedStoppedBeforeReadyError())) as FeedSubscription;
   const drain = (frozenRouteEpoch: string) => {
     if (drainRequested) {
       return frozenRouteEpoch === drainEpoch
@@ -923,7 +998,7 @@ function subscribeFeedMode(
   });
   startupTimer = schedule(() => {
     startupTimer = null;
-    terminate(new LiveFeedStartupTimeoutError(startupTimeoutMs));
+    void terminate(new LiveFeedStartupTimeoutError(startupTimeoutMs));
   }, startupTimeoutMs);
   start();
   return stop;

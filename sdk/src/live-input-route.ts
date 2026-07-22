@@ -163,15 +163,15 @@ export class ManagedLiveInputRoute {
     this.publish(route, this.published.liveInputState, required);
   }
 
-  private unbind(): void {
+  private async unbind(): Promise<void> {
     const subscription = this.subscription;
     this.subscription = undefined;
-    subscription?.();
+    if (subscription) await subscription();
   }
 
   private async drainAndUnbind(): Promise<void> {
     if (!this.settlementRequired) {
-      this.unbind();
+      await this.unbind();
       return;
     }
     let subscription = this.subscription;
@@ -187,7 +187,7 @@ export class ManagedLiveInputRoute {
         await readinessProof(subscription);
         this.subscription = subscription;
       } catch (error) {
-        subscription?.();
+        if (subscription) await subscription();
         throw error;
       }
     }
@@ -197,7 +197,7 @@ export class ManagedLiveInputRoute {
       await subscription.drain(this.published.liveInputEpoch);
       this.settlementRequired = false;
     } finally {
-      this.unbind();
+      await this.unbind();
     }
   }
 
@@ -217,7 +217,7 @@ export class ManagedLiveInputRoute {
       subscription = this.feedSubscriber(this.agentId, this.pushMessage);
       await readinessProof(subscription);
     } catch (error) {
-      if (subscription) subscription();
+      if (subscription) await subscription();
       if (
         error instanceof LiveFeedStoppedBeforeReadyError
         || error instanceof LiveFeedStartupTimeoutError
@@ -235,7 +235,7 @@ export class ManagedLiveInputRoute {
       this.publish(route, "armed", true);
       this.subscription = subscription;
     } catch (error) {
-      subscription();
+      await subscription();
       throw error;
     }
   }
@@ -261,7 +261,7 @@ export class ManagedLiveInputRoute {
       // behind a route we could not durably freeze is a worse split-brain. The
       // caller reports the failure loudly and may retry the idempotent durable
       // freeze; transport teardown is unconditional and exactly once.
-      this.unbind();
+      await this.unbind();
       throw error;
     }
     // Keep the old feed bound after the frozen publication until it proves all
@@ -280,7 +280,7 @@ export class ManagedLiveInputRoute {
     try {
       this.publish(this.published, "frozen", true);
     } catch (error) {
-      this.unbind();
+      await this.unbind();
       throw error;
     }
     await this.drainAndUnbind();

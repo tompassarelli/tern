@@ -18,10 +18,11 @@ function deferred<T = void>() {
 
 function subscription(
   ready: Promise<void>,
-  stop: () => void = () => {},
+  stop: () => void | Promise<void> = () => {},
   drain: (frozenRouteEpoch: string) => Promise<void> = async () => {},
 ): FeedSubscription {
-  return Object.assign(stop, {
+  const settle = async () => { await stop(); };
+  return Object.assign(settle, {
     ready,
     drain,
     isArmed: () => true,
@@ -40,6 +41,43 @@ const inputAdmission = {
   consumed: Promise.resolve(true),
   cancel: () => {},
 };
+
+test("terminal unbind waits for direct feed-child settlement", async () => {
+  const stopGate = deferred();
+  const events: string[] = [];
+  const route = new ManagedLiveInputRoute(
+    "lane-await-reap",
+    { kind: "lane" },
+    initialRoute,
+    () => inputAdmission,
+    () => subscription(
+      Promise.resolve(),
+      async () => {
+        events.push("stop");
+        await stopGate.promise;
+        events.push("reaped");
+      },
+      async () => { events.push("drain"); },
+    ),
+    (_agentId, facts) => { events.push(`write:${facts.liveInputState}`); },
+  );
+  await route.activate(initialRoute);
+  let settled = false;
+  const terminal = route.freezeAndUnbind().then(() => { settled = true; });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(events).toEqual(["write:armed", "write:frozen", "drain", "stop"]);
+  expect(settled).toBe(false);
+  stopGate.resolve();
+  await terminal;
+  expect(events).toEqual([
+    "write:armed",
+    "write:frozen",
+    "drain",
+    "stop",
+    "reaped",
+  ]);
+});
 
 test("streaming route publishes armed only after feed readiness", async () => {
   const gate = deferred();

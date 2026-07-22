@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import {
   inputChannel,
   LiveFeedConfigurationError,
+  LiveFeedReapTimeoutError,
   LiveFeedStartupTimeoutError,
   LiveFeedStoppedBeforeReadyError,
   subscribeFeed,
@@ -24,16 +25,39 @@ class FakeStdin extends EventEmitter {
     this.writes.push(String(value));
     return true;
   }
+
+  end() {
+    this.writable = false;
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.writable = false;
+  }
+}
+
+class FakeStdout extends EventEmitter {
+  destroyed = false;
+
+  destroy() {
+    this.destroyed = true;
+  }
 }
 
 class FakeChild extends EventEmitter {
-  stdout = new EventEmitter();
+  stdout = new FakeStdout();
   stdin = new FakeStdin();
+  stderr = null;
   signals: Array<string | undefined> = [];
+  unrefCalls = 0;
 
   kill(signal?: string) {
     this.signals.push(signal);
     return true;
+  }
+
+  unref() {
+    this.unrefCalls++;
   }
 }
 
@@ -47,6 +71,8 @@ function harness(options: {
   maxFrameBytes?: number;
   admissionTimeoutMs?: number;
   drainTimeoutMs?: number;
+  stopKillMs?: number;
+  stopReapMs?: number;
   settlementOnly?: boolean;
 } = {}) {
   const children: FakeChild[] = [];
@@ -92,7 +118,8 @@ function harness(options: {
     startupTimeoutMs: 20_000,
     admissionTimeoutMs: options.admissionTimeoutMs ?? 3_000,
     drainTimeoutMs: options.drainTimeoutMs ?? 45_000,
-    stopKillMs: 250,
+    stopKillMs: options.stopKillMs ?? 250,
+    stopReapMs: options.stopReapMs ?? 5_000,
     ...(options.maxFrameBytes === undefined
       ? {}
       : { maxFrameBytes: options.maxFrameBytes }),
@@ -825,6 +852,60 @@ test("stop before readiness rejects the typed readiness proof and reaps without 
   expect(killTimer!.cancelled).toBe(true);
   expect(h.activeTimers()).toEqual([]);
   expect(h.children).toHaveLength(1);
+});
+
+test("stop is idempotent and settles only after close and queued output processing", async () => {
+  const h = harness();
+  const admission = deferred<boolean>();
+  const subscription = subscribeFeed(
+    "agent-test",
+    () => ({ consumed: admission.promise, cancel: () => {} }),
+    h.runtime,
+  );
+  const child = h.children[0]!;
+  ready(child);
+  await subscription.ready;
+  mail(child);
+  await settle();
+
+  const first = subscription();
+  const second = subscription();
+  expect(first).toBe(second);
+  expect(child.signals).toEqual(["SIGTERM"]);
+  let settledStop = false;
+  void first.then(() => { settledStop = true; });
+  child.emit("close", 0);
+  await Promise.resolve();
+  expect(settledStop).toBe(false);
+  admission.resolve(false);
+  await first;
+  expect(settledStop).toBe(true);
+  expect(h.children).toHaveLength(1);
+});
+
+test("stop escalates once and rejects with a typed bounded reap failure", async () => {
+  const h = harness({ stopKillMs: 50, stopReapMs: 100 });
+  const subscription = subscribeFeed("agent-test", () => {}, h.runtime);
+  const child = h.children[0]!;
+  const settlement = subscription();
+
+  const killTimer = h.activeTimers().find(({ delayMs }) => delayMs === 50);
+  const reapTimer = h.activeTimers().find(({ delayMs }) => delayMs === 100);
+  expect(killTimer).toBeDefined();
+  expect(reapTimer).toBeDefined();
+  killTimer!.callback();
+  expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+  reapTimer!.callback();
+  const error = await settlement.catch((cause) => cause);
+  expect(error).toBeInstanceOf(LiveFeedReapTimeoutError);
+  expect(error).toMatchObject({
+    code: "NORTH_LIVE_FEED_REAP_TIMEOUT",
+    timeoutMs: 100,
+  });
+  expect(child.stdin.destroyed).toBe(true);
+  expect(child.stdout.destroyed).toBe(true);
+  expect(child.unrefCalls).toBe(1);
+  expect(subscription()).toBe(settlement);
 });
 
 test("subscription executes only the package-owned BB selector and ignores hostile PATH", () => {
