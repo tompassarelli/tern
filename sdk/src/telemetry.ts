@@ -29,6 +29,9 @@ import {
 import type { ProviderModelAdmissionReceipt } from "./provider-model-observation-store";
 import { canonicalWriteModel } from "./providers/catalog";
 import type { ProviderId } from "./providers/types";
+import type {
+  RoutingAdmissionReceipt, RoutingAssessment, RoutingPinEvidence,
+} from "./routing-economics";
 
 const REPO = resolve(import.meta.dir, "../..");
 const internalWriter = resolve(REPO, "cli/run-fact-internal.clj");
@@ -61,6 +64,16 @@ export interface RunRecord {
   requestedModel?: string;
   requestedEffort?: string;
   routingMetadata?: RoutingRequest;
+  routingAssessment?: RoutingAssessment;
+  routingAdmissionReceipt?: RoutingAdmissionReceipt;
+  routingPinEvidence?: RoutingPinEvidence;
+  /** Explicit execution-ledger provenance. Missing on legacy rows means unknown. */
+  executionSource?: "north-managed" | "provider-native";
+  executionTransport?: "anthropic-agent-sdk" | "codex-app-server" | "codex-cli" | "provider-hook";
+  providerSessionPersistence?: "persisted" | "ephemeral" | "unknown";
+  northSessionId?: string;
+  threadProvenance?: "exact" | "ad-hoc" | "unknown";
+  turnProvenance?: "provider-terminal" | "pre-provider" | "unknown";
   /** Redacted identifiers proving which operational prompt/tool contracts were applied. */
   promptComposition?: HarnessCompositionEvidence;
   /** Exact provider-executable authority from the final admitted route. */
@@ -102,6 +115,16 @@ export interface RunRecord {
   spendTarget?: string;
   spendPeriod?: string;
   spendReservationMicrousd?: number;
+}
+
+export function classifyTurnProvenance(
+  resultTerminal: unknown,
+  processOutcome: string | undefined,
+): NonNullable<RunRecord["turnProvenance"]> {
+  if (resultTerminal && typeof resultTerminal === "object") return "provider-terminal";
+  if (processOutcome === "blocked_preflight" || processOutcome === "blocked_spend_guard")
+    return "pre-provider";
+  return "unknown";
 }
 
 export type ObservedRunRecord = RunRecord & Required<
@@ -200,6 +223,13 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (rec.requestedTier) facts.push(["requested_tier", rec.requestedTier]);
   if (rec.requestedModel) facts.push(["requested_model", rec.requestedModel]);
   if (rec.requestedEffort) facts.push(["requested_effort", rec.requestedEffort]);
+  if (rec.executionSource) facts.push(["execution_source", rec.executionSource]);
+  if (rec.executionTransport) facts.push(["execution_transport", rec.executionTransport]);
+  if (rec.providerSessionPersistence)
+    facts.push(["provider_session_persistence", rec.providerSessionPersistence]);
+  if (rec.northSessionId) facts.push(["north_session_id", rec.northSessionId]);
+  if (rec.threadProvenance) facts.push(["thread_provenance", rec.threadProvenance]);
+  if (rec.turnProvenance) facts.push(["turn_provenance", rec.turnProvenance]);
   if (rec.allocationMode) facts.push(["allocation_mode", rec.allocationMode]);
   if (rec.entitlementPressure) facts.push(["entitlement_pressure", rec.entitlementPressure]);
   for (const [target, evidence] of Object.entries(rec.allocationEvidence ?? {}))
@@ -249,6 +279,57 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
       facts.push(["bespoke_reason", metadata.composition.bespokeReason]);
       facts.push(["promotion_candidate", String(metadata.composition.promotionCandidate)]);
     }
+  }
+  const assessment = rec.routingAssessment;
+  const receipt = rec.routingAdmissionReceipt;
+  if (receipt) {
+    facts.push(["routing_admission_receipt_version", String(receipt.version)]);
+    facts.push(["routing_request_sha256", receipt.routingRequestSha256]);
+    facts.push(["staffing_catalog_sha256", receipt.staffingCatalogSha256]);
+    facts.push(["provider_catalogs_sha256", receipt.providerCatalogsSha256]);
+    facts.push(["routing_policy_sha256", receipt.routingPolicySha256]);
+    facts.push(["routing_assessment_status", assessment ? "recorded" : "unavailable"]);
+    if (receipt.routingAssessmentSha256)
+      facts.push(["routing_assessment_sha256", receipt.routingAssessmentSha256]);
+    facts.push(["routing_pin_evidence_status", receipt.pinEvidenceStatus]);
+    if (receipt.pinEvidenceSha256)
+      facts.push(["routing_pin_evidence_sha256", receipt.pinEvidenceSha256]);
+    facts.push(["routing_override_evidence_status", receipt.overrideEvidence.status]);
+    if (receipt.overrideEvidence.exceptionCode)
+      facts.push(["routing_override_exception_code", receipt.overrideEvidence.exceptionCode]);
+    for (const field of receipt.overrideEvidence.changedAxes)
+      facts.push(["routing_receipt_override", field]);
+    for (const [axis, value] of Object.entries(receipt.appliedAxes))
+      facts.push([`routing_applied_${axis}`, value]);
+    for (const [axis, value] of Object.entries(receipt.stockAxes ?? {}))
+      facts.push([`routing_stock_${axis}`, value]);
+  }
+  if (assessment) {
+    facts.push(["routing_assessment_policy", assessment.version]);
+    for (const [signal, value] of Object.entries(assessment.signals))
+      facts.push([`routing_signal_${signal}`, value]);
+    facts.push(["routing_derived_tier", assessment.derived.minimumTier]);
+    facts.push(["routing_derived_reasoning", assessment.derived.minimumReasoning]);
+    for (const code of assessment.derived.ruleCodes)
+      facts.push(["routing_rule_code", code]);
+    facts.push(["routing_selected_tier", assessment.selected.tier]);
+    facts.push(["routing_selected_reasoning", assessment.selected.reasoning]);
+    if (assessment.exception) {
+      facts.push(["routing_exception_code", assessment.exception.code]);
+      facts.push(["routing_exception_detail", assessment.exception.detail]);
+    }
+    if (assessment.exceptionalDeliberation)
+      facts.push(["routing_exceptional_deliberation", assessment.exceptionalDeliberation]);
+  }
+  if (rec.routingPinEvidence) {
+    const pin = rec.routingPinEvidence;
+    facts.push(["routing_pin_policy", pin.policyVersion]);
+    facts.push(["routing_pin_issued_at", pin.issuedAt]);
+    facts.push(["routing_pin_expires_at", pin.expiresAt]);
+    facts.push(["routing_pin_reason_code", pin.reasonCode]);
+    facts.push(["routing_pin_detail", pin.detail]);
+    for (const item of pin.pins)
+      facts.push(["routing_pin", JSON.stringify(item)]);
   }
   const applied = rec.promptComposition;
   if (applied) {

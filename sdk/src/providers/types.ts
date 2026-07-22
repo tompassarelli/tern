@@ -175,6 +175,8 @@ export interface ProviderAvailability {
 // not escape their adapter directory.
 export interface AgentQuery {
   [Symbol.asyncIterator](): AsyncIterator<any>;
+  /** Exact adapter transport selected for this query; absent until unknowable. */
+  readonly executionTransport?: "anthropic-agent-sdk" | "codex-app-server" | "codex-cli";
   interrupt?(): Promise<void>;
   /** Idempotently dispose the provider query and await its owned process boundary. */
   close?(): Promise<void>;

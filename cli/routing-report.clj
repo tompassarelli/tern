@@ -11,10 +11,12 @@
 (def NORTH (some-> *file* io/file .getCanonicalFile .getParentFile .getParentFile str))
 (load-file (str NORTH "/cli/gaffer-staffing.clj"))
 (load-file (str NORTH "/cli/terminal-projection.clj"))
+(load-file (str NORTH "/cli/harness-state.clj"))
 
 (def multi-preds #{"done_when" "bar_evidence" "domain_requirement"
                    "applied_capability" "applied_domain_requirement"
-                   "composition_override" "applied_preset_override" "struggle"})
+                   "composition_override" "applied_preset_override" "struggle"
+                   "routing_rule_code" "routing_pin" "routing_receipt_override"})
 
 (def canonical-gaffer-capabilities
   ["filesystem.read" "filesystem.search" "filesystem.write" "shell"
@@ -570,6 +572,32 @@
        :model (or raw-model "unattributed") :effort (get' "effort" "unattributed")
        :providerTarget (or (normalized-token (get' "provider_target" nil))
                            "unattributed")
+       :requestedProvider (normalized-token (one facts entity "requested_provider"))
+       :requestedTarget (normalized-token (one facts entity "requested_target"))
+       :requestedModel (normalized-token (one facts entity "requested_model"))
+       :executionSource (normalized-token (one facts entity "execution_source"))
+       :executionTransport (normalized-token (one facts entity "execution_transport"))
+       :providerSessionPersistence
+       (normalized-token (one facts entity "provider_session_persistence"))
+       :northSessionId (normalized-token (one facts entity "north_session_id"))
+       :threadProvenance (normalized-token (one facts entity "thread_provenance"))
+       :turnProvenance (normalized-token (one facts entity "turn_provenance"))
+       :routingAssessmentStatus
+       (normalized-token (one facts entity "routing_assessment_status"))
+       :routingAssessmentPolicy
+       (normalized-token (one facts entity "routing_assessment_policy"))
+       :routingDerivedTier (normalized-token (one facts entity "routing_derived_tier"))
+       :routingDerivedReasoning
+       (normalized-token (one facts entity "routing_derived_reasoning"))
+       :routingSelectedTier (normalized-token (one facts entity "routing_selected_tier"))
+       :routingSelectedReasoning
+       (normalized-token (one facts entity "routing_selected_reasoning"))
+       :routingExceptionCode
+       (normalized-token (one facts entity "routing_exception_code"))
+       :routingPinEvidenceStatus
+       (normalized-token (one facts entity "routing_pin_evidence_status"))
+       :routingAdmissionReceiptVersion
+       (maybe-long (one facts entity "routing_admission_receipt_version"))
        ;; Run time is deliberately run-local: a lane/session timestamp is not a
        ;; terminal-run timestamp and must not be borrowed for interval reports.
        :at (normalized-token (one facts entity "at"))
@@ -662,6 +690,19 @@
                       :model (or model "unattributed")
                       :effort (or (normalized-token (one facts identity "effort"))
                                   "unobserved")
+                      :executionSource (or (normalized-token (one facts identity "execution_source"))
+                                           "unknown")
+                      :executionTransport (or (normalized-token (one facts identity "execution_transport"))
+                                              "unknown")
+                      :providerSessionPersistence
+                      (or (normalized-token (one facts identity "provider_session_persistence"))
+                          "unknown")
+                      :actorKind (or (normalized-token (one facts identity "native_actor_kind"))
+                                     "unknown")
+                      :depth (or (maybe-long (one facts identity "native_depth")) "unknown")
+                      :dispatchModeAtStart
+                      (or (normalized-token (one facts identity "dispatch_mode_at_start"))
+                          "unknown")
                       :startedAt (normalized-token (one facts entity "started_at"))}))))
          (sort-by :entity) vec)))
 
@@ -1122,6 +1163,267 @@
        :intervals intervals
        :cumulative (interval-report rows sessions persisted accounts start end)})))
 
+(def tier-rank {"economy" 0 "standard" 1 "senior" 2 "frontier" 3})
+(def reasoning-rank {"low" 0 "medium" 1 "high" 2 "xhigh" 3 "max" 4 "ultra" 5})
+(def economics-thresholds
+  {:premiumTokenSharePercent 75.0
+   :promotionSharePercent 25.0
+   :pinSharePercent 25.0
+   :assessmentCoveragePercent 80.0})
+(def economics-design-gates
+  {:minimumEligibleRuns 10
+   :minimumEvidenceCoveragePercent 80.0})
+
+(defn current-dispatch-mode []
+  (north.harness-state/get-value (System/getProperty "user.home") "dispatch" "north"))
+
+(defn assessed-promotion? [row]
+  (let [derived-tier (tier-rank (:routingDerivedTier row))
+        selected-tier (tier-rank (:routingSelectedTier row))
+        derived-reasoning (reasoning-rank (:routingDerivedReasoning row))
+        selected-reasoning (reasoning-rank (:routingSelectedReasoning row))]
+    (and (= "recorded" (:routingAssessmentStatus row))
+         (or (and derived-tier selected-tier (> selected-tier derived-tier))
+             (and derived-reasoning selected-reasoning
+                  (> selected-reasoning derived-reasoning))))))
+
+(defn alert [code observed threshold]
+  {:code code :severity "warning" :status "alert" :policy "alert-only"
+   :observed observed :threshold threshold})
+
+(defn insufficient-finding [code eligible coverage]
+  {:code code :severity "info" :status "cannot-determine"
+   :reason "insufficient-coverage" :policy "alert-only"
+   :eligibleRuns eligible :evidenceCoveragePercent coverage
+   :minimumEligibleRuns (:minimumEligibleRuns economics-design-gates)
+   :minimumEvidenceCoveragePercent
+   (:minimumEvidenceCoveragePercent economics-design-gates)})
+
+(defn gated-ratio-finding [alert-code insufficient-code observed threshold eligible coverage]
+  (cond
+    (or (< eligible (:minimumEligibleRuns economics-design-gates))
+        (nil? coverage)
+        (< coverage (:minimumEvidenceCoveragePercent economics-design-gates)))
+    (insufficient-finding insufficient-code eligible coverage)
+
+    (and (some? observed) (>= observed threshold))
+    (assoc (alert alert-code observed threshold)
+           :eligibleRuns eligible :evidenceCoveragePercent coverage)
+
+    :else nil))
+
+(defn openai-provider-owned-effort [usage]
+  (let [accounts (filter #(= "openai" (:provider %))
+                         (get-in usage [:accountObserved :accounts]))
+        rows (vec (mapcat :breakdown accounts))
+        all-tokens (reduce + 0 (keep :exactObservedTokens accounts))
+        known (vec (filter #(contains? reasoning-rank (:effort %)) rows))
+        known-tokens (reduce + 0 (keep :exactObservedTokens known))
+        known-observations (reduce + 0 (map :observations known))
+        high (filter #(>= (get reasoning-rank (:effort %) -1) 2) known)
+        ultra (filter #(= "ultra" (:effort %)) known)
+        high-tokens (reduce + 0 (keep :exactObservedTokens high))
+        ultra-tokens (reduce + 0 (keep :exactObservedTokens ultra))]
+    {:source "codex-account-jsonl:last-token-usage"
+     :scope "provider-owned-openai-turn-ledger"
+     :claim (str "OpenAI account-log effort is provider-owned per-turn evidence; it is not "
+                 "the mutable final native-session effort and cannot by itself prove which "
+                 "North/native execution path produced a turn")
+     :exactObservedTokens (when (pos? all-tokens) all-tokens)
+     :knownEffortExactObservedTokens (when (pos? known-tokens) known-tokens)
+     :unknownEffortExactObservedTokens (when (pos? all-tokens) (- all-tokens known-tokens))
+     :knownEffortObservations known-observations
+     :effortCoveragePercent (percent known-tokens all-tokens)
+     :highEffortExactObservedTokens (when (pos? high-tokens) high-tokens)
+     :highEffortTokenSharePercent (percent high-tokens known-tokens)
+     :ultraExactObservedTokens (when (pos? ultra-tokens) ultra-tokens)
+     :ultraTokenSharePercent (percent ultra-tokens known-tokens)}))
+
+(defn economics-interval [rows sessions persisted accounts start end]
+  (let [managed (vec (filter #(row-in-interval? % start end) rows))
+        usage (interval-report rows sessions persisted accounts start end)
+        native (vec (filter (fn [session]
+                              (when-let [at (parse-instant (:startedAt session))]
+                                (and (not (.isBefore at start)) (.isBefore at end))))
+                            sessions))
+        exact (vec (filter #(some? (:tokens %)) managed))
+        all-exact-tokens (exact-token-sum exact)
+        premium-eligible (vec (filter #(and (some? (:tokens %))
+                                            (= "applied" (:tierProvenance %))
+                                            (contains? tier-rank (:tier %))) managed))
+        premium-eligible-tokens (exact-token-sum premium-eligible)
+        premium (vec (filter #(#{"senior" "frontier"} (:tier %)) premium-eligible))
+        premium-tokens (exact-token-sum premium)
+        premium-share (percent premium-tokens premium-eligible-tokens)
+        current-receipt (vec (filter #(= 1 (:routingAdmissionReceiptVersion %)) managed))
+        assessed (vec (filter #(= "recorded" (:routingAssessmentStatus %)) current-receipt))
+        current-unavailable (vec (filter #(= "unavailable" (:routingAssessmentStatus %))
+                                         current-receipt))
+        promotions (vec (filter assessed-promotion? assessed))
+        promotion-share (percent (count promotions) (count assessed))
+        known-unpinned (count (filter #(= "none" (:routingPinEvidenceStatus %)) current-receipt))
+        evidenced-pins (count (filter #(= "current" (:routingPinEvidenceStatus %)) current-receipt))
+        missing-pin-evidence (count (filter #(= "missing" (:routingPinEvidenceStatus %)) current-receipt))
+        legacy-compatible-missing
+        (count (filter #(= "legacy-missing" (:routingPinEvidenceStatus %)) current-receipt))
+        known-pin-state (+ known-unpinned evidenced-pins missing-pin-evidence)
+        pin-share (percent (+ evidenced-pins missing-pin-evidence) known-pin-state)
+        receipt-coverage (percent (count current-receipt) (count managed))
+        pin-evidence-coverage (percent known-pin-state (count managed))
+        assessment-coverage (percent (count assessed) (count current-receipt))
+        premium-coverage (percent (count premium-eligible) (count managed))
+        assessed-coverage (percent (count assessed) (count managed))
+        native-high (vec (filter #(>= (get reasoning-rank (:effort %) -1) 2) native))
+        native-ultra (vec (filter #(= "ultra" (:effort %)) native))
+        dispatch-mode (current-dispatch-mode)
+        provider-effort (openai-provider-owned-effort usage)
+        descendants-under-north (vec (filter #(and (= "subagent" (:actorKind %))
+                                                    (= "north" (:dispatchModeAtStart %))) native))
+        premium-finding (gated-ratio-finding
+                         "ROUTING_PREMIUM_TOKEN_SHARE_HIGH"
+                         "ROUTING_PREMIUM_TOKEN_SHARE_INSUFFICIENT_EVIDENCE"
+                         premium-share (:premiumTokenSharePercent economics-thresholds)
+                         (count premium-eligible) premium-coverage)
+        promotion-finding (gated-ratio-finding
+                           "ROUTING_PROMOTION_SHARE_HIGH"
+                           "ROUTING_PROMOTION_SHARE_INSUFFICIENT_EVIDENCE"
+                           promotion-share (:promotionSharePercent economics-thresholds)
+                           (count assessed) assessed-coverage)
+        pin-finding (gated-ratio-finding
+                     "ROUTING_EXACT_PIN_SHARE_HIGH"
+                     "ROUTING_PIN_SHARE_INSUFFICIENT_EVIDENCE"
+                     pin-share (:pinSharePercent economics-thresholds)
+                     known-pin-state pin-evidence-coverage)
+        high-effort-finding
+        (some-> (gated-ratio-finding
+                 "OPENAI_PROVIDER_OWNED_HIGH_EFFORT_TOKEN_SHARE_HIGH"
+                 "OPENAI_PROVIDER_OWNED_EFFORT_INSUFFICIENT_EVIDENCE"
+                 (:highEffortTokenSharePercent provider-effort)
+                 (:premiumTokenSharePercent economics-thresholds)
+                 (:knownEffortObservations provider-effort)
+                 (:effortCoveragePercent provider-effort))
+                (assoc :eligibleObservations (:knownEffortObservations provider-effort)
+                       :minimumEligibleObservations
+                       (:minimumEligibleRuns economics-design-gates))
+                (dissoc :eligibleRuns :minimumEligibleRuns))
+        findings (cond-> []
+                   premium-finding (conj premium-finding)
+                   promotion-finding (conj promotion-finding)
+                   pin-finding (conj pin-finding)
+                 (pos? missing-pin-evidence)
+                 (conj (alert "ROUTING_PIN_EVIDENCE_MISSING" missing-pin-evidence 0))
+                 (pos? legacy-compatible-missing)
+                 (conj (alert "ROUTING_LEGACY_PIN_EVIDENCE_MISSING"
+                              legacy-compatible-missing 0))
+                 (and (>= (count current-receipt)
+                          (:minimumEligibleRuns economics-design-gates))
+                      (some? receipt-coverage)
+                      (>= receipt-coverage
+                          (:minimumEvidenceCoveragePercent economics-design-gates))
+                      assessment-coverage
+                      (< assessment-coverage (:assessmentCoveragePercent economics-thresholds)))
+                 (conj (alert "ROUTING_ASSESSMENT_COVERAGE_LOW" assessment-coverage
+                              (:assessmentCoveragePercent economics-thresholds)))
+                   high-effort-finding (conj high-effort-finding)
+                   (pos? (or (:ultraExactObservedTokens provider-effort) 0))
+                   (conj (assoc (alert "OPENAI_PROVIDER_OWNED_ULTRA_TOKENS_OBSERVED"
+                                       (:ultraExactObservedTokens provider-effort) 0)
+                                :source (:source provider-effort)))
+                   (seq descendants-under-north)
+                   (conj (alert "NATIVE_DESCENDANTS_UNDER_NORTH_DISPATCH"
+                                (count descendants-under-north) 0)))]
+    {:start (.toString start) :end (.toString end)
+     :boundary "start-inclusive,end-exclusive"
+     :usage usage
+     :managed {:runs (count managed)
+               :exactTokenRuns (count exact)
+               :unknownTokenRuns (- (count managed) (count exact))
+               :exactObservedTokens all-exact-tokens
+               :premiumExactObservedTokens premium-tokens
+               :premiumEligibleExactObservedTokens premium-eligible-tokens
+               :premiumTokenSharePercent premium-share
+               :premiumEvidenceCoveragePercent premium-coverage
+               :assessmentCoverage {:currentRecorded (count assessed)
+                                    :currentUnavailable (count current-unavailable)
+                                    :legacyUnknown (- (count managed) (count current-receipt))
+                                    :currentReceiptCoveragePercent receipt-coverage
+                                    :percentOfCurrent assessment-coverage}
+               :promotions {:observed (count promotions)
+                            :eligibleAssessedRuns (count assessed)
+                            :currentUnavailable (count current-unavailable)
+                            :legacyUnknown (- (count managed) (count current-receipt))
+                            :evidenceCoveragePercent assessed-coverage
+                            :percent promotion-share}
+               :pins {:knownUnpinned known-unpinned :current evidenced-pins
+                      :currentMissing missing-pin-evidence
+                      :legacyCompatibleMissing legacy-compatible-missing
+                      :legacyUnknown (- (count managed) (count current-receipt))
+                      :currentEvidenceCoveragePercent pin-evidence-coverage
+                      :currentReceiptCoveragePercent receipt-coverage
+                      :percent pin-share}
+               :provenanceCoverage
+               {:complete (count (filter #(and (:executionSource %)
+                                               (:executionTransport %)
+                                               (:providerSessionPersistence %)
+                                               (:threadProvenance %)
+                                               (:turnProvenance %)) managed))
+                :unknown (count (filter #(not (and (:executionSource %)
+                                                  (:executionTransport %)
+                                                  (:providerSessionPersistence %)
+                                                  (:threadProvenance %)
+                                                  (:turnProvenance %))) managed))}}
+     :native {:sessions (count native) :currentDispatchModeContext dispatch-mode
+              :historicalDispatchModeCoverage
+              {:recorded (count (remove #(= "unknown" (:dispatchModeAtStart %)) native))
+               :legacyUnknown (count (filter #(= "unknown" (:dispatchModeAtStart %)) native))}
+              :latestSessionEffortSnapshot
+              {:claim "mutable final session identity; not per-turn provider-log effort"
+               :highEffortSessions (count native-high)
+               :ultraSessions (count native-ultra)}
+              :providerOwnedOpenAIEffort provider-effort
+              :rootSessions (count (filter #(= "root" (:actorKind %)) native))
+              :subagentSessions (count (filter #(= "subagent" (:actorKind %)) native))
+              :unknownActorKind (count (filter #(= "unknown" (:actorKind %)) native))
+              :sessionsByDepth (->> native (map #(if (number? (:depth %))
+                                                  (str (:depth %)) "unknown"))
+                                    frequencies (into (sorted-map)))
+              :sessionsByDispatchModeAtStart
+              (->> native (map :dispatchModeAtStart) frequencies (into (sorted-map)))}
+     :findings findings
+     :alerts (vec (filter #(= "alert" (:status %)) findings))}))
+
+(defn windowed-economics-report [rows sessions {:keys [window-hours slice-hours now]}]
+  (let [end (or (parse-instant now)
+                (when now (throw (ex-info "--now expects an ISO-8601 instant" {})))
+                (java.time.Instant/now))
+        window-duration (duration-of-hours window-hours)
+        slice-duration (duration-of-hours slice-hours)
+        window-ms (.toMillis window-duration)
+        slice-ms (.toMillis slice-duration)]
+    (when (or (> slice-ms window-ms) (not (zero? (mod window-ms slice-ms))))
+      (throw (ex-info "--window must be an exact multiple of --slice" {})))
+    (let [start (.minus end window-duration)
+          window-rows (vec (filter #(row-in-interval? % start end) rows))
+          accounts (account-universe window-rows)
+          persisted (vec (account-log-records))]
+      {:report "economics" :scope "bounded-intervals"
+       :policy "alert-only; no model is silently downgraded"
+       :claim (str "token shares use exact observed managed tokens; native sessions and legacy "
+                   "admission/provenance fields remain unknown rather than being inferred")
+       :thresholds economics-thresholds
+       :designGates economics-design-gates
+       :window {:start (.toString start) :end (.toString end)
+                :hours window-hours :sliceHours slice-hours
+                :boundary "start-inclusive,end-exclusive"}
+       :intervals (mapv (fn [index]
+                          (let [interval-start (.plusMillis start (* index slice-ms))
+                                interval-end (.plusMillis interval-start slice-ms)]
+                            (assoc (economics-interval rows sessions persisted accounts
+                                                      interval-start interval-end)
+                                   :index (inc index))))
+                        (range (quot window-ms slice-ms)))
+       :cumulative (economics-interval rows sessions persisted accounts start end)})))
+
 (defn promotion-variant-key [row]
   (if (seq (:legacyDebtReasons row))
     ;; Incomplete historical evidence is debt local to this run. Never let two
@@ -1288,9 +1590,10 @@
   (case kind
     "performance" (performance-report rows all?)
     "usage" (usage-report rows {:by-model? by-model? :by-effort? by-effort?})
+    "economics" (throw (ex-info "economics requires bounded window options" {}))
     "promotions" (promotions-report rows)
     "calibration" (calibration-report rows)
-    (throw (ex-info "usage: north routing report [performance|usage|promotions|calibration] [--json] [--all]" {}))))
+    (throw (ex-info "usage: north routing report [performance|usage|economics|promotions|calibration] [--json] [--all]" {}))))
 
 (defn usage-table-line
   ([label row] (usage-table-line label row {}))
@@ -1363,7 +1666,12 @@
                        (:providerTarget account) (:provider account)
                        (observed-token-label (:exactObservedTokens account))
                        (observed-token-label (get-in account [:managedLedger :exactObservedTokens]))
-                       (:overlapStatus account))))))
+                       (:overlapStatus account)))
+      (doseq [row (:breakdown account)]
+        (println (format "      provider-owned %-24s / %-8s observations=%d tokens=%s"
+                         (:model row) (or (:effort row) "unobserved")
+                         (:observations row)
+                         (observed-token-label (:exactObservedTokens row))))))))
 
 (defn print-table [data]
   (case (:report data)
@@ -1452,9 +1760,41 @@
                            (:judgmentGrade row) (:topology row) (:runs row)
                            (:struggleRuns row) (:errorCount row)
                            (pr-str (:thresholds row))
-                           (pr-str (:triggerCounts row)))))))))
+                           (pr-str (:triggerCounts row)))))))
+    "economics"
+    (do
+      (println "ROUTING ECONOMICS — bounded exact observations, alert-only policy")
+      (println (format "WINDOW %s → %s · %.3gh slices"
+                       (get-in data [:window :start]) (get-in data [:window :end])
+                       (double (get-in data [:window :sliceHours]))))
+      (doseq [interval (concat (:intervals data) [(:cumulative data)])]
+        (println (format "%s %s → %s managed=%d tokens=%s premium=%s assessment-current=%s pins=%s latest-native-high=%d latest-native-ultra=%d"
+                         (if (:index interval) (str "INTERVAL " (:index interval)) "CUMULATIVE")
+                         (:start interval) (:end interval)
+                         (get-in interval [:managed :runs])
+                         (observed-token-label (get-in interval [:managed :exactObservedTokens]))
+                         (if-let [pct (get-in interval [:managed :premiumTokenSharePercent])]
+                           (format "%.2f%%" pct) "unobserved")
+                         (if-let [pct (get-in interval [:managed :assessmentCoverage :percentOfCurrent])]
+                           (format "%.2f%%" pct) "unobserved")
+                         (if-let [pct (get-in interval [:managed :pins :percent])]
+                           (format "%.2f%%" pct) "unobserved")
+                         (or (get-in interval [:native :latestSessionEffortSnapshot
+                                               :highEffortSessions]) 0)
+                         (or (get-in interval [:native :latestSessionEffortSnapshot
+                                               :ultraSessions]) 0)))
+        (print-account-interval "  ACCOUNT LEDGER" (:usage interval))
+        (doseq [{:keys [code status reason observed threshold
+                        eligibleRuns evidenceCoveragePercent]} (:findings interval)]
+          (if (= "cannot-determine" status)
+            (println (format "  CANNOT-DETERMINE %-34s reason=%s eligible=%s coverage=%s"
+                             code reason eligibleRuns
+                             (if (some? evidenceCoveragePercent)
+                               (format "%.2f%%" evidenceCoveragePercent) "unobserved")))
+            (println (format "  ALERT %-42s observed=%s threshold=%s"
+                             code observed threshold))))))))
 
-(def usage-help "usage: north routing report [performance|usage|promotions|calibration] [--json] [--all] [--by-model] [--by-effort] [--window 24h --slice 12h] [--now ISO-INSTANT]")
+(def usage-help "usage: north routing report [performance|usage|economics|promotions|calibration] [--json] [--all] [--by-model] [--by-effort] [--window 24h --slice 12h] [--now ISO-INSTANT]")
 
 (defn parse-options [args]
   (loop [remaining args options {:flags #{}}]
@@ -1493,19 +1833,19 @@
     (when (and (or by-model? by-effort?) (not= (or kind "performance") "usage"))
       (binding [*out* *err*] (println "--by-model/--by-effort apply only to the usage report"))
       (System/exit 2))
-    (when (and window? (not= (or kind "performance") "usage"))
-      (binding [*out* *err*] (println "--window/--slice/--now apply only to the usage report"))
+    (when (and window? (not (#{"usage" "economics"} (or kind "performance"))))
+      (binding [*out* *err*] (println "--window/--slice/--now apply only to usage/economics reports"))
       (System/exit 2))
     (let [facts (fold-facts (read-ops (default-paths)))
           rows (vec (run-rows facts))
           sessions (native-session-rows facts)
           data (try
-                 (if window?
-                   (windowed-usage-report
+                 (if (or window? (= kind "economics"))
+                   ((if (= kind "economics") windowed-economics-report windowed-usage-report)
                     rows sessions
                     {:window-hours (parse-hours (or (:window parsed) "24h") "--window")
-                          :slice-hours (parse-hours (or (:slice parsed) "12h") "--slice")
-                          :now (:now parsed)})
+                     :slice-hours (parse-hours (or (:slice parsed) "12h") "--slice")
+                     :now (:now parsed)})
                    (report (or kind "performance") rows
                            {:all? all? :by-model? by-model? :by-effort? by-effort?}))
                  (catch Exception error

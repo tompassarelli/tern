@@ -9,6 +9,29 @@
 
 (def checks (atom []))
 (defn check [label ok?] (swap! checks conj [label (boolean ok?)]))
+(defn pin-evidence-json [pins]
+  (let [issued (java.time.Instant/now)]
+    (json/generate-string
+     {:policyVersion "north-routing-pin-v1"
+      :issuedAt (str issued)
+      :expiresAt (str (.plusSeconds issued 3600))
+      :reasonCode "explicit-human-request"
+      :detail "agents CLI fixture"
+      :pins pins})))
+(defn economy-assessment-json []
+  (json/generate-string
+   {:version "minimum-sufficient-v1"
+    :signals {:decisionOwnership "none"
+              :seamScope "none"
+              :errorExposure "contained-reversible"
+              :oracleStrength "objective-local"
+              :foundationalImpact "none"
+              :dependencyShape "atomic-cohesive"
+              :reasoningShape "deterministic"}
+    :derived {:minimumTier "economy"
+              :minimumReasoning "low"
+              :ruleCodes ["reasoning-shape:deterministic"]}
+    :selected {:tier "economy" :reasoning "low"}}))
 
 (let [scratch (.toFile (java.nio.file.Files/createTempDirectory
                         "north-watch-test-"
@@ -509,6 +532,9 @@
               (str/includes? (:out help) "--rationale WHY --contract JSON|@file")
               (str/includes? (:out help) "responsibility, deliverable, capabilities, mayDecide")
               (str/includes? (:out help) "--target ACCOUNT")
+              (str/includes? (:out help) "--assessment JSON|@file")
+              (str/includes? (:out help) "--pin-evidence JSON|@file")
+              (str/includes? (:out help) "--model MODEL")
               (str/includes? (:out help) "validate pinned-provider capability authority")
               (not (str/includes? (str (:out help) (:err help)) "unknown spawn option")))))
 
@@ -534,7 +560,9 @@
 (let [dry (proc/shell {:out :string :err :string :continue true
                        :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
                       "bb" (str root "/cli/agents-cli.clj") "spawn" "designer" "probe"
-                      "--provider" "openai" "--dry-run")]
+                      "--provider" "openai"
+                      "--pin-evidence" (pin-evidence-json [{:kind "provider" :value "openai"}])
+                      "--dry-run")]
   (check "spawn dry-run leads with semantic identity and retains control key separately"
          (and (zero? (:exit dry))
               (re-find #"openai-ambient-sol-xhigh-gaffer-designer-[0-9a-f]{12}" (:out dry))
@@ -544,20 +572,58 @@
 (let [closed (proc/shell {:out :string :err :string :continue true
                           :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
                          "bb" (str root "/cli/agents-cli.clj") "spawn" "designer" "probe"
-                         "--provider" "anthropic" "--dry-run")]
-  (check "CLI dry route resolves anthropic frontier to the static Gaffer opus/xhigh route"
+                         "--provider" "anthropic"
+                         "--pin-evidence" (pin-evidence-json [{:kind "provider" :value "anthropic"}])
+                         "--dry-run")]
+  (check "CLI dry route resolves anthropic frontier to the static Gaffer fable/xhigh route"
          (and (zero? (:exit closed))
-              (re-find #"anthropic-ambient-opus-xhigh-gaffer-designer-[a-z0-9]+" (:out closed))
-              (not (str/includes? (:out closed) "anthropic-fable")))))
+              (re-find #"anthropic-ambient-fable-xhigh-gaffer-designer-[a-z0-9]+" (:out closed))
+              (not (str/includes? (:out closed) "anthropic-ambient-opus")))))
 
 (let [dry (proc/shell {:out :string :err :string :continue true
                        :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
                       "bb" (str root "/cli/agents-cli.clj") "spawn" "designer" "probe"
-                      "--provider" "openai" "--target" "codex-work" "--dry-run")]
+                      "--provider" "openai" "--target" "codex-work"
+                      "--pin-evidence" (pin-evidence-json
+                                        [{:kind "provider" :value "openai"}
+                                         {:kind "account" :value "codex-work"}])
+                      "--dry-run")]
   (check "spawn target becomes AGENT_TARGET and appears in the fallback identity"
          (and (zero? (:exit dry))
               (str/includes? (:out dry) "AGENT_TARGET=codex-work")
               (re-find #"openai-codex-work-sol-xhigh-gaffer-designer-[a-z0-9]+" (:out dry)))))
+
+(let [missing-pin (proc/shell {:out :string :err :string :continue true
+                               :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
+                              "bb" (str root "/cli/agents-cli.clj") "spawn" "executor" "probe"
+                              "--provider" "openai" "--dry-run")]
+  (check "new public CLI provider pins fail closed without typed current evidence"
+         (and (not (zero? (:exit missing-pin)))
+              (str/includes? (str (:out missing-pin) (:err missing-pin))
+                             "require current typed pinEvidence")
+              (not (str/includes? (:out missing-pin) "control:")))))
+
+(let [assessed (proc/shell {:out :string :err :string :continue true
+                            :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
+                           "bb" (str root "/cli/agents-cli.clj") "spawn" "executor" "probe"
+                           "--assessment" (economy-assessment-json) "--dry-run")]
+  (check "public CLI accepts a canonical Gaffer assessment and forwards only its recorded marker"
+         (and (zero? (:exit assessed))
+              (str/includes? (:out assessed) "AGENT_ROUTING_ASSESSMENT=RECORDED")
+              (not (str/includes? (:out assessed) "reasoning-shape:deterministic")))))
+
+(let [missing-max-assessment
+      (proc/shell {:out :string :err :string :continue true
+                   :extra-env {"NORTH_AGENTS_LIB" "" "NO_COLOR" "1"}}
+                  "bb" (str root "/cli/agents-cli.clj") "spawn" "executor" "probe"
+                  "--tier" "frontier" "--reasoning" "max"
+                  "--override-reason" "exceptional deliberation required"
+                  "--dry-run")]
+  (check "public CLI rejects max reasoning before lane creation without a canonical assessment"
+         (and (not (zero? (:exit missing-max-assessment)))
+              (str/includes? (str (:out missing-max-assessment) (:err missing-max-assessment))
+                             "reasoning=max requires a canonical routingAssessment")
+              (not (str/includes? (:out missing-max-assessment) "control:")))))
 
 (let [results @checks pass (count (filter second results))]
   (doseq [[label ok?] results]

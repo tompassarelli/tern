@@ -145,12 +145,15 @@
         "NORTH_RUN_ID" "run-parent"
         "NORTH_THREAD_ID" "thread-parent"
         "NORTH_RUN_CAPABILITY" "parent-secret"
+        "AGENT_ROUTING_ASSESSMENT" "parent-assessment"
+        "NORTH_ROUTING_PIN_EVIDENCE" "parent-pin"
         "UNRELATED" "preserved"})]
   (check "managed child scrub removes every inherited delivery capability binding"
          (and (= "preserved" (get scrubbed "UNRELATED"))
               (not-any? #(contains? scrubbed %)
                         ["NORTH_RUN_ID" "NORTH_THREAD_ID"
-                         "NORTH_RUN_CAPABILITY"]))))
+                         "NORTH_RUN_CAPABILITY" "AGENT_ROUTING_ASSESSMENT"
+                         "NORTH_ROUTING_PIN_EVIDENCE"]))))
 
 (let [result (proc/shell {:out :string :err :string :continue true
                           :extra-env {"AGENT_TOPOLOGY" "worker"

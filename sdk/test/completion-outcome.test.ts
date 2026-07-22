@@ -40,6 +40,31 @@ for (const k of MANAGED_ENV) origEnv[k] = process.env[k];
 
 const TEST_COORDINATOR = `test-coordinator-${process.pid}`;
 
+function pinEvidence(
+  provider: "anthropic" | "openai",
+  target?: string,
+): {
+  policyVersion: "north-routing-pin-v1";
+  issuedAt: string;
+  expiresAt: string;
+  reasonCode: "explicit-human-request";
+  detail: string;
+  pins: Array<{ kind: "provider" | "account"; value: string }>;
+} {
+  const issuedAt = new Date();
+  return {
+    policyVersion: "north-routing-pin-v1",
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: new Date(issuedAt.getTime() + 60 * 60 * 1000).toISOString(),
+    reasonCode: "explicit-human-request",
+    detail: "completion outcome fixture",
+    pins: [
+      { kind: "provider", value: provider },
+      ...(target ? [{ kind: "account" as const, value: target }] : []),
+    ],
+  };
+}
+
 function fakeTerminationHost() {
   const signals = new Map<string, Set<() => void>>([
     ["SIGTERM", new Set()], ["SIGINT", new Set()],
@@ -241,7 +266,8 @@ test("an Anthropic error terminal still records its authoritative usage", async 
   })();
 
   await spawn({ prompt: "terminal error usage", agentId: "test-terminal-error",
-    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic",
+    pinEvidence: pinEvidence("anthropic"), queryFn });
   await waitForLog("tell run:test-terminal-error-");
   await waitForLog("usage_total_status exact");
   const lines = readFileSync(log, "utf8").split("\n").filter((line) => line.includes("run:test-terminal-error-"));
@@ -264,7 +290,8 @@ test("repeated Anthropic terminals record ambiguity without a selected or summed
   })();
 
   await spawn({ prompt: "two terminal scopes", agentId: "test-repeated-terminals",
-    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn });
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic",
+    pinEvidence: pinEvidence("anthropic"), queryFn });
   await waitForLog("usage_total_status unknown_repeated_terminal");
   const lines = readFileSync(log, "utf8").split("\n").filter((line) => line.includes("run:test-repeated-terminals-"));
   expect(lines.some((line) => line.endsWith(" usage_terminal_count 2"))).toBe(true);
@@ -1782,7 +1809,7 @@ test("public spawn composes justified explicit axes before Gaffer hydration", as
       composition: { kind: "preset", id: "director",
         overrides: ["tier", "reasoning", "posture"],
         overrideReason: "exercise the explicit public-dial composition boundary" },
-    }), provider: "anthropic", queryFn,
+    }), provider: "anthropic", pinEvidence: pinEvidence("anthropic"), queryFn,
   });
 
   expect(queryOptions.model).toBe("claude-sonnet-5");
@@ -1807,7 +1834,8 @@ test("public role-only integrator spawn hydrates the complete Gaffer preset", as
 
   await spawn({
     prompt: "hydrate a role-only request", agentId: "test-role-only-integrator",
-    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic", queryFn,
+    role: "integrator", routingMetadata: presetRequest("integrator"), provider: "anthropic",
+    pinEvidence: pinEvidence("anthropic"), queryFn,
   });
 
   expect(queryOptions.model).toBe("claude-opus-4-8");
@@ -1840,7 +1868,8 @@ test("tier-routed OpenAI identity records the resolved Sol route, not requested 
   };
 
   await spawn({ prompt: "route with OpenAI", agentId: "test-openai-designer",
-    role: "designer", routingMetadata: presetRequest("designer"), provider: "openai", queryFn });
+    role: "designer", routingMetadata: presetRequest("designer"), provider: "openai",
+    pinEvidence: pinEvidence("openai"), queryFn });
 
   expect(queryOptions.model).toBe("gpt-5.6-sol");
   expect(queryOptions.effort).toBe("xhigh");
@@ -1871,6 +1900,7 @@ test("public SpawnOptions target and Gaffer role land on exact account identity"
     await spawn({
       prompt: "design on the work account", agentId: "test-target-designer",
       role: "designer", routingMetadata: presetRequest("designer"), provider: "anthropic", target: "claude-work",
+      pinEvidence: pinEvidence("anthropic", "claude-work"),
       queryFn: () => (async function* () {
         yield { type: "result", subtype: "success", result: "designed", duration_ms: 1, num_turns: 1 };
       })(),
@@ -1909,7 +1939,7 @@ test("a struggle sensor firing records a struggle run fact without any in-flight
 
   await spawn({ prompt: "hit repeated errors", agentId: "test-struggle-lane",
     role: "integrator", routingMetadata: presetRequest("integrator"),
-    provider: "anthropic", queryFn });
+    provider: "anthropic", pinEvidence: pinEvidence("anthropic"), queryFn });
 
   const logged = await waitForLog("struggle consecutive_errors");
   expect(logged).toContain("struggle consecutive_errors");

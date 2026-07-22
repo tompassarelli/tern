@@ -6,9 +6,22 @@ import { spawnSync } from "node:child_process";
 import { presetRequest } from "./routing-fixtures";
 
 const temporary: string[] = [];
+const GAFFER_ROOT = resolve(import.meta.dir, "../../..", "gaffer");
 afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
+
+function pinEvidence(pins: Array<{ kind: "provider" | "account" | "model"; value: string }>) {
+  const issuedAt = new Date();
+  return {
+    policyVersion: "north-routing-pin-v1",
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: new Date(issuedAt.getTime() + 60 * 60 * 1000).toISOString(),
+    reasonCode: "explicit-human-request",
+    detail: "MCP contract fixture",
+    pins,
+  };
+}
 
 function mcpSpawnEnvironment(
   configure: (home: string, env: Record<string, string>) => void,
@@ -48,6 +61,7 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
     NORTH_MCP_BUN: fakeBun,
     NORTH_MCP_CAPTURE: capture,
     NORTH_SPAWN_STARTUP_TIMEOUT_MS: "1000",
+    GAFFER_HOME: GAFFER_ROOT,
     NO_COLOR: "1",
     // Every ambient routing/proof axis below must be absent from the child.
     // The complete request-owned Gaffer contract is rebuilt below.
@@ -83,7 +97,7 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
     encoding: "utf8",
     env,
   });
-  expect(result.status).toBe(0);
+  expect(result.status, result.stderr).toBe(0);
   const response = JSON.parse(result.stdout.trim());
   expect(response.result.isError).not.toBe(true);
   const childEnv = Object.fromEntries(
@@ -144,7 +158,7 @@ function toolsListSchemaKeys(): Record<string, string[]> {
     encoding: "utf8",
     env: { ...process.env, NORTH_MCP_BUN: "/bin/false" },
   });
-  expect(result.status).toBe(0);
+  expect(result.status, result.stderr).toBe(0);
   const response = JSON.parse(result.stdout.trim());
   const keysByTool: Record<string, string[]> = {};
   for (const tool of response.result.tools) {
@@ -205,7 +219,7 @@ test("MCP rejects an invalid detector override before SDK launch", () => {
       STRUGGLE_STALL_TURNS: "0",
     },
   });
-  expect(result.status).toBe(0);
+  expect(result.status, result.stderr).toBe(0);
   const response = JSON.parse(result.stdout.trim());
   expect(response.result.isError).toBe(true);
   expect(response.result.content[0].text).toContain(
@@ -291,6 +305,10 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
       ...presetRequest("integrator"),
       provider: "anthropic",
       target: "claude-personal-tompas0x-gmail",
+      pinEvidence: pinEvidence([
+        { kind: "provider", value: "anthropic" },
+        { kind: "account", value: "claude-personal-tompas0x-gmail" },
+      ]),
     } },
   })}\n`;
   const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
@@ -306,7 +324,7 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
       FRAM_LOG: exactFramLog,
     },
   });
-  expect(result.status).toBe(0);
+  expect(result.status, result.stderr).toBe(0);
   const response = JSON.parse(result.stdout.trim());
   expect(response.result.isError).not.toBe(true);
   expect(response.result.content[0].text).toContain("completed anthropic-claude-gmail-opus-xhigh-integrator-probe");
@@ -334,6 +352,93 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
   expect(release).toBeGreaterThan(spawn);
 });
 
+test("canonical assessment preflight rejects tampering before driver claim or SDK launch", () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-mcp-assessment-preclaim-"));
+  temporary.push(directory);
+  const sdkMarker = join(directory, "sdk-launched");
+  const driverMarker = join(directory, "driver-claimed");
+  const fakeBun = join(directory, "bun");
+  const fakeBb = join(directory, "bb");
+  writeFileSync(fakeBun, `#!/usr/bin/env bash\ntouch ${JSON.stringify(sdkMarker)}\n`);
+  writeFileSync(fakeBb, `#!/usr/bin/env bash\ntouch ${JSON.stringify(driverMarker)}\nexit 0\n`);
+  chmodSync(fakeBun, 0o755);
+  chmodSync(fakeBb, 0o755);
+  const route = presetRequest("executor");
+  const hostileAssessment = {
+    version: "minimum-sufficient-v1",
+    signals: {
+      decisionOwnership: "none", seamScope: "none",
+      errorExposure: "contained-reversible", oracleStrength: "objective-local",
+      foundationalImpact: "none", dependencyShape: "atomic-cohesive",
+      reasoningShape: "deterministic",
+    },
+    derived: {
+      minimumTier: "standard", minimumReasoning: "medium", ruleCodes: ["forged"],
+    },
+    selected: { tier: route.tier, reasoning: route.reasoning },
+    exception: { code: "unmodeled-risk", detail: "attempt to bypass canonical derivation" },
+  };
+  const north = resolve(import.meta.dir, "../..");
+  const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
+    input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "dispatch", arguments: {
+        id: "019f6c5e-61d0-7880-98a0-f8999eac7b03",
+        ...route,
+        routingAssessment: hostileAssessment,
+      } } })}\n`,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NORTH_POLICY_BUN: process.execPath,
+      NORTH_MCP_BUN: fakeBun,
+      NORTH_MCP_BB: fakeBb,
+    },
+  });
+  expect(result.status).toBe(0);
+  const response = JSON.parse(result.stdout.trim());
+  expect(response.result.isError).toBe(true);
+  expect(response.result.content[0].text).toContain("canonical Gaffer validation");
+  expect(() => readFileSync(driverMarker)).toThrow();
+  expect(() => readFileSync(sdkMarker)).toThrow();
+});
+
+test("MCP rejects a new unassessed max request before SDK launch", () => {
+  const directory = mkdtempSync(join(tmpdir(), "north-mcp-max-preclaim-"));
+  temporary.push(directory);
+  const marker = join(directory, "sdk-launched");
+  const fakeBun = join(directory, "bun");
+  writeFileSync(fakeBun, `#!/usr/bin/env bash\ntouch ${JSON.stringify(marker)}\n`);
+  chmodSync(fakeBun, 0o755);
+  const route = presetRequest("executor");
+  const north = resolve(import.meta.dir, "../..");
+  const result = spawnSync("bb", [resolve(north, "bin/north-mcp")], {
+    input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "spawn", arguments: {
+        prompt: "unassessed max must fail",
+        ...route,
+        tier: "frontier",
+        reasoning: "max",
+        composition: {
+          kind: "preset", id: route.role, overrides: ["tier", "reasoning"],
+          overrideReason: "exceptional request",
+        },
+      } } })}\n`,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NORTH_POLICY_BUN: process.execPath,
+      NORTH_MCP_BUN: fakeBun,
+    },
+  });
+  expect(result.status).toBe(0);
+  const response = JSON.parse(result.stdout.trim());
+  expect(response.result.isError).toBe(true);
+  expect(response.result.content[0].text).toContain(
+    "reasoning=max requires a canonical routingAssessment",
+  );
+  expect(() => readFileSync(marker)).toThrow();
+});
+
 test("MCP spawn reports pre-identity construction failure instead of fabricating a handle", () => {
   const directory = mkdtempSync(join(tmpdir(), "north-mcp-startup-failure-"));
   temporary.push(directory);
@@ -355,6 +460,7 @@ test("MCP spawn reports pre-identity construction failure instead of fabricating
     env: {
       ...process.env,
       HOME: directory,
+      GAFFER_HOME: GAFFER_ROOT,
       NORTH_BIN: fakeNorth,
       NORTH_MCP_BUN: "/bin/false",
       NORTH_SPAWN_STARTUP_TIMEOUT_MS: "500",

@@ -99,6 +99,7 @@ export function routedQueryWithRegistry(
     return { options, evidence: rebuilt.evidence };
   };
   return {
+    get executionTransport() { return active?.executionTransport; },
     interrupt: async () => { await active?.interrupt?.(); },
     close: () => closePromise ??= (async () => {
       closed = true;

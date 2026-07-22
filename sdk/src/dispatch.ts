@@ -8,7 +8,7 @@ import {
 } from "./harness";
 import { inputChannel, subscribeFeed } from "./coordination";
 import { normalizeUsage } from "./usage";
-import { newRunId, recordRun } from "./telemetry";
+import { classifyTurnProvenance, newRunId, recordRun } from "./telemetry";
 import { causeChain, deathReason, notifyDeath } from "./death";
 import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchdog";
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
@@ -71,6 +71,10 @@ import {
 import {
   ManagedQueryTermination, type HostTerminationRegistrar,
 } from "./query-lifecycle";
+import {
+  admitRoutingEconomics, type AdmittedRoutingEconomics,
+  type RoutingAssessment, type RoutingPinEvidence,
+} from "./routing-economics";
 
 const PLAN_TOOLS = ["Read", "Grep", "Glob", "Bash"];
 const EXEC_TOOLS = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
@@ -85,6 +89,8 @@ interface DispatchResult {
 export interface DispatchDependencies {
   /** Complete per-subtask request; programmatic callers never inherit ambient routing. */
   routingMetadata: RoutingRequest;
+  routingAssessment?: RoutingAssessment;
+  pinEvidence?: RoutingPinEvidence;
   /** Explicit child identity for a programmatic handoff; never inferred from a parent. */
   agentId?: string;
 }
@@ -111,7 +117,11 @@ interface DispatchRuntime {
   ) => boolean | Promise<boolean>;
 }
 
-const DISPATCH_DEPENDENCY_FIELDS = new Set(["routingMetadata", "agentId"]);
+const DISPATCH_DEPENDENCY_FIELDS = new Set([
+  "routingMetadata", "routingAssessment", "pinEvidence", "agentId",
+]);
+
+let bootstrapLegacyPinCompatibilityGranted = false;
 
 function allowlistedDispatchDependencies(
   value: DispatchDependencies,
@@ -158,6 +168,8 @@ async function runDispatch(
   strugglePolicy: StrugglePolicy,
   envelopeAdmission?: EnvelopeAdmission,
   hydratedMetadata?: RoutingRequest,
+  routingEconomics?: AdmittedRoutingEconomics,
+  northSessionId?: string,
   hydratedWorkingDirectory?: string,
   hydratedAgentId?: string,
   queryFn?: (args: any) => AgentQuery,
@@ -173,6 +185,7 @@ async function runDispatch(
   const runStartedAt = process.hrtime.bigint();
   const routingMetadata = hydratedMetadata;
   if (!routingMetadata) throw new Error("managed North dispatch execution requires explicit routingMetadata");
+  if (!routingEconomics) throw new Error("managed North dispatch execution requires routing economics admission");
   const role = routingMetadata.role!;
   const capabilities = gafferCapabilities(routingMetadata);
   const facts = hydratedFacts ?? getThreadFacts(threadId);
@@ -353,6 +366,7 @@ async function runDispatch(
     authority: ProviderAuthoritySurface;
   } | undefined;
   let queryCloseError: unknown;
+  let activeExecutionQuery: AgentQuery | undefined;
 
   let compactions = 0; // SDK auto-compaction events observed across the run (audit fix 4)
   // Error boundary (thread 019f2800): the SDK runs the turn in a subprocess; if it dies
@@ -427,6 +441,7 @@ async function runDispatch(
             `[dispatch] effective authority: ${formatProviderAuthoritySurface(authority)}`,
           );
         });
+    activeExecutionQuery = q;
     termination.attachQuery(q);
     const watched = withStallWatchdog((q as AsyncIterable<any>)[Symbol.asyncIterator](), {
       stallMs: window,
@@ -762,6 +777,16 @@ async function runDispatch(
               envelopeRetries: envelopeAdmission?.retries,
               envelopeAdvisories: envelopeAdmission?.advisories,
               routingMetadata,
+              routingAssessment: routingEconomics.assessment,
+              routingAdmissionReceipt: routingEconomics.receipt,
+              routingPinEvidence: routingEconomics.pinEvidence,
+              executionSource: "north-managed",
+              executionTransport: activeExecutionQuery?.executionTransport
+                ?? (routing.provider === "anthropic" ? "anthropic-agent-sdk" : undefined),
+              providerSessionPersistence: "unknown",
+              northSessionId,
+              threadProvenance: "exact",
+              turnProvenance: classifyTurnProvenance(resultMsg, terminal.processOutcome),
               promptComposition: admittedRoute?.evidence ?? injectedCompositionEvidence,
               effectiveAuthority: admittedRoute?.authority,
               compactions,
@@ -819,6 +844,16 @@ export async function dispatch(
   const routingMetadata = admitRoutingRequest(
     admitted.routingMetadata ?? {}, "managed North dispatch",
   );
+  const routingEconomics = admitRoutingEconomics({
+    request: routingMetadata,
+    routingAssessment: admitted.routingAssessment,
+    pinEvidence: admitted.pinEvidence,
+    provider: process.env.AGENT_PROVIDER,
+    target: process.env.AGENT_TARGET,
+    model: process.env.AGENT_MODEL,
+    allowLegacyMissingPinEvidence: bootstrapLegacyPinCompatibilityGranted,
+    surface: "managed North dispatch routing economics",
+  });
   if (!bootstrapAuthorityGranted) {
     assertManagedChildTopology(
       "dispatch", routingMetadata.topology, callerTopology,
@@ -881,7 +916,8 @@ export async function dispatch(
     for (const advisory of admission?.advisories ?? []) console.warn(`[envelope] advisory: ${advisory}`);
     result = await runDispatch(
       threadId, judgmentGrade, strugglePolicy,
-      admission, routingMetadata, workingDirectory, agentId, injected.queryFn,
+      admission, routingMetadata, routingEconomics, context.sessionId,
+      workingDirectory, agentId, injected.queryFn,
       facts, children, injected.loadThreadFacts ?? getThreadFacts,
       injected.deliveryRuntime,
       injected.childSettlementReader,
@@ -930,6 +966,7 @@ if (import.meta.main) {
   // The Clojure adapter checked the caller before replacing its environment
   // with the composed child identity. Direct library calls retain both checks.
   bootstrapAuthorityGranted = true;
+  bootstrapLegacyPinCompatibilityGranted = true;
   const threadId = process.argv[2];
   if (!threadId) {
     console.error("usage: bun run src/dispatch.ts <thread-id>");
@@ -938,6 +975,10 @@ if (import.meta.main) {
   dispatch(threadId, {
     agentId: process.env.AGENT_ID,
     routingMetadata: routingRequestFromEnv("managed North dispatch bootstrap"),
+    routingAssessment: process.env.AGENT_ROUTING_ASSESSMENT
+      ? JSON.parse(process.env.AGENT_ROUTING_ASSESSMENT) : undefined,
+    pinEvidence: process.env.NORTH_ROUTING_PIN_EVIDENCE
+      ? JSON.parse(process.env.NORTH_ROUTING_PIN_EVIDENCE) : undefined,
   })
     .then((result) => {
       console.log(JSON.stringify(result, null, 2));

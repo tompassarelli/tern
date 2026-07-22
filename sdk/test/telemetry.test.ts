@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { newRunId, runFacts } from "../src/telemetry";
+import { classifyTurnProvenance, newRunId, runFacts } from "../src/telemetry";
 import {
   assessThreadDelivery, RUN_BAR_EVIDENCE_VERSION, validRunEntity,
 } from "../src/delivery-verification";
@@ -159,6 +159,53 @@ test("run telemetry is token- and routing-based with no price-derived fields", (
     ["at", "2026-07-16T00:00:00.000Z"],
     ["provider", "openai"],
   ]);
+});
+
+test("run telemetry carries admission receipt and overlap-safe execution provenance", () => {
+  const facts = runFacts({
+    thread: "thread-provenance", agent: "lane-provenance", durationMs: 1,
+    posture: "spawn", outcome: "ran", provider: "openai",
+    executionSource: "north-managed", executionTransport: "codex-cli",
+    providerSessionPersistence: "unknown", northSessionId: "north-session",
+    threadProvenance: "exact", turnProvenance: "provider-terminal",
+    routingAdmissionReceipt: {
+      version: 1,
+      routingRequestSha256: "a".repeat(64),
+      staffingCatalogSha256: "b".repeat(64),
+      providerCatalogsSha256: "c".repeat(64),
+      routingPolicySha256: "unavailable",
+      appliedAxes: { taskGrade: "mid", topology: "worker", tier: "standard", reasoning: "medium", posture: "deliver" },
+      overrideEvidence: { changedAxes: [], status: "none" },
+      pinEvidenceStatus: "none",
+    },
+  });
+  for (const expected of [
+    ["execution_source", "north-managed"],
+    ["execution_transport", "codex-cli"],
+    ["provider_session_persistence", "unknown"],
+    ["north_session_id", "north-session"],
+    ["thread_provenance", "exact"],
+    ["turn_provenance", "provider-terminal"],
+    ["routing_assessment_status", "unavailable"],
+    ["routing_pin_evidence_status", "none"],
+  ]) expect(facts).toContainEqual(expected);
+});
+
+test("turn provenance follows terminal phase, not a zero-turn counter", () => {
+  expect(classifyTurnProvenance({ type: "result", num_turns: 0 }, "ran"))
+    .toBe("provider-terminal");
+  expect(classifyTurnProvenance(undefined, "blocked_preflight")).toBe("pre-provider");
+  expect(classifyTurnProvenance(undefined, "blocked_spend_guard")).toBe("pre-provider");
+  expect(classifyTurnProvenance(undefined, "provider_error")).toBe("unknown");
+});
+
+test("telemetry accepts the managed Codex app-server transport distinctly from CLI fallback", () => {
+  const facts = runFacts({
+    thread: "thread-app-server", agent: "lane-app-server", durationMs: 1,
+    posture: "spawn", outcome: "ran", provider: "openai",
+    executionSource: "north-managed", executionTransport: "codex-app-server",
+  });
+  expect(facts).toContainEqual(["execution_transport", "codex-app-server"]);
 });
 
 test("run telemetry preserves requested, active, and fallback account targets", () => {

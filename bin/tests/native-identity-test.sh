@@ -39,6 +39,12 @@ if [ "${1:-}" = "-e" ] && [ -n "${NORTH_NATIVE_SUBJECT:-}" ]; then
     printf 'tell %s provider %s\n' "$subject" "$NORTH_NATIVE_PROVIDER"
     printf 'tell %s model %s\n' "$subject" "$NORTH_NATIVE_MODEL"
     printf 'tell %s effort %s\n' "$subject" "$NORTH_NATIVE_EFFORT"
+    printf 'tell %s execution_source provider-native\n' "$subject"
+    printf 'tell %s execution_transport provider-hook\n' "$subject"
+    printf 'tell %s provider_session_persistence unknown\n' "$subject"
+    printf 'tell %s native_actor_kind %s\n' "$subject" "$NORTH_NATIVE_ACTOR_KIND"
+    printf 'tell %s native_depth %s\n' "$subject" "$NORTH_NATIVE_DEPTH"
+    printf 'tell %s dispatch_mode_at_start %s\n' "$subject" "$NORTH_NATIVE_DISPATCH_MODE_AT_START"
     printf 'tell %s display_handle %s\n' "$subject" "$NORTH_NATIVE_DISPLAY"
     printf 'tell %s display_name %s\n' "$subject" "$NORTH_NATIVE_DISPLAY"
   } >> "$NORTH_IDENTITY_LOG"
@@ -85,6 +91,7 @@ run_hook "$SPAWN" \
   CLAUDECODE=1 AGENT_MODEL=wrong-model CLAUDE_EFFORT=high AGENT_EFFORT=low
 has "records exact SessionStart model" "tell agent:$ID model claude-opus-4-8"
 has "records exact structured effort" "tell agent:$ID effort xhigh"
+has "records immutable dispatch mode at session start" "tell agent:$ID dispatch_mode_at_start north"
 lacks "does not record ambient model over exact input" "tell agent:$ID model wrong-model"
 
 echo "== Codex SessionStart records exact provider/model and honest effort absence =="
@@ -227,6 +234,9 @@ run_hook "$SPAWN" \
   CLAUDECODE=1
 has "first native subagent owns its own row" "tell agent:$SUB_A_ID kind session"
 has "second native subagent owns its own row" "tell agent:$SUB_B_ID kind session"
+has "native subagent records provider-native execution provenance" "tell agent:$SUB_A_ID execution_source provider-native"
+has "native subagent records its actor kind" "tell agent:$SUB_A_ID native_actor_kind subagent"
+has "native subagent records bounded observed depth" "tell agent:$SUB_A_ID native_depth 1"
 
 : > "$LOG"; : > "$BB_LOG"
 run_hook "$TOOLUSE" \

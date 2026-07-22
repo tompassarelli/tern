@@ -696,10 +696,10 @@ test("provider selection filters unenforceable capability shapes before side eff
 });
 
 test("Anthropic frontier follows Gaffer's static route without a hidden time swap", () => {
-  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", undefined, "high"))
     .toThrow("provider anthropic cannot resolve semantic tier frontier with reasoning high");
-  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier", undefined, "xhigh")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", "sonnet", "xhigh"))
     .toThrow("model claude-sonnet-5 does not support reasoning xhigh");
   expect(() => resolveTier("openai", "frontier", "luna", "xhigh"))
@@ -707,10 +707,10 @@ test("Anthropic frontier follows Gaffer's static route without a hidden time swa
   expect(resolveTier("anthropic", "frontier", "opus", "xhigh")).toEqual({
     tier: "frontier", model: "claude-opus-4-8", effort: "xhigh",
   });
-  expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "max" });
+  expect(resolveTier("anthropic", "frontier", undefined, "max")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "max" });
   expect(resolveTier("openai", "frontier")).toEqual({ tier: "frontier", model: "gpt-5.6-sol", effort: "xhigh" });
   delete process.env.NORTH_FABLE_NOW;
-  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-opus-4-8", effort: "xhigh" });
+  expect(resolveTier("anthropic", "frontier")).toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
   expect(resolveTier("anthropic", "frontier", "fable", "xhigh"))
     .toEqual({ tier: "frontier", model: "claude-fable-5", effort: "xhigh" });
   expect(() => resolveTier("anthropic", "frontier", "fable", "high"))
