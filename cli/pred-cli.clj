@@ -83,6 +83,7 @@
    ["burn_limit_microusd_per_hour" "single" "literal" "maximum reserved spend burn admitted per rolling hour"]
    ["forced" "single" "literal" "whether an operator explicitly forced a guarded reset"]
    ["lane" "single" "literal" "managed lane identifier associated with a resource reservation"]
+   ["north_restore_checkpoint" "multi" "literal" "content-sealed audit marker for a planned snapshot restoration; paired assert/retract preserves raw provenance without a live graph fact"]
    ["period" "single" "literal" "budget/accounting period identifier"]
    ["pid" "single" "literal" "operating-system process id associated with a live reservation"]
    ["reserved_microusd" "single" "literal" "currently reserved spend in integer micro-USD"]

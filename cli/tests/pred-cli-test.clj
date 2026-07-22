@@ -296,6 +296,13 @@
             (= {:card "single" :kind "literal"}
                (select-keys (registry "entity_kind") [:card :kind]))))
 
+(let [restore-checkpoint (registry "north_restore_checkpoint")]
+  (check "snapshot restoration evidence is repeatable literal history"
+         (and (= {:card "multi" :kind "literal"}
+                 (select-keys restore-checkpoint [:card :kind]))
+              (= "content-sealed audit marker for a planned snapshot restoration; paired assert/retract preserves raw provenance without a live graph fact"
+                 (:doc restore-checkpoint)))))
+
 (let [missing (set/difference emitted-predicates registry-names)]
   (check "all fixed cross-language fact emitters are registered"
          (empty? missing)

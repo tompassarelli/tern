@@ -146,6 +146,8 @@ north — your one card. Type a command to do the thing next to it.
     north schema                       the fact vocabulary in use
     north predicate ls|show|define     inspect or extend executable predicate entities
     north schema-migrate plan|audit    deterministic schema cutover and strict audit
+    north snapshot create|verify|restore-plan
+                                       immutable dual-log checkpoint and restore planning
     north corpus-transaction check-boundaries
                                        verify split-log append safety before maintenance
 
@@ -269,6 +271,11 @@ CARD
     # maintenance operation and must follow a verified two-corpus snapshot;
     # plan/audit remain read-only at all times.
     exec "$BB" -cp "$FRAM_OUT" "$NORTH/cli/schema-migrate.clj" "${NORTH_PORT:-7977}" "${@:2}" ;;
+  snapshot)
+    # Content-addressed dual-log preservation. Create and restore-plan default
+    # to dry-run; restore-plan can only emit a corpus-transaction plan and has
+    # no authority to apply it or mutate the selected live corpus.
+    exec "$BB" -cp "$FRAM_OUT" "$NORTH/cli/snapshot-cli.clj" "${NORTH_PORT:-7977}" "${@:2}" ;;
   corpus-transaction)
     # Package-owned split-corpus replacement/recovery. The mutable journal and
     # immutable preimage/receipt objects live under XDG state, never in a
