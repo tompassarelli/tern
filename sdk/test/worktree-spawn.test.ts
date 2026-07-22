@@ -125,7 +125,7 @@ test("managed authoring without a registered worktree fails closed before canoni
   let providerQueries = 0;
   let thrown: unknown;
   try { await spawn({
-    prompt: "trivial default lane", agentId,
+    prompt: "trivial default lane", agentId, worktree: false,
     routingMetadata: presetRequest("integrator"),
     queryFn: (args: any) => {
       providerQueries++;
