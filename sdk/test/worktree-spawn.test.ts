@@ -190,16 +190,17 @@ test("OPT-IN (worktree:true) => real worktree, cwd inside it, payload appended, 
     concern: "@concern:unattributed",
   });
   expect(events.map(({ type }) => type)).toEqual([
-    "provisioned", "authority-profiled", "released",
+    "provisioned", "authority-profiled", "quarantined",
   ]);
   expect(events[1].providerAuthorityProfile).toMatchObject({
     phase: "resolved",
     authMode: expect.stringMatching(/^(ambient|isolated)$/),
   });
-  // Clean `ran` => the worktree + its branch were removed inline (salvage gate: remove case).
-  expect(existsSync(expectedPath)).toBe(false);
+  expect(existsSync(expectedPath)).toBe(true);
   const branches = execFileSync("git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" });
-  expect(branches.trim()).toBe("");
+  expect(branches).toContain(`lane-${agentId}`);
+  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", expectedPath]);
+  execFileSync("git", ["-C", repo, "branch", "-D", `lane-${agentId}`]);
 });
 
 test("explicit worktree provisioning failure aborts before provider, admission, identity, or run side effects", async () => {
@@ -259,19 +260,18 @@ test("explicit worktree provisioning failure aborts before provider, admission, 
   // every provider/admission/identity/run writer remains unreachable.
   const afterLog = existsSync(log) ? readFileSync(log, "utf8") : "";
   const delta = afterLog.slice(beforeLog.length).trim().split("\n");
-  expect(delta).toHaveLength(3);
+  expect(delta).toHaveLength(2);
   expect(delta[0]).toContain("worktree-allocation-internal.clj 59999 register");
-  expect(delta[1]).toContain('"type":"provision-failed"');
+  expect(delta[1]).toContain('"type":"quarantined"');
   expect(delta[1]).toContain('"code":"durable_ref_collision"');
-  expect(delta[1]).toContain('"resourceState":"absent"');
-  expect(delta[2]).toContain('"type":"rolled-back"');
+  expect(delta[1]).toContain('"resourceState":"quarantined"');
   expect(delta.every((line) => line.startsWith("bb "))).toBe(true);
   expect(delta.join("\n")).not.toContain("must never reach provider execution");
 
   execFileSync("git", ["-C", repo, "branch", "-d", "--", branch]);
 });
 
-test("pre-provider admission failure rolls back the physical resource and records exact absence", async () => {
+test("pre-provider admission failure preserves the physical resource in quarantine", async () => {
   const { spawn } = await import("./support/spawn");
   const agentId = "wt-admission-fail-1";
   const expectedPath = `/tmp/${require("node:path").basename(repo)}-lane-${agentId}`;
@@ -307,12 +307,14 @@ test("pre-provider admission failure rolls back the physical resource and record
   expect(String(thrown)).toContain("injected_clock_admission_failure");
   expect(providerQueries).toBe(0);
   expect(registrations).toHaveLength(1);
-  expect(events.map(({ type }) => type)).toEqual(["provisioned", "rolled-back"]);
-  expect(events.at(-1)).toMatchObject({ type: "rolled-back", resourceState: "absent" });
-  expect(existsSync(expectedPath)).toBe(false);
+  expect(events.map(({ type }) => type)).toEqual(["provisioned", "quarantined"]);
+  expect(events.at(-1)).toMatchObject({ type: "quarantined", resourceState: "quarantined" });
+  expect(existsSync(expectedPath)).toBe(true);
   expect(execFileSync(
     "git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" },
-  ).trim()).toBe("");
+  )).toContain(`lane-${agentId}`);
+  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", expectedPath]);
+  execFileSync("git", ["-C", repo, "branch", "-D", `lane-${agentId}`]);
 });
 
 test("typed provider preflight refusal preserves a queryable quarantine with exact recovery", async () => {

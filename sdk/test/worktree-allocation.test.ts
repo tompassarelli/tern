@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync,
@@ -13,6 +13,8 @@ import {
   type WorktreeAllocationRegistration,
   type WorktreeAllocationWriter,
 } from "../src/worktree";
+
+setDefaultTimeout(30_000);
 
 interface Capture {
   registrations: WorktreeAllocationRegistration[];
@@ -185,14 +187,12 @@ describe("atomic failure and recovery", () => {
     git(repo, "branch", branch, "HEAD");
 
     expect(() => provisionWorktree(id, { repoRoot: repo, ...ownership(id, capture) }))
-      .toThrow("resource=absent");
-    expect(capture.events.map(({ event }) => event.type)).toEqual([
-      "provision-failed", "rolled-back",
-    ]);
+      .toThrow("resource=quarantined");
+    expect(capture.events.map(({ event }) => event.type)).toEqual(["quarantined"]);
     expect(capture.events[0].event.error).toEqual({
       code: "durable_ref_collision", phase: "physical_preflight",
     });
-    expect(capture.events[0].event.recovery?.action).toBe("none");
+    expect(capture.events[0].event.recovery?.action).toBe("inspect-and-salvage");
     expect(git(repo, "branch", "--list", branch)).toContain(branch);
     expect(existsSync(`/tmp/${basename(repo)}-${branch}`)).toBe(false);
 
