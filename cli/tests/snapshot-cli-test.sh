@@ -3,14 +3,22 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
-fram=${FRAM_PATH:-$root/../fram}
+fram_origin=${FRAM_PATH:-$root/../fram}
 scratch=$(mktemp -d -t north-snapshot-cli.XXXXXX)
+fram=$scratch/fram
 daemon_pid=
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then kill "$daemon_pid" 2>/dev/null || true; fi
   rm -rf "${scratch:?}"
 }
 trap cleanup EXIT
+
+if git -C "$fram_origin" rev-parse --verify HEAD >/dev/null 2>&1; then
+  git clone --quiet --shared "$fram_origin" "$fram"
+else
+  mkdir -p "$fram"
+  cp -a "$fram_origin/." "$fram/"
+fi
 
 "$root/bin/north" help >"$scratch/help.out"
 grep -q 'north snapshot create|verify|restore-plan' "$scratch/help.out"

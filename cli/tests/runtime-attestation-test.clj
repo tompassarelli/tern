@@ -8,9 +8,6 @@
    (io/file (.getParent (io/file (System/getProperty "babashka.file"))) "../..")))
 (load-file (str root "/cli/runtime-attestation.clj"))
 (require '[north.runtime-attestation :as attestation])
-(def fram
-  (.getCanonicalPath
-   (io/file (or (System/getenv "FRAM_PATH") (str root "/../fram")))))
 (def failures (atom []))
 
 (defn check! [label value]
@@ -27,6 +24,35 @@
     (doseq [child (or (.listFiles file) (make-array java.io.File 0))]
       (delete-tree! child)))
   (java.nio.file.Files/deleteIfExists (.toPath file)))
+
+(defn previous-instant [[seconds nanos]]
+  (if (pos? nanos)
+    [seconds (dec nanos)]
+    [(dec seconds) 999999999]))
+
+(defn instant-millis [[seconds nanos]]
+  (+ (* seconds 1000) (quot nanos 1000000)))
+
+(def fram-origin
+  (.getCanonicalPath
+   (io/file (or (System/getenv "FRAM_PATH") (str root "/../fram")))))
+(def fram-fixture-root
+  (.toFile
+   (java.nio.file.Files/createTempDirectory
+    "north-clean-fram-checkout-"
+    (make-array java.nio.file.attribute.FileAttribute 0))))
+(def fram (.getCanonicalPath (io/file fram-fixture-root "fram")))
+
+(defn clone-fram! [source target]
+  (let [clone (proc/shell {:out :string :err :string :continue true}
+                          "git" "clone" "--quiet" "--shared"
+                          source target)]
+    (when-not (zero? (:exit clone))
+      (throw (ex-info "runtime attestation test requires a cloneable Git Fram source"
+                      {:fram source :error (:err clone)})))
+    target))
+
+(clone-fram! fram-origin fram)
 
 (defn git-value [expression]
   (let [result (proc/shell {:out :string :err :string :continue true}
@@ -261,17 +287,24 @@
                               (active-request selection port log telemetry)))))
     (reset! running (start-active-daemon! selection port log telemetry))
     (let [request (active-request selection port log telemetry)
-          first-attestation (attestation/attest-active-runtime! request)
+          first-attestation (atom (attestation/attest-active-runtime! request))
           valid-values (:values @running)]
       (check! "generation-scoped record binds the sole direct fixture listener"
               (= (:pid @running)
-                 (get-in first-attestation [:authority :pid])))
+                 (get-in @first-attestation [:authority :pid])))
       (check! "active runtime identity carries both exact split corpus paths"
               (= [log telemetry]
-                 [(get-in first-attestation [:identity :served-log])
-                  (get-in first-attestation [:identity :telemetry-log])]))
+                 [(get-in @first-attestation [:identity :served-log])
+                  (get-in @first-attestation [:identity :telemetry-log])]))
       (check! "unchanged generation-scoped authority re-attests"
-              (true? (attestation/assert-current! first-attestation)))
+              (true? (attestation/assert-current! @first-attestation)))
+
+      (write-active-record! selection valid-values)
+      (check! "same-byte active record republication invalidates prior authority"
+              (= :runtime-authority-lost
+                 (denied-type #(attestation/assert-current!
+                                @first-attestation))))
+      (reset! first-attestation (attestation/attest-active-runtime! request))
 
       (write-active-record!
        selection
@@ -322,15 +355,52 @@
                 (some? (denied-type #(attestation/attest-active-runtime!
                                      request)))))
       (write-active-record! selection valid-values)
+      (reset! first-attestation (attestation/attest-active-runtime! request))
 
-      (let [original attestation/fram-artifact-identity!]
-        (check! "source artifacts newer than the bound process are rejected"
+      (let [original attestation/fram-artifact-identity!
+            record-state (get-in @first-attestation
+                                 [:authority :active-record :state])
+            record-barrier
+            (let [mtime (:mtime-instant record-state)
+                  ctime (:ctime-instant record-state)]
+              (if (neg? (compare mtime ctime)) mtime ctime))
+            artifact-instant (previous-instant record-barrier)
+            artifact-time (instant-millis artifact-instant)
+            coarse-process-start (- artifact-time 249)
+            after-publication [Long/MAX_VALUE 999999999]]
+        (check! "immediate launch accepts artifacts after coarse process start but before record publication"
+                (map?
+                 (with-redefs
+                  [attestation/process-start-millis
+                   (fn [_] coarse-process-start)
+                   attestation/fram-artifact-identity!
+                   (fn [& args]
+                     (assoc (apply original args)
+                            :latest-artifact-mtime-millis artifact-time
+                            :latest-artifact-mtime-instant artifact-instant
+                            :latest-artifact-ctime-millis artifact-time
+                            :latest-artifact-ctime-instant artifact-instant))]
+                  (attestation/attest-active-runtime! request))))
+        (check! "artifact mtime after active record publication is rejected"
                 (= :active-runtime-process-attestation-failed
                    (with-redefs
                     [attestation/fram-artifact-identity!
                      (fn [& args]
                        (assoc (apply original args)
-                              :latest-artifact-mtime-millis Long/MAX_VALUE))]
+                              :latest-artifact-mtime-millis Long/MAX_VALUE
+                              :latest-artifact-mtime-instant
+                              after-publication))]
+                    (denied-type #(attestation/attest-active-runtime!
+                                  request)))))
+        (check! "artifact ctime after active record publication is rejected"
+                (= :active-runtime-process-attestation-failed
+                   (with-redefs
+                    [attestation/fram-artifact-identity!
+                     (fn [& args]
+                       (assoc (apply original args)
+                              :latest-artifact-ctime-millis Long/MAX_VALUE
+                              :latest-artifact-ctime-instant
+                              after-publication))]
                     (denied-type #(attestation/attest-active-runtime!
                                   request))))))
 
@@ -345,7 +415,7 @@
         (check! "selector rebind invalidates prior active authority"
                 (= :runtime-authority-lost
                    (denied-type #(attestation/assert-current!
-                                  first-attestation))))))
+                                  @first-attestation))))))
 
     (finally
       (when @running (stop-daemon! (:daemon @running)))
@@ -381,6 +451,41 @@
         (finally
           (when @running (stop-daemon! (:daemon @running)))
           (delete-tree! temp))))))
+
+(doseq [[label mutation]
+        [["dirty Git worktree is rejected as runtime provenance" :worktree]
+         ["dirty Git index is rejected as runtime provenance" :index]
+         ["untracked Git content is rejected as runtime provenance" :untracked]]]
+  (let [temp (.toFile
+              (java.nio.file.Files/createTempDirectory
+               "north-dirty-fram-checkout-"
+               (make-array java.nio.file.attribute.FileAttribute 0)))
+        source (.getCanonicalPath (io/file temp "fram"))]
+    (try
+      (clone-fram! fram source)
+      (let [revision (git-value-at source "HEAD")
+            tree (git-value-at source "HEAD^{tree}")]
+        (case mutation
+          :worktree
+          (spit (io/file source "coord.clj") "\n" :append true)
+
+          :index
+          (do
+            (spit (io/file source "coord.clj") "\n" :append true)
+            (let [added (proc/shell {:out :string :err :string :continue true}
+                                    "git" "-C" source "add" "--" "coord.clj")]
+              (when-not (zero? (:exit added))
+                (throw (ex-info "could not stage dirty-index fixture"
+                                {:error (:err added)})))))
+
+          :untracked
+          (spit (io/file source "north-untracked-runtime.clj") "fixture\n"))
+        (check! label
+                (= :runtime-source-checkout-dirty
+                   (denied-type #(attestation/fram-artifact-identity!
+                                  source revision tree)))))
+      (finally
+        (delete-tree! temp)))))
 
 (let [temp (.toFile
             (java.nio.file.Files/createTempDirectory
@@ -476,6 +581,8 @@
     (finally
       (.close socket)
       (delete-tree! temp))))
+
+(delete-tree! fram-fixture-root)
 
 (if (seq @failures)
   (do (binding [*out* *err*]

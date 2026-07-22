@@ -62,6 +62,22 @@
   (into-array java.nio.file.LinkOption
               [java.nio.file.LinkOption/NOFOLLOW_LINKS]))
 
+(defn- file-time-millis [value]
+  (.toMillis ^java.nio.file.attribute.FileTime value))
+
+(defn- file-time-instant [value]
+  (let [instant (.toInstant ^java.nio.file.attribute.FileTime value)]
+    [(.getEpochSecond instant) (.getNano instant)]))
+
+(defn- latest-file-time [values]
+  (reduce (fn [latest candidate]
+            (if (pos? (compare candidate latest)) candidate latest))
+          [0 0]
+          values))
+
+(defn- file-time<=? [candidate barrier]
+  (not (pos? (compare candidate barrier))))
+
 (defn- unix-file-state! [label path]
   (let [nio (.toPath (io/file (str path)))
         options (no-follow-options)]
@@ -73,15 +89,21 @@
              :active-runtime-path-invalid {:label label :path (str path)}))
     (let [attrs (java.nio.file.Files/readAttributes
                  nio "unix:dev,ino,uid,mode,nlink,size,lastModifiedTime,ctime"
-                 options)]
+                 options)
+          mtime (get attrs "lastModifiedTime")
+          ctime (get attrs "ctime")]
       {:dev (long (get attrs "dev"))
        :ino (long (get attrs "ino"))
        :uid (long (get attrs "uid"))
        :mode (bit-and (long (get attrs "mode")) 511)
        :nlink (long (get attrs "nlink"))
        :size (long (get attrs "size"))
-       :mtime (str (get attrs "lastModifiedTime"))
-       :ctime (str (get attrs "ctime"))})))
+       :mtime (str mtime)
+       :mtime-millis (file-time-millis mtime)
+       :mtime-instant (file-time-instant mtime)
+       :ctime (str ctime)
+       :ctime-millis (file-time-millis ctime)
+       :ctime-instant (file-time-instant ctime)})))
 
 (defn- unix-directory-state! [label path]
   (let [file (io/file (str path))
@@ -93,14 +115,20 @@
              :active-runtime-path-invalid {:label label :path (str path)}))
     (let [attrs (java.nio.file.Files/readAttributes
                  nio "unix:dev,ino,uid,mode,nlink,lastModifiedTime,ctime"
-                 options)]
+                 options)
+          mtime (get attrs "lastModifiedTime")
+          ctime (get attrs "ctime")]
       {:dev (long (get attrs "dev"))
        :ino (long (get attrs "ino"))
        :uid (long (get attrs "uid"))
        :mode (bit-and (long (get attrs "mode")) 511)
        :nlink (long (get attrs "nlink"))
-       :mtime (str (get attrs "lastModifiedTime"))
-       :ctime (str (get attrs "ctime"))})))
+       :mtime (str mtime)
+       :mtime-millis (file-time-millis mtime)
+       :mtime-instant (file-time-instant mtime)
+       :ctime (str ctime)
+       :ctime-millis (file-time-millis ctime)
+       :ctime-instant (file-time-instant ctime)})))
 
 (defn- channel-bytes! [label ^java.nio.channels.FileChannel channel size]
   (when (> size identity-read-limit)
@@ -396,6 +424,41 @@
                    :error (str/trim (:err result))}))
     value))
 
+(defn- git-clean-checkout! [root revision tree]
+  (let [options {:out :string :err :string :continue true}
+        worktree
+        (proc/shell options "git" "-C" root "diff" "--no-ext-diff"
+                    "--quiet" "--ignore-submodules=none" "--")
+        index
+        (proc/shell options "git" "-C" root "diff" "--cached"
+                    "--no-ext-diff" "--quiet" "--ignore-submodules=none" "--")
+        untracked
+        (proc/shell options "git" "-C" root "ls-files" "--others"
+                    "--exclude-standard" "-z" "--")]
+    (when-not (and (zero? (:exit worktree))
+                   (zero? (:exit index))
+                   (zero? (:exit untracked))
+                   (empty? (:out untracked)))
+      (fail! "selected Fram Git checkout is not exactly clean"
+             :runtime-source-checkout-dirty
+             {:root root
+              :revision revision
+              :tree tree
+              :worktree-exit (:exit worktree)
+              :worktree-error (str/trim (:err worktree))
+              :index-exit (:exit index)
+              :index-error (str/trim (:err index))
+              :untracked-exit (:exit untracked)
+              :untracked-sha256
+              (sha256-bytes
+               (.getBytes ^String (:out untracked)
+                          java.nio.charset.StandardCharsets/UTF_8))}))
+    {:head revision
+     :tree tree
+     :worktree-diff "clean"
+     :index-diff "clean"
+     :untracked-status "clean"}))
+
 (defn- source-version! [root expected-revision expected-tree]
   (let [marker (.toPath (io/file root ".git"))
         options (no-follow-options)
@@ -403,22 +466,28 @@
         (and (not (java.nio.file.Files/isSymbolicLink marker))
              (or (java.nio.file.Files/isDirectory marker options)
                  (java.nio.file.Files/isRegularFile marker options)))]
-  (if git-backed?
-    (let [revision (git-value! root "HEAD" :fram-revision-unavailable)
-          tree (git-value! root "HEAD^{tree}" :fram-tree-unavailable)]
-      (when-not (and (= expected-revision revision) (= expected-tree tree))
-        (fail! "launcher runtime revision/tree does not match its selected source"
-               :runtime-source-version-mismatch
-               {:expected {:revision expected-revision :tree expected-tree}
-                :actual {:revision revision :tree tree} :root root}))
-      {:revision revision :tree tree :provenance "git"})
-    (let [store? (boolean (re-matches #"/nix/store/[a-z0-9]{32}-.+" root))]
-      (when-not (and store? (not (str/blank? expected-revision))
-                     (= expected-tree (str "immutable:" expected-revision)))
-        (fail! "selected Fram runtime is neither a Git source nor an immutable store object"
-               :runtime-source-version-unavailable
-               {:root root :revision expected-revision :tree expected-tree}))
-      {:revision expected-revision :tree expected-tree :provenance "nix-store"}))))
+    (if git-backed?
+      (let [revision (git-value! root "HEAD" :fram-revision-unavailable)
+            tree (git-value! root "HEAD^{tree}" :fram-tree-unavailable)]
+        (when-not (and (= expected-revision revision) (= expected-tree tree))
+          (fail! "launcher runtime revision/tree does not match its selected source"
+                 :runtime-source-version-mismatch
+                 {:expected {:revision expected-revision :tree expected-tree}
+                  :actual {:revision revision :tree tree} :root root}))
+        {:revision revision
+         :tree tree
+         :provenance "git"
+         :proof (git-clean-checkout! root revision tree)})
+      (let [store? (boolean (re-matches #"/nix/store/[a-z0-9]{32}-.+" root))]
+        (when-not (and store? (not (str/blank? expected-revision))
+                       (= expected-tree (str "immutable:" expected-revision)))
+          (fail! "selected Fram runtime is neither a Git source nor an immutable store object"
+                 :runtime-source-version-unavailable
+                 {:root root :revision expected-revision :tree expected-tree}))
+        {:revision expected-revision
+         :tree expected-tree
+         :provenance "nix-store"
+         :proof {:immutable-store root}}))))
 
 (defn- runtime-artifact-paths [root]
   (let [root-file (io/file root)
@@ -459,15 +528,15 @@
                 (sorted-map)
                 (map
                  (fn [relative]
-                   (let [path (.getCanonicalPath (io/file canonical relative))]
+                   (let [path (.getCanonicalPath (io/file canonical relative))
+                         state (unix-file-state! "Fram runtime artifact" path)]
                      [relative
-                      {:bytes (.length (io/file path))
+                      {:bytes (:size state)
                        :sha256 (sha256-file path)
-                       :modified-millis
-                       (.toMillis
-                        (java.nio.file.Files/getLastModifiedTime
-                         (.toPath (io/file path))
-                         (make-array java.nio.file.LinkOption 0)))}]))
+                       :modified-millis (:mtime-millis state)
+                       :modified-instant (:mtime-instant state)
+                       :changed-millis (:ctime-millis state)
+                       :changed-instant (:ctime-instant state)}]))
                 paths))
           content (into
                    (sorted-map)
@@ -478,12 +547,19 @@
        :revision (:revision version)
        :tree (:tree version)
        :version-provenance (:provenance version)
+       :source-proof (:proof version)
        :artifact-sha256
        (sha256-bytes
         (.getBytes (pr-str content) java.nio.charset.StandardCharsets/UTF_8))
        :artifact-count (count rows)
        :latest-artifact-mtime-millis
-       (reduce max 0 (map :modified-millis (vals rows)))})))
+       (reduce max 0 (map :modified-millis (vals rows)))
+       :latest-artifact-mtime-instant
+       (latest-file-time (map :modified-instant (vals rows)))
+       :latest-artifact-ctime-millis
+       (reduce max 0 (map :changed-millis (vals rows)))
+       :latest-artifact-ctime-instant
+       (latest-file-time (map :changed-instant (vals rows)))})))
 
 (defn- process-shape!
   [pid source daemon port served-log]
@@ -788,6 +864,7 @@
           artifact (fram-artifact-identity!
                     (:source parsed) (get record "FRAM_RUNTIME_REV")
                     (get record "FRAM_RUNTIME_TREE"))
+          record-state (get-in parsed [:sealed :state])
           daemon (artifact-record "Fram daemon launcher" (:daemon parsed))
           shape (process-shape! pid (:source parsed) (:daemon parsed)
                                 port (:coordination-log parsed))
@@ -813,7 +890,10 @@
        (and (= [pid] pids)
             (= (get record "PID_BIRTH") actual-birth)
             (integer? process-start)
-            (<= (:latest-artifact-mtime-millis artifact) process-start)
+            (file-time<=? (:latest-artifact-mtime-instant artifact)
+                          (:mtime-instant record-state))
+            (file-time<=? (:latest-artifact-ctime-instant artifact)
+                          (:ctime-instant record-state))
             (= exact-environment (select-keys environment
                                                (keys exact-environment)))
             (every? (fn [[key expected]]
@@ -827,6 +907,16 @@
                 :process-start-millis process-start
                 :latest-artifact-mtime-millis
                 (:latest-artifact-mtime-millis artifact)
+                :latest-artifact-ctime-millis
+                (:latest-artifact-ctime-millis artifact)
+                :latest-artifact-mtime-instant
+                (:latest-artifact-mtime-instant artifact)
+                :latest-artifact-ctime-instant
+                (:latest-artifact-ctime-instant artifact)
+                :record-publication-mtime-millis (:mtime-millis record-state)
+                :record-publication-ctime-millis (:ctime-millis record-state)
+                :record-publication-mtime-instant (:mtime-instant record-state)
+                :record-publication-ctime-instant (:ctime-instant record-state)
                 :environment-keys (sort (concat (keys exact-environment)
                                                 (keys exact-path-environment)))}))
       {:format active-attestation-format
@@ -839,7 +929,10 @@
                  :controller-unit controller-unit}
        :identity
        (merge
-        (dissoc artifact :latest-artifact-mtime-millis)
+        (dissoc artifact :latest-artifact-mtime-millis
+                :latest-artifact-mtime-instant
+                :latest-artifact-ctime-millis
+                :latest-artifact-ctime-instant)
         {:runtime-mode (get record "NORTH_FRAM_RUNTIME")
          :generation (:generation selection)
          :generation-identity
@@ -858,6 +951,19 @@
        {:pid pid
         :pid-birth actual-birth
         :process-start-millis process-start
+        :publication-freshness
+        {:latest-artifact-mtime-millis
+         (:latest-artifact-mtime-millis artifact)
+         :latest-artifact-mtime-instant
+         (:latest-artifact-mtime-instant artifact)
+         :latest-artifact-ctime-millis
+         (:latest-artifact-ctime-millis artifact)
+         :latest-artifact-ctime-instant
+         (:latest-artifact-ctime-instant artifact)
+         :record-mtime-millis (:mtime-millis record-state)
+         :record-mtime-instant (:mtime-instant record-state)
+         :record-ctime-millis (:ctime-millis record-state)
+         :record-ctime-instant (:ctime-instant record-state)}
         :owner-token-sha256
         (sha256-bytes
          (.getBytes (get record "OWNER_TOKEN")
@@ -930,7 +1036,10 @@
       {:format attestation-format
        :identity
        (merge
-        (dissoc artifact :latest-artifact-mtime-millis)
+        (dissoc artifact :latest-artifact-mtime-millis
+                :latest-artifact-mtime-instant
+                :latest-artifact-ctime-millis
+                :latest-artifact-ctime-instant)
         {:daemon daemon
          :executable (:executable shape)
          :script (:script shape)
