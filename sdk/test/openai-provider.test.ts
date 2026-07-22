@@ -825,13 +825,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
     routingMetadata: applyGafferStaffing({ role: "scout" }),
     presenceRegistrar: false,
   }) as any;
-  expect(() => codexHarnessArguments(web))
-    .toThrow("openai_adapter_web_capability_unproven");
-  await expect(async () => {
-    for await (const _ of openaiProvider.query({
-      prompt: "must not spawn for unproven web authority", options: web,
-    }) as AsyncIterable<any>) {}
-  }).toThrow("openai_adapter_web_capability_unproven");
+  expect(codexHarnessArguments(web)).toEqual(expected);
   expect(existsSync(argvPath)).toBe(false);
 
   const unsupported = openaiProvider.query({
@@ -865,16 +859,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_
   expect(() => { canonical.env.AGENT_TOPOLOGY = undefined; }).toThrow();
 });
 
-test("the executable Codex adapter rejects orchestrator authority before starting a provider turn", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "north-codex-orchestrator-admission-"));
-  temporary.push(directory);
-  const marker = join(directory, "provider-started");
-  const command = join(directory, "fake-codex");
-  writeFileSync(command, `#!/usr/bin/env bash\nprintf started > "${marker}"\n`);
-  chmodSync(command, 0o700);
-  process.env.NORTH_CODEX_BIN = command;
-  process.env.NORTH_PORT = "65534";
-
+test("the executable Codex adapter admits exact managed orchestrator authority", () => {
   const options = harnessOptions({
     self: "openai-orchestrator-admission-proof",
     provider: "openai",
@@ -882,25 +867,10 @@ test("the executable Codex adapter rejects orchestrator authority before startin
     routingMetadata: applyGafferStaffing({ role: "director" }),
     presenceRegistrar: false,
   }) as any;
-  let caught: unknown;
-  try {
-    for await (const _ of openaiProvider.query({
-      prompt: "must not start a provider turn",
-      options,
-    }) as AsyncIterable<any>) {}
-  } catch (error) {
-    caught = error;
-  }
-
-  expect(caught).toMatchObject({
-    code: "blocked_preflight",
-    processOutcome: "blocked_preflight",
-    retrySafeBeforeAcceptance: true,
-  });
-  expect((caught as Error).message).toBe(
-    "openai_adapter_orchestrator_authority_unavailable",
-  );
-  expect(existsSync(marker)).toBe(false);
+  expect(codexHarnessArguments(options)).toEqual([
+    ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
+    ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),
+  ]);
 });
 
 test("managed executable resolution fails retry-safe before onRoute or query construction", async () => {

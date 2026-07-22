@@ -360,8 +360,12 @@ Topology authority is enforced on every supported North control surface: the
 TypeScript SDK, `north spawn`/`dispatch`/`delegate`/`steer`/`retask`, MCP,
 peer-command publication, listener reaction, map fan-out, and presence control.
 A managed `worker` cannot create or command another agent, and a requested child
-topology cannot elevate its caller. Ordinary completion/death mail and thread
-facts remain writable because workers need to report outcomes.
+topology cannot elevate its caller. A managed `orchestrator` may recursively
+create workers or child orchestrators, but every child crosses the complete
+Gaffer/admission/provider/budget boundary and gets a fresh run reservation,
+immediate-parent coordinator edge, and local child-set reduction gate. Ordinary
+completion/death mail, thread facts, and structured scope-overrun checkpoints
+remain writable because workers need to report outcomes and request replanning.
 
 This is an application authorization boundary, not a same-UID security sandbox.
 Code already holding an unrestricted user shell can bypass an application by

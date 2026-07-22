@@ -318,6 +318,7 @@
    ["struggle_loop_repeat_threshold" "single" "literal" "effective identical-call repeat threshold for a run"]
    ["struggle_loop_window" "single" "literal" "effective recent-call window for tool-loop detection"]
    ["struggle_no_progress_turn_threshold" "single" "literal" "effective assistant-turn threshold for no-progress detection"]
+   ["scope_escalation" "multi" "literal" "versioned JSON checkpoint for a managed scope-overrun/needs-replan escalation"]
    ["escalation_tier" "single" "literal" "legacy final escalation tier (historical reads only)"]
    ["escalation_count" "single" "literal" "legacy in-flight escalation count (historical reads only)"]
    ["escalation_path" "single" "literal" "legacy ordered escalation path (historical reads only)"]

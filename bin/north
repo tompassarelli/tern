@@ -163,6 +163,7 @@ north — your one card. Type a command to do the thing next to it.
     north watch <id>                   tail an agent's transcript
     north steer <id> "<msg>"           inject a message into a running agent
     north retask <id> "<goal>"         redirect a running agent's goal
+    north escalate needs-replan ...    checkpoint scope overrun + route it up the live parent chain
     north evidence record <bar> <result>
                                        bind done-bar evidence to this exact managed run
     north delivery attest <agent-id>   unavailable until verifier lanes have OS isolation
@@ -286,7 +287,7 @@ CARD
     exec "$BB" -cp "$FRAM_OUT" "$NORTH/cli/corpus-transaction-cli.clj" "${NORTH_PORT:-7977}" "${@:2}" ;;
   up)
     exec "$NORTH/bin/north-coord-up" "${@:2}" ;;
-  agents|templates|spawn|delegate|request|fork|req|watch|steer|retask)
+  agents|templates|spawn|delegate|request|fork|req|watch|steer|retask|escalate)
     # Agent verbs — agents are a north concern (spawn/presence/facts live here).
     # Implementation: cli/agents-cli.clj (ported from the convoy cockpit 2026-07-09).
     exec "$BB" "$NORTH/cli/agents-cli.clj" "$@" ;;

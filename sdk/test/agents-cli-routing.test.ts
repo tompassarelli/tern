@@ -121,7 +121,7 @@ test("CLI dry preview uses the exact topology policy selected for execution", ()
   expect(invalid.stdout).not.toContain("[dry-run]");
 });
 
-test("a managed CLI orchestrator can spawn workers but cannot grow another orchestrator tier", () => {
+test("a managed CLI orchestrator without an exact parent reservation fails safe before recursive spawn", () => {
   const run = (...args: string[]) => spawnSync("bb", [cli, "spawn", ...args, "--dry-run"], {
     encoding: "utf8",
     env: {
@@ -133,14 +133,12 @@ test("a managed CLI orchestrator can spawn workers but cannot grow another orche
       GAFFER_STAFFING_CATALOG: resolve(gaffer, "staffing/catalog.json"),
     },
   });
-  const worker = run("integrator", "bounded worker");
-  expect(worker.status).toBe(0);
-  expect(worker.stdout).toContain("AGENT_TOPOLOGY=worker");
-
-  const denied = [
+  const refused = [
+    run("integrator", "bounded worker"),
     run("director", "role-only nested director"),
     run(
       "director", "overridden nested director", "--tier", "senior",
+      "--reasoning", "high",
       "--override-reason", "bounded coordination does not require frontier tier",
     ),
     run(
@@ -151,11 +149,10 @@ test("a managed CLI orchestrator can spawn workers but cannot grow another orche
       "--contract", bespokeOrchestratorContract, "--no-promotion-candidate",
     ),
   ];
-  for (const result of denied) {
+  for (const result of refused) {
     expect(result.status).toBe(1);
-    expect(result.stdout).toContain(
-      "coordination depth denied: spawn from an orchestrator may create worker topology only",
-    );
+    expect(result.stdout).toContain("recursive orchestrator spawn requires its exact parent run/thread reservation");
+    expect(result.stdout).not.toContain("coordination depth denied");
   }
 });
 
@@ -203,7 +200,7 @@ test("composite preview and execution share pinned-provider admission before sid
   } catch (error) {
     productionReason = error instanceof Error ? error.message : String(error);
   }
-  expect(productionReason).toBe("openai_adapter_orchestrator_authority_unavailable");
+  expect(productionReason).toBe("");
 
   const env = {
     ...process.env,
@@ -225,37 +222,19 @@ test("composite preview and execution share pinned-provider admission before sid
       ["spawn", "director", "coordinate this"],
     ];
     for (const request of requests) {
-      for (const executionArgs of [["--dry-run"], []]) {
-        const result = spawnSync("bb", [
-          cli, ...request,
-          "--provider", "openai", "--target", "codex-work",
-          "--pin-evidence", pinEvidence(
-            { kind: "provider", value: "openai" },
-            { kind: "account", value: "codex-work" },
-          ),
-          ...executionArgs,
-        ], { encoding: "utf8", env });
-        expect(result.status).toBe(1);
-        const document = JSON.parse(result.stdout.trim());
-        expect(document).toEqual({
-          schema: "north:provider-capability-admission:v1",
-          provider: "openai",
-          capabilities: [...capabilities],
-          requestedTarget: "codex-work",
-          status: "unsupported",
-          code: "blocked_preflight",
-          processOutcome: "blocked_preflight",
-          reason: productionReason,
-          retrySafeBeforeAcceptance: true,
-        });
-        expect(result.stderr).toContain(
-          `provider capability admission rejected before side effects: ${productionReason}`,
-        );
-        expect(result.stdout).not.toContain("[dry-run]");
-        expect(result.stdout).not.toContain("semantic handle");
-        expect(result.stdout).not.toContain("control:");
-        expect(result.stdout).not.toContain("AGENT_");
-      }
+      const result = spawnSync("bb", [
+        cli, ...request,
+        "--provider", "openai", "--target", "codex-work",
+        "--pin-evidence", pinEvidence(
+          { kind: "provider", value: "openai" },
+          { kind: "account", value: "codex-work" },
+        ),
+        "--dry-run",
+      ], { encoding: "utf8", env });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("[dry-run]");
+      expect(result.stdout).toContain("semantic handle");
+      expect(result.stdout).not.toContain("blocked_preflight");
     }
 
     expect(existsSync(calls)).toBe(false);
@@ -374,6 +353,7 @@ function writeThreadFake(
   receipt: Record<string, unknown>,
   title: string,
   runFacts?: Array<{ predicate: string; value: string }>,
+  recursiveParent?: string,
 ): { command: string; calls: string } {
   const command = join(directory, "north-fake");
   const calls = join(directory, "calls.log");
@@ -381,6 +361,9 @@ function writeThreadFake(
 printf '%s\\n' "$*" >> ${JSON.stringify(calls)}
 if [ "$1" = "capture" ]; then
   printf '%s\\n' ${JSON.stringify(JSON.stringify(receipt))}
+  exit 0
+fi
+if [ "$1" = "tell" ]; then
   exit 0
 fi
 if [ "$1" = "json" ] && [ "$2" = "show" ]; then
@@ -392,6 +375,7 @@ if [ "$1" = "json" ] && [ "$2" = "show" ]; then
     { predicate: "title", value: title },
     { predicate: "kind", value: "thread" },
     { predicate: "committed", value: "2026-07-19" },
+    ...(recursiveParent ? [{ predicate: "part_of", value: `@${recursiveParent}` }] : []),
   ]))}
   exit 0
 fi
@@ -535,14 +519,25 @@ test("delegate derives a bounded single-line capture title without truncating th
   }
 });
 
-test("delegate explicit and complete managed bindings reuse one proven title-bearing thread", () => {
+test("delegate explicit binding reuses its thread while a managed parent receives a fresh linked child", () => {
   const directory = mkdtempSync(join(tmpdir(), "north-delegate-reuse-"));
   try {
+    const childReceipt = {
+      id: "fresh-child-thread",
+      thread: "@fresh-child-thread",
+      title: "child task",
+      path: "/tmp/fresh-child-thread.md",
+      expected: 7,
+      committed: 7,
+      complete: true,
+      reason: "captured",
+    };
     const fake = writeThreadFake(
       directory,
-      {},
-      "existing work",
+      childReceipt,
+      "child task",
       reservationFacts("existing-thread", "parent-agent", "capability"),
+      "existing-thread",
     );
     const explicit = resolveDelegateThread({ task: "child task", explicit: "@existing-thread" }, {
       NORTH_BIN: fake.command,
@@ -580,10 +575,14 @@ test("delegate explicit and complete managed bindings reuse one proven title-bea
     });
     expect(inherited.status).toBe(0);
     expect(JSON.parse(inherited.stdout.trim())).toMatchObject({
-      id: "existing-thread",
-      source: "inherited",
+      id: "fresh-child-thread",
+      source: "recursive-child",
+      parent: "existing-thread",
     });
-    expect(readFileSync(fake.calls, "utf8")).not.toContain("capture ");
+    expect(readFileSync(fake.calls, "utf8")).toContain("capture child task");
+    expect(readFileSync(fake.calls, "utf8")).toContain(
+      "tell fresh-child-thread part_of existing-thread",
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

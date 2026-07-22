@@ -49,9 +49,7 @@ import {
   admitResourceEnvelope, completeResourceEnvelope, envelopeContextFromEnv,
   reserveResourceEnvelopeRetry, ResourceEnvelopeExceededError, type EnvelopeAdmission,
 } from "./resource-envelopes";
-import {
-  assertCoordinationAuthority, assertManagedChildTopology,
-} from "./topology-authority";
+import { assertCoordinationAuthority } from "./topology-authority";
 import { admitPinnedProvider } from "./execution-admission";
 import { classifyExecutionTerminal, EMPTY_RESULT_OUTCOME, isEmptyResultTerminal } from "./execution-outcome";
 import { ManagedLiveInputRoute } from "./live-input-route";
@@ -881,6 +879,62 @@ async function runSpawn(
 // caller's and deny every managed delegate (the 2026-07-17 self-deny bug).
 let bootstrapAuthorityGranted = false;
 
+export class RecursiveChildBindingError extends Error {
+  readonly code = "NORTH_RECURSIVE_CHILD_BINDING_REQUIRED";
+  readonly preSideEffect = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "RecursiveChildBindingError";
+  }
+}
+
+function assertRecursiveChildBinding(
+  composed: SpawnOptions,
+  callerTopology: string | undefined,
+  loadThreadFacts: typeof getThreadFacts,
+): void {
+  if (callerTopology !== "orchestrator") return;
+  const parentThread = process.env.NORTH_THREAD_ID;
+  const parentRun = process.env.NORTH_RUN_ID;
+  const parentCapability = process.env.NORTH_RUN_CAPABILITY;
+  if (!parentThread || !parentRun || !parentCapability || !composed.thread) {
+    throw new RecursiveChildBindingError(
+      "recursive SDK spawn requires an exact managed parent run and a fresh child thread",
+    );
+  }
+  let child: string;
+  let parent: string;
+  try {
+    child = normalizeNorthEntityId(composed.thread);
+    parent = normalizeNorthEntityId(parentThread);
+  } catch {
+    throw new RecursiveChildBindingError(
+      "recursive SDK spawn received an invalid parent or child thread id",
+    );
+  }
+  if (child === parent) {
+    throw new RecursiveChildBindingError(
+      "recursive SDK spawn cannot reuse the parent thread as the child thread",
+    );
+  }
+  let parents: string[];
+  try {
+    parents = loadThreadFacts(child)
+      .filter((fact) => fact.predicate === "part_of")
+      .map((fact) => normalizeNorthEntityId(fact.value));
+  } catch {
+    throw new RecursiveChildBindingError(
+      "recursive SDK spawn could not verify the child thread parent link",
+    );
+  }
+  if (parents.length !== 1 || parents[0] !== parent) {
+    throw new RecursiveChildBindingError(
+      "recursive SDK spawn requires exactly one child part_of link to its immediate parent thread",
+    );
+  }
+}
+
 export async function spawn(opts: SpawnOptions): Promise<string> {
   const injected = takeSpawnTestRuntime<SpawnRuntime>(opts) ?? {};
   const admitted = allowlistedSpawnOptions(opts);
@@ -888,8 +942,8 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
   if (!bootstrapAuthorityGranted) assertCoordinationAuthority("spawn", callerTopology);
   const composed = composeSpawnOptions(admitted);
   if (!bootstrapAuthorityGranted) {
-    assertManagedChildTopology(
-      "spawn", composed.routingMetadata.topology, callerTopology,
+    assertRecursiveChildBinding(
+      composed, callerTopology, injected.loadThreadFacts ?? getThreadFacts,
     );
   }
   // Resolve the exact observer policy and immutable dispatcher grade before

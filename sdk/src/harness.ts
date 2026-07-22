@@ -7,7 +7,7 @@
 //   1. north MCP — native fact-graph verbs (capture/tell/ready/next/...),
 //      so agents act on facts, not by Edit-ing text files.
 //   2. explicit orchestrator topology — and only that topology — may dispatch or
-//      command peers. Workers and topology-neutral lanes remain terminal.
+//      command peers through North. Workers remain without coordination authority.
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";

@@ -114,8 +114,13 @@ test("North MCP tool inventory and managed provider exposure stay exact", () => 
     presenceRegistrar: false,
     routingMetadata: applyGafferStaffing({ role: "director" }),
   }) as any;
-  expect(() => codexHarnessArguments(director))
-    .toThrow("openai_adapter_orchestrator_authority_unavailable");
+  const directorSurface = compileProviderAuthoritySurface("openai", director);
+  expect(directorSurface.northEnabledTools).toEqual(expect.arrayContaining(["dispatch", "spawn"]));
+  expect(directorSurface.web).toBe("cached");
+  expect(codexHarnessArguments(director)).toEqual([
+    ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
+    ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),
+  ]);
 });
 
 test("route application rejects request laundering and authoring hooks are an exact frozen surface", () => {

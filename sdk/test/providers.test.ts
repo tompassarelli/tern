@@ -656,11 +656,11 @@ test("provider selection filters unenforceable capability shapes before side eff
     "auto", available, policy({ providerOrder: ["openai", "anthropic"] }),
     "senior", "web-route", "high", undefined, webCapabilities,
   );
-  expect(web.provider).toBe("anthropic");
-  expect(() => selectProviderFromAvailability(
+  expect(web.provider).toBe("openai");
+  expect(selectProviderFromAvailability(
     "openai", available, policy(), "senior", "web-pin", "high", undefined,
     webCapabilities,
-  )).toThrow("cannot enforce the requested Gaffer capabilities");
+  ).provider).toBe("openai");
 
   const orchestratorCapabilities = [
     "filesystem.read", "filesystem.search", "shell.readonly", "web", "coordination",
@@ -669,30 +669,23 @@ test("provider selection filters unenforceable capability shapes before side eff
     "auto", available, policy({ providerOrder: ["openai", "anthropic"] }),
     "senior", "coordination-route", "high", undefined, orchestratorCapabilities,
   );
-  expect(orchestrator.provider).toBe("anthropic");
-  expect(() => selectProviderFromAvailability(
+  expect(orchestrator.provider).toBe("openai");
+  expect(selectProviderFromAvailability(
     "openai", available, policy(), "senior", "coordination-pin", "high", undefined,
     orchestratorCapabilities,
-  )).toThrow("cannot enforce the requested Gaffer capabilities");
-  try {
-    selectProviderFromAvailability(
-      { provider: "auto", target: "codex-personal" },
-      accountAvailability,
-      accountPolicy(),
-      "senior",
-      "coordination-target-pin",
-      "high",
-      undefined,
-      orchestratorCapabilities,
-    );
-    throw new Error("expected target capability admission to fail");
-  } catch (error) {
-    expect(error).toMatchObject({
-      kind: "blocked_preflight",
-      processOutcome: "blocked_preflight",
-      preSideEffect: true,
-    });
-  }
+  ).provider).toBe("openai");
+  const pinnedTarget = selectProviderFromAvailability(
+    { provider: "auto", target: "codex-personal" },
+    accountAvailability,
+    accountPolicy(),
+    "senior",
+    "coordination-target-pin",
+    "high",
+    undefined,
+    orchestratorCapabilities,
+  );
+  expect(pinnedTarget.provider).toBe("openai");
+  expect(pinnedTarget.target).toBe("codex-personal");
 });
 
 test("Anthropic frontier follows Gaffer's static route without a hidden time swap", () => {

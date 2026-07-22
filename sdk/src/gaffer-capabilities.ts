@@ -60,18 +60,9 @@ export function providerCapabilityRejectionCode(
   if ((shell || readonlyShell) && (!fileRead || !fileSearch)) return generic;
   if (shell && !fileWrite) return generic;
   if (provider === "anthropic") return undefined;
-  // Codex managed workers have an enforceable North MCP surface, but its native
-  // exec adapter cannot yet prove child receipt/reconciliation. Orchestrator
-  // authority therefore routes elsewhere instead of spending a turn and
-  // reporting a coordinator-shaped prompt as operational coordination.
-  if (capabilities.includes("coordination"))
-    return "openai_adapter_orchestrator_authority_unavailable";
-  // `codex exec --search` enables a changing provider-native surface. North has
-  // not yet proven its exact item/receipt and policy boundary, so managed web
-  // work routes to an adapter that can enforce it instead of silently enabling
-  // a capability on faith.
-  if (capabilities.includes("web"))
-    return "openai_adapter_web_capability_unproven";
+  // Codex app-server receives an exact North MCP enabled-tools allowlist and a
+  // strict web_search mode in its admitted session config. Native multi-agent
+  // remains disabled; managed coordination crosses North's child boundary.
   // Codex exec always owns a shell surface. It can hard-sandbox that whole run
   // read-only, but cannot presently make only shell read-only while preserving
   // built-in file edits. Authority shapes outside those two modes route to an

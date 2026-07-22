@@ -824,15 +824,22 @@ north delegate "<task>" --thread <id> ...                     # bind an existing
 ```
 
 There is no unclassified default. Atomic handoff forwards every normal spawn
-axis and bespoke-composition option, so it starts exactly one selected terminal
-worker. Composite handoff alone hydrates the director, which then owns fan-out
-and reduction. Context carriage remains orthogonal via `--context <file>`.
+axis and bespoke-composition option, so it starts exactly one selected worker.
+Composite handoff hydrates an orchestrator, which owns its direct children and
+their reduction. An orchestrator may recursively delegate another composite:
+each level passes through North admission again and receives a fresh child
+thread, run reservation, routing/economics receipt, immediate-parent
+`coordinator` edge, and local settlement/reduction gate. Context carriage
+remains orthogonal via `--context <file>`.
 
 Every executed delegation has one durable, exact thread before a provider is
 invoked. `--thread` wins and must resolve to a title-bearing thread. Without it,
-North inherits a managed parent thread only when the ambient run reservation,
+North accepts a managed parent binding only when the ambient run reservation,
 reporter, and capability all verify; stray or stale environment variables never
-count as proof. Otherwise North mechanically captures one committed thread. Its
+count as proof. A managed orchestrator's child spawn never reuses that parent
+evidence thread: North captures a new committed child and proves its exact
+`part_of` edge before the provider starts. Otherwise North mechanically captures
+one committed root thread. Its
 title is a deterministic, bounded label derived from the first meaningful task
 line; the complete task remains in the spawn brief. Structured capture is
 transaction-like at this boundary: a partial write is retracted and absence is
@@ -852,8 +859,27 @@ Live children cause a bounded continuation (real state progress resets the
 bound); an unavailable settlement source, a no-progress cap, or an
 unacknowledged settled set records a blocked, never-ran terminal. North repeats
 the settlement/reduction gate immediately before publication to narrow the
-late-child race window to that publication seam. Terminal workers retain the
-loud early-exit notification behavior.
+late-child race window to that publication seam. Workers retain the loud
+early-exit notification behavior.
+
+A worker that discovers new seams or exceeds its accepted scope does not acquire
+coordination authority. It checkpoints and escalates through the structured
+canary:
+
+```sh
+north escalate needs-replan \
+  --summary "<why the accepted scope no longer fits>" \
+  --checkpoint "<completed work and evidence so far>" \
+  --seam "<new dependency or concern>" \
+  --propose "<one independently dispatchable piece>"
+```
+
+North appends one versioned `scope_escalation` JSON fact to the exact managed
+thread, then routes the same payload to the first live agent in the immediate
+parent/supervisor chain. If none is live, the checkpoint remains durable and the
+command fails safe: the worker stops instead of broadening scope. The parent
+decides continue, narrow, or split by creating new lanes; topology and authority
+are never mutated in place.
 
 **Ownership rule** (2026-07-09): a cockpit verb earns its place ONLY when it
 COMPOSES multiple tools (`dashboard`, `doctor`, `profile`, `spawn` = gaffer dials

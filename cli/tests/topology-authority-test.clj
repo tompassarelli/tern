@@ -17,6 +17,36 @@
 (check "an explicit orchestrator retains coordination authority"
        (nil? (binding [north.topology-authority/*topology* "orchestrator"]
                (north.topology-authority/authority-problem "spawn"))))
+(let [binding (with-redefs [managed-thread-binding
+                            (fn [] {:kind :complete :thread "parent-thread"})]
+                (resolve-recursive-child-thread! "recursive child" true))]
+  (check "an orchestrator child receives a fresh dry-run thread linked to its immediate parent"
+         (and (= "recursive-child-on-execution" (:id binding))
+              (= "parent-thread" (:parent binding))
+              (= "@parent-thread"
+                 (:value (first (filter #(= "part_of" (:predicate %))
+                                        (:facts binding))))))))
+
+(let [parsed (parse-scope-escalation-args
+              ["--summary" "scope grew" "--checkpoint" "probe A passed"
+               "--seam" "new database seam" "--seam" "new auth seam"
+               "--propose" "database worker" "--propose" "auth worker"
+               "--budget-signal" "75 percent" "--no-progress" "three turns"])]
+  (check "scope-overrun canary preserves structured checkpoint, seams, decomposition, and signals"
+         (= {:seams ["new database seam" "new auth seam"]
+             :decomposition ["database worker" "auth worker"]
+             :summary "scope grew" :checkpoint "probe A passed"
+             :budgetSignal "75 percent" :noProgress "three turns"}
+            parsed)))
+(check "scope-overrun routing uses the immediate live parent"
+       (= "parent" (supervisor-route "parent" #{"parent"} (constantly nil))))
+(check "scope-overrun routing skips a dead parent only along the declared supervisor chain"
+       (= "grandparent"
+          (supervisor-route "parent" #{"grandparent"}
+                            {"parent" "grandparent" "grandparent" nil})))
+(check "scope-overrun routing fails safe on an absent/cyclic supervisor chain"
+       (nil? (supervisor-route "parent" (constantly false)
+                               {"parent" "grandparent" "grandparent" "parent"})))
 (check "an unknown explicit topology fails closed"
        (str/includes?
         (binding [north.topology-authority/*topology* "unexpected"]

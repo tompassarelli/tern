@@ -33,7 +33,7 @@ interface AuthoritySurfaceBase {
 export interface OpenAIAuthoritySurface extends AuthoritySurfaceBase {
   provider: "openai";
   sandbox: "read-only" | "workspace-write";
-  web: "disabled";
+  web: "cached" | "disabled";
 }
 
 export interface AnthropicAuthoritySurface extends AuthoritySurfaceBase {
@@ -69,7 +69,7 @@ export function compileProviderAuthoritySurface(
       liveInput: "unsupported",
       authoringHooks: "managed-only",
       sandbox: capabilities.includes("shell.readonly") ? "read-only" : "workspace-write",
-      web: "disabled",
+      web: capabilities.includes("web") ? "cached" : "disabled",
       northEnabledTools: capabilities.includes("coordination")
         ? CODEX_ORCHESTRATOR_NORTH_ENABLED_TOOLS
         : CODEX_WORKER_NORTH_ENABLED_TOOLS,
