@@ -80,6 +80,52 @@
      (or (System/getenv "FRAM_TELEMETRY_LOG")
          (let [path (str dir "/telemetry.log")] (when (.exists (io/file path)) path)))]))
 
+(defn routing-policy-path []
+  (or (System/getenv "NORTH_ROUTING_POLICY")
+      (str (System/getProperty "user.home") "/.config/north/routing-policy.json")))
+
+(defn configured-targets
+  "Current routing-policy targets. A bounded usage report includes each one in
+  every interval, even when it has no terminal runs there. Used targets absent
+  from the current policy are added separately by the report builder."
+  []
+  (let [file (io/file (routing-policy-path))]
+    (if-not (.exists file) []
+      (let [document (json/parse-string (slurp file))
+            targets (get document "targets" [])]
+        (when-not (sequential? targets)
+          (throw (ex-info "routing policy targets must be an array" {})))
+        (->> targets
+             (map-indexed
+              (fn [index target]
+                (let [id (when (map? target) (normalized-token (get target "id")))
+                      provider (when (map? target)
+                                 (normalized-token (get target "provider")))]
+                  (when-not (and id provider)
+                    (throw (ex-info (str "routing policy target " index
+                                         " must name id and provider") {})))
+                  {:providerTarget id :provider provider :configuredNow true})))
+             distinct vec)))))
+
+(defn accounts-root []
+  (or (System/getenv "NORTH_ACCOUNTS_ROOT")
+      (str (System/getProperty "user.home") "/.local/state/north/accounts")))
+
+(defn configured-account-log-targets []
+  (let [file (io/file (routing-policy-path))]
+    (if-not (.exists file) []
+      (let [document (json/parse-string (slurp file))
+            targets (get document "targets" [])]
+        (->> targets
+             (keep (fn [target]
+                     (let [id (normalized-token (get target "id"))
+                           provider (normalized-token (get target "provider"))
+                           profile (or (normalized-token (get target "profile")) id)]
+                       (when (and id profile (#{"anthropic" "openai"} provider))
+                         {:providerTarget id :provider provider
+                          :root (io/file (accounts-root) provider profile)}))))
+             vec)))))
+
 (defn read-ops [paths]
   (mapcat (fn [path]
             (if (and path (.exists (io/file path)))
@@ -522,6 +568,11 @@
                          (attributed? (get' "requested_tier" nil)) "requested-route-fallback"
                          :else "unattributed")
        :model (or raw-model "unattributed") :effort (get' "effort" "unattributed")
+       :providerTarget (or (normalized-token (get' "provider_target" nil))
+                           "unattributed")
+       ;; Run time is deliberately run-local: a lane/session timestamp is not a
+       ;; terminal-run timestamp and must not be borrowed for interval reports.
+       :at (normalized-token (one facts entity "at"))
        :modelAvailability
        (when-let [source (normalized-token (one facts entity "model_availability_source"))]
          {:target (normalized-token (one facts entity "model_availability_target"))
@@ -588,6 +639,31 @@
        :effectiveAxes effective-axes
        :legacyDebtReasons legacy-debt
        :evidence (evidence facts thread)}))))
+
+(defn native-session-rows
+  "Provider-native interactive sessions are entitlement activity, but do not
+  publish terminal token totals or account targets. Keep them in a separate
+  projection so their session counts are visible without contaminating managed
+  run token percentages."
+  [facts]
+  (let [alias-map (model-alias-map)]
+    (->> facts
+         (keep (fn [[entity _]]
+                 (when (str/starts-with? entity "@session:native-")
+                   (let [agent (normalized-token (one facts entity "agent"))
+                         identity (when agent (str "@agent:" agent))
+                         model (normalize-model-alias
+                                alias-map (normalized-token (one facts identity "model")))
+                         provider (or (normalized-token (one facts identity "provider"))
+                                      (derive-provider-from-model model)
+                                      "unattributed")]
+                     {:entity entity
+                      :provider provider
+                      :model (or model "unattributed")
+                      :effort (or (normalized-token (one facts identity "effort"))
+                                  "unobserved")
+                      :startedAt (normalized-token (one facts entity "started_at"))}))))
+         (sort-by :entity) vec)))
 
 (def cohort-fields [:provider :tier :role :taskGrade])
 (def complete-attribution-fields (into cohort-fields [:model :effort]))
@@ -709,6 +785,342 @@
             :runs (count rows)
             :providers (->> rows (group-by :provider) (map usage-row) (sort-by :provider) vec)}
      (or by-model? by-effort?) (assoc :models (models-report rows by-effort?)))))
+
+(defn parse-instant [value]
+  (when value
+    (try (java.time.Instant/parse value) (catch Exception _ nil))))
+
+(defn jsonl-files [root child]
+  (let [dir (io/file root child)]
+    (if-not (.isDirectory dir) []
+      (->> (file-seq dir)
+           (filter #(and (.isFile %) (str/ends-with? (.getName %) ".jsonl")))
+           (sort-by #(.getPath %))))))
+
+(defn parse-json-line [line]
+  (try (json/parse-string line) (catch Exception _ nil)))
+
+(defn earlier-candidate [current candidate]
+  (if (or (nil? current)
+          (.isBefore (parse-instant (:at candidate)) (parse-instant (:at current))))
+    candidate current))
+
+(defn event-turn-id [event]
+  (or (normalized-token (get-in event ["payload" "turn_id"]))
+      (normalized-token
+       (get-in event ["payload" "internal_chat_message_metadata_passthrough" "turn_id"]))))
+
+(defn scan-openai-file [state file]
+  (with-open [reader (io/reader file)]
+    (first
+     (reduce
+      (fn [[state current-turn] line]
+        (if-let [event (parse-json-line line)]
+          (let [turn (or (event-turn-id event) current-turn)
+                payload (get event "payload")
+                state (if (and (= "turn_context" (get event "type")) turn)
+                        (assoc-in state [:turnMetadata turn]
+                                  {:model (normalized-token (get payload "model"))
+                                   :effort (or (normalized-token (get payload "effort"))
+                                               (normalized-token (get payload "reasoning_effort")))})
+                        state)
+                last-usage (get-in payload ["info" "last_token_usage"])
+                cumulative (maybe-long
+                            (get-in payload ["info" "total_token_usage" "total_tokens"]))
+                tokens (maybe-long (get last-usage "total_tokens"))
+                at (normalized-token (get event "timestamp"))]
+            (if (and (= "token_count" (get payload "type"))
+                     cumulative tokens (not (neg? tokens)) (parse-instant at))
+              (let [key [(or turn (str "file:" (.getPath file))) cumulative]
+                    candidate {:turn turn :at at :tokens tokens
+                               :dedupKeyHasTurn (boolean turn)}]
+                [(update-in state [:candidates key] earlier-candidate candidate) turn])
+              [state turn]))
+          [state current-turn]))
+      [state nil] (line-seq reader)))))
+
+(defn openai-account-records [{:keys [providerTarget root]}]
+  (let [state (reduce scan-openai-file {:turnMetadata {} :candidates {}}
+                      (jsonl-files root "sessions"))]
+    (->> (vals (:candidates state))
+         (map (fn [candidate]
+                (let [metadata (get-in state [:turnMetadata (:turn candidate)])]
+                  {:providerTarget providerTarget :provider "openai"
+                   :model (or (:model metadata) "unattributed")
+                   :effort (or (:effort metadata) "unobserved")
+                   :at (:at candidate) :tokens (:tokens candidate)
+                   :source "codex-account-jsonl:last-token-usage"
+                   :deduplication "turn-id+cumulative-total-earliest-timestamp"
+                   :dedupKeyHasTurn (:dedupKeyHasTurn candidate)})))
+         vec)))
+
+(defn anthropic-message-candidate [event]
+  (let [message (get event "message")
+        usage (get message "usage")
+        id (normalized-token (get message "id"))
+        at (normalized-token (get event "timestamp"))
+        components (map #(maybe-long (get usage %))
+                        ["input_tokens" "cache_creation_input_tokens"
+                         "cache_read_input_tokens" "output_tokens"])]
+    (when (and id (parse-instant at) (every? some? components)
+               (every? #(not (neg? %)) components))
+      {:messageId id :at at :tokens (reduce + components)
+       :model (or (normalized-token (get message "model")) "unattributed")})))
+
+(defn anthropic-account-records [{:keys [providerTarget root]}]
+  (let [deduped
+        (reduce
+         (fn [records file]
+           (with-open [reader (io/reader file)]
+             (reduce (fn [records line]
+                       (if-let [candidate (some-> line parse-json-line
+                                                  anthropic-message-candidate)]
+                         (update records (:messageId candidate)
+                                 earlier-candidate candidate)
+                         records))
+                     records (line-seq reader))))
+         {} (jsonl-files root "projects"))]
+    (mapv (fn [candidate]
+            {:providerTarget providerTarget :provider "anthropic"
+             :model (:model candidate) :effort nil
+             :at (:at candidate) :tokens (:tokens candidate)
+             :source "claude-account-jsonl:message-usage"
+             :deduplication "message-id-earliest-timestamp"})
+          (vals deduped))))
+
+(defn account-log-records []
+  (mapcat (fn [target]
+            (case (:provider target)
+              "openai" (openai-account-records target)
+              "anthropic" (anthropic-account-records target)
+              []))
+          (configured-account-log-targets)))
+
+(defn parse-hours [value option]
+  (let [match (re-matches #"(?i)([0-9]+(?:\.[0-9]+)?)h" (or value ""))
+        hours (when match (parse-double (second match)))]
+    (when-not (and hours (pos? hours) (Double/isFinite hours))
+      (throw (ex-info (str option " expects a positive duration such as 24h") {})))
+    hours))
+
+(defn duration-of-hours [hours]
+  (java.time.Duration/ofMillis (long (Math/round (* hours 60.0 60.0 1000.0)))))
+
+(defn row-in-interval? [row start end]
+  (when-let [at (parse-instant (:at row))]
+    (and (not (.isBefore at start)) (.isBefore at end))))
+
+(defn percent [numerator denominator]
+  (when (and (some? numerator) (some? denominator) (pos? denominator))
+    (/ (double (* 100 numerator)) (double denominator))))
+
+(defn account-breakdown-row [account [[model effort] rows] account-tokens]
+  (let [stats (usage-stats rows)
+        exact-runs (get-in stats [:tokenCoverage :exactRuns])]
+    {:providerTarget (:providerTarget account)
+     :provider (:provider account)
+     :model model
+     :effort effort
+     :terminalRuns (:runs stats)
+     :exactTokenRuns exact-runs
+     :unknownTokenRuns (- (:runs stats) exact-runs)
+     :exactObservedTokens (:tokens stats)
+     :percentageOfAccountExactObservedTokens (percent (:tokens stats) account-tokens)}))
+
+(defn account-usage-row [account rows]
+  (let [stats (usage-stats rows)
+        exact-runs (get-in stats [:tokenCoverage :exactRuns])
+        account-tokens (:tokens stats)]
+    (assoc account
+           :terminalRuns (:runs stats)
+           :exactTokenRuns exact-runs
+           :unknownTokenRuns (- (:runs stats) exact-runs)
+           ;; nil means no exact observation. An exact observed zero remains 0.
+           :exactObservedTokens account-tokens
+           :tokenEvidence (:tokenEvidence stats)
+           :breakdown (->> rows
+                           (group-by (juxt :model :effort))
+                           (map #(account-breakdown-row account % account-tokens))
+                           (sort-by (juxt :model :effort)) vec))))
+
+(defn account-universe [rows]
+  (let [configured (configured-targets)
+        configured-ids (set (map :providerTarget configured))
+        used (->> rows
+                  (group-by :providerTarget)
+                  (map (fn [[target target-rows]]
+                         {:providerTarget target
+                          :provider (:provider (first target-rows))
+                          :configuredNow false}))
+                  (remove #(configured-ids (:providerTarget %))))]
+    (vec (concat configured (sort-by (juxt :provider :providerTarget) used)))))
+
+(defn interval-usage [rows accounts start end]
+  (let [selected (vec (filter #(row-in-interval? % start end) rows))
+        by-target (group-by :providerTarget selected)
+        exact-rows (filter #(some? (:tokens %)) selected)]
+    {:start (.toString start)
+     :end (.toString end)
+     :boundary "start-inclusive,end-exclusive"
+     :terminalRuns (count selected)
+     :exactTokenRuns (count exact-rows)
+     :unknownTokenRuns (- (count selected) (count exact-rows))
+     :exactObservedTokens (when (seq exact-rows) (reduce + (map :tokens exact-rows)))
+     :accounts (mapv #(account-usage-row % (get by-target (:providerTarget %) [])) accounts)}))
+
+(defn native-session-group [[[provider model effort] sessions]]
+  {:provider provider
+   :providerTarget nil
+   :model model
+   :effort effort
+   :sessions (count sessions)
+   :exactObservedTokens nil
+   :tokenEvidence "unobserved"
+   :accountAttribution "unobserved"
+   :percentageOfAccountExactObservedTokens nil})
+
+(defn native-session-activity [sessions start end]
+  (let [selected (filter (fn [session]
+                           (when-let [at (parse-instant (:startedAt session))]
+                             (and (not (.isBefore at start)) (.isBefore at end))))
+                         sessions)]
+    {:scope "provider-native-interactive-sessions"
+     :sessions (count selected)
+     :providerTarget nil
+     :exactObservedTokens nil
+     :tokenEvidence "unobserved"
+     :accountAttribution "unobserved"
+     :includedInManagedRunPercentages false
+     :groups (->> selected
+                  (group-by (juxt :provider :model :effort))
+                  (map native-session-group)
+                  (sort-by (juxt :provider :model :effort)) vec)}))
+
+(defn exact-token-sum [rows]
+  (when (seq rows) (reduce + (map :tokens rows))))
+
+(defn account-observed-breakdown [records account-total]
+  (->> records
+       (group-by (juxt :model :effort))
+       (map (fn [[[model effort] grouped]]
+              (let [tokens (exact-token-sum grouped)]
+                {:model model :effort effort
+                 :observations (count grouped)
+                 :exactObservedTokens tokens
+                 :percentageOfProviderOwnedAccountExactObservedTokens
+                 (percent tokens account-total)
+                 :percentageBasis "provider-owned-account-observed-tokens"})))
+       (sort-by (juxt :model #(or (:effort %) ""))) vec))
+
+(defn account-observed-row [account persisted managed start end]
+  (let [target (:providerTarget account)
+        provider (:provider account)
+        persisted-selected (vec (filter #(and (= target (:providerTarget %))
+                                              (row-in-interval? % start end))
+                                        persisted))
+        managed-selected (vec (filter #(and (= target (:providerTarget %))
+                                            (row-in-interval? % start end))
+                                      managed))
+        managed-exact (filterv #(some? (:tokens %)) managed-selected)
+        managed-unknown (- (count managed-selected) (count managed-exact))
+        provider-owned-total (exact-token-sum persisted-selected)
+        provider-source (if (= provider "openai")
+                          {:source "codex-account-jsonl:last-token-usage"
+                           :observations (count persisted-selected)
+                           :turnAttributedObservations
+                           (count (filter :dedupKeyHasTurn persisted-selected))
+                           :fallbackDedupObservations
+                           (count (remove :dedupKeyHasTurn persisted-selected))
+                           :exactObservedTokens provider-owned-total}
+                          {:source "claude-account-jsonl:message-usage"
+                           :observations (count persisted-selected)
+                           :exactObservedTokens provider-owned-total})
+        managed-total (exact-token-sum managed-exact)
+        overlap-status (if (= provider "openai") "cannot-determine" "known-overlap")]
+    {:providerTarget target :provider provider
+     :exactObservedTokens provider-owned-total
+     :providerOwnedExactObservedTokens provider-owned-total
+     :tokenEvidence (if (some? provider-owned-total) "observed-lower-bound" "unobserved")
+     :overlapStatus overlap-status
+     :overlapReason
+     (if (= provider "openai")
+       "North run facts do not prove whether each managed run persisted into the account JSONL"
+       "Anthropic account JSONL includes managed activity")
+     :combinedExactObservedTokens nil
+     :combinedPercentageBasis nil
+     :combinationSemantics "non-additive ledgers; no combined usage claim"
+     :sources [provider-source]
+     :managedLedger {:source "north-managed-terminal"
+                     :exactTokenRuns (count managed-exact)
+                     :unknownTokenRuns managed-unknown
+                     :exactObservedTokens managed-total
+                     :tokenEvidence (cond
+                                      (empty? managed-exact) "unobserved"
+                                      (zero? managed-unknown) "exact"
+                                      :else "lower-bound")
+                     :breakdown (:breakdown (account-usage-row account managed-selected))}
+     :breakdown (account-observed-breakdown persisted-selected provider-owned-total)}))
+
+(defn account-observed-usage [persisted managed accounts start end]
+  (let [account-rows (mapv #(account-observed-row % persisted managed start end) accounts)
+        observed (filter #(some? (:exactObservedTokens %)) account-rows)]
+    {:scope "account-observed-provider-logs"
+     :claim (str "provider-owned observations and North managed terminals are separate, "
+                 "non-additive ledgers; OpenAI overlap cannot be determined without per-run "
+                 "persistence provenance, while Anthropic overlap is known")
+     :exactObservedTokens (when (seq observed)
+                            (reduce + (map :exactObservedTokens observed)))
+     :providerOwnedExactObservedTokens (when (seq observed)
+                                         (reduce + (map :exactObservedTokens observed)))
+     :combinedExactObservedTokens nil
+     :overlapStatus "see-account-ledgers"
+     :tokenEvidence (if (seq observed) "observed-lower-bound" "unobserved")
+     :accounts account-rows}))
+
+(defn interval-report [rows sessions persisted accounts start end]
+  (assoc (interval-usage rows accounts start end)
+         :usageScope "managed-terminal-runs-only"
+         :nativeInteractiveActivity (native-session-activity sessions start end)
+         :accountObserved (account-observed-usage persisted rows accounts start end)))
+
+(defn windowed-usage-report [rows sessions {:keys [window-hours slice-hours now]}]
+  (let [end (or (parse-instant now)
+                (when now (throw (ex-info "--now expects an ISO-8601 instant" {})))
+                (java.time.Instant/now))
+        window-duration (duration-of-hours window-hours)
+        slice-duration (duration-of-hours slice-hours)
+        window-ms (.toMillis window-duration)
+        slice-ms (.toMillis slice-duration)]
+    (when (or (> slice-ms window-ms) (not (zero? (mod window-ms slice-ms))))
+      (throw (ex-info "--window must be an exact multiple of --slice" {})))
+    (let [start (.minus end window-duration)
+          window-rows (vec (filter #(row-in-interval? % start end) rows))
+          accounts (account-universe window-rows)
+          persisted (vec (account-log-records))
+          intervals (mapv (fn [index]
+                            (let [interval-start (.plusMillis start (* index slice-ms))
+                                  interval-end (.plusMillis interval-start slice-ms)]
+                              (assoc (interval-report rows sessions persisted accounts interval-start interval-end)
+                                     :index (inc index))))
+                          (range (quot window-ms slice-ms)))
+          dated (count (filter #(parse-instant (:at %)) rows))]
+      {:report "usage"
+       :scope "bounded-intervals"
+       :unit "exact observed tokens, never dollars or API credits"
+       :claim (str "managed terminal-run token observations are lower bounds on subscription "
+                   "consumption; provider-native interactive sessions are counted separately "
+                   "with unknown tokens and account")
+       :window {:start (.toString start) :end (.toString end)
+                :hours window-hours :sliceHours slice-hours
+                :boundary "start-inclusive,end-exclusive"}
+       :reproducibility
+       {:boundaryBasis "provider-event-time"
+        :fixedWindowRerunStable false
+        :caveat (str "late-appended or backfilled provider events can change a rerun even when "
+                     "--now and event-time boundaries are identical")}
+       :timeCoverage {:datedRuns dated :undatedRuns (- (count rows) dated)}
+       :intervals intervals
+       :cumulative (interval-report rows sessions persisted accounts start end)})))
 
 (defn promotion-variant-key [row]
   (if (seq (:legacyDebtReasons row))
@@ -910,6 +1322,49 @@
              (:fallbacks row)
              (:escalatedRuns row)))))
 
+(defn observed-token-label [value]
+  (if (some? value) (str value) "unobserved"))
+
+(defn print-account-interval [label interval]
+  (println)
+  (println (format "%s  %s → %s  runs=%d exact=%d unknown=%d tokens=%s"
+                   label (:start interval) (:end interval)
+                   (:terminalRuns interval) (:exactTokenRuns interval)
+                   (:unknownTokenRuns interval)
+                   (observed-token-label (:exactObservedTokens interval))))
+  (println (format "%-42s %-10s %6s %7s %7s %16s" "ACCOUNT" "PROVIDER"
+                   "runs" "exact" "unknown" "tokens"))
+  (doseq [account (:accounts interval)]
+    (println (format "%-42s %-10s %6d %7d %7d %16s"
+                     (:providerTarget account) (:provider account)
+                     (:terminalRuns account) (:exactTokenRuns account)
+                     (:unknownTokenRuns account)
+                     (observed-token-label (:exactObservedTokens account))))
+    (doseq [row (:breakdown account)]
+      (let [pct (:percentageOfAccountExactObservedTokens row)]
+        (println (format "  %-24s / %-8s runs=%d exact=%d unknown=%d tokens=%s account-share=%s"
+                         (:model row) (:effort row) (:terminalRuns row)
+                         (:exactTokenRuns row) (:unknownTokenRuns row)
+                         (observed-token-label (:exactObservedTokens row))
+                         (if (some? pct) (format "%.2f%%" pct) "unobserved"))))))
+  (let [native (:nativeInteractiveActivity interval)]
+    (println (format "  native interactive: sessions=%d tokens=unobserved account=unobserved (excluded from managed percentages)"
+                     (:sessions native)))
+    (doseq [group (:groups native)]
+      (println (format "    %-10s %-24s / %-8s sessions=%d"
+                       (:provider group) (:model group) (:effort group)
+                       (:sessions group)))))
+  (let [observed (:accountObserved interval)]
+    (println (format "  account-observed: tokens=%s (%s)"
+                     (observed-token-label (:exactObservedTokens observed))
+                     (:tokenEvidence observed)))
+    (doseq [account (:accounts observed)]
+      (println (format "    %-42s %-10s provider-owned=%s managed=%s combined=unavailable overlap=%s"
+                       (:providerTarget account) (:provider account)
+                       (observed-token-label (:exactObservedTokens account))
+                       (observed-token-label (get-in account [:managedLedger :exactObservedTokens]))
+                       (:overlapStatus account))))))
+
 (defn print-table [data]
   (case (:report data)
     "performance"
@@ -936,22 +1391,32 @@
         (when (empty? (:cohorts data))
           (println "  (no complete current managed runs; use --all for historical rows)")))
     "usage"
-    (do (println "ROUTING USAGE — observed work (never dollars or API credits)")
-        (println (format "%-14s %6s %16s %11s %14s %11s %12s %11s %9s %9s"
-                         "PROVIDER" "runs" "tokens" "tok exact" "wall-s"
-                         "wall exact" "turns" "turn exact" "fallbacks" "escalated"))
-        (doseq [row (:providers data)]
-          (println (usage-table-line (:provider row) row)))
-        (when-let [models (:models data)]
-          (println)
-          (println "MODEL — observed work (row per model, or model × effort with --by-effort)")
-          (println (format "%-24s %6s %16s %11s %14s %11s %12s %11s %9s %9s"
-                           "MODEL" "runs" "tokens" "tok exact" "wall-s"
+    (if (= "bounded-intervals" (:scope data))
+      (do
+        (println "ROUTING USAGE — exact observed tokens (unknown usage is never zero)")
+        (println (format "WINDOW %s → %s · %.3gh slices · %s"
+                         (get-in data [:window :start]) (get-in data [:window :end])
+                         (double (get-in data [:window :sliceHours]))
+                         (get-in data [:window :boundary])))
+        (doseq [interval (:intervals data)]
+          (print-account-interval (str "INTERVAL " (:index interval)) interval))
+        (print-account-interval "CUMULATIVE" (:cumulative data)))
+      (do (println "ROUTING USAGE — observed work (never dollars or API credits)")
+          (println (format "%-14s %6s %16s %11s %14s %11s %12s %11s %9s %9s"
+                           "PROVIDER" "runs" "tokens" "tok exact" "wall-s"
                            "wall exact" "turns" "turn exact" "fallbacks" "escalated"))
-          (doseq [row models]
-            (println (usage-table-line
-                      (if (:effort row) (str (:model row) "/" (:effort row)) (:model row))
-                      row {:label-width 24})))))
+          (doseq [row (:providers data)]
+            (println (usage-table-line (:provider row) row)))
+          (when-let [models (:models data)]
+            (println)
+            (println "MODEL — observed work (row per model, or model × effort with --by-effort)")
+            (println (format "%-24s %6s %16s %11s %14s %11s %12s %11s %9s %9s"
+                             "MODEL" "runs" "tokens" "tok exact" "wall-s"
+                             "wall exact" "turns" "turn exact" "fallbacks" "escalated"))
+            (doseq [row models]
+              (println (usage-table-line
+                        (if (:effort row) (str (:model row) "/" (:effort row)) (:model row))
+                        row {:label-width 24}))))))
     "promotions"
     (do (println "BESPOKE PATTERNS — stock-template review candidates")
         (println "Variants use applied canonical hash + capabilities + effective axes; missing hashes are per-run legacy debt.")
@@ -989,20 +1454,38 @@
                            (pr-str (:thresholds row))
                            (pr-str (:triggerCounts row)))))))))
 
+(def usage-help "usage: north routing report [performance|usage|promotions|calibration] [--json] [--all] [--by-model] [--by-effort] [--window 24h --slice 12h] [--now ISO-INSTANT]")
+
+(defn parse-options [args]
+  (loop [remaining args options {:flags #{}}]
+    (if (empty? remaining) options
+      (let [[arg value & more] remaining]
+        (cond
+          (#{"--json" "--all" "--by-model" "--by-effort"} arg)
+          (recur (rest remaining) (update options :flags conj arg))
+
+          (#{"--window" "--slice" "--now"} arg)
+          (if (or (nil? value) (str/starts-with? value "--"))
+            (throw (ex-info (str arg " requires a value") {}))
+            (recur more (assoc options (keyword (subs arg 2)) value)))
+
+          :else (throw (ex-info (str "unknown routing report option: " arg) {})))))))
+
 (defn -main [& args]
-  (let [[verb kind & flags] args
-        allowed-flags #{"--json" "--all" "--by-model" "--by-effort"}
-        unknown-flags (remove allowed-flags flags)
+  (let [[verb kind & raw-flags] args
+        parsed (try (parse-options raw-flags)
+                    (catch Exception error
+                      (binding [*out* *err*]
+                        (println (.getMessage error))
+                        (println usage-help))
+                      (System/exit 2)))
+        flags (:flags parsed)
         all? (some #{"--all"} flags)
         by-model? (some #{"--by-model"} flags)
-        by-effort? (some #{"--by-effort"} flags)]
+        by-effort? (some #{"--by-effort"} flags)
+        window? (or (:window parsed) (:slice parsed) (:now parsed))]
     (when-not (= verb "report")
-      (binding [*out* *err*] (println "usage: north routing report [performance|usage|promotions|calibration] [--json] [--all] [--by-model] [--by-effort]"))
-      (System/exit 2))
-    (when (seq unknown-flags)
-      (binding [*out* *err*]
-        (println "unknown routing report option:" (first unknown-flags))
-        (println "usage: north routing report [performance|usage|promotions|calibration] [--json] [--all] [--by-model] [--by-effort]"))
+      (binding [*out* *err*] (println usage-help))
       (System/exit 2))
     (when (and all? (not= (or kind "performance") "performance"))
       (binding [*out* *err*] (println "--all applies only to the performance report"))
@@ -1010,9 +1493,26 @@
     (when (and (or by-model? by-effort?) (not= (or kind "performance") "usage"))
       (binding [*out* *err*] (println "--by-model/--by-effort apply only to the usage report"))
       (System/exit 2))
+    (when (and window? (not= (or kind "performance") "usage"))
+      (binding [*out* *err*] (println "--window/--slice/--now apply only to the usage report"))
+      (System/exit 2))
     (let [facts (fold-facts (read-ops (default-paths)))
-          data (report (or kind "performance") (run-rows facts)
-                       {:all? all? :by-model? by-model? :by-effort? by-effort?})]
+          rows (vec (run-rows facts))
+          sessions (native-session-rows facts)
+          data (try
+                 (if window?
+                   (windowed-usage-report
+                    rows sessions
+                    {:window-hours (parse-hours (or (:window parsed) "24h") "--window")
+                          :slice-hours (parse-hours (or (:slice parsed) "12h") "--slice")
+                          :now (:now parsed)})
+                   (report (or kind "performance") rows
+                           {:all? all? :by-model? by-model? :by-effort? by-effort?}))
+                 (catch Exception error
+                   (binding [*out* *err*]
+                     (println (.getMessage error))
+                     (println usage-help))
+                   (System/exit 2)))]
       (if (some #{"--json"} flags)
         (println (json/generate-string data))
         (print-table data)))))

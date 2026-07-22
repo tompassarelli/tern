@@ -660,3 +660,202 @@
       (check "--by-model is rejected outside the usage report" (not (zero? (:exit bad-flag))))))
   (finally
     (doseq [file (reverse (file-seq tmp2))] (io/delete-file file true)))))
+
+;; Bounded usage is account-complete, deterministically sliced, and keeps
+;; unknown token totals distinct from exact zero.
+(let [tmp3 (.toFile (java.nio.file.Files/createTempDirectory
+                     "north-routing-window" (make-array java.nio.file.attribute.FileAttribute 0)))
+      coord3 (io/file tmp3 "coordination.log")
+      telem3 (io/file tmp3 "telemetry.log")
+      policy3 (io/file tmp3 "routing-policy.json")
+      accounts3 (io/file tmp3 "accounts")
+      env3 {"FRAM_LOG" (.getPath coord3)
+            "FRAM_TELEMETRY_LOG" (.getPath telem3)
+            "NORTH_ROUTING_POLICY" (.getPath policy3)
+            "NORTH_ACCOUNTS_ROOT" (.getPath accounts3)}]
+  (try
+    (spit policy3 (json/generate-string
+                   {"version" 1
+                    "targets" [{"id" "codex-a" "provider" "openai"}
+                               {"id" "claude-b" "provider" "anthropic"}]}))
+    (let [codex-dir (io/file accounts3 "openai/codex-a/sessions/2026/07/22")
+          claude-dir (io/file accounts3 "anthropic/claude-b/projects/test")
+          turn-context (fn [at turn model effort]
+                         {"timestamp" at "type" "turn_context"
+                          "payload" {"turn_id" turn "model" model "effort" effort}})
+          token-count (fn [at cumulative tokens]
+                        {"timestamp" at "type" "event_msg"
+                         "payload" {"type" "token_count"
+                                    "info" {"total_token_usage" {"total_tokens" cumulative}
+                                            "last_token_usage" {"total_tokens" tokens}}}})
+          claude-message (fn [at id tokens]
+                           {"timestamp" at "type" "assistant"
+                            "message" {"id" id "model" "claude-fable-5"
+                                       "usage" {"input_tokens" tokens
+                                                "cache_creation_input_tokens" 0
+                                                "cache_read_input_tokens" 0
+                                                "output_tokens" 0}}})]
+      (.mkdirs codex-dir)
+      (.mkdirs claude-dir)
+      ;; Fork clone: the same turn+cumulative event appears twice. Earliest wins.
+      (spit (io/file codex-dir "one.jsonl")
+            (str (json/generate-string (turn-context "2026-07-21T18:00:00Z" "turn-a" "gpt-5.6-sol" "high")) "\n"
+                 (json/generate-string (token-count "2026-07-21T18:01:00Z" 1000 40)) "\n"
+                 (json/generate-string (turn-context "2026-07-22T04:00:00Z" "turn-b" "gpt-5.6-terra" "medium")) "\n"
+                 (json/generate-string (token-count "2026-07-22T04:01:00Z" 2000 60)) "\n"))
+      (spit (io/file codex-dir "fork.jsonl")
+            (str (json/generate-string (turn-context "2026-07-22T05:00:00Z" "turn-a" "gpt-5.6-sol" "high")) "\n"
+                 (json/generate-string (token-count "2026-07-22T05:01:00Z" 1000 40)) "\n"))
+      ;; Claude repeats the same message while streaming; message.id dedups it.
+      (spit (io/file claude-dir "one.jsonl")
+            (str (json/generate-string (claude-message "2026-07-22T03:00:00Z" "msg-a" 50)) "\n"
+                 (json/generate-string (claude-message "2026-07-22T03:00:01Z" "msg-a" 50)) "\n")))
+    (letfn [(window-run! [id target provider model effort at tokens]
+              (fact telem3 id "kind" "run")
+              (fact telem3 id "agent" (str "agent-" (subs id 5)))
+              (fact telem3 id "thread" "(ad-hoc)")
+              (fact telem3 id "provider_target" target)
+              (fact telem3 id "provider" provider)
+              (fact telem3 id "model" model)
+              (fact telem3 id "effort" effort)
+              (fact telem3 id "at" at)
+              (fact telem3 id "outcome" "ran")
+              (when (some? tokens) (fact telem3 id "tokens" (str tokens))))
+            (window-report []
+              (let [result (proc/shell {:out :string :err :string :extra-env env3}
+                                       "bb" (str root "/cli/routing-report.clj")
+                                       "report" "usage" "--json"
+                                       "--window" "24h" "--slice" "12h"
+                                       "--now" "2026-07-22T12:00:00Z")]
+                (when-not (zero? (:exit result)) (throw (ex-info (:err result) result)))
+                (json/parse-string (str/trim (:out result)) true)))]
+      (window-run! "@run-window-sol" "codex-a" "openai" "gpt-5.6-sol" "high"
+                   "2026-07-21T12:00:00Z" 100)
+      (window-run! "@run-window-terra" "codex-a" "openai" "gpt-5.6-terra" "medium"
+                   "2026-07-22T01:00:00Z" 300)
+      (window-run! "@run-window-unknown" "codex-a" "openai" "gpt-5.6-terra" "medium"
+                   "2026-07-22T02:00:00Z" nil)
+      (window-run! "@run-window-retired" "retired-codex" "openai" "gpt-5.6-luna" "low"
+                   "2026-07-22T03:00:00Z" 50)
+      (window-run! "@run-window-claude-overlap" "claude-b" "anthropic" "claude-fable-5" "max"
+                   "2026-07-22T03:30:00Z" 70)
+      ;; The end boundary belongs to a future report, never both adjacent windows.
+      (window-run! "@run-window-at-end" "codex-a" "openai" "gpt-5.6-sol" "high"
+                   "2026-07-22T12:00:00Z" 999)
+      (doseq [[agent provider model effort started]
+              [["native-window-opus" "anthropic" "opus" "high" "2026-07-21T18:00:00Z"]
+               ["native-window-sol" "openai" "gpt-5.6-sol" "unobserved" "2026-07-22T06:00:00Z"]]]
+        (let [identity (str "@agent:" agent)
+              session (str "@session:" agent)]
+          (fact telem3 identity "kind" "session")
+          (fact telem3 identity "provider" provider)
+          (fact telem3 identity "model" model)
+          (fact telem3 identity "effort" effort)
+          (fact telem3 session "agent" agent)
+          (fact telem3 session "session_id" agent)
+          (fact telem3 session "started_at" started)))
+      (let [report (window-report)
+            [older recent] (:intervals report)
+            cumulative (:cumulative report)
+            accounts (:accounts cumulative)
+            codex (first (filter #(= "codex-a" (:providerTarget %)) accounts))
+            claude (first (filter #(= "claude-b" (:providerTarget %)) accounts))
+            retired (first (filter #(= "retired-codex" (:providerTarget %)) accounts))
+            sol (first (filter #(= "gpt-5.6-sol" (:model %)) (:breakdown codex)))
+            terra (first (filter #(= "gpt-5.6-terra" (:model %)) (:breakdown codex)))]
+        (check "window usage emits two adjacent deterministic 12-hour intervals plus cumulative"
+               (and (= "bounded-intervals" (:scope report))
+                    (= 2 (count (:intervals report)))
+                    (= (:end older) (:start recent))
+                    (= "2026-07-21T12:00:00Z" (:start older))
+                    (= "2026-07-22T12:00:00Z" (:end recent))))
+        (check "every configured and in-window used target appears in every interval"
+               (and (= ["codex-a" "claude-b" "retired-codex"]
+                       (mapv :providerTarget (:accounts older)))
+                    (= ["codex-a" "claude-b" "retired-codex"]
+                       (mapv :providerTarget (:accounts recent)))))
+        (check "unknown token runs remain explicit and never become zero tokens"
+               (and (= 5 (:terminalRuns cumulative))
+                    (= 4 (:exactTokenRuns cumulative))
+                    (= 1 (:unknownTokenRuns cumulative))
+                    (= 520 (:exactObservedTokens cumulative))
+                    (= 3 (:terminalRuns codex))
+                    (= 1 (:unknownTokenRuns codex))
+                    (= "lower-bound" (:tokenEvidence codex))
+                    (= 70 (:exactObservedTokens claude))))
+        (check "account model-effort rows expose exact totals and within-account percentages"
+               (and (= 100 (:exactObservedTokens sol))
+                    (= 25.0 (:percentageOfAccountExactObservedTokens sol))
+                    (= 300 (:exactObservedTokens terra))
+                    (= 1 (:unknownTokenRuns terra))
+                    (= 75.0 (:percentageOfAccountExactObservedTokens terra))
+                    (= 50 (:exactObservedTokens retired))
+                    (false? (:configuredNow retired))))
+        (check "bounded usage records dated/undated time coverage"
+               (= {:datedRuns 6 :undatedRuns 0} (:timeCoverage report)))
+        (check "native interactive activity is separate per slice and cumulative"
+               (let [older-native (:nativeInteractiveActivity older)
+                     recent-native (:nativeInteractiveActivity recent)
+                     cumulative-native (:nativeInteractiveActivity cumulative)]
+                 (and (= 1 (:sessions older-native))
+                      (= 1 (:sessions recent-native))
+                      (= 2 (:sessions cumulative-native))
+                      (nil? (:exactObservedTokens cumulative-native))
+                      (nil? (:providerTarget cumulative-native))
+                      (= "unobserved" (:accountAttribution cumulative-native))
+                      (false? (:includedInManagedRunPercentages cumulative-native))
+                      (= ["claude-opus-4-8" "gpt-5.6-sol"]
+                         (mapv :model (:groups cumulative-native)))
+                      ;; Managed-run token totals and percentages remain unchanged.
+                      (= 520 (:exactObservedTokens cumulative))
+                      (= 25.0 (:percentageOfAccountExactObservedTokens sol)))))
+        (check "bounded report warns managed token observations are not total subscription consumption"
+               (and (= "managed-terminal-runs-only" (:usageScope cumulative))
+                    (str/includes? (:claim report) "lower bounds on subscription consumption")))
+        (check "account-observed OpenAI dedups fork clones but never assumes managed additivity"
+               (let [account (first (filter #(= "codex-a" (:providerTarget %))
+                                            (get-in cumulative [:accountObserved :accounts])))
+                     persisted (first (:sources account))
+                     managed (:managedLedger account)]
+                 (and (= 100 (:exactObservedTokens account))
+                      (= 100 (:providerOwnedExactObservedTokens account))
+                      (nil? (:combinedExactObservedTokens account))
+                      (nil? (:combinedPercentageBasis account))
+                      (= "cannot-determine" (:overlapStatus account))
+                      (= 2 (:observations persisted))
+                      (= 2 (:turnAttributedObservations persisted))
+                      (= 0 (:fallbackDedupObservations persisted))
+                      (= 100 (:exactObservedTokens persisted))
+                      (= "north-managed-terminal" (:source managed))
+                      (= 2 (:exactTokenRuns managed))
+                      (= 400 (:exactObservedTokens managed))
+                      (= 1 (:unknownTokenRuns managed))
+                      (str/includes? (:overlapReason account) "do not prove")
+                      (str/includes? (:combinationSemantics account) "non-additive"))))
+        (check "account-observed Anthropic dedups message ids and never adds overlapping managed usage"
+               (let [account (first (filter #(= "claude-b" (:providerTarget %))
+                                            (get-in cumulative [:accountObserved :accounts])))
+                     source (first (:sources account))]
+                 (and (= 50 (:exactObservedTokens account))
+                      (= 1 (:observations source))
+                      (= "known-overlap" (:overlapStatus account))
+                      (= 70 (get-in account [:managedLedger :exactObservedTokens]))
+                      (nil? (:combinedExactObservedTokens account))
+                      ;; The 70-token North managed Anthropic run is deliberately
+                      ;; not added: the provider-owned log is the overlap ledger.
+                      (not= 120 (:exactObservedTokens account))
+                      (nil? (:effort (first (:breakdown account))))
+                      (str/includes? (:combinationSemantics account) "non-additive"))))
+        (check "account-observed aggregate is provider-owned only and refuses a combined total"
+               (and (= 150 (get-in cumulative [:accountObserved :exactObservedTokens]))
+                    (= 150 (get-in cumulative [:accountObserved :providerOwnedExactObservedTokens]))
+                    (nil? (get-in cumulative [:accountObserved :combinedExactObservedTokens]))
+                    (str/includes? (get-in cumulative [:accountObserved :claim])
+                                   "non-additive ledgers")))
+        (check "fixed event-time windows disclose late/backfill rerun instability"
+               (let [repro (:reproducibility report)]
+                 (and (= "provider-event-time" (:boundaryBasis repro))
+                      (false? (:fixedWindowRerunStable repro))
+                      (str/includes? (:caveat repro) "late-appended or backfilled"))))))
+  (finally
+    (doseq [file (reverse (file-seq tmp3))] (io/delete-file file true)))))
