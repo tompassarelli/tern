@@ -75,13 +75,15 @@ daemon="$FRAM_BIN/fram-daemon"
 north_bb="${NORTH_BB:-${NORTH_MCP_BB:-bb}}"
 restart=0
 check_runtime=0
+stop=0
 
 case "${1:-}" in
   "") ;;
   --restart) restart=1 ;;
   --check-runtime) check_runtime=1 ;;
+  --stop) stop=1 ;;
   *)
-    echo "usage: north up [--restart]" >&2
+    echo "usage: north up [--restart|--check-runtime|--stop]" >&2
     exit 2
     ;;
 esac
@@ -232,6 +234,8 @@ listener_supervisor=
 listener_identity_error=
 listener_ownership_error=
 owned_listener_pid=
+owned_listener_birth=
+owned_listener_owner=
 
 process_env_value() {
   local pid="$1" name="$2"
@@ -412,6 +416,8 @@ launcher_owns_listener() {
   local recorded_owner running_owner
   listener_ownership_error=
   owned_listener_pid=
+  owned_listener_birth=
+  owned_listener_owner=
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
     count=$((count + 1))
@@ -432,6 +438,8 @@ launcher_owns_listener() {
     listener_ownership_error="listener PID $owned_listener_pid has no matching launcher ownership record (pid/birth/token)"
     return 1
   fi
+  owned_listener_birth="$recorded_birth"
+  owned_listener_owner="$recorded_owner"
 
   running_owner="$(process_env_value "$owned_listener_pid" FRAM_RUNTIME_OWNER_TOKEN || true)"
   if [[ -r "$proc_root/$owned_listener_pid/environ" && "$running_owner" != "$recorded_owner" ]]; then
@@ -501,7 +509,16 @@ if [[ "$same_log" -eq 1 ]] && strict_ready; then
   strict=1
 fi
 
-if [[ "$strict" -eq 1 && "$restart" -eq 0 ]]; then
+if [[ "$stop" -eq 1 && -z "$before_pids" ]]; then
+  if [[ "$have_pid_probe" -ne 1 ]]; then
+    echo "north up: coordinator listener state cannot be identified safely; refusing stop" >&2
+    exit 1
+  fi
+  echo "coordinator already stopped on :$FRAM_PORT"
+  exit 0
+fi
+
+if [[ "$strict" -eq 1 && "$restart" -eq 0 && "$stop" -eq 0 ]]; then
   if [[ "$identity_matches" -ne 1 ]]; then
     echo "north up: coordinator runtime identity mismatch — $listener_identity_error" >&2
     exit 1
@@ -510,7 +527,7 @@ if [[ "$strict" -eq 1 && "$restart" -eq 0 ]]; then
   exit 0
 fi
 
-if [[ "$same_log" -eq 1 && "$strict" -eq 0 && "$restart" -eq 0 ]]; then
+if [[ "$same_log" -eq 1 && "$strict" -eq 0 && "$restart" -eq 0 && "$stop" -eq 0 ]]; then
   echo "north up: coordinator on :$FRAM_PORT serves the configured log but does not enforce corpus fences; run \`north up --restart\` to replace it safely" >&2
   [[ -z "$strict_probe_output" ]] || printf '%s\n' "$strict_probe_output" >&2
   exit 1
@@ -524,9 +541,19 @@ if [[ -n "$before_pids" ]]; then
   fi
 fi
 
-if [[ "$restart" -eq 1 && "$same_log" -eq 1 ]]; then
+if [[ ( "$restart" -eq 1 || "$stop" -eq 1 ) && "$same_log" -eq 1 ]]; then
+  if [[ "$stop" -eq 1 && "$strict" -ne 1 ]]; then
+    echo "north up: coordinator on :$FRAM_PORT does not enforce corpus fences; refusing to signal it" >&2
+    [[ -z "$strict_probe_output" ]] || printf '%s\n' "$strict_probe_output" >&2
+    exit 1
+  fi
   if [[ "$have_pid_probe" -ne 1 || -z "$before_pids" ]]; then
-    echo "north up: coordinator is healthy, but its listener PID cannot be identified safely; refusing restart" >&2
+    echo "north up: coordinator is healthy, but its listener PID cannot be identified safely; refusing stop/restart" >&2
+    exit 1
+  fi
+
+  if [[ "$stop" -eq 1 && "$identity_matches" -ne 1 ]]; then
+    echo "north up: coordinator runtime identity mismatch — $listener_identity_error; refusing stop" >&2
     exit 1
   fi
 
@@ -535,7 +562,7 @@ if [[ "$restart" -eq 1 && "$same_log" -eq 1 ]]; then
   # same port. Fail before any signal so the owning service can be changed and
   # restarted through its one authoritative control plane.
   if [[ -n "$listener_supervisor" ]]; then
-    echo "north up: coordinator listener is owned by systemd unit $listener_supervisor; refusing a direct restart that the supervisor would reclaim" >&2
+    echo "north up: coordinator listener is owned by systemd unit $listener_supervisor; refusing a direct stop/restart that the supervisor would reclaim" >&2
     if [[ "$identity_matches" -ne 1 ]]; then
       echo "north up: coordinator runtime identity mismatch — $listener_identity_error" >&2
     fi
@@ -570,6 +597,23 @@ if [[ "$restart" -eq 1 && "$same_log" -eq 1 ]]; then
   if [[ -n "$(listener_pids)" ]]; then
     echo "north up: coordinator on :$FRAM_PORT did not stop after SIGTERM; refusing to force-kill it" >&2
     exit 1
+  fi
+
+  # Clear only the identity records still naming the exact PID/birth/token we
+  # just proved and stopped. A concurrent launcher that published a successor
+  # must never have its authority unlinked by this process.
+  if [[ "$(runtime_record_value PID || true)" == "$owned_listener_pid" &&
+        "$(runtime_record_value PID_BIRTH || true)" == "$owned_listener_birth" &&
+        "$(runtime_record_value OWNER_TOKEN || true)" == "$owned_listener_owner" ]]; then
+    unlink -- "$runtime_identity_file"
+  fi
+  if [[ -n "${NORTH_COORD_PID_FILE:-}" && -f "$NORTH_COORD_PID_FILE" &&
+        "$(<"$NORTH_COORD_PID_FILE")" == "$owned_listener_pid" ]]; then
+    unlink -- "$NORTH_COORD_PID_FILE"
+  fi
+  if [[ "$stop" -eq 1 ]]; then
+    echo "coordinator stopped on :$FRAM_PORT"
+    exit 0
   fi
 fi
 

@@ -197,6 +197,28 @@ git -C "$FRAM_ROOT" diff --quiet --no-ext-diff HEAD --
 env "${common_env[@]}" "$UP" >"$TMP/idempotent.out"
 grep -q '^coordinator already up on :39871' "$TMP/idempotent.out"
 
+# The explicit stop surface accepts only the exact launcher-owned, strict,
+# same-log listener and leaves no stale PID authority behind.
+STOPPED_DAEMON_PID="$DAEMON_PID"
+env "${common_env[@]}" "$UP" --stop >"$TMP/owned-stop.out"
+grep -q '^stopping coordinator on :39871$' "$TMP/owned-stop.out"
+grep -q '^coordinator stopped on :39871$' "$TMP/owned-stop.out"
+if kill -0 "$STOPPED_DAEMON_PID" 2>/dev/null; then
+  echo "north-coord-up test: launcher-owned coordinator survived stop" >&2
+  exit 1
+fi
+[[ ! -e "$RUNTIME_RECORD" ]]
+[[ ! -e "$STATE/published.pid" ]]
+DAEMON_PID=
+
+env "${common_env[@]}" "$UP" --stop >"$TMP/already-stopped.out"
+grep -q '^coordinator already stopped on :39871$' "$TMP/already-stopped.out"
+
+env "${common_env[@]}" "$UP" >"$TMP/restart-after-stop.out"
+DAEMON_PID="$(cat "$STATE/daemon-pid")"
+[[ "$DAEMON_PID" != "$STOPPED_DAEMON_PID" ]]
+grep -q '^coordinator up on :39871$' "$TMP/restart-after-stop.out"
+
 # A matching owner token + PID + birth record authorizes replacement of the
 # exact direct child this launcher previously published.
 OLD_DAEMON_PID="$DAEMON_PID"
@@ -278,9 +300,16 @@ if env "${common_env[@]}" NORTH_PROC_ROOT="$FAKE_PROC" "$UP" --restart >"$TMP/su
   echo "north-coord-up test: direct restart accepted a supervisor-owned listener" >&2
   exit 1
 fi
-grep -q 'owned by systemd unit north-coord.service.*refusing a direct restart' "$TMP/supervised.out"
+grep -q 'owned by systemd unit north-coord.service.*refusing a direct stop/restart' "$TMP/supervised.out"
 kill -0 "$LISTENER_PID"
 [[ ! -e "$STATE/daemon-pid" ]]
+
+if env "${common_env[@]}" NORTH_PROC_ROOT="$FAKE_PROC" "$UP" --stop >"$TMP/supervised-stop.out" 2>&1; then
+  echo "north-coord-up test: direct stop accepted a supervisor-owned listener" >&2
+  exit 1
+fi
+grep -q 'owned by systemd unit north-coord.service.*refusing a direct stop/restart' "$TMP/supervised-stop.out"
+kill -0 "$LISTENER_PID"
 
 # PID reuse cannot inherit a stale ownership record. Keep the PID field and
 # owner token identical while changing only the process birth identity.

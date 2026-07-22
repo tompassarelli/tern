@@ -146,6 +146,8 @@ north — your one card. Type a command to do the thing next to it.
     north schema                       the fact vocabulary in use
     north predicate ls|show|define     inspect or extend executable predicate entities
     north schema-migrate plan|audit    deterministic schema cutover and strict audit
+    north corpus-transaction check-boundaries
+                                       verify split-log append safety before maintenance
 
   HAND OFF WORK   (starts a new lane — your own channel never blocks)
     /delegate "<thing>" [--new]        chat: delegate; session context rides by
@@ -267,6 +269,11 @@ CARD
     # maintenance operation and must follow a verified two-corpus snapshot;
     # plan/audit remain read-only at all times.
     exec "$BB" -cp "$FRAM_OUT" "$NORTH/cli/schema-migrate.clj" "${NORTH_PORT:-7977}" "${@:2}" ;;
+  corpus-transaction)
+    # Package-owned split-corpus replacement/recovery. The mutable journal and
+    # immutable preimage/receipt objects live under XDG state, never in a
+    # checkout; the system unit invokes the same route before/after daemon boot.
+    exec "$BB" -cp "$FRAM_OUT" "$NORTH/cli/corpus-transaction-cli.clj" "${NORTH_PORT:-7977}" "${@:2}" ;;
   up)
     exec "$NORTH/bin/north-coord-up" "${@:2}" ;;
   agents|templates|spawn|delegate|request|fork|req|watch|steer|retask)
