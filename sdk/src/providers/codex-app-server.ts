@@ -29,6 +29,8 @@ const MAX_QUEUED_NOTIFICATIONS = 256;
 const MAX_DISABLED_PROJECT_CONFIG_BYTES = 64 * 1024;
 const MAX_DISABLED_PROJECT_CONFIG_DEPTH = 16;
 const MAX_DISABLED_PROJECT_CONFIG_NODES = 2_048;
+const MAX_SAFETY_BUFFERING_VALUES = 64;
+const MAX_SAFETY_BUFFERING_VALUE_BYTES = 4_096;
 const MANAGED_CODEX_VERSION = "0.144.4";
 const SUPERVISOR_FRAME_PREFIX = "NORTH_CODEX_RPC 1 ";
 
@@ -333,6 +335,7 @@ type AppServerWriter = (
   line: string,
   callback: (error?: Error | null) => void,
 ) => void;
+type AppServerRequestHandler = (id: RpcId, method: string, params: unknown) => JsonObject | undefined;
 
 interface SupervisorControl {
   path: string;
@@ -392,9 +395,12 @@ function createSupervisorControl(): SupervisorControl {
 
 const SAFE_NOTIFICATIONS = new Set([
   "configWarning",
+  "deprecationNotice",
   "remoteControl/status/changed",
   "mcpServer/startupStatus/updated",
+  "model/safetyBuffering/updated",
   "account/rateLimits/updated",
+  "serverRequest/resolved",
   "thread/started",
   "thread/status/changed",
   "thread/tokenUsage/updated",
@@ -435,6 +441,7 @@ class AppServerRpc {
     private child: ChildProcessWithoutNullStreams,
     private timeoutMs: number,
     private onNotification: (method: string, params: unknown) => void,
+    private onServerRequest: AppServerRequestHandler,
     private writeLine: AppServerWriter = (line, callback) => {
       child.stdin.write(line, callback);
     },
@@ -507,7 +514,13 @@ class AppServerRpc {
           this.fail(new Error("managed Codex server request has invalid id"));
           return;
         }
-        this.rejectServerRequest(id);
+        let result: JsonObject | undefined;
+        try { result = this.onServerRequest(id, message.method, message.params); }
+        catch (error) { this.fail(error instanceof Error ? error : new Error("managed Codex callback invalid")); return; }
+        if (result === undefined) { this.rejectServerRequest(id); return; }
+        this.writeLine(`${JSON.stringify({ id, result })}\n`, (error) => {
+          if (error) this.fail(new Error("managed Codex callback response failed", { cause: error }));
+        });
         return;
       }
       try { onlyKeys(message, ["method", "params"], "managed Codex notification"); }
@@ -664,7 +677,17 @@ function validateConfig(
     ["remote_control", false] as const,
   ]);
   exact(config.features, expectedFeatures, "Codex effective feature set");
-  exact(config.mcp_servers, contract.expectedSessionConfig.mcp_servers, "Codex effective MCP set");
+  const sessionMcp = record(
+    contract.expectedSessionConfig.mcp_servers, "Codex expected MCP session set",
+  );
+  const expectedEffectiveMcp = Object.fromEntries(Object.entries(sessionMcp).map(
+    ([name, raw]) => [name, {
+      ...record(raw, `Codex expected MCP session ${name}`),
+      environment_id: "local",
+      tool_timeout_sec: null,
+    }],
+  ));
+  exact(config.mcp_servers, expectedEffectiveMcp, "Codex effective MCP set");
   exact(config.projects, contract.expectedSessionConfig.projects, "Codex project trust set");
   if (config.project_doc_max_bytes !== 0 || config.model_provider !== "openai"
       || config.cli_auth_credentials_store !== "file" || config.forced_login_method !== "chatgpt"
@@ -852,7 +875,7 @@ function validateStartedThread(
       || started.reasoningEffort !== (options.effort ?? null)
       || started.multiAgentMode !== "explicitRequestOnly")
     throw new Error("Codex thread/start resolved different execution authority");
-  exact(started.runtimeWorkspaceRoots, [], "Codex thread runtime workspace roots");
+  exact(started.runtimeWorkspaceRoots, [contract.cwd], "Codex thread runtime workspace roots");
   exact(started.instructionSources, [resolve(contract.codexHome, "AGENTS.md")],
     "Codex thread instruction sources");
   exact(started.sandbox, expectedSandbox(options.surface), "Codex thread sandbox");
@@ -876,12 +899,68 @@ function validateStartedTurn(response: unknown): string {
 interface RuntimeNotificationState {
   threadId: string;
   cwd: string;
+  model: string;
   turnId?: string;
   hookRuns: Map<string, string>;
   text: string;
   usage?: ManagedCodexResult["usage"];
   terminalSeen: boolean;
   mcpActivity: McpActivityAccumulator;
+}
+
+function validateMcpStartupNotification(
+  value: unknown,
+  expectedThreadId: string | undefined,
+  allowPendingThreadId = false,
+): JsonObject {
+  const params = record(value, "Codex MCP startup notification");
+  onlyKeys(params, ["threadId", "name", "status", "error", "failureReason"],
+    "Codex MCP startup notification");
+  let validThreadId = params.threadId === null;
+  if (typeof params.threadId === "string") {
+    try {
+      protocolId(params.threadId, "Codex MCP startup thread id");
+      validThreadId = expectedThreadId === undefined
+        ? allowPendingThreadId
+        : params.threadId === expectedThreadId;
+    } catch { validThreadId = false; }
+  }
+  if (!validThreadId || params.name !== "north"
+      || !["starting", "ready"].includes(String(params.status))
+      || params.error !== null || params.failureReason !== null) {
+    const expected = expectedThreadId === undefined
+      ? (allowPendingThreadId ? "null or the pending thread/start protocol id" : "null")
+      : `null or ${JSON.stringify(expectedThreadId)}`;
+    throw new Error(`Codex North MCP startup status is invalid: expected threadId ${expected}, `
+      + `name \"north\", status \"starting\"|\"ready\", error null, failureReason null; `
+      + `observed ${JSON.stringify(canonical(params))}`);
+  }
+  return params;
+}
+
+function validateSafetyBufferingNotification(
+  value: unknown,
+  state: RuntimeNotificationState,
+): void {
+  const params = record(value, "Codex safety-buffering notification");
+  const keys = ["threadId", "turnId", "model", "useCases", "reasons", "showBufferingUi"];
+  if ("fasterModel" in params) keys.push("fasterModel");
+  onlyKeys(params, keys, "Codex safety-buffering notification");
+  exactRuntimeIds(params, state, "Codex safety-buffering notification");
+  if (boundedString(params.model, "Codex safety-buffering model") !== state.model)
+    throw new Error("Codex safety-buffering notification changed the active model");
+  for (const [key, label] of [["useCases", "use case"], ["reasons", "reason"]] as const) {
+    const values = params[key];
+    if (!Array.isArray(values) || values.length > MAX_SAFETY_BUFFERING_VALUES)
+      throw new Error(`Codex safety-buffering ${key} are invalid`);
+    values.forEach((entry, index) => boundedString(
+      entry, `Codex safety-buffering ${label} ${index}`, MAX_SAFETY_BUFFERING_VALUE_BYTES,
+    ));
+  }
+  if (typeof params.showBufferingUi !== "boolean")
+    throw new Error("Codex safety-buffering UI flag is invalid");
+  if ("fasterModel" in params)
+    optionalBoundedString(params.fasterModel, "Codex safety-buffering faster model");
 }
 
 function validateNotifiedTurn(
@@ -927,23 +1006,26 @@ function validateHookNotification(
 ): void {
   const params = record(value, "Codex hook notification");
   onlyKeys(params, ["threadId", "turnId", "run"], "Codex hook notification");
-  exactRuntimeIds(params, state, "Codex hook", params.turnId !== null);
-  if (params.turnId !== null && params.turnId !== state.turnId)
-    throw new Error("Codex hook belongs to another turn");
   const run = record(params.run, "Codex hook run");
   onlyKeys(run, [
     "id", "eventName", "handlerType", "executionMode", "scope", "sourcePath", "source",
     "displayOrder", "status", "statusMessage", "startedAt", "completedAt", "durationMs",
     "entries",
   ], "Codex hook run");
-  const id = protocolId(run.id, "Codex hook run id");
+  const id = boundedString(run.id, "Codex hook run id", 512);
   const allowedEvents = new Set(Object.keys(expectedManagedCodexHooks()).map(camelEvent));
   const eventName = boundedString(run.eventName, "Codex hook event", 64);
   const threadScoped = eventName === "sessionStart";
+  if (params.threadId !== state.threadId)
+    throw new Error("Codex hook belongs to another thread");
+  if (threadScoped) {
+    if (params.turnId !== null) protocolId(params.turnId, "Codex session hook turn id");
+  } else if (!state.turnId || params.turnId !== state.turnId) {
+    throw new Error("Codex hook belongs to another turn");
+  }
   if (!allowedEvents.has(eventName)
       || run.handlerType !== "command" || run.executionMode !== "sync"
       || run.scope !== (threadScoped ? "thread" : "turn")
-      || (threadScoped ? params.turnId !== null : params.turnId !== state.turnId)
       || run.sourcePath !== "/etc/codex/hooks" || run.source !== "system"
       || !Number.isSafeInteger(run.displayOrder) || (run.displayOrder as number) < 0
       || !Number.isSafeInteger(run.startedAt) || (run.startedAt as number) < 0
@@ -966,6 +1048,7 @@ function validateHookNotification(
     source: run.source,
     displayOrder: run.displayOrder,
     startedAt: run.startedAt,
+    turnId: params.turnId,
   }));
   if (method === "hook/started") {
     if (run.status !== "running" || run.statusMessage !== null || run.completedAt !== null
@@ -1064,12 +1147,11 @@ function validateProgressNotification(
     return;
   }
   if (method === "mcpServer/startupStatus/updated") {
-    onlyKeys(params, ["threadId", "name", "status", "error", "failureReason"],
-      "Codex MCP startup notification");
-    if ((params.threadId !== null && params.threadId !== state.threadId)
-        || params.name !== "north" || !["starting", "ready"].includes(String(params.status))
-        || params.error !== null || params.failureReason !== null)
-      throw new Error("Codex North MCP startup status is invalid");
+    validateMcpStartupNotification(params, state.threadId);
+    return;
+  }
+  if (method === "model/safetyBuffering/updated") {
+    validateSafetyBufferingNotification(params, state);
     return;
   }
 
@@ -1323,6 +1405,7 @@ export class ManagedCodexAppServerRun {
     let threadId: string | undefined;
     let turnId: string | undefined;
     let runtimeState: RuntimeNotificationState | undefined;
+    const approvedServerRequests = new Set<RpcId>();
     const queuedNotifications: Array<{ method: string; value: unknown }> = [];
     let terminalResolve!: () => void;
     let terminalReject!: (error: Error) => void;
@@ -1349,6 +1432,13 @@ export class ManagedCodexAppServerRun {
         exactProjectWarningSeen = true;
         return true;
       }
+      if (method === "deprecationNotice") {
+        const params = record(value, "Codex deprecation notice");
+        onlyKeys(params, ["summary", "details"], "Codex deprecation notice");
+        boundedString(params.summary, "Codex deprecation summary", 2_048);
+        boundedString(params.details, "Codex deprecation details", 4_096);
+        return true;
+      }
       if (method === "remoteControl/status/changed") {
         const params = record(value, "Codex remote-control status");
         onlyKeys(params, ["status", "serverName", "installationId", "environmentId"],
@@ -1366,13 +1456,14 @@ export class ManagedCodexAppServerRun {
         return true;
       }
       if (method === "mcpServer/startupStatus/updated") {
-        const params = record(value, "Codex MCP startup notification");
-        onlyKeys(params, ["threadId", "name", "status", "error", "failureReason"],
-          "Codex MCP startup notification");
-        if ((params.threadId !== null && params.threadId !== threadId)
-            || params.name !== "north" || !["starting", "ready"].includes(String(params.status))
-            || params.error !== null || params.failureReason !== null)
-          throw new Error("Codex North MCP startup status is invalid");
+        const pendingThreadStart = threadId === undefined && this.threadStarted;
+        const params = validateMcpStartupNotification(value, threadId, pendingThreadStart);
+        console.error(`[managed-codex] MCP startup: ${JSON.stringify(params)}`);
+        // Codex may emit a thread-scoped startup transition before the
+        // thread/start response that establishes the exact local thread id.
+        // Preserve it until that signed response arrives, then validate the
+        // queued id against runtimeState through the normal strict path.
+        if (params.threadId !== null && threadId === undefined) return false;
         return true;
       }
       if (method === "account/rateLimits/updated") {
@@ -1381,15 +1472,26 @@ export class ManagedCodexAppServerRun {
         record(params.rateLimits, "Codex rate-limit snapshot");
         return true;
       }
+      if (method === "serverRequest/resolved") {
+        const params = record(value, "Codex server request resolution");
+        onlyKeys(params, ["threadId", "requestId"], "Codex server request resolution");
+        const requestId = params.requestId;
+        if (params.threadId !== threadId
+            || (typeof requestId !== "number" && typeof requestId !== "string")
+            || !approvedServerRequests.delete(requestId))
+          throw new Error("Codex resolved an unknown server request");
+        return true;
+      }
       return false;
     };
     const canProcessWithoutTurn = (entry: { method: string; value: unknown }): boolean => {
-      if (entry.method === "thread/started" || entry.method === "thread/status/changed") return true;
+      if (entry.method === "thread/started" || entry.method === "thread/status/changed"
+          || entry.method === "mcpServer/startupStatus/updated") return true;
       if (entry.method === "hook/started" || entry.method === "hook/completed") {
         try {
           const params = record(entry.value, "Codex hook notification");
           const run = record(params.run, "Codex hook run");
-          return params.turnId === null && run.eventName === "sessionStart";
+          return run.eventName === "sessionStart";
         }
         catch { return true; }
       }
@@ -1421,8 +1523,36 @@ export class ManagedCodexAppServerRun {
       }
       processRuntime(entry);
     };
+    const onServerRequest: AppServerRequestHandler = (id, method, value) => {
+      if (method !== "item/tool/requestUserInput") return undefined;
+      const params = record(value, "Codex tool input request");
+      onlyKeys(params, ["threadId", "turnId", "itemId", "questions", "autoResolutionMs"],
+        "Codex tool input request");
+      if (params.threadId !== threadId || params.turnId !== turnId || params.autoResolutionMs !== null)
+        throw new Error("Codex tool input request belongs to another execution");
+      const itemId = protocolId(params.itemId, "Codex tool input item id");
+      if (!Array.isArray(params.questions) || params.questions.length !== 1)
+        throw new Error("Codex tool input request must contain one approval question");
+      const question = record(params.questions[0], "Codex North MCP approval question");
+      onlyKeys(question, ["id", "header", "question", "isOther", "isSecret", "options"],
+        "Codex North MCP approval question");
+      const questionId = `mcp_tool_call_approval_${itemId}`;
+      const prompt = boundedString(question.question, "Codex North MCP approval prompt", 512);
+      const match = /^Allow the north MCP server to run tool "([a-z][a-z0-9_]*)"\?$/.exec(prompt);
+      if (question.id !== questionId || question.header !== "Approve app tool call?"
+          || question.isOther !== false || question.isSecret !== false || !match
+          || !this.options.surface.northEnabledTools.includes(match[1]!))
+        throw new Error("Codex requested approval outside North's sealed MCP grant");
+      exact(question.options, [
+        { label: "Allow", description: "Run the tool and continue." },
+        { label: "Allow for this session", description: "Run the tool and remember this choice for this session." },
+        { label: "Cancel", description: "Cancel this tool call." },
+      ], "Codex North MCP approval options");
+      approvedServerRequests.add(id);
+      return { answers: { [questionId]: { answers: ["Allow"] } } };
+    };
     const rpc = new AppServerRpc(
-      child, this.options.timeoutMs ?? RPC_TIMEOUT_MS, onNotification, control?.writeLine,
+      child, this.options.timeoutMs ?? RPC_TIMEOUT_MS, onNotification, onServerRequest, control?.writeLine,
       !supervised,
     );
     this.rpc = rpc;
@@ -1474,6 +1604,7 @@ export class ManagedCodexAppServerRun {
       runtimeState = {
         threadId,
         cwd: contract.cwd,
+        model: this.options.model,
         hookRuns: new Map(),
         text: "",
         terminalSeen: false,

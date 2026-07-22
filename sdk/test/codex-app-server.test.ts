@@ -197,7 +197,11 @@ function setup(mode = "ok") {
   };
   const baseConfig = {
     config: {
-      features: effectiveFeatures, mcp_servers: session.mcp_servers, projects: session.projects,
+      features: effectiveFeatures,
+      mcp_servers: { north: {
+        ...session.mcp_servers.north, environment_id: "local", tool_timeout_sec: null,
+      } },
+      projects: session.projects,
       project_doc_max_bytes: 0, model_provider: "openai",
       cli_auth_credentials_store: "file", forced_login_method: "chatgpt",
       sqlite_home: sqliteHome, apps: null, plugins: {}, marketplaces: {},
@@ -248,9 +252,9 @@ function setup(mode = "ok") {
       { item: value, threadId, turnId, [kind === "started" ? "startedAtMs" : "completedAtMs"]: at },
     );
     const emitHook = (event: string, terminalStatus = "completed", id = `hook-${event}`) => {
-      let hookTurnId: string | null = event === "sessionStart" ? null : turnId;
+      let hookTurnId: string | null = turnId;
       let scope = event === "sessionStart" ? "thread" : "turn";
-      if (mode === "hook-session-turn" && event === "sessionStart") hookTurnId = turnId;
+      if (mode === "hook-session-invalid-turn" && event === "sessionStart") hookTurnId = "bad/value";
       if (mode === "hook-session-scope" && event === "sessionStart") scope = "turn";
       if (mode === "hook-tool-null-turn" && event === "preToolUse") hookTurnId = null;
       if (mode === "hook-tool-thread-scope" && event === "preToolUse") scope = "thread";
@@ -292,7 +296,7 @@ function setup(mode = "ok") {
       };
       const response: any = {
         thread, model: request.params.model, modelProvider: request.params.modelProvider,
-        serviceTier: null, cwd, runtimeWorkspaceRoots: [],
+        serviceTier: null, cwd, runtimeWorkspaceRoots: [cwd],
         instructionSources: [join(codexHome, "AGENTS.md")], approvalPolicy: "never",
         approvalsReviewer: "user",
         sandbox: {
@@ -327,6 +331,28 @@ function setup(mode = "ok") {
       const startedTurn: any = turn(turnId, "inProgress");
       if (mode === "notification-turn-extra") startedTurn.futureAuthority = true;
       notify("turn/started", { threadId, turn: startedTurn });
+      if (mode.startsWith("safety-buffering")) {
+        const safetyBuffering: any = {
+          threadId, turnId, model: "gpt-fixture-exact",
+          useCases: ["long-running-agent-work"], reasons: ["safety-buffering-eligible"],
+          showBufferingUi: false, fasterModel: null,
+        };
+        if (mode === "safety-buffering-without-faster-model") delete safetyBuffering.fasterModel;
+        if (mode === "safety-buffering-with-faster-model")
+          safetyBuffering.fasterModel = "gpt-faster-fixture";
+        if (mode === "safety-buffering-extra") safetyBuffering.futureAuthority = true;
+        if (mode === "safety-buffering-wrong-thread") safetyBuffering.threadId = "wrong";
+        if (mode === "safety-buffering-wrong-turn") safetyBuffering.turnId = "wrong";
+        if (mode === "safety-buffering-wrong-model") safetyBuffering.model = "hostile-model";
+        if (mode === "safety-buffering-missing-reasons") delete safetyBuffering.reasons;
+        if (mode === "safety-buffering-invalid-reason") safetyBuffering.reasons = [7];
+        if (mode === "safety-buffering-too-many-reasons") safetyBuffering.reasons = Array(65).fill("x");
+        if (mode === "safety-buffering-oversized-use-case")
+          safetyBuffering.useCases = ["x".repeat(4097)];
+        if (mode === "safety-buffering-invalid-ui") safetyBuffering.showBufferingUi = "false";
+        if (mode === "safety-buffering-invalid-faster-model") safetyBuffering.fasterModel = 7;
+        notify("model/safetyBuffering/updated", safetyBuffering);
+      }
       emitHook("preToolUse", mode === "hook-pretool-failed" ? "failed"
         : mode === "hook-pretool-blocked" ? "blocked"
         : mode === "hook-pretool-stopped" ? "stopped" : "completed", "hook-pre");
@@ -412,6 +438,9 @@ function setup(mode = "ok") {
         if (mode === "remote-extra-field") remote.futureAuthority = true;
         if (mode === "remote-missing-installation") delete remote.installationId;
         notify("remoteControl/status/changed", remote);
+        const deprecation: any = { summary: "fixture deprecation", details: "fixture details" };
+        if (mode === "deprecation-extra-field") deprecation.futureAuthority = true;
+        notify("deprecationNotice", deprecation);
         if (mode === "notification-unknown-prethread")
           notify("future/authority", { enabled: true });
         if (mode === "server-request-prethread")
@@ -477,6 +506,20 @@ function setup(mode = "ok") {
       }
       if (request.method === "thread/start") {
         if (mode === "thread-failure") { fail(request); return; }
+        if (mode === "mcp-startup-before-thread-response"
+            || mode === "mcp-startup-wrong-thread-before-thread-response") {
+          const startupThreadId = mode === "mcp-startup-wrong-thread-before-thread-response"
+            ? "019f7abc-0000-7000-8000-000000000099"
+            : threadId;
+          notify("mcpServer/startupStatus/updated", {
+            threadId: startupThreadId, name: "north", status: "starting",
+            error: null, failureReason: null,
+          });
+          notify("mcpServer/startupStatus/updated", {
+            threadId: startupThreadId, name: "north", status: "ready",
+            error: null, failureReason: null,
+          });
+        }
         result(request, startedThread(request));
         const notificationThread = startedThread(request).thread;
         if (mode === "notification-thread-cwd") notificationThread.cwd = root;
@@ -574,6 +617,57 @@ test("one app-server proves authority and executes realistic shell/file/MCP traf
     tools: [{ server: "north", tool: "tell", count: 1 }],
   });
   expect(JSON.stringify(run.mcpActivity())).not.toContain("CANARY");
+});
+
+test("thread-scoped MCP startup may precede the thread/start response", async () => {
+  const { options } = setup("mcp-startup-before-thread-response");
+  await expect(new ManagedCodexAppServerRun(options).execute()).resolves.toMatchObject({
+    text: "managed answer",
+    usage: { input_tokens: 9, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1 },
+  });
+});
+
+test("queued MCP startup remains bound to the exact thread/start response", async () => {
+  const { options } = setup("mcp-startup-wrong-thread-before-thread-response");
+  let caught: unknown;
+  try { await new ManagedCodexAppServerRun(options).execute(); } catch (error) { caught = error; }
+  expect(caught).toBeInstanceOf(Error);
+  expect((caught as Error).message).toBe("openai_provider_execution_failed");
+  expect((caught as Error).cause).toBeInstanceOf(Error);
+  expect(((caught as Error).cause as Error).message)
+    .toContain("expected threadId null or \"019f7abc-0000-7000-8000-000000000001\"");
+  expect(((caught as Error).cause as Error).message)
+    .toContain("\"threadId\":\"019f7abc-0000-7000-8000-000000000099\"");
+});
+
+test("pinned safety-buffering notifications accept bounded, nullable, or omitted fasterModel", async () => {
+  for (const mode of [
+    "safety-buffering-valid", "safety-buffering-without-faster-model",
+    "safety-buffering-with-faster-model",
+  ]) {
+    const { options } = setup(mode);
+    await expect(new ManagedCodexAppServerRun(options).execute()).resolves.toMatchObject({
+      text: "managed answer",
+      usage: { input_tokens: 9, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1 },
+    });
+  }
+});
+
+test("hostile safety-buffering payloads fail closed", async () => {
+  const modes = [
+    "safety-buffering-extra", "safety-buffering-wrong-thread",
+    "safety-buffering-wrong-turn", "safety-buffering-wrong-model",
+    "safety-buffering-missing-reasons", "safety-buffering-invalid-reason",
+    "safety-buffering-too-many-reasons", "safety-buffering-oversized-use-case",
+    "safety-buffering-invalid-ui", "safety-buffering-invalid-faster-model",
+  ];
+  for (const mode of modes) {
+    const { options } = setup(mode);
+    let caught: unknown;
+    try { await new ManagedCodexAppServerRun(options).execute(); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe("openai_provider_execution_failed");
+  }
 });
 
 test("a later North frame drives a same-thread continuation turn under re-proven authority", async () => {
@@ -945,7 +1039,8 @@ test("pre-thread authority mutants fail before thread/start", async () => {
     "hook-failure-continue", "hook-failure-unrecognized",
     "feature-default-enabled", "feature-omitted", "mcp-resource", "mcp-template", "mcp-auth",
     "mcp-server-info", "remote-enabled", "remote-extra-field", "remote-missing-installation",
-    "notification-unknown-prethread", "server-request-prethread", "config-warning-drift",
+    "deprecation-extra-field", "notification-unknown-prethread", "server-request-prethread",
+    "config-warning-drift",
   ];
   for (const mode of modes) {
     const { options, requests } = setup(mode);
@@ -996,7 +1091,7 @@ test("post-thread drift, rejection, malformed traffic, and hook failures are nev
     "notification-thread-cwd", "notification-turn-extra", "notification-terminal-error",
     "hook-session-failed", "hook-session-stopped", "hook-pretool-failed", "hook-pretool-blocked",
     "hook-pretool-stopped", "hook-posttool-stopped", "hook-posttool-failed",
-    "hook-missing-completion", "hook-duplicate-completion", "hook-session-turn",
+    "hook-missing-completion", "hook-duplicate-completion", "hook-session-invalid-turn",
     "hook-session-scope", "hook-tool-null-turn", "hook-tool-thread-scope",
     "hook-completion-event-drift", "terminal-notification-unknown",
   ];
