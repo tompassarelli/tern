@@ -96,30 +96,32 @@ export function getThreadFacts(
   return parsed as Fact[];
 }
 
+/** A value is a canonical bare North id iff normalizing is a no-op. */
+function isBareEntityId(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    return normalizeNorthEntityId(value) === value;
+  } catch {
+    return false;
+  }
+}
+
 export function getChildren(
   parentId: string,
   options: NorthReadOptions = {},
 ): string[] {
   const canonicalId = normalizeNorthEntityId(parentId);
-  const query = `{:find "child" :rules [{:head {:rel "child" :args [{:var "child"}]} :body [{:rel "triple" :args [{:var "child"} "part_of" "@${canonicalId}"]}]}]}`;
-  const out = invokeNorth("children", ["query", query], options);
-  const lines = out.split("\n").map((value) => value.trim()).filter(Boolean);
-  if (lines.length === 0 || (lines.length === 1 && lines[0] === "(no results)")) {
-    return [];
+  // Supported warm projection returns one sorted, unique array; a leaf is [].
+  const out = invokeNorth("children", ["json", "children", canonicalId], options);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(out.trim());
+  } catch {
+    throw new NorthReadProtocolError("children");
   }
-  const children: string[] = [];
-  for (const line of lines) {
-    let row: unknown;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      throw new NorthReadProtocolError("children");
-    }
-    if (!Array.isArray(row) || row.length !== 1 || typeof row[0] !== "string"
-      || !row[0].startsWith("@") || normalizeNorthEntityId(row[0]) !== row[0].slice(1)) {
-      throw new NorthReadProtocolError("children");
-    }
-    children.push(row[0].slice(1));
+  if (!Array.isArray(parsed) || !parsed.every(isBareEntityId)
+    || parsed.some((id, index) => index > 0 && parsed[index - 1] >= id)) {
+    throw new NorthReadProtocolError("children");
   }
-  return children;
+  return parsed as string[];
 }

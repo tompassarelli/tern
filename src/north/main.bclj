@@ -1034,6 +1034,13 @@
             arg
             (subject-fact-projection facts children)
             (subject-fact-projection facts runs)))))]
+      [(= what "children")
+       ;; One warm live-facts reverse lookup replaces the SDK's former cold
+       ;; Datalog read. Map keys make children unique; sort makes the JSON
+       ;; contract deterministic, and a leaf emits [].
+       (println (fram.rt/to-json
+                 (vec (sort (mapv short-id
+                                  (keys (matching-subjects facts "part_of" (str "@" arg))))))))]
       [(= what "agents")
        (println (fram.rt/to-json
                  (mapv (fn [c :- k/Fact] :- JAgentFact
@@ -1051,7 +1058,7 @@
        (println (fram.rt/to-json
                  (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready")
                                   (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))]
-      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|child-settlement <coordinator>|agents|presentation")])))
+      [:else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|children <parent>|child-settlement <coordinator>|agents|presentation")])))
 
 (defn cmd-needs-review [log :- String] :- Nil
   (let [as (fram.rt/read-log log)

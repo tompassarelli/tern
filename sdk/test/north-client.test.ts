@@ -51,14 +51,14 @@ test("North entity ids reject ambiguity and injection shapes before reads", () =
   }
 });
 
-test("children use the supported structured query and distinguish parent from leaf", () => {
+test("children use one warm JSON projection and distinguish parent from leaf", () => {
   const command = fakeNorth(`
-if [ "$1" != query ]; then exit 91; fi
-case "$2" in
-  *019f75a8-032c-741a-b65d-e4af097e3837*)
-    printf '  ["@019f75a8-032c-741a-b65d-e4af097e3838"]\\n'
-    printf '  ["@019f75a8-032c-741a-b65d-e4af097e3839"]\\n'
+if [ "$1:$2" != json:children ]; then exit 91; fi
+case "$3" in
+  019f75a8-032c-741a-b65d-e4af097e3837)
+    printf '%s\\n' '["019f75a8-032c-741a-b65d-e4af097e3838","019f75a8-032c-741a-b65d-e4af097e3839"]'
     ;;
+  *) printf '%s\\n' '[]' ;;
 esac
 `);
   expect(getChildren("019f75a8-032c-741a-b65d-e4af097e3837", { command })).toEqual([
@@ -66,10 +66,27 @@ esac
     "019f75a8-032c-741a-b65d-e4af097e3839",
   ]);
   expect(getChildren("019f75a8-032c-741a-b65d-e4af097e3840", { command })).toEqual([]);
+});
 
-  const explicitLeaf = fakeNorth("printf '  (no results)\\n'");
-  expect(getChildren("019f75a8-032c-741a-b65d-e4af097e3840", { command: explicitLeaf }))
-    .toEqual([]);
+test("children fail closed on every non-canonical array contract", () => {
+  const first = "019f75a8-032c-741a-b65d-e4af097e3838";
+  const second = "019f75a8-032c-741a-b65d-e4af097e3839";
+  for (const response of [
+    JSON.stringify([first, first]),
+    JSON.stringify([second, first]),
+    JSON.stringify([`@${first}`]),
+    JSON.stringify(["bad child"]),
+    JSON.stringify([first, 42]),
+    JSON.stringify([[first]]),
+    JSON.stringify({ children: [first] }),
+    `${JSON.stringify([first])}\n[]`,
+    "not-json",
+  ]) {
+    const command = fakeNorth(`printf '%s' ${JSON.stringify(response)}`);
+    expect(() => getChildren(
+      "019f75a8-032c-741a-b65d-e4af097e3837", { command },
+    ), response).toThrow(NorthReadProtocolError);
+  }
 });
 
 test("North reads distinguish authoritative absence from transport and protocol failure", () => {

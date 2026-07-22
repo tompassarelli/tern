@@ -346,7 +346,7 @@ test("env-less MCP SDK launches materialize the canonical North instance exactly
   expect(explicit.childEnv).not.toHaveProperty("FRAM_TELEMETRY_LOG");
 });
 
-test("MCP dispatch advertises and forwards an exact account target to the SDK process", () => {
+test("MCP dispatch runs warm child preflight within budget and forwards an exact account target", () => {
   const directory = mkdtempSync(join(tmpdir(), "north-mcp-target-"));
   temporary.push(directory);
   const capture = join(directory, "sdk-env");
@@ -360,7 +360,11 @@ case "$*" in
 esac
 printf 'spawn:%s\n' "$AGENT_ID" >> "$NORTH_MCP_EVENTS"
 printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$AGENT_TARGET" "$AGENT_PROVIDER" "$AGENT_ID" "$NORTH_DISPATCH_DRIVER_PRECLAIMED" "$FRAM_LOG" "$AGENT_CAVEMAN" "$NORTH_CAVEMAN_SOURCE" "$*" > "$NORTH_MCP_CAPTURE"
-"$NORTH_MCP_BB" ignored 7977 release "@\${@: -1}" "$AGENT_ID"
+thread="\${@: -1}"
+NORTH_SDK_PREFLIGHT=1 "$NORTH_BIN" json show "$thread" >/dev/null || { printf '%s\n' NORTH_READ_UNAVAILABLE >&2; exit 17; }
+children="$(NORTH_SDK_PREFLIGHT=1 "$NORTH_BIN" json children "$thread")" || { printf '%s\n' NORTH_READ_UNAVAILABLE >&2; exit 17; }
+[ "$children" = '[]' ] || exit 18
+"$NORTH_MCP_BB" ignored 7977 release "@$thread" "$AGENT_ID"
 `);
   chmodSync(fakeBun, 0o755);
   writeFileSync(fakeBb, `#!/usr/bin/env bash
@@ -369,6 +373,15 @@ exit 0
 `);
   chmodSync(fakeBb, 0o755);
   writeFileSync(fakeNorth, `#!/usr/bin/env bash
+printf 'north:%s\n' "$*" >> "$NORTH_MCP_EVENTS"
+if [ "\${NORTH_SDK_PREFLIGHT:-}" = 1 ]; then
+  case "$1:$2" in
+    json:show) printf '%s\n' '[{"predicate":"title","value":"completed dispatch probe"}]' ;;
+    json:children) printf '%s\n' '[]' ;;
+    *) exit 88 ;;
+  esac
+  exit 0
+fi
 for _ in $(seq 1 200); do
   grep -q '^driver:release:' "$NORTH_MCP_EVENTS" 2>/dev/null && break
   sleep 0.01
@@ -398,17 +411,21 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
     encoding: "utf8",
     env: {
       ...process.env,
+      HOME: directory,
       NORTH_MCP_BUN: fakeBun,
       NORTH_MCP_BB: fakeBb,
       NORTH_MCP_CAPTURE: capture,
       NORTH_MCP_EVENTS: events,
       NORTH_BIN: fakeNorth,
+      NORTH_SPAWN_STARTUP_TIMEOUT_MS: "1000",
+      GAFFER_HOME: GAFFER_ROOT,
       FRAM_LOG: exactFramLog,
     },
   });
   expect(result.status, result.stderr).toBe(0);
   const response = JSON.parse(result.stdout.trim());
   expect(response.result.isError, JSON.stringify(response.result)).not.toBe(true);
+  expect(response.result.content[0].text).not.toContain("NORTH_READ_UNAVAILABLE");
   expect(response.result.content[0].text).toContain("completed anthropic-claude-gmail-opus-xhigh-integrator-probe");
   expect(response.result.content[0].text).not.toContain("Agent is running");
   expect(response.result.content[0].text).toContain("target=claude-personal-tompas0x-gmail");
@@ -428,6 +445,9 @@ printf '%s\n' '[{"predicate":"kind","value":"lane"},{"predicate":"role","value":
   expect(agentId).toMatch(/^sdk-f8999eac7b03-[a-z0-9]+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 
   const lifecycle = readFileSync(events, "utf8").trim().split("\n");
+  expect(lifecycle).toContain("north:json show 019f6c5e-61d0-7880-98a0-f8999eac7b03");
+  expect(lifecycle).toContain("north:json children 019f6c5e-61d0-7880-98a0-f8999eac7b03");
+  expect(lifecycle.some((line) => line.includes(" query "))).toBe(false);
   const claim = lifecycle.findIndex((line) => line === `driver:claim:@019f6c5e-61d0-7880-98a0-f8999eac7b03:${agentId}`);
   const spawn = lifecycle.findIndex((line) => line === `spawn:${agentId}`);
   const release = lifecycle.findIndex((line) => line === `driver:release:@019f6c5e-61d0-7880-98a0-f8999eac7b03:${agentId}`);

@@ -617,10 +617,11 @@
    committed-runs (matching-subjects facts "kind" "run")
    runs (child-run-subjects facts child-ids committed-runs)]
   (println (fram.rt/to-json (->JChildSettlementProjection "north.child-settlement" 1 arg (subject-fact-projection facts children) (subject-fact-projection facts runs)))))
+  (= what "children") (println (fram.rt/to-json (vec (sort (mapv short-id (keys (matching-subjects facts "part_of" (str "@" arg))))))))
   (= what "agents") (println (fram.rt/to-json (mapv (fn [c] (->JAgentFact (subs (:l c) (count "@agent:")) (:p c) (:r c))) (filterv (fn [c] (let [l (:l c)]
   (and (some? l) (str/starts-with? l "@agent:")))) facts))))
   (= what "presentation") (println (fram.rt/to-json (->JPresentation (proj/condition-emoji idx "active") (proj/condition-emoji idx "ready") (proj/condition-emoji idx "blocked") (proj/condition-emoji idx "draft"))))
-  :else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|child-settlement <coordinator>|agents|presentation"))))
+  :else (println "usage: json board|ready|blocked|needs-review|clock-report|show <id>|show-many <id,id,...>|children <parent>|child-settlement <coordinator>|agents|presentation"))))
 
 (defn cmd-needs-review [^String log]
   (let [as (fram.rt/read-log log)
