@@ -5,7 +5,7 @@ import {
   renameSync, rmSync, unlinkSync, writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { codexConfigArguments } from "../accounts";
 import { managedNorthMcpEnvironment } from "../execution-admission";
 import { parseStrictJson, StrictJsonlFrames } from "../strict-json";
@@ -18,6 +18,7 @@ import { CODEX_SUPERVISOR_STATUS_PREFIX } from "./codex-supervisor-protocol";
 import { providerJoinEvidence, type ProviderJoinEvidence } from "./provider-join";
 
 const SUPERVISOR = resolve(import.meta.dir, "codex-supervisor.ts");
+const ENGINE = resolve(import.meta.dir, "../../../bin/north");
 const RPC_TIMEOUT_MS = 20_000;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
@@ -278,6 +279,17 @@ export function managedCodexAppServerLaunch(
   options.env.CODEX_SQLITE_HOME = sqliteHome;
   options.env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED = "1";
 
+  const managedPath = options.env.PATH;
+  if (typeof managedPath !== "string" || !managedPath
+      || managedPath !== managedPath.trim()
+      || managedPath.split(delimiter)[0] !== dirname(ENGINE)
+      || options.env.NORTH_BIN !== ENGINE)
+    throw new ManagedCodexPreThreadError("openai_managed_shell_environment_invalid");
+  const shellEnvironmentPolicy = {
+    inherit: "core",
+    set: { PATH: managedPath, NORTH_BIN: ENGINE },
+  };
+
   const northEnv = managedNorthMcpEnvironment(options.north.env);
   const features = Object.fromEntries([
     ...MANAGED_CODEX_ENABLED_FEATURES.map((name) => [name, true] as const),
@@ -291,6 +303,7 @@ export function managedCodexAppServerLaunch(
     project_root_markers: [".git"],
     projects: { [projectRoot]: { trust_level: "untrusted" } },
     project_doc_max_bytes: 0,
+    shell_environment_policy: shellEnvironmentPolicy,
     mcp_servers: {
       north: {
         command: options.north.command,
@@ -310,6 +323,8 @@ export function managedCodexAppServerLaunch(
     "-c", 'project_root_markers=[".git"]',
     "-c", `projects=${tomlProjectMap(projectRoot)}`,
     "-c", "project_doc_max_bytes=0",
+    "-c", 'shell_environment_policy.inherit="core"',
+    "-c", `shell_environment_policy.set=${tomlStringMap(shellEnvironmentPolicy.set)}`,
     "-c", `mcp_servers.north.command=${JSON.stringify(options.north.command)}`,
     "-c", `mcp_servers.north.args=${JSON.stringify(options.north.args)}`,
     "-c", `mcp_servers.north.env=${tomlStringMap(northEnv)}`,
@@ -689,6 +704,11 @@ function validateConfig(
   ));
   exact(config.mcp_servers, expectedEffectiveMcp, "Codex effective MCP set");
   exact(config.projects, contract.expectedSessionConfig.projects, "Codex project trust set");
+  exact(
+    config.shell_environment_policy,
+    contract.expectedSessionConfig.shell_environment_policy,
+    "Codex effective shell environment policy",
+  );
   if (config.project_doc_max_bytes !== 0 || config.model_provider !== "openai"
       || config.cli_auth_credentials_store !== "file" || config.forced_login_method !== "chatgpt"
       || config.sqlite_home !== contract.sqliteHome || config.apps !== null

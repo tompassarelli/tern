@@ -7,7 +7,7 @@ import {
   readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import {
@@ -180,6 +180,12 @@ function setup(mode = "ok") {
     args: [] as string[],
     env: { NORTH_BIN: "/nix/store/north/bin/north" },
   };
+  const engine = join(realpathSync(join(import.meta.dir, "../..")), "bin/north");
+  const managedPath = `${dirname(engine)}${delimiter}${process.env.PATH ?? ""}`;
+  const shellEnvironmentPolicy = {
+    inherit: "core",
+    set: { PATH: managedPath, NORTH_BIN: engine },
+  };
   const session = {
     cli_auth_credentials_store: "file",
     forced_login_method: "chatgpt",
@@ -188,6 +194,7 @@ function setup(mode = "ok") {
     project_root_markers: [".git"],
     projects: { [cwd]: { trust_level: "untrusted" } },
     project_doc_max_bytes: 0,
+    shell_environment_policy: shellEnvironmentPolicy,
     mcp_servers: { north: {
       command: north.command, args: [], env: north.env,
       enabled: true, required: true, enabled_tools: tools,
@@ -202,6 +209,7 @@ function setup(mode = "ok") {
         ...session.mcp_servers.north, environment_id: "local", tool_timeout_sec: null,
       } },
       projects: session.projects,
+      shell_environment_policy: shellEnvironmentPolicy,
       project_doc_max_bytes: 0, model_provider: "openai",
       cli_auth_credentials_store: "file", forced_login_method: "chatgpt",
       sqlite_home: sqliteHome, apps: null, plugins: {}, marketplaces: {},
@@ -476,6 +484,12 @@ function setup(mode = "ok") {
         }
         if (mode === "feature-default-enabled") current.config.features.browser_use = true;
         if (mode === "feature-omitted") delete current.config.features.browser_use;
+        if (mode === "shell-policy-missing")
+          delete current.layers[0].config.shell_environment_policy;
+        if (mode === "shell-policy-wrong-inherit")
+          current.config.shell_environment_policy.inherit = "all";
+        if (mode === "shell-policy-drift")
+          current.config.shell_environment_policy.set.PATH = "/run/current-system/sw/bin";
         if (mode === "fingerprint-mutation" && configReads > 1)
           current.layers[0].version = `sha256:${"f".repeat(64)}`;
         if (mode === "terminal-notification-unknown" && configReads > 2)
@@ -567,7 +581,13 @@ function setup(mode = "ok") {
     queueMicrotask(() => child.emit("spawn"));
     return child;
   }) as any;
-  const env = { ...process.env, CODEX_HOME: codexHome, CODEX_SQLITE_HOME: sqliteHome };
+  const env = {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    CODEX_SQLITE_HOME: sqliteHome,
+    NORTH_BIN: engine,
+    PATH: managedPath,
+  };
   const options = {
     command: executable,
     testExpectedExecutable: executable,
@@ -622,6 +642,19 @@ test("one app-server proves authority and executes realistic shell/file/MCP traf
     tools: [{ server: "north", tool: "tell", count: 1 }],
   });
   expect(JSON.stringify(run.mcpActivity())).not.toContain("CANARY");
+});
+
+test("launch seals the exact package shell environment policy", () => {
+  const { options } = setup();
+  const launch = managedCodexAppServerLaunch(options);
+  expect(launch.expectedSessionConfig.shell_environment_policy).toEqual({
+    inherit: "core",
+    set: { PATH: options.env.PATH, NORTH_BIN: options.env.NORTH_BIN },
+  });
+  expect(launch.args).toContain('shell_environment_policy.inherit="core"');
+  expect(launch.args).toContain(
+    `shell_environment_policy.set={"NORTH_BIN"=${JSON.stringify(options.env.NORTH_BIN)},"PATH"=${JSON.stringify(options.env.PATH)}}`,
+  );
 });
 
 test("a first-result consumer sees exact MCP activity without resuming the session", async () => {
@@ -1081,6 +1114,7 @@ test("pre-thread authority mutants fail before thread/start", async () => {
     "project-enabled", "hook-warning", "hook-failure-unattested",
     "hook-failure-continue", "hook-failure-unrecognized",
     "feature-default-enabled", "feature-omitted", "mcp-resource", "mcp-template", "mcp-auth",
+    "shell-policy-missing", "shell-policy-wrong-inherit", "shell-policy-drift",
     "mcp-server-info", "remote-enabled", "remote-extra-field", "remote-missing-installation",
     "deprecation-extra-field", "notification-unknown-prethread", "server-request-prethread",
     "config-warning-drift",
