@@ -20,6 +20,27 @@
 (defn data [] (json/parse-string (slurp policy) false))
 
 (try
+  (let [base-env {"HOME" (.getPath tmp-dir) "NORTH_HOME" root
+                  "NORTH_ROUTING_POLICY" policy}
+        status (p/shell {:out :string :err :string :continue true :extra-env base-env}
+                        "env" "-u" "AGENT_CAVEMAN" "bb" cli "status")
+        help (p/shell {:out :string :err :string :continue true :extra-env base-env}
+                      "env" "-u" "AGENT_CAVEMAN" "bb" cli "help")
+        inherited (p/shell {:out :string :err :string :continue true
+                            :extra-env (assoc base-env "AGENT_CAVEMAN" "full")}
+                           "bb" cli "status")]
+    (check "operator status states managed compression defaults off when unresolved"
+           (and (zero? (:exit status))
+                (str/includes? (:out status) "off (managed default; savings unproven)")
+                (not (str/includes? (:out status) "full (SDK default)"))))
+    (check "operator help states managed request-env-off precedence"
+           (and (zero? (:exit help))
+                (str/includes? (:out help) "request > AGENT_CAVEMAN > off")
+                (str/includes? (:out help) "with neither input it defaults off")))
+    (check "operator status labels an actual inherited override without making it the default"
+           (and (zero? (:exit inherited))
+                (str/includes? (:out inherited) "full (inherited AGENT_CAVEMAN)"))))
+
   (let [show (run!)]
     (check "no-arg show exposes obvious defaults" (and (zero? (:exit show))
                                                         (str/includes? (:out show) "mode balanced")

@@ -740,18 +740,30 @@
       (window-run! "@run-window-claude-overlap" "claude-b" "anthropic" "claude-fable-5" "max"
                    "2026-07-22T03:30:00Z" 70)
       (doseq [[entity values]
-              [["@run-window-sol"
-                [["response_strategy_id" "none"] ["caveman_mode" "off"]
+               [["@run-window-sol"
+                [["response_strategy_id" "none"] ["response_strategy_implementation" "disabled"]
+                 ["caveman_mode" "off"] ["caveman_measurement_coverage" "unknown"]
                  ["caveman_source" "default"]
                  ["caveman_decision_reason" "default-off-unproven-savings"]
                  ["mcp_activity_source" "codex-app-server:item-completed"]
                  ["mcp_activity_coverage" "exact"] ["mcp_actual_calls" "0"]]]
                ["@run-window-terra"
-                [["response_strategy_id" "caveman"] ["caveman_mode" "lite"]
+                [["response_strategy_id" "caveman"]
+                 ["response_strategy_implementation" "fork-skill"]
+                 ["response_strategy_version" "020f650daa42a506660a2959f62f2a999d7e1018"]
+                 ["caveman_mode" "lite"] ["caveman_measurement_coverage" "exact"]
                  ["caveman_source" "request"] ["caveman_decision_reason" "explicit-request"]
+                 ["caveman_repository" "github.com/tompassarelli/caveman"]
+                 ["caveman_revision" "020f650daa42a506660a2959f62f2a999d7e1018"]
+                 ["caveman_skill_sha256" "e38ec671ecbee47ce234190be12615daf60ac667d775b7340d49d07f4f63c7bc"]
+                 ["caveman_skill_bytes" "5009"]
+                 ["caveman_rendered_sha256" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                 ["caveman_rendered_bytes" "3210"] ["caveman_source_kind" "git-object"]
+                 ["caveman_resolution_provenance" "local-dev"]
                  ["mcp_activity_source" "codex-app-server:item-completed"]
-                 ["mcp_activity_coverage" "exact"] ["mcp_actual_calls" "2"]
-                 ["mcp_actual_tool" "{\"server\":\"north\",\"tool\":\"tell\",\"count\":2}"]]]
+                 ["mcp_activity_coverage" "exact"] ["mcp_actual_calls" "3"]
+                 ["mcp_actual_tool" "{\"server\":\"north\",\"tool\":\"tell\",\"count\":2}"]
+                 ["mcp_actual_tool" "{\"server\":\"north\",\"tool\":\"ready\",\"count\":1}"]]]
                ["@run-window-claude-overlap"
                 [["response_strategy_id" "caveman"] ["caveman_mode" "full"]
                  ["caveman_source" "env"] ["caveman_decision_reason" "inherited-env"]
@@ -816,16 +828,42 @@
         (check "window telemetry reports Caveman provenance and actual MCP calls without guessing legacy"
                (let [older-op (:operationalTelemetry older)
                      recent-op (:operationalTelemetry recent)
-                     cumulative-op (:operationalTelemetry cumulative)]
+                     cumulative-op (:operationalTelemetry cumulative)
+                     terra-op (first (filter #(and (= "codex-a" (:account %))
+                                                   (= "gpt-5.6-terra" (:model %)))
+                                             (:byProviderAccountModel cumulative-op)))
+                     provenance (first (filter #(= "caveman" (:strategyId %))
+                                               (:responseStrategyProvenance terra-op)))]
                  (and (= {:off 1} (get-in older-op [:coverage :cavemanModeCounts]))
                       (= 0 (get-in older-op [:coverage :mcpActualCalls]))
                       (= {:full 1 :legacy-unknown 2 :lite 1}
                          (get-in recent-op [:coverage :cavemanModeCounts]))
-                      (= 3 (get-in recent-op [:coverage :mcpActualCalls]))
-                      (= 3 (get-in cumulative-op [:coverage :mcpActualCalls]))
-                      (= [{:server "north" :tool "show" :calls 1}
+                      (= 4 (get-in recent-op [:coverage :mcpActualCalls]))
+                      (= 4 (get-in cumulative-op [:coverage :mcpActualCalls]))
+                      (= [{:server "north" :tool "ready" :calls 1}
+                          {:server "north" :tool "show" :calls 1}
                           {:server "north" :tool "tell" :calls 2}]
-                         (get-in cumulative-op [:coverage :mcpToolDistribution])))))
+                         (get-in cumulative-op [:coverage :mcpToolDistribution]))
+                      ;; One run carries two distinct multi-valued tool facts.
+                      (= 2 (count (:mcpToolDistribution terra-op)))
+                      (= {:complete 1 :legacy-unknown 1}
+                         (:responseStrategyProvenanceCoverageCounts terra-op))
+                      (= {:strategyId "caveman" :implementation "fork-skill"
+                          :version "020f650daa42a506660a2959f62f2a999d7e1018"
+                          :mode "lite" :source "request" :decisionReason "explicit-request"
+                          :repository "github.com/tompassarelli/caveman"
+                          :revision "020f650daa42a506660a2959f62f2a999d7e1018"
+                          :skillSha256 "e38ec671ecbee47ce234190be12615daf60ac667d775b7340d49d07f4f63c7bc"
+                          :skillBytes 5009
+                          :renderedSha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                          :renderedBytes 3210
+                          :sourceKind "git-object" :resolutionProvenance "local-dev"
+                          :measurementCoverage "exact" :runs 1}
+                         (select-keys provenance
+                                      [:strategyId :implementation :version :mode :source
+                                       :decisionReason :repository :revision :skillSha256
+                                       :skillBytes :renderedSha256 :renderedBytes :sourceKind
+                                       :resolutionProvenance :measurementCoverage :runs])))))
         (check "native interactive activity is separate per slice and cumulative"
                (let [older-native (:nativeInteractiveActivity older)
                      recent-native (:nativeInteractiveActivity recent)

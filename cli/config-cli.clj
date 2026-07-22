@@ -400,11 +400,14 @@
         c  (get' "coord" "north")
         cv (caveman-lvl)
         cd (caveman-default)
-        ac (or (System/getenv "AGENT_CAVEMAN") "full (SDK default)")]
+        inherited-caveman (System/getenv "AGENT_CAVEMAN")
+        ac (if (and inherited-caveman (not (str/blank? inherited-caveman)))
+             (str inherited-caveman " (inherited AGENT_CAVEMAN)")
+             "off (managed default; savings unproven)")]
     (println (banner))
     (println (str "
  1  CAVEMAN    output compression
-    session: " cv " (lite|full|ultra + wenyan-*)      workers: " ac " (inherited at spawn)
+    session: " cv " (lite|full|ultra + wenyan-*)      workers: " ac "
     default: " cd " (persists — new sessions start here)
     [live]   session → north config caveman lite|full|ultra   (or /caveman)
     [live]   default → north config caveman default off|lite|full|ultra|wenyan-*
@@ -415,8 +418,8 @@
     " (mark d "north") " north    SDK workers — persistent, steerable, fact trail;
                model, effort, caveman all have per-spawn opts on mcp__north__spawn;
                model/effort resolve from the requested Gaffer composition and
-               provider catalog; caveman alone inherits ambient AGENT_CAVEMAN
-               when omitted ([spawn] — frozen for the worker lifetime)
+               provider catalog; managed response compression resolves explicit
+               request > AGENT_CAVEMAN > off, then freezes for worker lifetime
     " (mark d "warn") " warn     native Agent/Workflow allowed, nudged toward north
     " (mark d "native") " native   raw Claude Code spawns, no interference
     flip → north config dispatch north|warn|native
@@ -447,7 +450,7 @@
     policy: " ROUTING-POLICY "
 
  elsewhere: system/nix settings → firn tag status · session effort → /effort
- dials: [live] north config flip, effective now · [launch] env at claude launch, frozen for session · [spawn] request-owned routing; caveman may inherit ambient env
+ dials: [live] north config flip, effective now · [launch] env at claude launch, frozen for session · [spawn] request-owned routing; managed compression defaults off when no request/env exists
  state: ~/.local/state/north/harness.conf · legacy read fallback: ~/.claude/my-config.state · descriptions + advice: north config help"))))
 
 (defn help []
@@ -460,7 +463,8 @@
    [live]   default — north config caveman default off|lite|full|ultra|wenyan-*;
             new sessions start here; persists across sessions.
    [spawn]  one worker — pass {caveman: off|lite|full} on mcp__north__spawn;
-            frozen for that worker's lifetime.
+            frozen for that worker's lifetime. Managed resolution is explicit
+            request > AGENT_CAVEMAN > off; off is the unproven-savings default.
    [launch] all workers from a session — AGENT_CAVEMAN=off|lite|full claude;
             inherited at spawn by workers without a per-spawn override;
             frozen for the session; mid-session flip impossible.
@@ -486,7 +490,8 @@
            per-spawn opts on mcp__north__spawn. Managed children scrub ambient
            routing/staffing variables: model and effort come from the request's
            Gaffer composition and provider catalog unless explicitly pinned.
-           Caveman alone may inherit ambient AGENT_CAVEMAN when omitted and is
+           Response compression may inherit an explicit AGENT_CAVEMAN when the
+           request omits it; with neither input it defaults off. The result is
            frozen for each worker's lifetime.
    warn    native spawns allowed; the hook injects a reminder instead.
    native  no interference. For A/B baselines against stock Claude Code.

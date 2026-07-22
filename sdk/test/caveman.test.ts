@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { expect, test } from "bun:test";
 import { renderCavemanSkill, resolveManagedCaveman } from "../src/caveman";
 
@@ -72,4 +74,12 @@ test("enabled modes fail closed for incomplete, missing, or wrong immutable prov
   expect(() => resolveManagedCaveman("full", {
     NORTH_CAVEMAN_HOME: HOME, NORTH_CAVEMAN_REV: `${REV.slice(0, -1)}0`,
   })).toThrow();
+});
+
+test("adapted fork behavior retains the upstream MIT notice", () => {
+  const notice = readFileSync(resolve(import.meta.dir, "../..", "THIRD_PARTY_NOTICES.md"), "utf8");
+  expect(notice).toContain("https://github.com/tompassarelli/caveman");
+  expect(notice).toContain("MIT License");
+  expect(notice).toContain("Copyright (c) 2026 Julius Brussee");
+  expect(notice).toContain("src/hooks/caveman-subagent.js");
 });

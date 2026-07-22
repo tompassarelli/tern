@@ -16,7 +16,8 @@
 (def multi-preds #{"done_when" "bar_evidence" "domain_requirement"
                    "applied_capability" "applied_domain_requirement"
                    "composition_override" "applied_preset_override" "struggle"
-                   "routing_rule_code" "routing_pin" "routing_receipt_override"})
+                   "routing_rule_code" "routing_pin" "routing_receipt_override"
+                   "mcp_actual_tool"})
 
 (def canonical-gaffer-capabilities
   ["filesystem.read" "filesystem.search" "filesystem.write" "shell"
@@ -583,6 +584,16 @@
        (normalized-token (one facts entity "caveman_decision_reason"))
        :cavemanMeasurementCoverage
        (normalized-token (one facts entity "caveman_measurement_coverage"))
+       :cavemanRepository (normalized-token (one facts entity "caveman_repository"))
+       :cavemanRevision (normalized-token (one facts entity "caveman_revision"))
+       :cavemanSkillSha256 (normalized-token (one facts entity "caveman_skill_sha256"))
+       :cavemanSkillBytes (maybe-long (one facts entity "caveman_skill_bytes"))
+       :cavemanRenderedSha256
+       (normalized-token (one facts entity "caveman_rendered_sha256"))
+       :cavemanRenderedBytes (maybe-long (one facts entity "caveman_rendered_bytes"))
+       :cavemanSourceKind (normalized-token (one facts entity "caveman_source_kind"))
+       :cavemanResolutionProvenance
+       (normalized-token (one facts entity "caveman_resolution_provenance"))
        :mcpActivitySource (normalized-token (one facts entity "mcp_activity_source"))
        :mcpActivityCoverage (normalized-token (one facts entity "mcp_activity_coverage"))
        :mcpActualCalls (maybe-long (one facts entity "mcp_actual_calls"))
@@ -1161,7 +1172,43 @@
      :accounts account-rows}))
 
 (defn operational-telemetry [rows]
-  (let [group-key (fn [row] [(or (:provider row) "unattributed")
+  (let [unknown "legacy-unknown"
+        provenance
+        (fn [row]
+          {:strategyId (or (:responseStrategyId row) unknown)
+           :implementation (or (:responseStrategyImplementation row) unknown)
+           :version (or (:responseStrategyVersion row) unknown)
+           :mode (or (:cavemanMode row) unknown)
+           :source (or (:cavemanSource row) unknown)
+           :decisionReason (or (:cavemanDecisionReason row) unknown)
+           :measurementCoverage (or (:cavemanMeasurementCoverage row) unknown)
+           :repository (or (:cavemanRepository row) unknown)
+           :revision (or (:cavemanRevision row) unknown)
+           :skillSha256 (or (:cavemanSkillSha256 row) unknown)
+           :skillBytes (or (:cavemanSkillBytes row) unknown)
+           :renderedSha256 (or (:cavemanRenderedSha256 row) unknown)
+           :renderedBytes (or (:cavemanRenderedBytes row) unknown)
+           :sourceKind (or (:cavemanSourceKind row) unknown)
+           :resolutionProvenance (or (:cavemanResolutionProvenance row) unknown)})
+        provenance-status
+        (fn [row]
+          (let [value (provenance row)]
+            (cond
+              (= unknown (:strategyId value)) "legacy-unknown"
+              (= "none" (:strategyId value))
+              (if (and (= "disabled" (:implementation value))
+                       (not= unknown (:mode value))
+                       (not= unknown (:source value))
+                       (not= unknown (:decisionReason value))
+                       (not= unknown (:measurementCoverage value)))
+                "complete" "partial")
+              (every? #(not= unknown (get value %))
+                      [:implementation :version :mode :source :decisionReason
+                       :measurementCoverage :repository :revision :skillSha256 :skillBytes
+                       :renderedSha256 :renderedBytes :sourceKind :resolutionProvenance])
+              "complete"
+              :else "partial")))
+        group-key (fn [row] [(or (:provider row) "unattributed")
                              (or (:providerTarget row) "unattributed")
                              (or (:model row) "unattributed")])
         summarize
@@ -1178,6 +1225,21 @@
                   frequencies (into (sorted-map)))
              :responseStrategyCounts
              (->> cohort (map #(or (:responseStrategyId %) "legacy-unknown"))
+                  frequencies (into (sorted-map)))
+             :responseStrategyImplementationCounts
+             (->> cohort (map #(or (:responseStrategyImplementation %) unknown))
+                  frequencies (into (sorted-map)))
+             :responseStrategyVersionCounts
+             (->> cohort (map #(or (:responseStrategyVersion %) unknown))
+                  frequencies (into (sorted-map)))
+             :responseStrategyProvenanceCoverageCounts
+             (->> cohort (map provenance-status) frequencies (into (sorted-map)))
+             :responseStrategyProvenance
+             (->> cohort (map provenance) frequencies
+                  (map (fn [[value runs]] (assoc value :runs runs)))
+                  (sort-by (juxt :strategyId :implementation :version :mode :source)) vec)
+             :cavemanMeasurementCoverageCounts
+             (->> cohort (map #(or (:cavemanMeasurementCoverage %) unknown))
                   frequencies (into (sorted-map)))
              :mcpCoverageCounts
              (->> cohort (map #(or (:mcpActivityCoverage %) "legacy-unknown"))
