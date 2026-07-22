@@ -9,6 +9,7 @@
 
 (def root (.getCanonicalPath (io/file (.getParent (io/file *file*)) "../..")))
 (load-file (str root "/cli/schema-migrate.clj"))
+(require '[north.runtime-attestation :as runtime-attestation])
 (def fram (.getCanonicalPath
            (io/file (or (System/getenv "FRAM_PATH") (str root "/../fram")))))
 (when-not (.isFile (io/file fram "coord_daemon.clj"))
@@ -37,6 +38,10 @@
 (defn values [facts subject predicate]
   (set (map :r (filter #(and (= subject (:l %)) (= predicate (:p %))) facts))))
 
+(defn runtime-record-for-log [log]
+  (.getCanonicalPath
+   (io/file (.getParentFile (io/file log)) "runtime.identity")))
+
 (defn run-schema [port log telemetry receipt-dir & args]
   (apply proc/shell
          {:dir root
@@ -44,7 +49,11 @@
           :err :string
           :continue true
           :extra-env {"FRAM_LOG" log "FRAM_TELEMETRY_LOG" telemetry
-                      "FRAM_SINGLE_VALUED" ""}}
+                      "FRAM_SINGLE_VALUED" ""
+                      "NORTH_SCHEMA_STAGE_PYTHON"
+                      (or (System/getenv "NORTH_SCHEMA_STAGE_PYTHON")
+                          "/run/current-system/sw/bin/python3")
+                      "NORTH_COORD_RUNTIME_FILE" (runtime-record-for-log log)}}
          "bb" "-cp" (str fram "/out")
          (str root "/cli/schema-migrate.clj") (str port)
          (concat args ["--log" log "--telemetry" telemetry
@@ -73,18 +82,107 @@
           :extra-env {"FRAM_LOG" log "FRAM_TELEMETRY_LOG" telemetry}}
          "bb" (str root "/cli/pred-cli.clj") (str port) args))
 
+(defn fram-git-value [expression]
+  (let [result (proc/shell {:out :string :err :string :continue true}
+                           "git" "-C" fram "rev-parse" "--verify" expression)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "schema integration requires a Git Fram source"
+                      {:fram fram :expression expression :error (:err result)})))
+    (str/trim (:out result))))
+
+(defn write-runtime-record! [path pid owner]
+  (spit path
+        (str "PID=" pid "\n"
+             "PID_BIRTH=" (runtime-attestation/process-birth-token pid) "\n"
+             "OWNER_TOKEN=" owner "\n"
+             "FRAM_RUNTIME_SOURCE=" fram "\n"
+             "FRAM_RUNTIME_REV=" (fram-git-value "HEAD") "\n"
+             "FRAM_RUNTIME_TREE=" (fram-git-value "HEAD^{tree}") "\n"
+             "FRAM_RUNTIME_DAEMON=" fram "/bin/fram-daemon\n"))
+  path)
+
 (defn start-daemon [port log telemetry]
-  (proc/process {:dir fram :out :string :err :string
-                 :extra-env {"FRAM_LOG" log "FRAM_TELEMETRY_LOG" telemetry
-                             "FRAM_REQUIRE_LOG_FENCE" "1"
-                             "FRAM_SINGLE_VALUED" ""}}
-                "bb" "-cp" "out" "coord_daemon.clj"
-                "serve-flat" (str port) log))
+  (let [owner (str (java.util.UUID/randomUUID))
+        daemon
+        (proc/process {:dir fram :out :string :err :string
+                       :extra-env
+                       {"FRAM_LOG" log
+                        "FRAM_TELEMETRY_LOG" telemetry
+                        "FRAM_REQUIRE_LOG_FENCE" "1"
+                        "FRAM_SINGLE_VALUED" ""
+                        "FRAM_RUNTIME_SOURCE" fram
+                        "FRAM_RUNTIME_REV" (fram-git-value "HEAD")
+                        "FRAM_RUNTIME_TREE" (fram-git-value "HEAD^{tree}")
+                        "FRAM_RUNTIME_DAEMON" (str fram "/bin/fram-daemon")
+                        "FRAM_RUNTIME_OWNER_TOKEN" owner}}
+                      "bb" "-cp" "out" "coord_daemon.clj"
+                      "serve-flat" (str port) log)
+        pid (.pid ^Process (:proc daemon))]
+    (write-runtime-record! (runtime-record-for-log log) pid owner)
+    daemon))
 
 (defn stop-daemon! [daemon]
   (when daemon
     (proc/destroy-tree daemon)
     (try @daemon (catch Exception _ nil))))
+
+(defn start-request-counter []
+  (let [server (java.net.ServerSocket. 0)
+        count (atom 0)
+        running (atom true)
+        worker
+        (future
+          (while @running
+            (try
+              (with-open [_ (.accept server)]
+                (swap! count inc))
+              (catch java.net.SocketException _ nil))))]
+    {:port (.getLocalPort server)
+     :count count
+     :stop (fn []
+             (reset! running false)
+             (.close server)
+             (deref worker 2000 nil))}))
+
+(defn exact-file-seal [path]
+  (let [nio (.toPath (io/file path))
+        attrs (java.nio.file.Files/readAttributes
+               nio java.nio.file.attribute.BasicFileAttributes
+               (make-array java.nio.file.LinkOption 0))]
+    {:bytes (.size attrs)
+     :sha256 (north.corpus-transaction/sha256-file path)
+     :file_key (str (.fileKey attrs))
+     :permissions
+     (set (java.nio.file.Files/getPosixFilePermissions
+           nio (make-array java.nio.file.LinkOption 0)))
+     :links (long (java.nio.file.Files/getAttribute
+                   nio "unix:nlink" (make-array java.nio.file.LinkOption 0)))}))
+
+(defn candidate-authority-seals [store]
+  (into (sorted-map)
+        (keep (fn [^java.io.File file]
+                (when (and (.isFile file)
+                           (or (re-matches
+                                #"schema-candidate-[0-9a-f]{64}\.edn"
+                                (.getName file))
+                               (re-matches
+                                #"schema-payload-(coordination|telemetry)-[0-9a-f]{64}\.log"
+                                (.getName file))))
+                  [(.getName file) (exact-file-seal (.getPath file))])))
+        (or (.listFiles (io/file store))
+            (make-array java.io.File 0))))
+
+(defn capture-fixture-snapshot! [store log telemetry]
+  (let [identity {:fixture "schema-migrate-integration-snapshot/v1"}]
+    (north.snapshot/create-snapshot!
+     {:store store
+      :live {:coordination log :telemetry telemetry}
+      :runtime! (fn [] identity)
+      :controller! (fn [] identity)
+      :runtime-current! (fn [_] true)
+      :controller-current! (fn [_] true)
+      :provenance {:fixture "schema-migrate-integration-snapshot/v1"}
+      :execute? true})))
 
 (defn delete-tree! [file]
   (when (.isDirectory file)
@@ -99,6 +197,9 @@
       telemetry (.getCanonicalPath (io/file temp "telemetry.log"))
       log-alias (.getAbsolutePath (io/file temp "coordination-alias.log"))
       receipts (.getCanonicalPath (io/file temp "receipts"))
+      snapshot-store (.getCanonicalPath (io/file temp "snapshots"))
+      workspace-root (.getCanonicalPath (io/file temp "workspaces"))
+      candidate-store (.getCanonicalPath (io/file temp "candidates"))
       manifest-path (.getCanonicalPath (io/file temp "reviewed-manifest.edn"))
       invalid-log (.getCanonicalPath (io/file temp "acyclic-invalid.log"))
       invalid-telemetry (.getCanonicalPath (io/file temp "acyclic-invalid-telemetry.log"))
@@ -106,10 +207,14 @@
       corrupt-log (.getCanonicalPath (io/file temp "corrupt.log"))
       corrupt-telemetry (.getCanonicalPath (io/file temp "corrupt-telemetry.log"))
       corrupt-receipts (.getCanonicalPath (io/file temp "corrupt-receipts"))
+      corrupt-snapshot-store (.getCanonicalPath (io/file temp "corrupt-snapshots"))
+      corrupt-workspace-root (.getCanonicalPath (io/file temp "corrupt-workspaces"))
+      corrupt-candidate-store (.getCanonicalPath (io/file temp "corrupt-candidates"))
       corrupt-manifest (.getCanonicalPath (io/file temp "corrupt-manifest.edn"))
       unterminated-log (.getCanonicalPath (io/file temp "unterminated.log"))
       unterminated-telemetry (.getCanonicalPath (io/file temp "unterminated-telemetry.log"))
       unterminated-receipts (.getCanonicalPath (io/file temp "unterminated-receipts"))
+      unterminated-snapshots (.getCanonicalPath (io/file temp "unterminated-snapshots"))
       unterminated-manifest (.getCanonicalPath (io/file temp "unterminated-manifest.edn"))
       _ (spit log (str (str/join "\n"
                                  [(op 1 "assert" "@thread-a" "title" "one")
@@ -171,6 +276,11 @@
          {"@thread-a" {:entity_kind "north/quarantined_legacy_artifact"
                        :rationale "Keeps the corrupt fixture classification explicit during preflight."}})
       daemon (atom (start-daemon port log telemetry))
+      active-log (atom log)
+      active-telemetry (atom telemetry)
+      prepared-workspace (atom nil)
+      source-snapshot (atom nil)
+      finalized-candidate (atom nil)
       checks (atom [])
       check! (fn [label ok detail]
                (swap! checks conj {:label label :ok (boolean ok) :detail detail}))]
@@ -208,10 +318,13 @@
           alias-duplicate (run-schema port log log-alias receipts "plan")
           direct-before (run-schema port log telemetry receipts "migrate" "--execute")
           unterminated-before (slurp unterminated-log)
-          unterminated-execute (run-schema port unterminated-log unterminated-telemetry
-                                           unterminated-receipts
-                                           "build-candidate" "--execute" "--offline-confirm"
-                                           "--manifest" unterminated-manifest)]
+          unterminated-execute
+          (try
+            (capture-fixture-snapshot! unterminated-snapshots
+                                       unterminated-log unterminated-telemetry)
+            {:exit 0 :err ""}
+            (catch Throwable error
+              {:exit 1 :err (.getMessage error)}))]
       (check! "mandatory zero-byte telemetry log is accepted as a corpus member"
               (zero? (:exit empty-telemetry-plan))
               (str "exit=" (:exit empty-telemetry-plan) " err=" (:err empty-telemetry-plan)))
@@ -248,7 +361,7 @@
               (str "exit=" (:exit direct-before) " err=" (:err direct-before)))
       (check! "execute rejects an unterminated append boundary before coordinator work"
               (and (not (zero? (:exit unterminated-execute)))
-                   (str/includes? (:err unterminated-execute) "not newline-terminated")
+                   (str/includes? (:err unterminated-execute) "lacks a terminal LF")
                    (= unterminated-before (slurp unterminated-log))
                    (not (.exists (io/file unterminated-receipts))))
               (str "exit=" (:exit unterminated-execute) " err=" (:err unterminated-execute)))
@@ -304,9 +417,30 @@
 
     (let [corrupt-before (run-schema port corrupt-log corrupt-telemetry corrupt-receipts
                                      "audit" "--strict")
-          refused (run-schema port corrupt-log corrupt-telemetry corrupt-receipts
-                              "build-candidate" "--execute" "--offline-confirm"
-                              "--manifest" corrupt-manifest)]
+          corrupt-snapshot
+          (capture-fixture-snapshot! corrupt-snapshot-store
+                                     corrupt-log corrupt-telemetry)
+          corrupt-workspace
+          (prepare-workspace!
+           {:snapshot-store corrupt-snapshot-store
+            :source-snapshot (:snapshot-id corrupt-snapshot)
+            :workspace-root corrupt-workspace-root
+            :manifest corrupt-manifest
+            :execute true})
+          corrupt-workspace-log (get-in corrupt-workspace
+                                        [:records :coordination :path])
+          corrupt-workspace-telemetry (get-in corrupt-workspace
+                                              [:records :telemetry :path])
+          refused
+          (run-schema
+           port corrupt-workspace-log corrupt-workspace-telemetry corrupt-receipts
+           "build-candidate" "--execute" "--offline-confirm"
+           "--manifest" corrupt-manifest
+           "--snapshot-store" corrupt-snapshot-store
+           "--source-snapshot" (:snapshot-id corrupt-snapshot)
+           "--workspace-root" corrupt-workspace-root
+           "--workspace" (:workspace_id corrupt-workspace)
+           "--candidate-store" corrupt-candidate-store)]
       (check! "strict audit names the malformed predicate"
               (and (= 1 (:exit corrupt-before))
                    (str/includes? (:out corrupt-before) "corrupt predicate"))
@@ -341,41 +475,212 @@
                    (not (.exists (io/file corrupt-receipts))))
               nil))
 
-    (let [migrate (run-schema port log telemetry receipts
-                              "build-candidate" "--execute" "--offline-confirm"
-                              "--manifest" manifest-path)
+    ;; The source snapshot remains immutable. The coordinator is switched to
+    ;; the exact owned workspace, and only the finalized object is consumable.
+    (stop-daemon! @daemon)
+    (reset! daemon nil)
+    (let [snapshot (capture-fixture-snapshot! snapshot-store log telemetry)
+          _ (reset! source-snapshot (:snapshot-id snapshot))
+          workspace
+          (prepare-workspace!
+           {:snapshot-store snapshot-store
+            :source-snapshot (:snapshot-id snapshot)
+            :workspace-root workspace-root
+            :manifest manifest-path
+            :execute true})
+          workspace-log (get-in workspace [:records :coordination :path])
+          workspace-telemetry (get-in workspace [:records :telemetry :path])
+          _ (reset! prepared-workspace workspace)
+          _ (reset! active-log workspace-log)
+          _ (reset! active-telemetry workspace-telemetry)
+          _ (reset! daemon (start-daemon port workspace-log workspace-telemetry))
+          daemon-ready (eventually #(port-open? port))
+          migrate
+          (run-schema
+           port workspace-log workspace-telemetry receipts
+           "build-candidate" "--execute" "--offline-confirm"
+           "--manifest" manifest-path
+           "--snapshot-store" snapshot-store
+           "--source-snapshot" (:snapshot-id snapshot)
+           "--workspace-root" workspace-root
+           "--workspace" (:workspace_id workspace)
+           "--candidate-store" candidate-store)
           receipt-files (when (.isDirectory (io/file receipts))
-                          (vec (.listFiles (io/file receipts))))
+                          (->> (.listFiles (io/file receipts))
+                               (filter #(and (.isFile ^java.io.File %)
+                                             (re-matches
+                                              #"schema-(converged|rejected)-[0-9a-f]{64}\.edn"
+                                              (.getName ^java.io.File %))))
+                               vec))
+          retained-receipt-stages
+          (when (.isDirectory (io/file receipts))
+            (->> (.listFiles (io/file receipts))
+                 (filter #(str/starts-with?
+                           (.getName ^java.io.File %)
+                           ".schema-receipt-stage-v1."))
+                 vec))
           receipt-data (when (= 1 (count receipt-files))
-                         (edn/read-string (slurp (first receipt-files))))]
-      (check! "offline candidate build exits 0 on the completely reviewed corpus"
+                         (edn/read-string (slurp (first receipt-files))))
+          candidate-id (get-in receipt-data
+                               [:finalized_candidate :candidate_id])
+          _ (reset! finalized-candidate candidate-id)
+          verified
+          (when candidate-id
+            (run-schema
+             port workspace-log workspace-telemetry receipts
+             "verify-candidate"
+             "--snapshot-store" snapshot-store
+             "--candidate-store" candidate-store
+             "--candidate" candidate-id))
+          candidate-authority-before (candidate-authority-seals candidate-store)
+          workspace-before
+          {:coordination (exact-file-seal workspace-log)
+           :telemetry (exact-file-seal workspace-telemetry)}
+          _ (stop-daemon! @daemon)
+          _ (reset! daemon nil)
+          counter (start-request-counter)
+          resume
+          (run-schema
+           (:port counter) workspace-log workspace-telemetry receipts
+           "build-candidate" "--execute" "--offline-confirm"
+           "--manifest" manifest-path
+           "--snapshot-store" snapshot-store
+           "--source-snapshot" (:snapshot-id snapshot)
+           "--workspace-root" workspace-root
+           "--workspace" (:workspace_id workspace)
+           "--candidate-store" candidate-store)
+          _ ((:stop counter))
+          resume-request-count @(:count counter)
+          candidate-authority-after (candidate-authority-seals candidate-store)
+          retained-candidate-stages-after
+          (->> (or (.listFiles (io/file candidate-store))
+                   (make-array java.io.File 0))
+               (filter #(and (.isDirectory ^java.io.File %)
+                             (str/starts-with?
+                              (.getName ^java.io.File %)
+                              ".schema-candidate-stage-v1.")))
+               vec)
+          workspace-after
+          {:coordination (exact-file-seal workspace-log)
+           :telemetry (exact-file-seal workspace-telemetry)}
+          retained-receipt-stages-after
+          (when (.isDirectory (io/file receipts))
+            (->> (.listFiles (io/file receipts))
+                 (filter #(str/starts-with?
+                           (.getName ^java.io.File %)
+                           ".schema-receipt-stage-v1."))
+                 vec))
+          resume-verified
+          (when candidate-id
+            (run-schema
+             (:port counter) workspace-log workspace-telemetry receipts
+             "verify-candidate"
+             "--snapshot-store" snapshot-store
+             "--candidate-store" candidate-store
+             "--candidate" candidate-id))
+          _ (reset! daemon (start-daemon port workspace-log workspace-telemetry))
+          daemon-resumed (eventually #(port-open? port))]
+      (check! "real Fram coordinator restarts on the exact owned workspace"
+              (and daemon-ready daemon-resumed) nil)
+      (check! "offline candidate build exits 0 on the completely reviewed workspace"
               (zero? (:exit migrate))
-              (str "exit=" (:exit migrate) " out=" (:out migrate) " err=" (:err migrate)))
-      (check! "only the converged candidate build emits a persisted receipt"
+              (str "exit=" (:exit migrate) " out=" (:out migrate)
+                   " err=" (:err migrate)))
+      (check! "finalized candidate independently verifies"
+              (and verified (zero? (:exit verified))
+                   (str/includes? (:out verified) ":candidate_id")
+                   (zero? (:exit resume))
+                   (zero? resume-request-count)
+                   (= workspace-before workspace-after)
+                   (= candidate-authority-before candidate-authority-after)
+                   (<= 2 (count retained-candidate-stages-after))
+                   resume-verified (zero? (:exit resume-verified)))
+              (pr-str {:initial verified :resume resume
+                       :resume_request_count resume-request-count
+                       :workspace_unchanged (= workspace-before workspace-after)
+                       :candidate_authority_unchanged
+                       (= candidate-authority-before candidate-authority-after)
+                       :retained_candidate_stages
+                       (count retained-candidate-stages-after)
+                       :resume_verified resume-verified}))
+      (check! "successful candidate emits exactly one attested converged receipt"
               (and (str/includes? (:out migrate) "receipt ")
                    (.isDirectory (io/file receipts))
                    (= 1 (count receipt-files))
-                   (= "north-schema-candidate-build/v1" (:format receipt-data))
+                   (<= 2 (count retained-receipt-stages-after))
+                   (str/starts-with? (.getName (first receipt-files))
+                                     "schema-converged-")
+                   (= CANDIDATE-RECEIPT-FORMAT (:format receipt-data))
+                   (= "converged" (:result receipt-data))
                    (true? (:converged receipt-data))
                    (true? (:post_matches_simulation receipt-data))
                    (= (:actions_acknowledged receipt-data)
                       (count (:requested_action_identities receipt-data)))
-                   (empty? (:remaining_action_identities receipt-data)))
-              (str (:out migrate) " receipt=" (pr-str receipt-data))))
-
-    (let [after (run-schema port log telemetry receipts "audit" "--strict")]
+                   (empty? (:remaining_action_identities receipt-data))
+                   (= "advisory-file-locks"
+                      (get-in receipt-data [:source_authority :lock :mode]))
+                   (= "cooperating-processes-only"
+                      (get-in receipt-data [:source_authority :lock :scope]))
+                   (true? (get-in receipt-data
+                                  [:source_authority
+                                   :held_through_candidate_and_receipt_publication]))
+                   (= 2 (count (get-in receipt-data
+                                      [:source_authority :revalidated_files])))
+                   (every? #(and (re-matches #"[0-9]+:[0-9]+"
+                                             (:file_key %))
+                                 (integer? (:bytes %))
+                                 (re-matches #"[0-9a-f]{64}" (:sha256 %)))
+                           (get-in receipt-data
+                                   [:source_authority :revalidated_files]))
+                   (= runtime-attestation/attestation-format
+                      (get-in receipt-data [:daemon :runtime :format]))
+                   (pos-int? (get-in receipt-data
+                                     [:daemon :runtime :authority :pid]))
+                   (re-matches #"[0-9a-f]{40,64}"
+                               (get-in receipt-data
+                                       [:daemon :runtime :identity :revision]))
+                   (re-matches #"[0-9a-f]{40,64}"
+                               (get-in receipt-data
+                                       [:daemon :runtime :identity :tree]))
+                   (re-matches #"[0-9a-f]{64}"
+                               (get-in receipt-data
+                                       [:daemon :runtime :identity
+                                        :artifact-sha256]))
+                   (<= (count runtime-attestation/required-runtime-artifacts)
+                       (get-in receipt-data
+                               [:daemon :runtime :identity :artifact-count]))
+                   (same-existing-file?
+                    (str fram "/coord_daemon.clj")
+                    (get-in receipt-data
+                            [:daemon :runtime :identity :script :path]))
+                   (same-existing-file?
+                    workspace-log
+                    (get-in receipt-data
+                            [:daemon :runtime :identity :served-log]))
+                   (= candidate-id
+                      (get-in receipt-data
+                              [:finalized_candidate :candidate_id])))
+              (pr-str {:exit (:exit migrate)
+                       :receipt_file (some-> receipt-files first .getName)
+                       :receipt (select-keys receipt-data
+                                             [:format :result :converged
+                                              :source_authority :daemon
+                                              :finalized_candidate])})))
+    (let [after (run-schema port @active-log @active-telemetry
+                            receipts "audit" "--strict")]
       (check! "strict audit passes after migration"
               (zero? (:exit after)) (str "exit=" (:exit after) " out=" (:out after)))
       (check! "audit reports executable authority + governed entity kinds"
               (str/includes? (:out after) "executable predicate entities are authoritative")
               (:out after)))
 
-    (let [lint-after (run-pred port log telemetry "lint" "--strict")]
+    (let [lint-after (run-pred port @active-log @active-telemetry
+                               "lint" "--strict")]
       (check! "connected strict lint passes from migrated graph authority"
               (zero? (:exit lint-after))
               (str "exit=" (:exit lint-after) " out=" (:out lint-after))))
 
-    (let [facts (live-facts log telemetry)]
+    (let [facts (live-facts @active-log @active-telemetry)]
       (check! "valid graph declaration wins over bootstrap intent"
               (= #{"multi"} (values facts "@title" "cardinality")) nil)
       (check! "valid explicit false acyclic policy survives migration"
@@ -417,16 +722,18 @@
       (check! "reviewed ambiguous extension receives only its explicit classification"
               (= #{"vendor/opaque"} (values facts "@ambiguous" "entity_kind")) nil))
 
-    (let [second (run-schema port log telemetry receipts "plan")]
+    (let [second (run-schema port @active-log @active-telemetry
+                             receipts "plan")]
       (check! "post-candidate plan is a zero-delta idempotence proof"
               (and (zero? (:exit second)) (str/includes? (:out second) "0 action(s)"))
               (str "exit=" (:exit second) " out=" (:out second))))
 
-    (let [defined (run-pred port log telemetry "define" "extension/example" "single" "literal"
+    (let [defined (run-pred port @active-log @active-telemetry
+                            "define" "extension/example" "single" "literal"
                             "extension predicate")]
       (check! "pred define writes the exact executable entity"
               (zero? (:exit defined)) (str "exit=" (:exit defined) " out=" (:out defined))))
-    (let [facts (live-facts log telemetry)]
+    (let [facts (live-facts @active-log @active-telemetry)]
       (check! "pred define stores executable metadata on @name"
               (and (= #{"single"} (values facts "@extension/example" "cardinality"))
                    (= #{"literal"} (values facts "@extension/example" "value_kind"))
@@ -434,7 +741,8 @@
       (check! "pred define never creates a historical @pred:* authority"
               (empty? (filter #(= "@pred:extension/example" (:l %)) facts)) nil))
 
-    (let [alias (run-pred port log telemetry "alias" "old" "new")]
+    (let [alias (run-pred port @active-log @active-telemetry
+                          "alias" "old" "new")]
       (check! "unsound executable predicate alias is rejected"
               (= 2 (:exit alias)) (str "exit=" (:exit alias) " err=" (:err alias))))
 

@@ -209,6 +209,71 @@
             ./bin/ensure-private-docs
           ];
         };
+        schemaStageRuntime = pkgs.runCommand "north-schema-stage-io-runtime" {
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+        } ''
+          mkdir -p $out/bin $out/libexec
+          cp ${runtimeSource}/cli/schema-stage-io.py \
+            $out/libexec/schema-stage-io.py
+          makeWrapper ${pkgs.python3}/bin/python3 \
+            $out/bin/north-schema-stage-io \
+            --add-flags $out/libexec/schema-stage-io.py
+        '';
+        schemaStageRuntimeClosure = pkgs.closureInfo {
+          rootPaths = [ schemaStageRuntime ];
+        };
+        schemaStageRuntimeSmoke = pkgs.runCommand
+          "north-schema-stage-runtime-smoke"
+          { }
+          ''
+            test -f ${schemaStageRuntime}/libexec/schema-stage-io.py
+            ${pkgs.gnugrep}/bin/grep -Fq \
+              '${pkgs.python3}/bin/python3' \
+              ${schemaStageRuntime}/bin/north-schema-stage-io
+            ${pkgs.gnugrep}/bin/grep -Fxq \
+              '${pkgs.python3}' \
+              ${schemaStageRuntimeClosure}/store-paths
+
+            schema_smoke_parent="$(${pkgs.coreutils}/bin/mktemp -d)"
+            schema_smoke_owned="$schema_smoke_parent/owned"
+            printf 'schema stage runtime closure probe\n' > "$schema_smoke_owned"
+            schema_smoke_identity="$(${pkgs.python3}/bin/python3 - \
+              "$schema_smoke_owned" <<'PY'
+import json
+import os
+import stat
+import sys
+
+row = os.lstat(sys.argv[1])
+print(json.dumps({
+    "dev": row.st_dev,
+    "ino": row.st_ino,
+    "uid": row.st_uid,
+    "mode": stat.S_IMODE(row.st_mode),
+    "kind": stat.S_IFMT(row.st_mode),
+}, sort_keys=True))
+PY
+            )"
+            ${pkgs.coreutils}/bin/env -i PATH= \
+              ${schemaStageRuntime}/bin/north-schema-stage-io \
+              inspect-retained-file "$schema_smoke_parent" owned \
+              "$schema_smoke_identity" > schema-stage-runtime.out
+            ${pkgs.gnugrep}/bin/grep -Fq '"ok": true' \
+              schema-stage-runtime.out
+            ${pkgs.gnugrep}/bin/grep -Fq '"retained": "owned"' \
+              schema-stage-runtime.out
+            test -e "$schema_smoke_owned"
+            ${pkgs.coreutils}/bin/env -i PATH= \
+              ${schemaStageRuntime}/bin/north-schema-stage-io \
+              read-object "$schema_smoke_parent" owned - \
+              > schema-stage-runtime-read.out
+            ${pkgs.gnugrep}/bin/grep -Fq '"ok": true' \
+              schema-stage-runtime-read.out
+            ${pkgs.gnugrep}/bin/grep -Fq \
+              'schema stage runtime closure probe' \
+              schema-stage-runtime-read.out
+            touch $out
+          '';
         # Runtime-only Gaffer contract. Generated adapters, authoring scripts,
         # skills, and private docs stay out of North's closure.
         gafferContract = pkgs.stdenvNoCC.mkDerivation {
@@ -284,6 +349,7 @@
             # on the packaged binary with "File does not exist: .../cli/*.clj".
             cp -r cli $out/cli
             test ! -e "$out/cli/tests"
+            test -f "$out/cli/schema-stage-io.py"
             # Package the complete TypeScript runtime tree. Hand-maintained
             # transitive import lists inevitably rot as provider adapters grow.
             cp -r sdk/src $out/sdk/src
@@ -320,6 +386,7 @@
               --set NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
               --set NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
               --set NORTH_MCP_BUN ${pkgs.bun}/bin/bun \
+              --set NORTH_SCHEMA_STAGE_PYTHON ${pkgs.python3}/bin/python3 \
               --set NORTH_MANAGED_CODEX_BIN ${codexPkg}/bin/codex \
               --set NORTH_PACKAGE_MODE nix-store \
               --set NORTH_PACKAGE_REV ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")} \
@@ -340,6 +407,7 @@
               --set NORTH_PEER_BB ${pkgs.babashka}/bin/bb \
               --set NORTH_MCP_BB ${pkgs.babashka}/bin/bb \
               --set NORTH_MCP_BUN ${pkgs.bun}/bin/bun \
+              --set NORTH_SCHEMA_STAGE_PYTHON ${pkgs.python3}/bin/python3 \
               --set NORTH_MANAGED_CODEX_BIN ${codexPkg}/bin/codex
 
             for hook in north-mark-delegated north-on-spawn north-on-stop \
@@ -440,11 +508,14 @@ EOF
             test -e ${codexVersionSmoke}
             expected_codex_export="export NORTH_MANAGED_CODEX_BIN='${codexPkg}/bin/codex'"
             expected_mkfifo_export="export NORTH_MKFIFO_BIN='${pkgs.coreutils}/bin/mkfifo'"
+            expected_schema_python_export="export NORTH_SCHEMA_STAGE_PYTHON='${pkgs.python3}/bin/python3'"
             for wrapper in "$out/bin/north" "$out/bin/north-mcp"; do
               test "$(grep -Fxc "$expected_codex_export" "$wrapper")" -eq 1
               test "$(grep -Fc 'NORTH_MANAGED_CODEX_BIN=' "$wrapper")" -eq 1
               test "$(grep -Fxc "$expected_mkfifo_export" "$wrapper")" -eq 1
               test "$(grep -Fc 'NORTH_MKFIFO_BIN=' "$wrapper")" -eq 1
+              test "$(grep -Fxc "$expected_schema_python_export" "$wrapper")" -eq 1
+              test "$(grep -Fc 'NORTH_SCHEMA_STAGE_PYTHON=' "$wrapper")" -eq 1
             done
             mkdir -p "$smoke/home/.local/state/north/threads"
             : > "$smoke/home/.local/state/north/facts.log"
@@ -1021,6 +1092,8 @@ PY
 
         checks = {
           codex-version = codexVersionSmoke;
+        } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          schema-stage-runtime = schemaStageRuntimeSmoke;
         } // lib.optionalAttrs (system == "x86_64-linux") {
           codex-managed-hook-failure = codexManagedHookFailureSmoke;
         };

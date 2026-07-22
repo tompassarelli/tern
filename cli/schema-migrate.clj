@@ -23,6 +23,7 @@
          '[clojure.java.io :as io]
          '[clojure.set :as set]
          '[clojure.string :as str]
+         '[cheshire.core :as json]
          '[fram.fold :as fold]
          '[fram.kernel :as kernel]
          '[fram.rt :as rt])
@@ -31,6 +32,17 @@
   (.getCanonicalPath (io/file (or *file* (System/getProperty "babashka.file")))))
 
 (load-file (str (.getParent (io/file SCHEMA-MIGRATE-SOURCE)) "/coord.clj"))
+(load-file (str (.getParent (io/file SCHEMA-MIGRATE-SOURCE))
+                "/corpus-transaction.clj"))
+(load-file (str (.getParent (io/file SCHEMA-MIGRATE-SOURCE))
+                "/runtime-attestation.clj"))
+(load-file (str (.getParent (io/file SCHEMA-MIGRATE-SOURCE)) "/snapshot.clj"))
+(load-file (str (.getParent (io/file SCHEMA-MIGRATE-SOURCE))
+                "/schema-candidate.clj"))
+(require '[north.corpus-transaction :as corpus-transaction]
+         '[north.schema-candidate :as schema-candidate]
+         '[north.snapshot :as snapshot]
+         '[north.runtime-attestation :as runtime-attestation])
 
 (def VALID-PREDICATE #"^[A-Za-z][A-Za-z0-9_-]*(?:/[A-Za-z][A-Za-z0-9_-]*)?$")
 (def VALID-ENTITY-KIND #"^[a-z][a-z0-9_-]*(?:/[a-z][a-z0-9_-]*)?$")
@@ -39,6 +51,19 @@
 (def REPAIR-MANIFEST-FORMAT "north-schema-repair-manifest/v1")
 (def PLAN-FORMAT "north-schema-plan/v2")
 (def AUDIT-FORMAT "north-schema-audit/v2")
+(def CANDIDATE-RECEIPT-FORMAT "north-schema-candidate-build/v2")
+(def WORKSPACE-FORMAT "north-schema-workspace/v1")
+(def FINAL-CANDIDATE-FORMAT "north-schema-finalized-candidate/v1")
+(def OWNED-STAGE-FORMAT "north-schema-owned-stage/v1")
+(def WORKSPACE-ID-PATTERN
+  #"schema-workspace-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+(def FINAL-CANDIDATE-ID-PATTERN #"schema-candidate-[0-9a-f]{64}")
+(def OWNED-STAGE-NAME-PATTERN
+  #"^\.schema-(workspace|candidate)-stage-v1\.([1-9][0-9]*)\.proc-([1-9][0-9]*)\.([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$")
+(def RECEIPT-STAGE-NAME-PATTERN
+  #"^\.schema-receipt-stage-v1\.([1-9][0-9]*)\.proc-([1-9][0-9]*)\.([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$")
+(def WORKSPACE-FILE-NAMES
+  {:coordination "coordination.log" :telemetry "telemetry.log"})
 
 ;; Fram's transitional fallback is copied only into the migration input.  The
 ;; migration materializes each applicable value as @p cardinality single; no
@@ -182,6 +207,44 @@
     (.update md (.getBytes (str s) java.nio.charset.StandardCharsets/UTF_8))
     (format "%064x" (java.math.BigInteger. 1 (.digest md)))))
 
+(defn bytes-sha256 [bytes]
+  (let [md (java.security.MessageDigest/getInstance "SHA-256")]
+    (.update md ^bytes bytes)
+    (format "%064x" (java.math.BigInteger. 1 (.digest md)))))
+
+(defn corpus-file-stat [path]
+  (let [file (io/file path)
+        nio (.toPath file)
+        attrs (java.nio.file.Files/readAttributes
+               nio
+               java.nio.file.attribute.BasicFileAttributes
+               (make-array java.nio.file.LinkOption 0))
+        unix (java.nio.file.Files/readAttributes
+              nio "unix:dev,ino" (make-array java.nio.file.LinkOption 0))
+        dev (get unix "dev")
+        ino (get unix "ino")]
+    (when-not (and (integer? dev) (integer? ino))
+      (throw (ex-info "filesystem did not expose a stable corpus file identity"
+                      {:type :corpus-file-identity-unavailable
+                       :path (.getCanonicalPath file)})))
+    {:file_key (str dev ":" ino)
+     :bytes (.size attrs)
+     :modified_millis (.toMillis (.lastModifiedTime attrs))}))
+
+(defn corpus-file-record [path]
+  (let [canonical (.getCanonicalPath (io/file path))
+        before (corpus-file-stat canonical)
+        sha256 (file-sha256 canonical)
+        after (corpus-file-stat canonical)]
+    (when-not (= before after)
+      (throw (ex-info "corpus file changed while its content seal was being computed"
+                      {:type :corpus-seal-raced :path canonical
+                       :before before :after after})))
+    {:path canonical
+     :file_key (:file_key after)
+     :bytes (:bytes after)
+     :sha256 sha256}))
+
 (defn configured-path? [path]
   (and (string? path) (not (str/blank? path))))
 
@@ -243,18 +306,20 @@
   (let [paths (->> paths
                    (mapv #(canonical-readable-file! "configured" %))
                    distinct-corpus-paths!)
+        before-files (mapv corpus-file-record paths)
         ops (vec (mapcat rt/read-log paths))
+        files (mapv corpus-file-record paths)
+        _ (when-not (= before-files files)
+            (throw (ex-info "corpus changed while the sealed fold was being read"
+                            {:type :corpus-read-raced
+                             :before before-files :after files})))
         folded (fold-for-cutover ops)]
     {:paths paths
      :ops ops
      :facts (:facts folded)
      :version (:version folded)
      :card_map (:card_map folded)
-     :files (mapv (fn [path]
-                    {:path (.getCanonicalPath (io/file path))
-                     :bytes (.length (io/file path))
-                     :sha256 (file-sha256 path)})
-                  paths)}))
+     :files files}))
 
 (defn source-seal [corpus]
   {:fold_version (:version corpus)
@@ -375,6 +440,40 @@
               {:type :unsafe-corpus-append-boundary
                :path path}))))
   paths)
+
+(defn with-corpus-authority [paths f]
+  (let [channels (atom [])
+        locks (atom [])]
+    (try
+      (doseq [path paths]
+        (let [channel (java.nio.channels.FileChannel/open
+                       (.toPath (io/file path))
+                       (into-array java.nio.file.OpenOption
+                                   [java.nio.file.StandardOpenOption/READ
+                                    java.nio.file.StandardOpenOption/WRITE]))]
+          (swap! channels conj channel)
+          (swap! locks conj (.lock channel))))
+      (f {:mode "advisory-file-locks"
+          :scope "cooperating-processes-only"
+          :paths (mapv #(.getCanonicalPath (io/file %)) paths)})
+      (finally
+        (doseq [lock (reverse @locks)]
+          (try (.release lock) (catch Exception _ nil)))
+        (doseq [channel (reverse @channels)]
+          (try (.close channel) (catch Exception _ nil)))))))
+
+(defn revalidate-sealed-corpus! [corpus]
+  (let [expected (:files corpus)
+        actual (mapv corpus-file-record (:paths corpus))
+        identity-fields [:path :file_key :bytes :sha256]]
+    (when-not (= (mapv #(select-keys % identity-fields) expected)
+                 (mapv #(select-keys % identity-fields) actual))
+      (throw (ex-info "sealed candidate source changed after planning; zero candidate writes attempted"
+                      {:type :sealed-source-drift
+                       :expected (mapv #(select-keys % identity-fields) expected)
+                       :actual (mapv #(select-keys % identity-fields) actual)})))
+    (require-append-boundaries! (:paths corpus))
+    actual))
 
 (defn registrable-predicate? [p]
   (and (string? p) (boolean (re-matches VALID-PREDICATE p))))
@@ -1095,20 +1194,548 @@
                     {:type :candidate-fallback-environment-refused})))
   true)
 
+(defn state-home []
+  (or (when (configured-path? (System/getenv "XDG_STATE_HOME"))
+        (System/getenv "XDG_STATE_HOME"))
+      (str (System/getProperty "user.home") "/.local/state")))
+
+(defn runtime-record-path [port]
+  (or (when (configured-path? (System/getenv "NORTH_COORD_RUNTIME_FILE"))
+        (System/getenv "NORTH_COORD_RUNTIME_FILE"))
+      (str (state-home) "/north/fram-daemon-" port ".runtime")))
+
+(defn attest-selected-fram-runtime! [port log]
+  (runtime-attestation/attest-runtime!
+   {:port port
+    :served-log (.getCanonicalPath (io/file log))
+    :record-path (runtime-record-path port)}))
+
 (defn action-identities [actions]
   (mapv #(select-keys % [:subject :predicate :value]) actions))
 
-(defn write-receipt! [dir receipt]
-  (let [sha (text-sha256 (pr-str receipt))
-        directory (io/file dir)
-        target (io/file directory (str "schema-" sha ".edn"))
-        tmp (io/file directory (str ".schema-" sha ".tmp"))]
+(defn validate-receipt-verdict! [receipt]
+  (when-not (= CANDIDATE-RECEIPT-FORMAT (:format receipt))
+    (throw (ex-info "candidate receipt requires the canonical format"
+                    {:type :invalid-candidate-receipt-format
+                     :expected CANDIDATE-RECEIPT-FORMAT
+                     :actual (:format receipt)})))
+  (let [expected (case (:converged receipt)
+                   true "converged"
+                   false "rejected"
+                   nil)]
+    (when-not (and expected
+                   (= expected (:result receipt))
+                   (if (:converged receipt)
+                     (let [candidate (:finalized_candidate receipt)]
+                       (and (map? candidate)
+                            (re-matches FINAL-CANDIDATE-ID-PATTERN
+                                        (str (:candidate_id candidate)))
+                            (re-matches #"[0-9a-f]{64}"
+                                        (str (:manifest_sha256 candidate)))))
+                     (nil? (:finalized_candidate receipt))))
+      (throw (ex-info "candidate receipt requires an explicit result consistent with :converged"
+                      {:type :invalid-candidate-receipt-verdict
+                       :converged (:converged receipt) :result (:result receipt)
+                       :finalized_candidate (:finalized_candidate receipt)})))
+    receipt))
+
+(defn receipt-bytes [receipt]
+  (snapshot/canonical-edn-bytes (validate-receipt-verdict! receipt)))
+
+(defn receipt-target [dir receipt]
+  (let [bytes (receipt-bytes receipt)
+        sha (bytes-sha256 bytes)]
+    (io/file dir (str "schema-" (:result receipt) "-" sha ".edn"))))
+
+(defn bytes-equal? [path expected]
+  (try
+    (java.util.Arrays/equals ^bytes expected
+                             ^bytes (java.nio.file.Files/readAllBytes (.toPath (io/file path))))
+    (catch Exception _ false)))
+
+(defn regular-receipt-target? [path]
+  (let [nio (.toPath (io/file path))
+        no-follow (into-array java.nio.file.LinkOption
+                              [java.nio.file.LinkOption/NOFOLLOW_LINKS])]
+    (and (not (java.nio.file.Files/isSymbolicLink nio))
+         (java.nio.file.Files/isRegularFile nio no-follow))))
+
+(declare same-receipt-stage-file!)
+
+(defn write-receipt-stage-bytes! [directory stage bytes]
+  (let [current (same-receipt-stage-file! directory stage)]
+  (with-open [channel (java.nio.channels.FileChannel/open
+                       (.toPath (io/file (:path current)))
+                       (into-array java.nio.file.OpenOption
+                                   [java.nio.file.StandardOpenOption/WRITE
+                                    java.nio.file.LinkOption/NOFOLLOW_LINKS]))]
+    (.truncate channel 0)
+    (.position channel 0)
+    (let [buffer (java.nio.ByteBuffer/wrap bytes)]
+      (loop []
+        (when (.hasRemaining buffer)
+          (.write channel buffer)
+          (recur))))
+    (.force channel true))
+  (same-receipt-stage-file! directory current)))
+
+(defn force-directory! [directory]
+  (with-open [channel (java.nio.channels.FileChannel/open
+                       (.toPath (io/file directory))
+                       (into-array java.nio.file.OpenOption
+                                   [java.nio.file.StandardOpenOption/READ]))]
+    (.force channel true))
+  directory)
+
+(def receipt-stage-permissions
+  #{#{java.nio.file.attribute.PosixFilePermission/OWNER_READ
+      java.nio.file.attribute.PosixFilePermission/OWNER_WRITE}
+    #{java.nio.file.attribute.PosixFilePermission/OWNER_READ
+      java.nio.file.attribute.PosixFilePermission/GROUP_READ
+      java.nio.file.attribute.PosixFilePermission/OTHERS_READ}})
+
+(defn receipt-stage-name-parts [file]
+  (when-let [[_ pid ticks nonce]
+             (re-matches RECEIPT-STAGE-NAME-PATTERN
+                         (.getName (io/file file)))]
+    {:pid (parse-long pid)
+     :pid-birth (str "proc:" ticks)
+     :nonce nonce}))
+
+(defn process-owner-state [{:keys [pid pid-birth]}]
+  (try
+    (let [optional (java.lang.ProcessHandle/of (long pid))]
+      (if-not (.isPresent optional)
+        :dead
+        (let [handle (.get optional)]
+          (if-not (.isAlive handle)
+            :dead
+            (let [actual (runtime-attestation/process-birth-token pid)]
+              (cond
+                (nil? actual) :ambiguous
+                (= pid-birth actual) :live
+                :else :dead))))))
+    (catch Throwable _ :ambiguous)))
+
+(defn current-process-owner! []
+  (let [pid (.pid (java.lang.ProcessHandle/current))
+        birth (runtime-attestation/process-birth-token pid)]
+    (when-not (and (pos-int? pid)
+                   (string? birth)
+                   (re-matches #"proc:[1-9][0-9]*" birth))
+      (throw (ex-info "cannot establish receipt-stage process ownership"
+                      {:type :candidate-receipt-stage-owner-unavailable
+                       :pid pid :pid-birth birth})))
+    {:pid pid :pid-birth birth}))
+
+(defn file-owner [path]
+  (java.nio.file.Files/getOwner
+   (.toPath (io/file path))
+   (into-array java.nio.file.LinkOption
+               [java.nio.file.LinkOption/NOFOLLOW_LINKS])))
+
+(defn assert-owned-receipt-stage! [directory candidate]
+  (let [directory (.getCanonicalPath (io/file directory))
+        file (io/file candidate)
+        path (.toPath file)
+        parts (receipt-stage-name-parts file)
+        no-follow (into-array java.nio.file.LinkOption
+                              [java.nio.file.LinkOption/NOFOLLOW_LINKS])]
+    (when-not (and parts
+                   (= directory
+                      (.getCanonicalPath (.getParentFile file)))
+                   (not (java.nio.file.Files/isSymbolicLink path))
+                   (java.nio.file.Files/isRegularFile path no-follow)
+                   (= (file-owner directory) (file-owner file))
+                   (contains? receipt-stage-permissions
+                              (set (java.nio.file.Files/getPosixFilePermissions
+                                    path no-follow))))
+      (throw (ex-info "matching receipt stage lacks exact schema ownership evidence"
+                      {:type :candidate-receipt-stage-ownership-invalid
+                       :path (.getAbsolutePath file)})))
+    (let [attributes
+          (java.nio.file.Files/readAttributes
+           path java.nio.file.attribute.BasicFileAttributes no-follow)
+          links (long (java.nio.file.Files/getAttribute
+                       path "unix:nlink" no-follow))]
+      (when-not (and (.isRegularFile attributes)
+                     (.fileKey attributes)
+                     (<= 1 links 2))
+        (throw (ex-info "receipt stage file identity is ambiguous"
+                        {:type :candidate-receipt-stage-ownership-invalid
+                         :path (.getAbsolutePath file) :links links})))
+      (assoc parts :path (.getCanonicalPath file)
+             :file-key (str (.fileKey attributes))
+             :fd-identity
+             (schema-candidate/file-fd-identity! path)
+             :links links))))
+
+(defn same-receipt-stage-file! [directory expected]
+  (let [actual (assert-owned-receipt-stage! directory (:path expected))]
+    (when-not (= (select-keys expected [:file-key :fd-identity])
+                 (select-keys actual [:file-key :fd-identity]))
+      (throw (ex-info "receipt stage identity changed before inspection"
+                      {:type :candidate-receipt-stage-ownership-invalid
+                       :expected expected :actual actual})))
+    actual))
+
+(defn inspect-retained-receipt-stages! [directory]
+  (let [directory (.getCanonicalPath (io/file directory))
+        prefix ".schema-receipt-stage-v1."
+        candidates (->> (or (.listFiles (io/file directory))
+                            (make-array java.io.File 0))
+                        (filter #(str/starts-with? (.getName ^java.io.File %)
+                                                  prefix))
+                        (sort-by #(.getName ^java.io.File %)))]
+    (reduce
+     (fn [inspected candidate]
+       (try
+         (let [owned (assert-owned-receipt-stage! directory candidate)]
+           (case (process-owner-state owned)
+             :live inspected
+             :dead
+             (let [current (same-receipt-stage-file! directory owned)]
+               (schema-candidate/run-stage-io-helper!
+                ["inspect-retained-file" directory
+                 (.getName (io/file (:path current)))
+                 (json/generate-string (:fd-identity current))])
+               (inc inspected))
+             :ambiguous
+             (throw (ex-info "receipt-stage owner process identity is ambiguous"
+                             {:type :candidate-receipt-stage-owner-ambiguous
+                              :path (:path owned)
+                              :pid (:pid owned)
+                              :pid-birth (:pid-birth owned)}))))
+         (catch java.nio.file.NoSuchFileException _ inspected))
+       )
+     0 candidates)))
+
+(defn create-owned-receipt-stage! [directory]
+  (let [{:keys [pid pid-birth]} (current-process-owner!)
+        ticks (subs pid-birth 5)
+        permissions
+        (java.nio.file.attribute.PosixFilePermissions/asFileAttribute
+         (java.util.HashSet.
+          ^java.util.Collection
+          [java.nio.file.attribute.PosixFilePermission/OWNER_READ
+           java.nio.file.attribute.PosixFilePermission/OWNER_WRITE]))]
+    (loop []
+      (let [nonce (str (java.util.UUID/randomUUID))
+            path (.toPath
+                  (io/file directory
+                           (str ".schema-receipt-stage-v1."
+                                pid ".proc-" ticks "." nonce ".tmp")))
+            created
+            (try
+              (java.nio.file.Files/createFile
+               path (into-array java.nio.file.attribute.FileAttribute
+                                [permissions]))
+              true
+              (catch java.nio.file.FileAlreadyExistsException _ false))]
+        (if created
+          (do
+            (force-directory! directory)
+            (assert-owned-receipt-stage! directory (.toFile path)))
+          (recur))))))
+
+(defn assert-existing-receipt! [target bytes]
+  (let [no-follow (into-array java.nio.file.LinkOption
+                              [java.nio.file.LinkOption/NOFOLLOW_LINKS])]
+  (when-not (and (regular-receipt-target? target)
+                 (bytes-equal? target bytes)
+                 (= #{java.nio.file.attribute.PosixFilePermission/OWNER_READ
+                      java.nio.file.attribute.PosixFilePermission/GROUP_READ
+                      java.nio.file.attribute.PosixFilePermission/OTHERS_READ}
+                    (set (java.nio.file.Files/getPosixFilePermissions
+                          (.toPath (io/file target)) no-follow)))
+                 (= 1 (long (java.nio.file.Files/getAttribute
+                             (.toPath (io/file target)) "unix:nlink"
+                             no-follow))))
+    (throw (ex-info "content-addressed candidate receipt already exists with different bytes"
+                    {:type :candidate-receipt-content-collision
+                       :path (.getCanonicalPath (io/file target))})))
+  (.getCanonicalPath (io/file target))))
+
+(defn ensure-receipt-directory! [dir]
+  (let [directory (io/file dir)]
     (.mkdirs directory)
-    (spit tmp (str (pr-str receipt) "\n"))
-    (java.nio.file.Files/move (.toPath tmp) (.toPath target)
-                              (into-array java.nio.file.CopyOption
-                                          [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
-    (.getCanonicalPath target)))
+    (when-not (and (.isDirectory directory)
+                   (not (java.nio.file.Files/isSymbolicLink
+                         (.toPath directory))))
+      (throw (ex-info "candidate receipt directory is unavailable"
+                      {:type :candidate-receipt-directory-unavailable
+                       :path (.getAbsolutePath directory)})))
+    (.getCanonicalPath directory)))
+
+(defn reserve-receipt-publication! [dir]
+  (let [directory (ensure-receipt-directory! dir)
+        parent-identity (schema-candidate/file-fd-identity! directory)]
+    (inspect-retained-receipt-stages! directory)
+    (let [stage (create-owned-receipt-stage! directory)
+          current-parent (schema-candidate/file-fd-identity! directory)]
+      (when-not (= parent-identity current-parent)
+        (throw (ex-info "receipt sink changed while publication was reserved"
+                        {:type :candidate-receipt-publication-unreserved
+                         :directory directory :expected-parent parent-identity
+                         :actual-parent current-parent})))
+      {:directory directory :parent-identity parent-identity
+       :stage stage})))
+
+(defn release-receipt-publication! [reservation]
+  ;; Linux exposes no unlink-by-FD. The private reservation is retained rather
+  ;; than converting an identity check into a later pathname deletion that
+  ;; could remove a replacement inode.
+  nil)
+
+(defn write-receipt!
+  ([dir receipt]
+   (let [reservation (reserve-receipt-publication! dir)]
+     (write-receipt! dir receipt reservation)))
+  ([dir receipt reservation]
+  (let [bytes (receipt-bytes receipt)
+        directory (ensure-receipt-directory! dir)
+        target (receipt-target directory receipt)
+        tmp (:stage reservation)]
+    (when-not (and (= directory (:directory reservation))
+                   (= (:parent-identity reservation)
+                      (schema-candidate/file-fd-identity! directory)))
+      (throw (ex-info "candidate receipt publication was not reserved for this sink"
+                      {:type :candidate-receipt-publication-unreserved})))
+    (try
+      (let [written (write-receipt-stage-bytes! directory tmp bytes)
+            response
+            (schema-candidate/run-stage-io-helper!
+             ["publish-receipt" directory
+              (.getName (io/file (:path written))) (.getName target)
+              (json/generate-string (:fd-identity written))
+              (bytes-sha256 bytes)
+              (json/generate-string (:parent-identity reservation))])]
+        (when-not (and (= (.getName target) (:target response))
+                       (= (:parent-identity reservation)
+                          (:parent_identity response)))
+          (throw (ex-info "receipt helper returned the wrong target"
+                          {:type :candidate-receipt-publication-invalid
+                           :response response})))
+        (assert-existing-receipt! target bytes))
+      (finally
+        (release-receipt-publication! reservation))))))
+
+(defn required-option! [opts key option]
+  (let [value (get opts key)]
+    (when-not (configured-path? value)
+      (throw (ex-info (str option " is required")
+                      {:type :schema-option-required :option option})))
+    value))
+
+(defn verify-source-snapshot! [opts]
+  (schema-candidate/verify-source!
+   (required-option! opts :snapshot-store "--snapshot-store")
+   (required-option! opts :source-snapshot "--source-snapshot")))
+
+(defn verify-workspace! [opts source repair-manifest-sha]
+  (let [verified
+        (schema-candidate/verify-origin!
+         {:workspace-root (required-option! opts :workspace-root "--workspace-root")
+          :workspace (required-option! opts :workspace "--workspace")
+          :snapshot-store (required-option! opts :snapshot-store "--snapshot-store")
+          :source-snapshot (required-option! opts :source-snapshot "--source-snapshot")
+          :repair-manifest-sha256 repair-manifest-sha})]
+    (when-not (= (:provenance source) (get-in verified [:source :provenance]))
+      (throw (ex-info "schema workspace source snapshot changed"
+                      {:type :schema-source-snapshot-drift})))
+    (dissoc verified :source)))
+
+(defn prepare-workspace! [opts]
+  (let [source (verify-source-snapshot! opts)
+        source-corpus
+        (read-corpus
+         (mapv #(get-in source [:records % :path])
+               [:coordination :telemetry]))
+        manifest (read-repair-manifest!
+                  (required-option! opts :manifest "--manifest") source-corpus)]
+    (schema-candidate/prepare-workspace!
+     {:workspace-root (required-option! opts :workspace-root "--workspace-root")
+      :snapshot-store (required-option! opts :snapshot-store "--snapshot-store")
+      :source-snapshot (required-option! opts :source-snapshot "--source-snapshot")
+      :repair-manifest-sha256 (:_sha256 manifest)
+      :execute? (:execute opts)})))
+
+(defn workspace-identity [workspace]
+  (schema-candidate/workspace-identity workspace))
+
+(defn assert-explicit-workspace-paths! [opts workspace]
+  (doseq [[option role] [[:log :coordination] [:telemetry :telemetry]]]
+    (when-let [selected (get opts option)]
+      (let [actual (.getCanonicalPath (io/file selected))
+            expected (get-in workspace [:records role :path])]
+        (when-not (= expected actual)
+          (throw (ex-info
+                  (str "explicit --" (name option)
+                       " does not name the verified schema workspace payload")
+                  {:type :schema-workspace-path-mismatch
+                   :option option :expected expected :actual actual}))))))
+  workspace)
+
+(defn candidate-build-input! [opts]
+  (let [source (verify-source-snapshot! opts)
+        source-corpus
+        (read-corpus
+         (mapv #(get-in source [:records % :path])
+               [:coordination :telemetry]))
+        manifest (read-repair-manifest!
+                  (required-option! opts :manifest "--manifest") source-corpus)
+        workspace (assert-explicit-workspace-paths!
+                   opts (verify-workspace! opts source (:_sha256 manifest)))
+        corpus (read-corpus (:paths workspace))]
+    (doseq [[role file]
+            (map vector [:coordination :telemetry] (:files corpus))]
+      (when-not (= (select-keys (get-in workspace [:records role])
+                                [:path :file_key :bytes :sha256])
+                   (select-keys file [:path :file_key :bytes :sha256]))
+        (throw (ex-info "schema workspace changed between verification and planning"
+                        {:type :schema-workspace-planning-raced :role role}))))
+    {:source source :source_corpus source-corpus :origin_corpus source-corpus
+     :workspace workspace :corpus corpus :manifest manifest}))
+
+(def BUILT-PROOF-FORMAT "north-schema-built-proof/v1")
+
+(defn canonical-value-sha256 [value]
+  (bytes-sha256 (snapshot/canonical-edn-bytes value)))
+
+(defn corpus-facts-sha256 [corpus]
+  (canonical-value-sha256
+   (->> (:facts corpus) (sort-by (juxt :l :p :r)) vec)))
+
+(defn semantic-plan-evidence [plan]
+  ;; `plan-for` also carries file paths, inode keys, byte modes, and source
+  ;; seals. Those correctly bind a migration attempt, but they must not make an
+  ;; exact byte-for-byte immutable copy look like a different logical schema.
+  (select-keys plan
+               [:schema :corrupt :collisions :actions :ambiguous
+                :unresolved-semantics :cardinality-conflicts
+                :reference-shape-defects :dangling-reference-defects
+                :acyclic-cycle-defects :manifest-defects]))
+
+(defn semantic-audit-evidence [report]
+  (dissoc report :corpus))
+
+(defn finalized-domain-evidence [corpus]
+  (let [plan (plan-for corpus)
+        report (audit-report corpus)
+        proof {:format BUILT-PROOF-FORMAT
+               :post_version (:version corpus)
+               :post_facts_sha256 (corpus-facts-sha256 corpus)
+               :post_plan_sha256
+               (canonical-value-sha256 (semantic-plan-evidence plan))
+               :post_audit_sha256
+               (canonical-value-sha256 (semantic-audit-evidence report))}
+        ok (and (empty? (:actions plan))
+                (empty? (:cardinality-conflicts plan))
+                (:ok report))]
+    {:ok (boolean ok) :proof proof :plan plan :audit report}))
+
+(defn same-logical-corpus? [left right]
+  (and (= (:version left) (:version right))
+       (= (set (:facts left)) (set (:facts right)))))
+
+(defn classify-workspace [workspace current preflight]
+  (let [prepared? (schema-candidate/current-matches-origin? workspace)
+        expected (:simulated_corpus preflight)
+        domain (when (same-logical-corpus? current expected)
+                 (finalized-domain-evidence current))
+        built? (and (:ok domain)
+                    (or (nil? (:built_seal_path workspace))
+                        (try
+                          (= (:proof domain)
+                             (get-in (schema-candidate/verify-built-seal!
+                                      workspace)
+                                     [:seal :proof]))
+                          (catch Throwable _ false))))]
+    (cond
+      (and prepared? (nil? (:built_seal_path workspace)))
+      {:state :prepared :current current}
+
+      built?
+      {:state :built :current current :domain domain}
+
+      :else
+      {:state :diverged :current current
+       :expected_version (:version expected)
+       :actual_version (:version current)})))
+
+(defn finalized-corpus-from-pinned-records! [candidate]
+  (let [records (:records candidate)
+        _ (when-not (every? #(vector? (get-in records [% :ops]))
+                            [:coordination :telemetry])
+            (throw (ex-info
+                    "finalized candidate validator requires pinned payload operations"
+                    {:type :final-schema-candidate-validator-input-invalid})))
+        ops (vec (mapcat #(get-in records [% :ops])
+                         [:coordination :telemetry]))
+        folded (fold-for-cutover ops)]
+    {:paths (mapv #(get-in records [% :path])
+                  [:coordination :telemetry])
+     :ops ops
+     :facts (:facts folded)
+     :version (:version folded)
+     :card_map (:card_map folded)
+     :files
+     (mapv (fn [role]
+             (select-keys (get records role)
+                          [:path :file_key :bytes :sha256]))
+           [:coordination :telemetry])}))
+
+(defn validate-finalized-domain! [candidate]
+  (let [corpus (finalized-corpus-from-pinned-records! candidate)
+        domain (finalized-domain-evidence corpus)
+        expected (get-in candidate [:manifest :build :proof])]
+    {:ok (and (:ok domain) (= expected (:proof domain)))
+     :proof (:proof domain)
+     :remaining_actions (count (get-in domain [:plan :actions]))
+     :audit_ok (get-in domain [:audit :ok])}))
+
+(defn verify-final-candidate! [store selector snapshot-store]
+  (schema-candidate/verify-finalized!
+   {:candidate-store store :candidate selector :snapshot-store snapshot-store
+    :validate! validate-finalized-domain!}))
+
+(defn publish-final-candidate! [opts workspace post _attempt-evidence]
+  (let [current (schema-candidate/verify-origin!
+                 {:workspace-root
+                  (required-option! opts :workspace-root "--workspace-root")
+                  :workspace (required-option! opts :workspace "--workspace")
+                  :snapshot-store
+                  (required-option! opts :snapshot-store "--snapshot-store")
+                  :source-snapshot
+                  (required-option! opts :source-snapshot "--source-snapshot")
+                  :repair-manifest-sha256
+                  (get-in workspace [:manifest :repair_manifest_sha256])
+                 })
+        _ (doseq [[role file]
+                  (map vector [:coordination :telemetry] (:files post))]
+            (when-not (= (select-keys (get-in current [:records role])
+                                      [:path :file_key :bytes :sha256])
+                         (select-keys file [:path :file_key :bytes :sha256]))
+              (throw (ex-info "workspace changed after postcondition validation"
+                              {:type :schema-workspace-post-drift
+                               :role role}))))
+        domain (finalized-domain-evidence post)
+        _ (when-not (:ok domain)
+            (throw (ex-info "workspace is not semantically converged"
+                            {:type :schema-workspace-not-converged})))
+        _ (schema-candidate/seal-built! current (:proof domain))
+        built (schema-candidate/verify-origin!
+               {:workspace-root (:workspace-root opts)
+                :workspace (:workspace opts)
+                :snapshot-store (:snapshot-store opts)
+                :source-snapshot (:source-snapshot opts)
+                :repair-manifest-sha256
+                (get-in workspace [:manifest :repair_manifest_sha256])})]
+    (schema-candidate/verify-built-seal! built)
+    (schema-candidate/publish-finalized!
+     {:snapshot-store (required-option! opts :snapshot-store "--snapshot-store")
+      :workspace built :validate! validate-finalized-domain!
+      :publication (:candidate-publication opts)})))
 
 (defn option-value! [option remaining]
   (let [value (first remaining)]
@@ -1133,8 +1760,14 @@
           "--telemetry" (recur (rest more) (assoc opts :telemetry (option-value! arg more)))
           "--manifest" (recur (rest more) (assoc opts :manifest (option-value! arg more)))
           "--receipt-dir" (recur (rest more) (assoc opts :receipt-dir (option-value! arg more)))
+          "--snapshot-store" (recur (rest more) (assoc opts :snapshot-store (option-value! arg more)))
+          "--source-snapshot" (recur (rest more) (assoc opts :source-snapshot (option-value! arg more)))
+          "--workspace-root" (recur (rest more) (assoc opts :workspace-root (option-value! arg more)))
+          "--workspace" (recur (rest more) (assoc opts :workspace (option-value! arg more)))
+          "--candidate-store" (recur (rest more) (assoc opts :candidate-store (option-value! arg more)))
+          "--candidate" (recur (rest more) (assoc opts :candidate (option-value! arg more)))
           ;; Compatibility with the abandoned lane's positional log argument.
-          (if (:log opts)
+          (if (or (:log opts) (str/starts-with? arg "--"))
             (throw (ex-info (str "unknown argument: " arg) {}))
             (recur more (assoc opts :log arg))))))))
 
@@ -1269,8 +1902,11 @@
 
 (defn usage! []
   (binding [*out* *err*]
-    (println "usage: schema-migrate.clj <port> {plan|manifest-template|migrate|build-candidate|audit|repair-corrupt} [--execute] [--strict] [--verbose] [--manifest PATH] [--log PATH] [--telemetry PATH] [--receipt-dir PATH]")
-    (println "       coordination and telemetry logs are mandatory; canonical mutation routes through an offline candidate plus corpus-transaction"))
+    (println "usage: schema-migrate.clj <port> {plan|manifest-template|migrate|prepare-workspace|build-candidate|verify-candidate|audit|repair-corrupt} [options]")
+    (println "       prepare-workspace: --snapshot-store DIR --source-snapshot ID --workspace-root DIR --manifest PATH [--execute]")
+    (println "       build-candidate: --snapshot-store DIR --source-snapshot ID --workspace-root DIR --workspace ID --candidate-store DIR --manifest PATH [--execute --offline-confirm]")
+    (println "       verify-candidate: --snapshot-store DIR --candidate-store DIR --candidate ID")
+    (println "       read-only graph verbs retain --log PATH --telemetry PATH; finalized candidates install only through corpus-transaction"))
   (System/exit 2))
 
 (defn print-preflight [preflight]
@@ -1281,133 +1917,272 @@
     (doseq [defect (:defects preflight)]
       (println (str "  ✗ candidate preflight: " (pr-str defect))))))
 
-(defn require-offline-daemon! [port log version]
-  (let [status (north.coord/strict-coordinator-status port log)]
-    (when-not (and (:ready status) (= version (:version status)))
-      (throw (ex-info "offline candidate coordinator is not strict-ready on the exact sealed corpus version"
-                      {:type :offline-candidate-daemon-mismatch
-                       :expected_version version :status status})))
-    status))
+(defn require-offline-daemon!
+  ([port log version]
+   (require-offline-daemon! port log version
+                            (attest-selected-fram-runtime! port log)))
+  ([port log version runtime]
+   (let [status (north.coord/strict-coordinator-status port log)]
+     (when-not (and (:ready status) (= version (:version status)))
+       (throw (ex-info "offline candidate coordinator is not strict-ready on the exact sealed corpus version"
+                       {:type :offline-candidate-daemon-mismatch
+                        :expected_version version :status status})))
+     (assoc status :runtime runtime))))
 
-(defn execute-offline-candidate! [port paths corpus manifest opts]
+(defn reverify-source-snapshot! [opts expected]
+  (let [actual (verify-source-snapshot! opts)]
+    (when-not (= (:provenance expected) (:provenance actual))
+      (throw (ex-info "source snapshot identity changed during schema candidate construction"
+                      {:type :schema-source-snapshot-drift
+                       :expected (:provenance expected)
+                       :actual (:provenance actual)})))
+    actual))
+
+(defn execute-offline-candidate!
+  [port source workspace origin-corpus current-corpus manifest opts]
   (when-not (:offline-confirm opts)
     (throw (ex-info "build-candidate --execute requires --offline-confirm"
                     {:type :offline-confirm-required})))
-  (assert-offline-candidate! paths)
-  (require-append-boundaries! paths)
-  (let [preflight (candidate-preflight corpus manifest)]
+  (let [paths (:paths workspace)
+        preflight (candidate-preflight origin-corpus manifest)
+        initial-state (classify-workspace workspace current-corpus preflight)]
+    (assert-offline-candidate! paths)
+    (require-append-boundaries! paths)
     (print-plan (:plan preflight) (:verbose opts))
     (print-preflight preflight)
     (when-not (:ok preflight)
       (throw (ex-info "complete candidate preflight failed; zero coordinator writes attempted"
                       {:type :candidate-preflight-failed
                        :defects (:defects preflight)})))
-    (let [daemon-status (require-offline-daemon! port (first paths) (:version corpus))
-          acknowledged (apply-wire-actions! port (:wire_actions preflight))
-          post (read-corpus paths)
-          post-plan (plan-for post)
-          report (audit-report post)
-          expected-post (get preflight :simulated_corpus)
-          expected-version (+ (long (:version corpus))
-                              (count (:wire_actions preflight)))
-          exact-simulation? (and (= expected-version (:version post))
-                                 (= (set (:facts expected-post))
-                                    (set (:facts post))))
-          converged? (and exact-simulation?
-                          (empty? (:actions post-plan))
-                          (empty? (:cardinality-conflicts post-plan))
-                          (:ok report))
-          receipt {:format "north-schema-candidate-build/v1"
-                   :source (source-seal corpus)
-                   :manifest_sha256 (:_sha256 manifest)
-                   :plan_sha256 (get-in preflight [:plan :sha256])
-                   :simulated_post_plan_sha256 (get-in preflight [:post_plan :sha256])
-                   :daemon daemon-status
+    (when (= :diverged (:state initial-state))
+      (throw (ex-info "schema workspace is neither prepared nor exactly converged"
+                      {:type :schema-workspace-diverged
+                       :state initial-state})))
+    ;; Both publication sinks prove create/retained-stage authority before the first
+    ;; coordinator request. Their live owned stages remain reserved through the
+    ;; locked build/finalization callback.
+    (let [candidate-publication
+          (schema-candidate/reserve-publication!
+           (required-option! opts :candidate-store "--candidate-store"))
+          receipt-dir (or (:receipt-dir opts) (default-receipt-dir))
+          receipt-publication
+          (try
+            (reserve-receipt-publication! receipt-dir)
+            (catch Throwable error
+              (schema-candidate/release-publication! candidate-publication)
+              (throw error)))
+          execution-opts (assoc opts :candidate-publication
+                               candidate-publication)]
+      (try
+        (with-corpus-authority
+          paths
+          (fn [authority]
+            (let [locked-source (reverify-source-snapshot! opts source)
+                  locked-workspace
+                  (verify-workspace! opts locked-source (:_sha256 manifest))
+                  current (read-corpus paths)
+                  locked-state (classify-workspace
+                                locked-workspace current preflight)
+                  _ (when (= :diverged (:state locked-state))
+                      (throw (ex-info
+                              "schema workspace drifted before coordinator access"
+                              {:type :schema-workspace-diverged
+                               :state locked-state})))
+                  prepared? (= :prepared (:state locked-state))
+                  runtime (when prepared?
+                            (attest-selected-fram-runtime! port (first paths)))
+                  daemon-status
+                  (if prepared?
+                    (require-offline-daemon!
+                     port (first paths) (:version origin-corpus) runtime)
+                    {:ready true :resumed_finalization true
+                     :wire_skipped true :version (:version current)})
+                  _ (when runtime
+                      (runtime-attestation/assert-current! runtime))
+                  _ (reverify-source-snapshot! opts source)
+                  immediately-before
+                  (if prepared?
+                    (let [sealed (read-corpus paths)
+                          state (classify-workspace
+                                 locked-workspace sealed preflight)]
+                      (when-not (= :prepared (:state state))
+                        (throw (ex-info
+                                "schema workspace changed immediately before append"
+                                {:type :schema-workspace-drift
+                                 :state state})))
+                      (revalidate-sealed-corpus! sealed)
+                      sealed)
+                    current)
+                  acknowledged
+                  (if prepared?
+                    (apply-wire-actions! port (:wire_actions preflight))
+                    0)
+                  post (read-corpus paths)
+                  post-plan (plan-for post)
+                  report (audit-report post)
+                  expected-post (:simulated_corpus preflight)
+                  expected-version (:version expected-post)
+                  exact-simulation? (same-logical-corpus? post expected-post)
+                  converged? (and exact-simulation?
+                                  (empty? (:actions post-plan))
+                                  (empty? (:cardinality-conflicts post-plan))
+                                  (:ok report))
+                  result (if converged? "converged" "rejected")
+                  _ (reverify-source-snapshot! opts source)
+                  _ (when runtime
+                      (runtime-attestation/assert-current! runtime))
+                  build-evidence
+                  {:daemon daemon-status
+                   :workspace_entry_state (:state locked-state)
+                   :source_plan_sha256 (get-in preflight [:plan :sha256])
+                   :simulated_post_plan_sha256
+                   (get-in preflight [:post_plan :sha256])
                    :requested_action_identities
-                   (mapv #(select-keys % [:action :subject :predicate :value])
+                   (mapv #(select-keys
+                           % [:action :subject :predicate :value])
                          (:wire_actions preflight))
                    :actions_acknowledged acknowledged
                    :expected_post_version expected-version
                    :actual_post_version (:version post)
                    :post_matches_simulation exact-simulation?
                    :post_plan_sha256 (:sha256 post-plan)
-                   :remaining_action_identities (action-identities (:actions post-plan))
+                   :remaining_action_identities
+                   (action-identities (:actions post-plan))
+                   :post_audit report}
+                  finalized
+                  (when converged?
+                    (publish-final-candidate!
+                     execution-opts locked-workspace post build-evidence))
+                  finalized-summary
+                  (when finalized
+                    {:candidate_id (:candidate_id finalized)
+                     :manifest_sha256 (:manifest_sha256 finalized)})
+                  receipt
+                  {:format CANDIDATE-RECEIPT-FORMAT
+                   :result result
+                   :source (source-seal origin-corpus)
+                   :source_snapshot (:provenance source)
+                   :workspace_preimage
+                   {:workspace_id (:workspace_id workspace)
+                    :manifest_sha256 (:manifest_sha256 workspace)
+                    :files (get-in workspace [:manifest :files])}
+                   :source_authority
+                   {:lock authority
+                    :revalidated_files (:files immediately-before)
+                    :held_through_candidate_and_receipt_publication true}
+                   :manifest_sha256 (:_sha256 manifest)
+                   :plan_sha256 (get-in preflight [:plan :sha256])
+                   :simulated_post_plan_sha256
+                   (get-in preflight [:post_plan :sha256])
+                   :daemon daemon-status
+                   :requested_action_identities
+                   (mapv #(select-keys
+                           % [:action :subject :predicate :value])
+                         (:wire_actions preflight))
+                   :actions_acknowledged acknowledged
+                   :expected_post_version expected-version
+                   :actual_post_version (:version post)
+                   :post_matches_simulation exact-simulation?
+                   :post_plan_sha256 (:sha256 post-plan)
+                   :remaining_action_identities
+                   (action-identities (:actions post-plan))
                    :converged converged?
                    :post_audit report
-                   :candidate_corpus (:files post)}
-          receipt-path (write-receipt! (or (:receipt-dir opts) (default-receipt-dir)) receipt)]
-      (print-audit report)
-      (println (str "  receipt " receipt-path))
-      (when-not converged?
-        (throw (ex-info "offline candidate diverged from its complete simulation"
+                   :candidate_corpus (:files post)
+                   :finalized_candidate finalized-summary}
+                  receipt-path
+                  (write-receipt! receipt-dir receipt receipt-publication)]
+              (print-audit report)
+              (println (str "  receipt " receipt-path " result=" result))
+              (when-not converged?
+                (throw (ex-info
+                        "offline candidate diverged from its complete simulation"
                         {:type :candidate-postcondition-failed
+                         :receipt receipt-path :result result
                          :post_matches_simulation exact-simulation?
                          :expected_version expected-version
                          :actual_version (:version post)
                          :remaining (count (:actions post-plan))
                          :audit_ok (:ok report)})))
-      receipt)))
-
+              receipt)))
+        (finally
+          (release-receipt-publication! receipt-publication)
+          (schema-candidate/release-publication!
+           candidate-publication))))))
 (defn main! [args]
   (let [[port-arg verb & raw-args] args]
     (when-not (and port-arg verb) (usage!))
     (let [port (Integer/parseInt port-arg)
-          opts (parse-opts raw-args)
-          log (or (:log opts) (System/getenv "FRAM_LOG") (north.coord/expected-log))
-          telemetry (or (:telemetry opts) (System/getenv "FRAM_TELEMETRY_LOG"))
-          paths (resolve-corpus-paths! log telemetry)
-          corpus (read-corpus paths)
-          manifest (when (:manifest opts)
-                     (read-repair-manifest! (:manifest opts) corpus))]
-      (case verb
-        "plan"
-        (print-plan (plan-for corpus manifest) (:verbose opts))
+          opts (parse-opts raw-args)]
+      (cond
+        (= "prepare-workspace" verb)
+        (println (pr-str (prepare-workspace! opts)))
 
-        "manifest-template"
-        (let [plan (plan-for corpus)]
-          (println (pr-str (manifest-template corpus plan))))
+        (= "verify-candidate" verb)
+        (println
+         (pr-str
+          (verify-final-candidate!
+           (required-option! opts :candidate-store "--candidate-store")
+           (required-option! opts :candidate "--candidate")
+           (required-option! opts :snapshot-store "--snapshot-store"))))
 
-        "audit"
-        (let [report (audit-report corpus)]
-          (print-audit report)
-          (when (and (:strict opts) (not (:ok report))) (System/exit 1)))
-
-        "migrate"
-        (let [plan (plan-for corpus manifest)]
-          (print-plan plan (:verbose opts))
+        (= "build-candidate" verb)
+        (let [{:keys [source workspace origin_corpus corpus manifest]}
+              (candidate-build-input! opts)
+              preflight (candidate-preflight origin_corpus manifest)
+              state (classify-workspace workspace corpus preflight)]
           (if (:execute opts)
-            (throw (ex-info "direct migrate --execute is disabled before the first write; build a reviewed offline candidate, then install it with north corpus-transaction"
-                            {:type :direct-schema-migration-disabled
-                             :route "build-candidate + corpus-transaction"}))
-            (println "  plan-only compatibility verb; use manifest-template, then build-candidate on disposable copies")))
-
-        "build-candidate"
-        (if (:execute opts)
-          (do
-            (when-not manifest
-              (throw (ex-info "build-candidate --execute requires --manifest PATH"
-                              {:type :missing-repair-manifest})))
-            (execute-offline-candidate! port paths corpus manifest opts))
-          (let [plan (plan-for corpus manifest)
-                preflight (when manifest (candidate-preflight corpus manifest))]
-            (print-plan plan (:verbose opts))
-            (if preflight
+            (execute-offline-candidate!
+             port source workspace origin_corpus corpus manifest opts)
+            (do
+              (print-plan (:plan preflight) (:verbose opts))
               (print-preflight preflight)
-              (println "  dry-run only; supply a reviewed manifest to evaluate complete preflight"))))
+              (println (str "  workspace_state " (name (:state state)))))))
 
-        "repair-corrupt"
-        (let [bad (corrupt-facts (:facts corpus))]
-          (println (str "repair-corrupt — " (count bad) " live non-registrable predicate fact(s)"))
-          (doseq [fact bad]
-            (println (str "  would retract exact triple "
-                          (pr-str (select-keys fact [:l :p :r])))))
-          (if (:execute opts)
-            (throw (ex-info "repair-corrupt execute unavailable: corpus transaction required; no bytes written"
-                            {:type :corpus-transaction-required
-                             :count (count bad)}))
-            (println "  diagnostic dry-run only; no bytes written")))
+        :else
+        (let [log (or (:log opts) (System/getenv "FRAM_LOG")
+                      (north.coord/expected-log))
+              telemetry (or (:telemetry opts)
+                            (System/getenv "FRAM_TELEMETRY_LOG"))
+              paths (resolve-corpus-paths! log telemetry)
+              corpus (read-corpus paths)
+              manifest (when (:manifest opts)
+                         (read-repair-manifest! (:manifest opts) corpus))]
+          (case verb
+            "plan"
+            (print-plan (plan-for corpus manifest) (:verbose opts))
 
-        (usage!)))))
+            "manifest-template"
+            (let [plan (plan-for corpus)]
+              (println (pr-str (manifest-template corpus plan))))
+
+            "audit"
+            (let [report (audit-report corpus)]
+              (print-audit report)
+              (when (and (:strict opts) (not (:ok report))) (System/exit 1)))
+
+            "migrate"
+            (let [plan (plan-for corpus manifest)]
+              (print-plan plan (:verbose opts))
+              (if (:execute opts)
+                (throw (ex-info "direct migrate --execute is disabled before the first write; build a reviewed offline candidate, then install it with north corpus-transaction"
+                                {:type :direct-schema-migration-disabled
+                                 :route "prepare-workspace + build-candidate + corpus-transaction"}))
+                (println "  plan-only compatibility verb; use prepare-workspace, then build-candidate on that exact owned workspace")))
+
+            "repair-corrupt"
+            (let [bad (corrupt-facts (:facts corpus))]
+              (println (str "repair-corrupt — " (count bad) " live non-registrable predicate fact(s)"))
+              (doseq [fact bad]
+                (println (str "  would retract exact triple "
+                              (pr-str (select-keys fact [:l :p :r])))))
+              (if (:execute opts)
+                (throw (ex-info "repair-corrupt execute unavailable: corpus transaction required; no bytes written"
+                                {:type :corpus-transaction-required
+                                 :count (count bad)}))
+                (println "  diagnostic dry-run only; no bytes written")))
+
+            (usage!)))))))
 
 (defn invoked-as-script? []
   (when-let [main-source (System/getProperty "babashka.file")]
