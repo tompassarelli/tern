@@ -387,6 +387,7 @@ function createSupervisorControl(): SupervisorControl {
 }
 
 const SAFE_NOTIFICATIONS = new Set([
+  "configWarning",
   "remoteControl/status/changed",
   "mcpServer/startupStatus/updated",
   "account/rateLimits/updated",
@@ -1306,6 +1307,15 @@ export class ManagedCodexAppServerRun {
     // never as a detached unhandled rejection.
     void terminal.catch(() => {});
     const validateConnectionNotification = (method: string, value: unknown): boolean => {
+      if (method === "configWarning") {
+        const params = record(value, "Codex config warning");
+        onlyKeys(params, ["summary", "details"], "Codex config warning");
+        const expectedSummary = "Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted, but skills still load.\n"
+          + `    1. ${contract.cwd}/.codex\n`
+          + `       ${contract.cwd} is marked as untrusted in ${contract.codexHome}/config.toml. To load project-local config, hooks, and exec policies, mark it trusted.\n`;
+        exact(params, { summary: expectedSummary, details: null }, "Codex config warning");
+        return true;
+      }
       if (method === "remoteControl/status/changed") {
         const params = record(value, "Codex remote-control status");
         onlyKeys(params, ["status", "serverName", "installationId", "environmentId"],

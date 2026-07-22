@@ -393,6 +393,15 @@ function setup(mode = "ok") {
           userAgent,
           codexHome, platformFamily: "unix", platformOs: "linux",
         });
+        if (mode === "config-warning" || mode === "config-warning-drift") {
+          const expectedSummary = "Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted, but skills still load.\n"
+            + `    1. ${cwd}/.codex\n`
+            + `       ${cwd} is marked as untrusted in ${codexHome}/config.toml. To load project-local config, hooks, and exec policies, mark it trusted.\n`;
+          notify("configWarning", {
+            summary: mode === "config-warning-drift" ? `${expectedSummary}drift` : expectedSummary,
+            details: null,
+          });
+        }
         const remote: any = {
           status: "disabled", serverName: "fixture", installationId: "fixture-installation",
           environmentId: null,
@@ -924,7 +933,7 @@ test("pre-thread authority mutants fail before thread/start", async () => {
     "hook-failure-continue", "hook-failure-unrecognized",
     "feature-default-enabled", "feature-omitted", "mcp-resource", "mcp-template", "mcp-auth",
     "mcp-server-info", "remote-enabled", "remote-extra-field", "remote-missing-installation",
-    "notification-unknown-prethread", "server-request-prethread",
+    "notification-unknown-prethread", "server-request-prethread", "config-warning-drift",
   ];
   for (const mode of modes) {
     const { options, requests } = setup(mode);
@@ -932,6 +941,12 @@ test("pre-thread authority mutants fail before thread/start", async () => {
       .rejects.toBeInstanceOf(ManagedCodexPreThreadError);
     expect(requests.some(({ method }) => method === "thread/start")).toBe(false);
   }
+});
+
+test("the exact untrusted-project config warning is accepted before thread/start", async () => {
+  const { options, requests } = setup("config-warning");
+  await expect(new ManagedCodexAppServerRun(options).execute()).resolves.toBeDefined();
+  expect(requests.some(({ method }) => method === "thread/start")).toBe(true);
 });
 
 test("every security-relevant thread/start response field is attested independently", async () => {
