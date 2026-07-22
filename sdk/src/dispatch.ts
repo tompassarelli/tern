@@ -6,7 +6,11 @@ import {
   harnessCompositionEvidence, harnessOptions, renewHarnessPresence, DEFAULT_SYSTEM_PROMPT,
   type Effort, type HarnessCompositionEvidence,
 } from "./harness";
-import { inputChannel, subscribeFeed } from "./coordination";
+import {
+  inputChannel,
+  LiveFeedReapTimeoutError,
+  subscribeFeed,
+} from "./coordination";
 import { normalizeUsage } from "./usage";
 import { classifyTurnProvenance, newRunId, recordRun } from "./telemetry";
 import { publishRunLifecycleLedger } from "./run-ledger";
@@ -638,14 +642,18 @@ async function runDispatch(
   }
 
   if (liveInputFreezeError) {
+    let retrySucceeded = false;
     try {
       await liveInputRoute.freezeAndUnbind();
+      retrySucceeded = true;
+    } catch { /* the original freeze error remains the terminal authority */ }
+    const error = liveInputFreezeError instanceof Error
+      ? liveInputFreezeError
+      : new Error("managed live-input route could not be frozen");
+    if (retrySucceeded && !(error instanceof LiveFeedReapTimeoutError)) {
       liveInputFreezeError = undefined;
-    } catch {
+    } else {
       outcome = "died";
-      const error = liveInputFreezeError instanceof Error
-        ? liveInputFreezeError
-        : new Error("managed live-input route could not be frozen");
       terminalSignal = { subject: "AGENT DEATH", detail: deathReason(error) };
       terminalAuxiliaryWrites.push((timeoutMs) =>
         notifyDeath(agentId, error, { thread: threadId }, timeoutMs)

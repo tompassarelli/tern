@@ -93,6 +93,7 @@ export class ManagedLiveInputRoute {
   private subscription: FeedSubscription | undefined;
   private everArmedStreaming = false;
   private settlementRequired = false;
+  private unbindSettlement: Promise<void> = Promise.resolve();
   private readonly settlementFeedSubscriber: FeedSubscriber;
 
   constructor(
@@ -166,7 +167,24 @@ export class ManagedLiveInputRoute {
   private async unbind(): Promise<void> {
     const subscription = this.subscription;
     this.subscription = undefined;
-    if (subscription) await subscription();
+    if (subscription) {
+      let currentSettlement: Promise<void>;
+      try {
+        currentSettlement = Promise.resolve(subscription());
+      } catch (error) {
+        currentSettlement = Promise.reject(error);
+      }
+      // Stopping a later transport must never erase an earlier failed child
+      // settlement. Repeated callers share this cumulative promise, so a reap
+      // timeout remains terminal while successful unbinds stay idempotent.
+      void currentSettlement.catch(() => {});
+      this.unbindSettlement = this.unbindSettlement.then(
+        () => currentSettlement,
+        (error) => { throw error; },
+      );
+      void this.unbindSettlement.catch(() => {});
+    }
+    await this.unbindSettlement;
   }
 
   private async drainAndUnbind(): Promise<void> {
@@ -176,6 +194,11 @@ export class ManagedLiveInputRoute {
     }
     let subscription = this.subscription;
     if (!subscription) {
+      // A fresh settlement feed can recover a failed graph publication or
+      // drain only after the prior transport proved that its child reaped.
+      // Re-awaiting this shared settlement replays a terminal stop rejection
+      // instead of manufacturing success from an absent subscription.
+      await this.unbindSettlement;
       // A prior freeze write or drain may have failed after transport teardown.
       // Recovery must earn a fresh barrier rather than treating absence as
       // success: arm a dedicated settlement feed against the now-frozen route.

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  LiveFeedReapTimeoutError,
   LiveFeedStartupTimeoutError,
   type FeedSubscription,
 } from "../src/coordination";
@@ -77,6 +78,58 @@ test("terminal unbind waits for direct feed-child settlement", async () => {
     "stop",
     "reaped",
   ]);
+});
+
+test("terminal reap rejection is shared by repeated freeze calls with one stop", async () => {
+  const reapTimeout = new LiveFeedReapTimeoutError(5_000);
+  const stopSettlement = Promise.reject(reapTimeout);
+  void stopSettlement.catch(() => {});
+  let stops = 0;
+  const route = new ManagedLiveInputRoute(
+    "lane-sticky-reap-timeout",
+    { kind: "lane" },
+    initialRoute,
+    () => inputAdmission,
+    () => subscription(
+      Promise.resolve(),
+      () => {
+        stops++;
+        return stopSettlement;
+      },
+    ),
+    () => {},
+  );
+  await route.activate(initialRoute);
+
+  const first = await route.freezeAndUnbind().catch((error) => error);
+  const second = await route.freezeAndUnbind().catch((error) => error);
+
+  expect(first).toBe(reapTimeout);
+  expect(second).toBe(first);
+  expect((second as LiveFeedReapTimeoutError).code)
+    .toBe("NORTH_LIVE_FEED_REAP_TIMEOUT");
+  expect(stops).toBe(1);
+});
+
+test("successful terminal unbind remains idempotent across repeated freeze calls", async () => {
+  let stops = 0;
+  const route = new ManagedLiveInputRoute(
+    "lane-idempotent-terminal-unbind",
+    { kind: "lane" },
+    initialRoute,
+    () => inputAdmission,
+    () => subscription(
+      Promise.resolve(),
+      () => { stops++; },
+    ),
+    () => {},
+  );
+  await route.activate(initialRoute);
+
+  await route.freezeAndUnbind();
+  await route.freezeAndUnbind();
+
+  expect(stops).toBe(1);
 });
 
 test("streaming route publishes armed only after feed readiness", async () => {

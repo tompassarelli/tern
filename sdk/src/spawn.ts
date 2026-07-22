@@ -19,7 +19,11 @@ import { publishRunLifecycleLedger } from "./run-ledger";
 import { resolveManagedCaveman, type CavemanResolution } from "./caveman";
 import { unknownMcpActivity } from "./tool-activity";
 import { causeChain, deathReason, notifyDeath } from "./death";
-import { inputChannel, subscribeFeed } from "./coordination";
+import {
+  inputChannel,
+  LiveFeedReapTimeoutError,
+  subscribeFeed,
+} from "./coordination";
 import {
   bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute, goalFromPrompt,
   userAnchoredPath,
@@ -668,12 +672,11 @@ async function runSpawn(
   // Snapshot BEFORE any cleanup-only failure below can touch outcome: this is
   // the provider's own terminal, not a cleanup verdict. A lane that already
   // reached its success terminal (a real result was read) has done the work;
-  // teardown of the terminal live-feed drain afterward is best-effort cleanup,
-  // not part of the provider turn, and must not retroactively convert a
-  // completed lane into process=died — that would erase real evidence/outcome
-  // the lane already recorded. A drain failure that happens BEFORE a success
-  // terminal (no result yet) is a genuine feed/provider failure and stays
-  // fail-closed via the branches below, unchanged.
+  // teardown of the terminal live-feed drain afterward is usually best-effort
+  // cleanup, not part of the provider turn. The exception is a typed direct-
+  // child reap timeout: an unreaped managed child means the process itself has
+  // not earned a clean terminal. A drain failure that happens BEFORE a success
+  // terminal (no result yet) also stays fail-closed via the branches below.
   const reachedProviderSuccessTerminal = outcome === "ran";
 
   const hostSignal = termination.hostSignal();
@@ -689,14 +692,19 @@ async function runSpawn(
   }
 
   if (liveInputFreezeError) {
+    let retrySucceeded = false;
     try {
       await liveInputRoute.freezeAndUnbind();
+      retrySucceeded = true;
+    } catch { /* the original freeze error remains the terminal authority */ }
+    const error = liveInputFreezeError instanceof Error
+      ? liveInputFreezeError
+      : new Error("managed live-input route could not be frozen");
+    const terminalSettlementFailed = error instanceof LiveFeedReapTimeoutError;
+    if (retrySucceeded && !terminalSettlementFailed) {
       liveInputFreezeError = undefined;
-    } catch {
-      const error = liveInputFreezeError instanceof Error
-        ? liveInputFreezeError
-        : new Error("managed live-input route could not be frozen");
-      if (reachedProviderSuccessTerminal) {
+    } else {
+      if (reachedProviderSuccessTerminal && !terminalSettlementFailed) {
         // Completed provider turn: the feed leak is real (best-effort, logged
         // for operator follow-up) but it is cleanup after success — process/
         // delivery already earned by the completed turn stays as recorded.
@@ -706,6 +714,9 @@ async function runSpawn(
           `[live-input] @agent:${agentId} terminal live-feed drain failed after a completed provider turn — process/delivery preserved (${error.message})`,
         );
       } else {
+        // A direct child that cannot be reaped is not a completed managed
+        // process, even if the provider emitted a result first. Keep the
+        // original typed settlement error and prohibit a clean terminal.
         outcome = "died";
         terminalSignal = { subject: "AGENT DEATH", detail: deathReason(error) };
         terminalAuxiliaryWrites.push((timeoutMs) =>

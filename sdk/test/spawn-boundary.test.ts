@@ -10,12 +10,27 @@ import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { presetRequest } from "./routing-fixtures";
+import { LiveFeedReapTimeoutError } from "../src/coordination";
 
 let dir: string;
 let log: string;
 
 function readySubscription(stop: () => void = () => {}) {
   return Object.assign(stop, {
+    ready: Promise.resolve(),
+    drain: async () => {},
+    isArmed: () => true,
+  });
+}
+
+function reapTimeoutSubscription(counter: { stops: number }) {
+  const error = new LiveFeedReapTimeoutError(5_000);
+  const settlement = Promise.reject(error);
+  void settlement.catch(() => {});
+  return Object.assign(() => {
+    counter.stops++;
+    return settlement;
+  }, {
     ready: Promise.resolve(),
     drain: async () => {},
     isArmed: () => true,
@@ -271,6 +286,76 @@ test("a terminal live-feed drain failure AFTER a completed provider turn preserv
   expect(logged).not.toContain("tell agent:test-drain-safe-completion outcome died");
   expect(logged).not.toContain("tell agent:test-drain-safe-completion delivery_outcome blocked");
   expect(logged).not.toContain("agent_death");
+});
+
+test("a spawn feed reap timeout cannot become a clean terminal on teardown retry", async () => {
+  const { spawn } = await import("./support/spawn");
+  writeFileSync(log, "");
+  const counter = { stops: 0 };
+
+  const result = await spawn({
+    prompt: "complete provider work but fail to reap the live feed",
+    agentId: "test-spawn-reap-timeout",
+    provider: "anthropic",
+    pinEvidence: pinEvidence("anthropic"),
+    routingMetadata: presetRequest("integrator"),
+    feedSubscriber: () => reapTimeoutSubscription(counter),
+    queryFn: () => ({
+      async *[Symbol.asyncIterator]() {
+        yield { type: "result", subtype: "success", result: "provider completed", num_turns: 1 };
+      },
+    }),
+  });
+
+  expect(result).toBe("provider completed");
+  expect(counter.stops).toBe(1);
+  const logged = readFileSync(log, "utf8");
+  expect(logged).toContain("tell agent:test-spawn-reap-timeout outcome died");
+  expect(logged).toContain("tell agent:test-spawn-reap-timeout process_outcome died");
+  expect(logged).toContain("tell agent:test-spawn-reap-timeout delivery_outcome blocked");
+  expect(logged).toContain("North live feed did not reap after bounded termination");
+  expect(logged).not.toContain("tell agent:test-spawn-reap-timeout outcome ran");
+});
+
+test("a dispatch feed reap timeout cannot become a clean terminal on teardown retry", async () => {
+  const { dispatch } = await import("./support/dispatch");
+  writeFileSync(log, "");
+  const counter = { stops: 0 };
+  const previousProvider = process.env.AGENT_PROVIDER;
+  process.env.AGENT_PROVIDER = "anthropic";
+  try {
+    const result = await dispatch("thread-test-dispatch-reap-timeout", {
+      agentId: "test-dispatch-reap-timeout",
+      routingMetadata: presetRequest("integrator"),
+      pinEvidence: pinEvidence("anthropic"),
+      claimDriver: (() => ({ release() {} })) as any,
+      feedSubscriber: () => reapTimeoutSubscription(counter),
+      queryFn: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield { type: "result", subtype: "success", result: "provider completed", num_turns: 1 };
+        },
+      }),
+      loadThreadFacts: () => [
+        { predicate: "title", value: "Dispatch feed reap timeout" },
+        { predicate: "planned", value: "true" },
+        { predicate: "atomic", value: "true" },
+        { predicate: "judgment_grade", value: "s" },
+      ],
+      loadChildren: () => [],
+    });
+
+    expect(result.result).toBe("provider completed");
+  } finally {
+    if (previousProvider === undefined) delete process.env.AGENT_PROVIDER;
+    else process.env.AGENT_PROVIDER = previousProvider;
+  }
+  expect(counter.stops).toBe(1);
+  const logged = readFileSync(log, "utf8");
+  expect(logged).toContain("tell agent:test-dispatch-reap-timeout outcome died");
+  expect(logged).toContain("tell agent:test-dispatch-reap-timeout process_outcome died");
+  expect(logged).toContain("tell agent:test-dispatch-reap-timeout delivery_outcome blocked");
+  expect(logged).toContain("North live feed did not reap after bounded termination");
+  expect(logged).not.toContain("tell agent:test-dispatch-reap-timeout outcome ran");
 });
 
 // The fail-closed peer of the test above: when the provider itself never
