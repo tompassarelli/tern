@@ -303,7 +303,7 @@ PY
             cp staffing/catalog.json $out/staffing/
             cp providers/anthropic.json providers/openai.json $out/providers/
             cp docs/roles.md docs/task-grades.md docs/topologies.md docs/postures.md docs/comms.md $out/docs/
-            cp docs/deltas/opus.md docs/deltas/sonnet.md $out/docs/deltas/
+            cp -r docs/deltas/. $out/docs/deltas/
             runHook postInstall
           '';
         };
@@ -1063,15 +1063,26 @@ PY
             # Runtime Gaffer reads must be hermetic: exercise exact provider/model
             # resolution against the packaged contract, with no sibling checkout.
             GAFFER_HOME=${gafferContract} HOME="$smoke/home" ${pkgs.bun}/bin/bun -e \
-              'import { resolveModelAlias, resolveModelDelta, resolveTier } from "'$out'/sdk/src/providers/catalog.ts";
+              'import { readFileSync } from "node:fs";
+               import { resolveModelAlias, resolveModelDelta, resolveTier } from "'$out'/sdk/src/providers/catalog.ts";
                const route = resolveTier("openai", "frontier");
+               const terra = resolveModelAlias("openai", "terra");
+               const terraDelta = resolveModelDelta("openai", terra);
+               const terraContents = terraDelta.kind === "calibrated" && terraDelta.absolutePath
+                 ? readFileSync(terraDelta.absolutePath, "utf8") : "";
+               const validTerraDelta = terraDelta.provider === "openai"
+                 && terraDelta.model === "gpt-5.6-terra"
+                 && terraDelta.kind === "calibrated"
+                 && terraDelta.path === "docs/deltas/gpt-5.6-terra.md"
+                 && terraContents.startsWith("# gpt-5.6-terra delta");
                const opus = resolveModelAlias("anthropic", "opus");
                const delta = resolveModelDelta("anthropic", opus);
                const validDelta = delta.provider === "anthropic" && delta.model === "claude-opus-4-8"
                  && (delta.kind === "calibrated"
                    ? Boolean(delta.path?.trim() && delta.absolutePath?.trim())
                    : delta.kind === "none" && Boolean(delta.reason?.trim()));
-               if (route.model !== "gpt-5.6-sol" || opus !== "claude-opus-4-8" || !validDelta) process.exit(1);'
+               if (route.model !== "gpt-5.6-sol" || terra !== "gpt-5.6-terra"
+                 || !validTerraDelta || opus !== "claude-opus-4-8" || !validDelta) process.exit(1);'
             grep -q '^## research-grade$' ${gafferContract}/docs/task-grades.md
             grep -q '^## worker$' ${gafferContract}/docs/topologies.md
             grep -q '^## universal$' ${gafferContract}/docs/comms.md
