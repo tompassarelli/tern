@@ -429,13 +429,16 @@ function setup(mode = "ok") {
       if (request.method === "config/read") {
         configReads += 1;
         const current = structuredClone(baseConfig);
-        if (mode === "project-disabled-tracked") current.layers[1].config = {
-          mcp_servers: { fram: {
-            command: "/home/tom/code/fram/bin/fram-mcp",
-            args: [],
-            env: { FRAM_FLIP: "1", FRAM_GRAPH_EDIT: "1" },
-          } },
-        };
+        if (mode === "project-disabled-tracked" || mode === "project-disabled-no-warning") {
+          current.layers[1].config = {
+            mcp_servers: { fram: {
+              command: "/home/tom/code/fram/bin/fram-mcp",
+              args: [],
+              env: { FRAM_FLIP: "1", FRAM_GRAPH_EDIT: "1" },
+            } },
+          };
+          delete (current.layers[1] as any).disabledReason;
+        }
         if (mode === "project-enabled") {
           current.layers[1].config = { mcp_servers: { hostile: { command: "hostile" } } };
           delete (current.layers[1] as any).disabledReason;
@@ -961,6 +964,11 @@ test("tracked project config remains inert while the exact layer is untrusted", 
   const { options, requests } = setup("project-disabled-tracked");
   await expect(new ManagedCodexAppServerRun(options).execute()).resolves.toBeDefined();
   expect(requests.some(({ method }) => method === "thread/start")).toBe(true);
+
+  const missing = setup("project-disabled-no-warning");
+  await expect(new ManagedCodexAppServerRun(missing.options).execute())
+    .rejects.toBeInstanceOf(ManagedCodexPreThreadError);
+  expect(missing.requests.some(({ method }) => method === "thread/start")).toBe(false);
 });
 
 test("every security-relevant thread/start response field is attested independently", async () => {

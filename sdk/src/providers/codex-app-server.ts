@@ -612,12 +612,14 @@ function validateDisabledProjectConfig(value: JsonObject): void {
 function validateConfig(
   response: unknown,
   contract: LaunchContract,
+  exactProjectWarningSeen = false,
 ): string {
   const body = record(response, "Codex config/read response");
   const config = record(body.config, "Codex effective config");
   if (!Array.isArray(body.layers)) throw new Error("Codex config/read omitted layers");
   const layers = body.layers.map((raw) => record(raw, "Codex config layer"));
   const seen = new Map<string, number>();
+  let projectWarningRequired = false;
   for (const layer of layers) {
     const name = record(layer.name, "Codex config layer name");
     const type = boundedString(name.type, "Codex config layer type", 64);
@@ -628,11 +630,14 @@ function validateConfig(
     if (type === "sessionFlags") {
       exact(layerConfig, contract.expectedSessionConfig, "Codex session authority layer");
     } else if (type === "project") {
-      onlyKeys(layer, ["name", "version", "config", "disabledReason"], "Codex project layer");
+      onlyKeys(layer, layer.disabledReason === undefined
+        ? ["name", "version", "config"]
+        : ["name", "version", "config", "disabledReason"], "Codex project layer");
       onlyKeys(name, ["type", "dotCodexFolder"], "Codex project layer name");
-      if (layer.disabledReason !== "untrusted")
+      if (layer.disabledReason !== undefined && layer.disabledReason !== "untrusted")
         throw new Error("Codex project layer is not disabled");
       validateDisabledProjectConfig(layerConfig);
+      if (Object.keys(layerConfig).length > 0) projectWarningRequired = true;
       if (boundedString(name.dotCodexFolder, "Codex project layer folder", 4_096)
           !== join(contract.projectRoot, ".codex"))
         throw new Error("Codex project layer names an invalid config folder");
@@ -649,6 +654,8 @@ function validateConfig(
   }
   if (seen.get("sessionFlags") !== 1 || seen.get("user") !== 1)
     throw new Error("Codex config layer authority is incomplete");
+  if (projectWarningRequired && !exactProjectWarningSeen)
+    throw new Error("Codex tracked project layer lacks its exact disabled warning");
 
   const expectedFeatures = Object.fromEntries([
     ...MANAGED_CODEX_ENABLED_FEATURES.map((name) => [name, true] as const),
@@ -1328,6 +1335,7 @@ export class ManagedCodexAppServerRun {
     // handler immediately so that the same error is observed by the main flow,
     // never as a detached unhandled rejection.
     void terminal.catch(() => {});
+    let exactProjectWarningSeen = false;
     const validateConnectionNotification = (method: string, value: unknown): boolean => {
       if (method === "configWarning") {
         const params = record(value, "Codex config warning");
@@ -1336,6 +1344,7 @@ export class ManagedCodexAppServerRun {
           + `    1. ${contract.cwd}/.codex\n`
           + `       ${contract.cwd} is marked as untrusted in ${contract.codexHome}/config.toml. To load project-local config, hooks, and exec policies, mark it trusted.\n`;
         exact(params, { summary: expectedSummary, details: null }, "Codex config warning");
+        exactProjectWarningSeen = true;
         return true;
       }
       if (method === "remoteControl/status/changed") {
@@ -1439,7 +1448,7 @@ export class ManagedCodexAppServerRun {
       rpc.notify("initialized", {});
       validateAccount(await rpc.request("account/read", {}));
       const config = await rpc.request("config/read", { includeLayers: true, cwd: contract.cwd });
-      const fingerprint = validateConfig(config, contract);
+      const fingerprint = validateConfig(config, contract, exactProjectWarningSeen);
       validateRequirements(await rpc.request("configRequirements/read"));
       validateHooks(await rpc.request("hooks/list", { cwds: [contract.cwd] }), contract.cwd);
       await validateMcp(rpc, this.options.surface.northEnabledTools);
@@ -1480,7 +1489,7 @@ export class ManagedCodexAppServerRun {
         // widened config, hook set, or MCP tool grant fails the turn closed
         // rather than executing a continuation under changed capability.
         const repeated = await rpc.request("config/read", { includeLayers: true, cwd: contract.cwd });
-        if (validateConfig(repeated, contract) !== fingerprint)
+        if (validateConfig(repeated, contract, exactProjectWarningSeen) !== fingerprint)
           throw new Error("Codex config authority changed after thread/start");
         validateHooks(await rpc.request("hooks/list", { cwds: [contract.cwd] }), contract.cwd);
         await validateMcp(rpc, this.options.surface.northEnabledTools, threadId);
@@ -1515,7 +1524,7 @@ export class ManagedCodexAppServerRun {
         const terminalConfig = await rpc.request("config/read", {
           includeLayers: true, cwd: contract.cwd,
         });
-        if (validateConfig(terminalConfig, contract) !== fingerprint)
+        if (validateConfig(terminalConfig, contract, exactProjectWarningSeen) !== fingerprint)
           throw new Error("Codex config authority changed at terminal settlement");
         rpc.assertHealthy();
         protocolSucceeded = true;
