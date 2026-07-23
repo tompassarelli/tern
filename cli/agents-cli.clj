@@ -215,14 +215,29 @@
 
 (declare known semantic-handle)
 
+(def max-agent-facts-one-rows 256)
+
 (defn- agent-facts-one [id]
-  (let [r (run [(str NORTH "/bin/north") "json" "show" (str "agent:" id)] :timeout 3000)]
-    (when (:ok r)
-      (try
-        (reduce (fn [acc {:keys [predicate value]}]
+  (try
+    (let [response
+          (north.coord/indexed-query
+           (parse-long PORT)
+           {:find "agent_fact"
+            :rules
+            [{:head {:rel "agent_fact"
+                     :args [{:var "p"} {:var "v"}]}
+              :body [{:rel "triple"
+                      :args [(str "@agent:" id) {:var "p"} {:var "v"}]}]}]}
+           max-agent-facts-one-rows)
+          rows (:ok response)]
+      (when (and (vector? rows)
+                 (every? #(and (vector? %) (= 2 (count %))
+                               (every? string? %))
+                         rows))
+        (reduce (fn [acc [predicate value]]
                   (north.agent-provenance/fold-fact acc predicate value))
-                {} (json/parse-string (:out r) true))
-        (catch Exception _ nil)))))
+                {} rows)))
+    (catch Exception _ nil)))
 
 (defn agent-facts
   ;; Zero arity is the existing library contract used by routing consumers.

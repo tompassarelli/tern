@@ -389,15 +389,25 @@
               (not= "fable" (:model route)))))
 
 (let [bulk [(str root "/bin/north") "json" "agents"]
-      show [(str root "/bin/north") "json" "show" "agent:sdk-recovered"]
       calls (atom [])
-      facts (with-redefs [run (fn [argv & _]
-                                (swap! calls conj argv)
-                                (cond
-                                  (= argv bulk) {:ok false :exit 1 :err "malformed warm row"}
-                                  (= argv show) {:ok true :exit 0
-                                                 :out "[{\"predicate\":\"provider\",\"value\":\"openai\"},{\"predicate\":\"model\",\"value\":\"gpt-5.6-sol\"}]"}
-                                  :else {:ok true :exit 0 :out "[]"}))]
+      indexed (atom [])
+      facts (with-redefs [run
+                          (fn [argv & _]
+                            (swap! calls conj argv)
+                            (if (= argv bulk)
+                              {:ok false :exit 1 :err "malformed warm row"}
+                              (throw (ex-info "unexpected subprocess identity read"
+                                              {:argv argv}))))
+                          north.coord/indexed-query
+                          (fn [port query max-rows]
+                            (swap! indexed conj [port query max-rows])
+                            (let [subject (get-in query [:rules 0 :body 0 :args 0])]
+                              {:ok (if (= "@agent:sdk-recovered" subject)
+                                     [["provider" "openai"]
+                                      ["model" "gpt-5.6-sol"]]
+                                     [])
+                               :version 1
+                               :engine "index"}))]
               (agent-facts ["sdk-recovered" "legacy-session"]))]
   (check "a failed bulk projection recovers structured identity per live agent"
          (= {"provider" "openai" "model" "gpt-5.6-sol"}
@@ -406,9 +416,14 @@
          (and (= {} (get facts "legacy-session"))
               (str/starts-with? (agent-primary-line {:online true} (get facts "legacy-session" {}))
                                 "unknown · unknown · unknown · gaffer:legacy-debt")))
-  (check "fallback is structured and scoped only to missing live ids"
-         (and (= bulk (first @calls))
-              (= 3 (count @calls)))))
+  (check "fallback uses one bounded coordinator query per missing live id and no show subprocess"
+         (and (= [bulk] @calls)
+              (= [7977 7977] (mapv first @indexed))
+              (= [max-agent-facts-one-rows max-agent-facts-one-rows]
+                 (mapv #(nth % 2) @indexed))
+              (= ["@agent:sdk-recovered" "@agent:legacy-session"]
+                 (mapv #(get-in (second %) [:rules 0 :body 0 :args 0])
+                       @indexed)))))
 
 (let [bulk [(str root "/bin/north") "json" "show-many"
             "agent:lane-a,session:lane-a"]
