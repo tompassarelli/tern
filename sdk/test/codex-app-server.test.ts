@@ -201,6 +201,7 @@ function setup(mode = "ok") {
     project_root_markers: [".git"],
     projects: { [cwd]: { trust_level: "untrusted" } },
     project_doc_max_bytes: 0,
+    allow_login_shell: false,
     shell_environment_policy: shellEnvironmentPolicy,
     mcp_servers: { north: {
       command: north.command, args: [], env: north.env,
@@ -219,7 +220,8 @@ function setup(mode = "ok") {
       shell_environment_policy: effectiveShellEnvironmentPolicy,
       project_doc_max_bytes: 0, model_provider: "openai",
       cli_auth_credentials_store: "file", forced_login_method: "chatgpt",
-      sqlite_home: sqliteHome, apps: null, plugins: {}, marketplaces: {},
+      sqlite_home: sqliteHome, allow_login_shell: false,
+      apps: null, plugins: {}, marketplaces: {},
     },
     origins: {},
     layers: [
@@ -499,6 +501,7 @@ function setup(mode = "ok") {
           current.config.shell_environment_policy.set.PATH = "/run/current-system/sw/bin";
         if (mode === "shell-policy-extra-key")
           current.config.shell_environment_policy.future_authority = true;
+        if (mode === "login-shell-enabled") current.config.allow_login_shell = true;
         if (mode === "fingerprint-mutation" && configReads > 1)
           current.layers[0].version = `sha256:${"f".repeat(64)}`;
         if (mode === "terminal-notification-unknown" && configReads > 2)
@@ -661,9 +664,43 @@ test("launch seals the exact package shell environment policy", () => {
     set: { PATH: options.env.PATH, NORTH_BIN: options.env.NORTH_BIN },
   });
   expect(launch.args).toContain('shell_environment_policy.inherit="core"');
+  expect(launch.args).toContain("allow_login_shell=false");
   expect(launch.args).toContain(
     `shell_environment_policy.set={"NORTH_BIN"=${JSON.stringify(options.env.NORTH_BIN)},"PATH"=${JSON.stringify(options.env.PATH)}}`,
   );
+});
+
+test("effective native shell keeps the sealed package environment without manual export", () => {
+  const { options, root } = setup();
+  const hostileHome = join(root, "hostile-login-home");
+  mkdirSync(hostileHome);
+  writeFileSync(join(hostileHome, ".bash_profile"), 'PATH="/hostile/login/path"\n');
+  const launch = managedCodexAppServerLaunch(options);
+  const policy = launch.expectedSessionConfig.shell_environment_policy as {
+    inherit: string;
+    set: { PATH: string; NORTH_BIN: string };
+  };
+  expect(launch.expectedSessionConfig.allow_login_shell).toBe(false);
+  const command = 'command -v north; printf "%s\\n" "$NORTH_BIN"';
+  const shellArgs = launch.expectedSessionConfig.allow_login_shell === false
+    ? ["-c", command]
+    : ["-lc", command];
+  const result = spawnSync(Bun.which("bash")!, shellArgs, {
+    cwd: options.cwd,
+    env: {
+      HOME: hostileHome,
+      USER: process.env.USER ?? "north-test",
+      SHELL: Bun.which("bash")!,
+      ...policy.set,
+    },
+    encoding: "utf8",
+  });
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(result.stdout.trim().split("\n")).toEqual([
+    options.env.NORTH_BIN,
+    options.env.NORTH_BIN,
+  ]);
 });
 
 test("real expanded effective shell policy is accepted without widening the session request", async () => {
@@ -1130,7 +1167,7 @@ test("pre-thread authority mutants fail before thread/start", async () => {
     "hook-failure-continue", "hook-failure-unrecognized",
     "feature-default-enabled", "feature-omitted", "mcp-resource", "mcp-template", "mcp-auth",
     "shell-policy-missing", "shell-policy-wrong-inherit", "shell-policy-drift",
-    "shell-policy-extra-key",
+    "shell-policy-extra-key", "login-shell-enabled",
     "mcp-server-info", "remote-enabled", "remote-extra-field", "remote-missing-installation",
     "deprecation-extra-field", "notification-unknown-prethread", "server-request-prethread",
     "config-warning-drift",

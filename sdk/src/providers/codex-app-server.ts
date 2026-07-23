@@ -303,6 +303,7 @@ export function managedCodexAppServerLaunch(
     project_root_markers: [".git"],
     projects: { [projectRoot]: { trust_level: "untrusted" } },
     project_doc_max_bytes: 0,
+    allow_login_shell: false,
     shell_environment_policy: shellEnvironmentPolicy,
     mcp_servers: {
       north: {
@@ -323,6 +324,7 @@ export function managedCodexAppServerLaunch(
     "-c", 'project_root_markers=[".git"]',
     "-c", `projects=${tomlProjectMap(projectRoot)}`,
     "-c", "project_doc_max_bytes=0",
+    "-c", "allow_login_shell=false",
     "-c", 'shell_environment_policy.inherit="core"',
     "-c", `shell_environment_policy.set=${tomlStringMap(shellEnvironmentPolicy.set)}`,
     "-c", `mcp_servers.north.command=${JSON.stringify(options.north.command)}`,
@@ -721,7 +723,8 @@ function validateConfig(
   );
   if (config.project_doc_max_bytes !== 0 || config.model_provider !== "openai"
       || config.cli_auth_credentials_store !== "file" || config.forced_login_method !== "chatgpt"
-      || config.sqlite_home !== contract.sqliteHome || config.apps !== null
+      || config.sqlite_home !== contract.sqliteHome || config.allow_login_shell !== false
+      || config.apps !== null
       || JSON.stringify(config.plugins) !== "{}" || JSON.stringify(config.marketplaces) !== "{}")
     throw new Error("Codex effective authority surface is not closed");
   return configFingerprint(response);
