@@ -1,6 +1,7 @@
 ;; orchestration-vocab-cli.clj — Phase 0 (inert) seed for the Gaffer -> North
-;; Orchestration migration vocabulary (thread 019f8f5c-74e0-7be7-ba65-3179f1bccde1,
-;; design doc ~/code/north/docs/private/north-orchestration-vocabulary-design.md).
+;; Orchestration migration vocabulary (thread 019f8f5c-74e0-7be7-ba65-3179f1bccde1;
+;; design doc: north-orchestration-vocabulary-design.md in the repo's private docs —
+;; packaged code must not embed checkout paths, per the package path-hygiene lint).
 ;;
 ;; This registers DATA only: the 13 new @entity-kind:* kind definitions (source
 ;; of truth: schema-migrate.clj ORCHESTRATION-ENTITY-KINDS, read the same way
