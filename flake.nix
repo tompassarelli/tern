@@ -305,11 +305,16 @@ PY
           dontBuild = true;
           installPhase = ''
             runHook preInstall
-            mkdir -p $out/staffing $out/providers $out/docs/deltas
+            mkdir -p $out/staffing $out/providers $out/docs/deltas $out/scripts
             cp staffing/catalog.json $out/staffing/
             cp providers/anthropic.json providers/openai.json $out/providers/
             cp docs/roles.md docs/task-grades.md docs/topologies.md docs/postures.md docs/comms.md $out/docs/
             cp -r docs/deltas/. $out/docs/deltas/
+            # Canonical assessment validator + its only import. North's runtime
+            # (routing-economics.ts) resolves selection-assessment.mjs under
+            # GAFFER_HOME/scripts; provider-catalog.mjs reads the provider JSON
+            # already installed above. No authoring or private material.
+            cp scripts/selection-assessment.mjs scripts/provider-catalog.mjs $out/scripts/
             runHook postInstall
           '';
         };
@@ -1069,6 +1074,37 @@ PY
               --dry-run > "$smoke/spawn.out"
             grep -q 'grade=mid tier=standard' "$smoke/spawn.out"
             grep -q 'AGENT_ROLE=implementer' "$smoke/spawn.out"
+            # Assessed dispatch must resolve Gaffer's canonical selection
+            # validator from the packaged contract alone. The sandbox has no
+            # ~/code/gaffer, and the wrapper forces GAFFER_HOME at the runtime
+            # contract, so this exercises the exact shape (stock verifier
+            # composition + assessment sidecar, dry-run) that failed before
+            # scripts/selection-assessment.mjs + provider-catalog.mjs were
+            # packaged. The dry-run resolves the composition, admits the
+            # assessment through the canonical validator, and stops — it makes
+            # no worker, no provider turn, and no lane.
+            printf '%s\n' '{"version":"minimum-sufficient-v1","signals":{"decisionOwnership":"none","seamScope":"none","errorExposure":"contained-reversible","oracleStrength":"judgment-only","foundationalImpact":"none","dependencyShape":"atomic-cohesive","reasoningShape":"multi-hypothesis"},"derived":{"minimumTier":"senior","minimumReasoning":"high","ruleCodes":["oracle-strength:judgment-only","reasoning-shape:multi-hypothesis"]},"selected":{"tier":"senior","reasoning":"high"}}' \
+              > "$smoke/verifier-assessment.json"
+            GAFFER_HOME=${gafferContract} HOME="$smoke/home" NO_COLOR=1 \
+              $out/bin/north spawn verifier probe \
+              --assessment "@$smoke/verifier-assessment.json" --dry-run \
+              > "$smoke/assessed-spawn.out"
+            grep -q 'grade=senior tier=senior reasoning=high role=verifier' "$smoke/assessed-spawn.out"
+            grep -q 'AGENT_ROUTING_ASSESSMENT=RECORDED' "$smoke/assessed-spawn.out"
+            grep -q '\[dry-run\] not executed' "$smoke/assessed-spawn.out"
+            # Fail-closed is intact: a forged derived block is rejected THROUGH
+            # the packaged canonical validator, never silently admitted.
+            printf '%s\n' '{"version":"minimum-sufficient-v1","signals":{"decisionOwnership":"none","seamScope":"none","errorExposure":"contained-reversible","oracleStrength":"judgment-only","foundationalImpact":"none","dependencyShape":"atomic-cohesive","reasoningShape":"multi-hypothesis"},"derived":{"minimumTier":"senior","minimumReasoning":"high","ruleCodes":["forged"]},"selected":{"tier":"senior","reasoning":"high"}}' \
+              > "$smoke/verifier-assessment-forged.json"
+            if GAFFER_HOME=${gafferContract} HOME="$smoke/home" NO_COLOR=1 \
+                 $out/bin/north spawn verifier probe \
+                 --assessment "@$smoke/verifier-assessment-forged.json" --dry-run \
+                 > "$smoke/assessed-forged.out" 2>&1; then
+              echo "north package smoke: forged assessment was admitted" >&2
+              cat "$smoke/assessed-forged.out" >&2
+              exit 1
+            fi
+            grep -q 'canonical Gaffer validation' "$smoke/assessed-forged.out"
             # Runtime Gaffer reads must be hermetic: exercise exact provider/model
             # resolution against the packaged contract, with no sibling checkout.
             GAFFER_HOME=${gafferContract} HOME="$smoke/home" ${pkgs.bun}/bin/bun -e \

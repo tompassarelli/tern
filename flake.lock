@@ -106,11 +106,11 @@
     "gaffer": {
       "flake": false,
       "locked": {
-        "lastModified": 1784492014,
-        "narHash": "sha256-f+o2fkxClYNIrX85YBfFe6Kx8uBgi0+Dpp7VbewHAw4=",
+        "lastModified": 1784719908,
+        "narHash": "sha256-RQ2imJmtIkkesFuAWsuq90rEjivFAK9I8wNh7lxiIF8=",
         "owner": "tompassarelli",
         "repo": "gaffer",
-        "rev": "777809697bd33479042eabd55c028eca6c6f917a",
+        "rev": "2f7ab9fa7b24ad23ad4321929a0ccfed792a47b7",
         "type": "github"
       },
       "original": {
