@@ -197,10 +197,10 @@ test("OPT-IN (worktree:true) => real worktree, cwd inside it, payload appended, 
     authMode: expect.stringMatching(/^(ambient|isolated)$/),
   });
   expect(existsSync(expectedPath)).toBe(true);
-  const branches = execFileSync("git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" });
+  // The lane branch lives in the CLONE's own ref space (self-contained), not the canonical repo.
+  const branches = execFileSync("git", ["-C", expectedPath, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" });
   expect(branches).toContain(`lane-${agentId}`);
-  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", expectedPath]);
-  execFileSync("git", ["-C", repo, "branch", "-D", `lane-${agentId}`]);
+  rmSync(expectedPath, { recursive: true, force: true });
 });
 
 test("explicit worktree provisioning failure aborts before provider, admission, identity, or run side effects", async () => {
@@ -314,10 +314,9 @@ test("pre-provider admission failure preserves the physical resource in quaranti
   expect(events.at(-1)).toMatchObject({ type: "quarantined", resourceState: "quarantined" });
   expect(existsSync(expectedPath)).toBe(true);
   expect(execFileSync(
-    "git", ["-C", repo, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" },
+    "git", ["-C", expectedPath, "branch", "--list", `lane-${agentId}`], { encoding: "utf8" },
   )).toContain(`lane-${agentId}`);
-  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", expectedPath]);
-  execFileSync("git", ["-C", repo, "branch", "-D", `lane-${agentId}`]);
+  rmSync(expectedPath, { recursive: true, force: true });
 });
 
 test("typed provider preflight refusal preserves a queryable quarantine with exact recovery", async () => {
@@ -361,6 +360,5 @@ test("typed provider preflight refusal preserves a queryable quarantine with exa
   });
   expect(existsSync(expectedPath)).toBe(true);
 
-  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", expectedPath]);
-  execFileSync("git", ["-C", repo, "branch", "-D", `lane-${agentId}`]);
+  rmSync(expectedPath, { recursive: true, force: true });
 });

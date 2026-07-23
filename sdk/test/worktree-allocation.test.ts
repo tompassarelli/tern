@@ -111,8 +111,7 @@ describe("physical allocation registration", () => {
       error: { code: "manual_reclamation_required", phase: "finalize" },
     });
     expect(existsSync(lease.path)).toBe(true);
-    git(repo, "worktree", "remove", "--force", lease.path);
-    git(repo, "branch", "-D", lease.branch);
+    rmSync(lease.path, { recursive: true, force: true });
   });
 
   test("linked source retains physical common-dir identity while naming the exact linked root", () => {
@@ -129,8 +128,7 @@ describe("physical allocation registration", () => {
     expect(registration.repositoryIdentity).toStartWith("north:git-common-dir-sha256:v1:");
 
     worktreeFinalize(id, "ran", { ...lease });
-    git(repo, "worktree", "remove", "--force", lease.path);
-    git(repo, "branch", "-D", lease.branch);
+    rmSync(lease.path, { recursive: true, force: true });
     git(repo, "worktree", "remove", source);
     git(repo, "branch", "-d", `linked-source-${process.pid}`);
   });
@@ -158,10 +156,8 @@ describe("physical allocation registration", () => {
 
     worktreeFinalize(leftId, "ran", { ...leftLease });
     worktreeFinalize(rightId, "ran", { ...rightLease });
-    for (const lease of [leftLease, rightLease]) {
-      git(repo, "worktree", "remove", "--force", lease.path);
-      git(repo, "branch", "-D", lease.branch);
-    }
+    for (const lease of [leftLease, rightLease])
+      rmSync(lease.path, { recursive: true, force: true });
   });
 });
 
@@ -211,9 +207,9 @@ describe("atomic failure and recovery", () => {
       error: { code: "admission_aborted", phase: "admission_rollback" },
     });
     expect(existsSync(lease.path)).toBe(true);
-    expect(git(repo, "branch", "--list", lease.branch)).toContain(lease.branch);
-    git(repo, "worktree", "remove", "--force", lease.path);
-    git(repo, "branch", "-D", lease.branch);
+    // The lane branch lives in the CLONE's own ref space, not the canonical repo.
+    expect(git(lease.path, "branch", "--list", lease.branch)).toContain(lease.branch);
+    rmSync(lease.path, { recursive: true, force: true });
   });
 
   test("dirty pre-provider rollback preserves and queryably quarantines with machine recovery", () => {
@@ -241,7 +237,51 @@ describe("atomic failure and recovery", () => {
     });
     expect(existsSync(lease.path)).toBe(true);
 
-    git(repo, "worktree", "remove", "--force", lease.path);
-    git(repo, "branch", "-D", lease.branch);
+    rmSync(lease.path, { recursive: true, force: true });
+  });
+});
+
+describe("commit capability under a workspace-only write sandbox", () => {
+  // Reproduction-then-proof for defect 019f8eaa. A linked worktree's commit needs
+  // index.lock under the PARENT repo's .git/worktrees/<id>/ — outside a provider's
+  // workspace-write sandbox (Codex `workspace-write`, no --add-dir) — so `git commit`
+  // died with "index.lock ... read-only". We SIMULATE that sandbox by making the
+  // canonical repo's .git READ-ONLY, then prove a provisioned CLONE still commits (its
+  // whole git-dir is inside the workspace). The pre-fix linked-worktree mechanism fails
+  // this exact assertion; the clone passes it.
+  test("a provisioned clone commits on its lane branch while the canonical .git is read-only", () => {
+    const capture: Capture = { registrations: [], events: [] };
+    const id = `commit-capability-${process.pid}`;
+    const lease = provisionWorktree(id, { repoRoot: repo, ...ownership(id, capture) });
+
+    // git-dir is INSIDE the workspace, not the canonical .git.
+    const gitDir = git(lease.path, "rev-parse", "--absolute-git-dir");
+    expect(gitDir.startsWith(realpathSync(lease.path))).toBe(true);
+    expect(gitDir).not.toContain(realpathSync(join(repo, ".git")));
+
+    const canonicalHeadBefore = git(repo, "rev-parse", "HEAD");
+    const canonicalGit = join(repo, ".git");
+    execFileSync("chmod", ["-R", "a-w", canonicalGit]);
+    try {
+      writeFileSync(join(lease.path, "worker-edit.txt"), "written inside the sandbox\n");
+      git(lease.path, "add", "worker-edit.txt");
+      // No throw == commit succeeded under the read-only-canonical restriction.
+      git(lease.path, "-c", "user.email=lane@test.invalid", "-c", "user.name=lane",
+        "commit", "-qm", "lane commit under sandbox");
+      expect(git(lease.path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(`lane-${id}`);
+      expect(git(lease.path, "log", "-1", "--pretty=%s")).toBe("lane commit under sandbox");
+      // Isolation held: the canonical checkout HEAD never moved.
+      expect(git(repo, "rev-parse", "HEAD")).toBe(canonicalHeadBefore);
+    } finally {
+      execFileSync("chmod", ["-R", "u+w", canonicalGit]);
+    }
+
+    // Push is neutered to the sentinel; fetch still points at the canonical repo.
+    expect(git(lease.path, "remote", "get-url", "--push", "origin"))
+      .toBe("north-disabled://managed-clone-no-push");
+    expect(realpathSync(git(lease.path, "remote", "get-url", "origin")))
+      .toBe(realpathSync(repo));
+
+    rmSync(lease.path, { recursive: true, force: true });
   });
 });

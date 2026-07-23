@@ -6,7 +6,10 @@ import { test, expect, describe } from "bun:test";
 import {
   worktreeBranch,
   worktreePath,
-  provisionArgs,
+  cloneArgs,
+  cloneBranchArgs,
+  cloneNeuterPushArgs,
+  CLONE_PUSH_SENTINEL,
   removeArgs,
   worktreeCleanupDecision,
   worktreePayload,
@@ -29,17 +32,29 @@ describe("branch + path naming", () => {
   });
 });
 
-describe("git command builders", () => {
-  test("provisionArgs is `git -C <root> worktree add <path> -b <branch> HEAD`", () => {
-    expect(provisionArgs("abc", "/repo")).toEqual([
-      "-C", "/repo", "worktree", "add", "/tmp/repo-lane-abc", "-b", "lane-abc", "HEAD",
+describe("clone provisioning builders", () => {
+  test("cloneArgs is `git clone --no-hardlinks <repoRoot> <path>` (git-dir lands inside path)", () => {
+    expect(cloneArgs("abc", "/repo")).toEqual([
+      "clone", "--no-hardlinks", "/repo", "/tmp/repo-lane-abc",
     ]);
   });
-  test("removeArgs uses PLAIN worktree remove (no --force) + branch -d", () => {
+  test("cloneBranchArgs cuts lane-<id> in the CLONE's own ref space, at the base oid", () => {
+    expect(cloneBranchArgs("abc", "/repo")).toEqual([
+      "-C", "/tmp/repo-lane-abc", "checkout", "-b", "lane-abc", "HEAD",
+    ]);
+    expect(cloneBranchArgs("abc", "/repo", "deadbeef")).toEqual([
+      "-C", "/tmp/repo-lane-abc", "checkout", "-b", "lane-abc", "deadbeef",
+    ]);
+  });
+  test("cloneNeuterPushArgs points origin's PUSH url at the unroutable sentinel", () => {
+    expect(cloneNeuterPushArgs("abc", "/repo")).toEqual([
+      "-C", "/tmp/repo-lane-abc", "remote", "set-url", "--push", "origin", CLONE_PUSH_SENTINEL,
+    ]);
+    expect(CLONE_PUSH_SENTINEL).toBe("north-disabled://managed-clone-no-push");
+  });
+  test("removeArgs is a plain `rm -rf -- <workspace>` (self-contained clone, no canonical unwind)", () => {
     const rm = removeArgs("abc", "/repo");
-    expect(rm.worktree).toEqual(["-C", "/repo", "worktree", "remove", "/tmp/repo-lane-abc"]);
-    expect(rm.branch).toEqual(["-C", "/repo", "branch", "-d", "lane-abc"]);
-    expect(rm.worktree).not.toContain("--force");
+    expect(rm.workspace).toEqual(["-rf", "--", "/tmp/repo-lane-abc"]);
   });
 });
 

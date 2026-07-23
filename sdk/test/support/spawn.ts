@@ -6,8 +6,8 @@ import {
 } from "../../src/spawn";
 import { bindSpawnTestRuntime } from "../../src/internal/test-runtime";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { worktreeBranch, worktreePath } from "../../src/worktree";
+import { existsSync, rmSync } from "node:fs";
+import { worktreePath } from "../../src/worktree";
 
 const RUNTIME_FIELDS = new Set([
   "queryFn", "deliveryRuntime", "loadThreadFacts",
@@ -37,10 +37,9 @@ export async function spawn(value: SpawnOptions & Record<string, unknown>): Prom
   try {
     return await productionSpawn(prepared({ ...value, agentId, worktree: true }));
   } finally {
-    if (existsSync(path)) {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", path]);
-      execFileSync("git", ["-C", repoRoot, "branch", "-D", "--", worktreeBranch(agentId)]);
-    }
+    // A managed writable lane is a SELF-CONTAINED clone (git-dir inside the workspace),
+    // not a linked worktree — reclaim it with a plain directory delete, not `worktree remove`.
+    if (existsSync(path)) rmSync(path, { recursive: true, force: true });
   }
 }
 

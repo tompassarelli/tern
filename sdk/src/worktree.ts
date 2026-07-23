@@ -1,9 +1,21 @@
-// Per-lane git worktree isolation (design: docs/private/worktree-isolation-report.md).
-// A worktree lane owns its OWN index + working tree, so a `git add -A` in one lane can
+// Per-lane git workspace isolation (design: docs/private/worktree-isolation-report.md).
+// A workspace lane owns its OWN index + working tree, so a `git add -A` in one lane can
 // never sweep a peer's junk into a feature commit, and a peer's stage/commit can never
-// reset this lane's index mid-stage. north stays REPO-AGNOSTIC: this module does generic
-// `git worktree add` + an optional caller-supplied setup command; every repo-specific tax
+// reset this lane's index mid-stage. north stays REPO-AGNOSTIC: this module does the
+// provisioning + an optional caller-supplied setup command; every repo-specific tax
 // (copy gitignored env, pick a port, run e2e) rides in the INJECTED payload text, not here.
+//
+// MECHANISM: a managed writable lane gets a SELF-CONTAINED CLONE, not a linked worktree.
+// A linked worktree's commit machinery (index.lock, per-worktree gitdir, shared refs) lives
+// in the PARENT repo's .git/worktrees/<id>/ — outside a provider's workspace-write sandbox
+// (Codex `workspace-write` allows writes only under the workspace path and has no --add-dir),
+// so `git commit` dies with "index.lock ... read-only" (defect 019f8eaa, canary 3 rerun). A
+// `git clone --no-hardlinks` puts the whole git-dir INSIDE the workspace, so every commit
+// write stays inside the sandbox. --no-hardlinks keeps the object store fully independent
+// (immune to a canonical `git gc`); origin's PUSH url is neutered to a sentinel so a lane
+// cannot accidentally push into the canonical checkout, while origin's FETCH url stays the
+// canonical repo (the landing rebase reads origin/main). The ledger vocabulary stays
+// "worktree" throughout — this is a MECHANISM swap, not a rename.
 //
 // Mirrors death.ts's PURE/impure split: pure command-builders + the cleanup-decision table
 // are unit-testable with no live git; the impure shell-outs are thin. Two hard rules match
@@ -271,28 +283,39 @@ export function worktreeBranch(agentId: string): string {
   return `lane-${agentId}`;
 }
 
-// Absolute path of a lane's worktree. /tmp (not <repo>-worktrees/) DELIBERATELY: it matches
-// kea's already-in-production worktree-lane pattern (msa131-*, msa210* on /tmp) AND wins the
-// btrfs reflink/CoW clone for a near-free `git worktree add` — measured ~free in kea (report
-// Q1). basename separates the normal case of repositories with distinct names;
-// the allocation ledger makes any residual path/ref collision explicit.
+// Absolute path of a lane's workspace (the clone root; its .git lives INSIDE). /tmp (not
+// <repo>-worktrees/) DELIBERATELY: it matches kea's already-in-production worktree-lane
+// pattern (msa131-*, msa210* on /tmp). basename separates the normal case of repositories
+// with distinct names; the allocation ledger makes any residual path/ref collision explicit.
 export function worktreePath(agentId: string, repoRoot: string): string {
   return `/tmp/${basename(repoRoot)}-${worktreeBranch(agentId)}`;
 }
 
-// `git -C <repoRoot> worktree add <path> -b lane-<id> HEAD` — the whole provisioning verb.
-export function provisionArgs(agentId: string, repoRoot: string, baseOid = "HEAD"): string[] {
-  return ["-C", repoRoot, "worktree", "add", worktreePath(agentId, repoRoot), "-b", worktreeBranch(agentId), baseOid];
+// Push url sentinel: an unroutable transport so an accidental `git push` from a lane clone
+// fails hard (no such remote helper) instead of reaching the canonical checkout.
+export const CLONE_PUSH_SENTINEL = "north-disabled://managed-clone-no-push" as const;
+
+// The three provisioning verbs of a self-contained clone (git-dir INSIDE the workspace):
+//   1. clone   — `git clone --no-hardlinks <repoRoot> <path>` (independent object store).
+//   2. branch  — `git -C <path> checkout -b lane-<id> <baseOid>` in the CLONE's own ref space.
+//   3. neuter  — `git -C <path> remote set-url --push origin <sentinel>` (fetch url kept).
+export function cloneArgs(agentId: string, repoRoot: string): string[] {
+  return ["clone", "--no-hardlinks", repoRoot, worktreePath(agentId, repoRoot)];
+}
+export function cloneBranchArgs(agentId: string, repoRoot: string, baseOid = "HEAD"): string[] {
+  return ["-C", worktreePath(agentId, repoRoot), "checkout", "-b", worktreeBranch(agentId), baseOid];
+}
+export function cloneNeuterPushArgs(agentId: string, repoRoot: string): string[] {
+  return ["-C", worktreePath(agentId, repoRoot), "remote", "set-url", "--push", "origin", CLONE_PUSH_SENTINEL];
 }
 
-// The two commands a clean removal issues, managed from the MAIN checkout (worktrees are
-// removed from the primary tree). Plain `worktree remove` (no --force): git refusing a dirty
-// tree is a belt-and-suspenders backstop UNDER the cleanliness gate, never a forced delete.
-export function removeArgs(agentId: string, repoRoot: string): { worktree: string[]; branch: string[] } {
-  return {
-    worktree: ["-C", repoRoot, "worktree", "remove", worktreePath(agentId, repoRoot)],
-    branch: ["-C", repoRoot, "branch", "-d", worktreeBranch(agentId)],
-  };
+// A clean removal of a self-contained clone is a single filesystem delete of the workspace
+// directory — the whole git-dir (branch, refs, index) lives inside it, so there is NO
+// canonical linked-worktree registration or shared branch to unwind. Plain `rm -rf <path>`
+// under the cleanliness gate, never against a dirty/salvage tree (worktreeCleanupDecision
+// owns that asymmetry). Returned as an arg array so the recovery surface shells it directly.
+export function removeArgs(agentId: string, repoRoot: string): { workspace: string[] } {
+  return { workspace: ["-rf", "--", worktreePath(agentId, repoRoot)] };
 }
 
 // PURE cleanup decision — the salvage gate. The asymmetry is the whole design: a wrongful
@@ -468,7 +491,12 @@ export function provisionWorktree(
     if (refExists(repoRoot, allocation.durableRef))
       throw new Error("derived durable ref is already occupied");
     phase = "git_provision";
-    git(provisionArgs(agentId, repoRoot, allocation.baseOid));
+    // Self-contained clone: git-dir lands INSIDE `path`, so a workspace-only write sandbox
+    // can commit. Cut the lane branch at the exact base oid in the clone's own ref space,
+    // then neuter the push url so the lane cannot reach the canonical checkout.
+    git(cloneArgs(agentId, repoRoot));
+    git(cloneBranchArgs(agentId, repoRoot, allocation.baseOid));
+    git(cloneNeuterPushArgs(agentId, repoRoot));
     phase = "head_observation";
     allocation.headOid = oid(path, "HEAD");
     phase = "allocation_publication";
