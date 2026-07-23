@@ -157,7 +157,7 @@ test("Gaffer capabilities compile to exact provider authority before work starts
   expect(designer.mcpServers[READONLY_SHELL_SERVER]).toBeDefined();
   expect(designer.allowedTools).not.toEqual(expect.arrayContaining(["Edit", "Write", "WebSearch"]));
   expect(designer.disallowedTools).toEqual(expect.arrayContaining([
-    "Edit", "Write", "MultiEdit", "NotebookEdit", "WebSearch", "WebFetch",
+    "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch",
     "mcp__north__spawn", "mcp__north__dispatch",
   ]));
   expect(designer.permissionMode).toBe("default");
@@ -187,7 +187,7 @@ test("Gaffer capabilities compile to exact provider authority before work starts
     "mcp__north__spawn", "mcp__north__dispatch", "mcp__north-peer__command_peer",
   ]));
   expect(director.disallowedTools).toEqual(expect.arrayContaining([
-    "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Agent", "Task", "Workflow",
+    "Edit", "Write", "NotebookEdit", "Bash", "Agent", "Task", "Workflow",
   ]));
   expect(director.allowedTools).toContain(READONLY_SHELL_TOOL);
   expect(director.allowedTools).not.toContain("Bash");

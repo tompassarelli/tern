@@ -172,7 +172,8 @@
     "effective_authority_capability" "effective_builtin" "effective_mcp_tool"
     "effective_north_enabled_tool" "envelope_advisory" "envelope_scope"
     "fallback_reason" "routing_pin" "routing_receipt_override" "routing_rule_code"
-    "run_observation_coverage" "struggle" "mcp_actual_tool" "provider_turn_key"})
+    "run_observation_coverage" "struggle" "mcp_actual_tool" "provider_turn_key"
+    "native_command_completion"})
 (def audited-run-ref #{"parent_run" "parent_thread"})
 (def audited-run-single
   #{"agent" "agent_run_ledger_version" "allocation_mode" "applied_bespoke_contract_sha256"
@@ -238,6 +239,10 @@
     "caveman_rendered_sha256" "caveman_rendered_bytes" "caveman_source_kind"
     "caveman_resolution_provenance" "mcp_activity_source" "mcp_activity_coverage"
     "mcp_actual_calls"
+    "native_command_activity_source" "native_command_activity_coverage"
+    "native_north_binary_probe" "native_command_total" "native_command_successful"
+    "native_command_failed" "native_command_declined" "native_command_truncated"
+    "completed" "passed"
     "topology" "usage_scope" "usage_terminal_count" "usage_total_status"})
 (def audited-run-predicates
   (set/union audited-run-single audited-run-multi audited-run-ref))

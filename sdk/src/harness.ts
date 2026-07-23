@@ -229,7 +229,7 @@ const ALL_NORTH_MCP_TOOLS = NORTH_MCP_TOOL_NAMES.map((name) => `mcp__north__${na
 const CAPABILITY_TOOLS: Record<GafferCapability, string[]> = {
   "filesystem.read": ["Read"],
   "filesystem.search": ["Grep", "Glob"],
-  "filesystem.write": ["Edit", "Write", "MultiEdit", "NotebookEdit"],
+  "filesystem.write": ["Edit", "Write", "NotebookEdit"],
   shell: ["Bash"],
   "shell.readonly": [READONLY_SHELL_TOOL],
   web: ["WebSearch", "WebFetch"],

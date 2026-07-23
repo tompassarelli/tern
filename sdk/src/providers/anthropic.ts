@@ -158,7 +158,7 @@ function validateAnthropicHarness(options: any): ReturnType<typeof requireGaffer
   exactCapability(capabilities.includes("filesystem.search"), ["Grep", "Glob"], "filesystem_search");
   exactCapability(
     capabilities.includes("filesystem.write"),
-    ["Edit", "Write", "MultiEdit", "NotebookEdit"],
+    ["Edit", "Write", "NotebookEdit"],
     "filesystem_write",
   );
   exactCapability(capabilities.includes("web"), ["WebSearch", "WebFetch"], "web");
