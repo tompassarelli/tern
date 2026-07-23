@@ -1303,6 +1303,117 @@ test("an orchestrator reduction continuation racing a closing provider stream bl
   )).toBe(false);
 });
 
+// Orchestrator continuation race PREVENTION (thread 019f8ec5): on a streaming
+// provider North no longer injects the reduction continuation into the prior
+// turn's closing stream. It ends the turn and opens a fresh RESUMED turn (the
+// provider `resume` carrying the observed session id) that delivers the
+// continuation. The resumed turn returns a genuine reduction, so the lane
+// completes process=ran without ever touching the closing stream.
+test("a spawn orchestrator resumes the session for its reduction turn instead of racing a closing stream", async () => {
+  const { spawn } = await import("./support/spawn");
+  writeFileSync(log, "");
+  const settlement = {
+    kind: "settled" as const,
+    children: ["@agent:child-a", "@agent:child-b"],
+  };
+  const seenPrompts: string[] = [];
+  const resumeArgs: Array<string | undefined> = [];
+  let turn = 0;
+  const queryFn: any = (args: any) => ({
+    async *[Symbol.asyncIterator]() {
+      turn++;
+      resumeArgs.push(args.resume);
+      const input = args.prompt[Symbol.asyncIterator]();
+      const first = await input.next();
+      seenPrompts.push(first.value.message.content);
+      // Every turn publishes the same provider session id; the second turn must
+      // arrive as a genuine resume of it, not a streamed continuation.
+      yield {
+        type: "result", subtype: "success",
+        result: turn === 1 ? "children coordinated" : "reduced",
+        session_id: "sess-anthropic-1",
+        duration_ms: turn, num_turns: 1,
+      };
+    },
+  });
+
+  const result = await spawn({
+    prompt: "coordinate two children then reduce",
+    agentId: "test-spawn-resume-reduction",
+    role: "director",
+    routingMetadata: presetRequest("director"),
+    provider: "anthropic",
+    pinEvidence: pinEvidence("anthropic"),
+    coordinator: TEST_COORDINATOR,
+    queryFn,
+    childSettlementReader: () => settlement,
+  });
+
+  expect(result).toBe("reduced");
+  expect(turn).toBe(2); // a genuine second (resumed) turn was opened
+  expect(resumeArgs[0]).toBeUndefined(); // turn 1 is the initial streaming turn
+  expect(resumeArgs[1]).toBe("sess-anthropic-1"); // turn 2 resumes the observed session
+  expect(seenPrompts[1]).toContain("post-settlement reduction turn"); // continuation delivered
+  const lines = await settledRunLines("test-spawn-resume-reduction");
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(true);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran_empty"))).toBe(false);
+});
+
+// Resume is not a success guarantee (thread 019f8ec5): if the resumed reduction
+// turn itself comes back with a degenerate empty terminal, the obligation is
+// still unmet. The lane must record the obligation-specific blocked outcome,
+// never a ran_empty masquerade and never a false AGENT COMPLETE.
+test("a spawn orchestrator whose resumed reduction turn returns empty records the blocked outcome, never ran_empty", async () => {
+  const { spawn } = await import("./support/spawn");
+  writeFileSync(log, "");
+  const settlement = {
+    kind: "settled" as const,
+    children: ["@agent:child-a", "@agent:child-b"],
+  };
+  const resumeArgs: Array<string | undefined> = [];
+  let turn = 0;
+  const queryFn: any = (args: any) => ({
+    async *[Symbol.asyncIterator]() {
+      turn++;
+      resumeArgs.push(args.resume);
+      const input = args.prompt[Symbol.asyncIterator]();
+      await input.next();
+      yield {
+        type: "result", subtype: "success",
+        // Turn 1 is a genuine turn; the resumed reduction turn answers empty.
+        result: turn === 1 ? "children coordinated" : "",
+        session_id: "sess-anthropic-2",
+        duration_ms: turn, num_turns: 1,
+      };
+    },
+  });
+
+  await spawn({
+    prompt: "coordinate two children then reduce",
+    agentId: "test-spawn-resume-reduction-empty",
+    role: "director",
+    routingMetadata: presetRequest("director"),
+    provider: "anthropic",
+    pinEvidence: pinEvidence("anthropic"),
+    coordinator: TEST_COORDINATOR,
+    queryFn,
+    childSettlementReader: () => settlement,
+  });
+
+  expect(turn).toBe(2); // the resumed turn was still opened
+  expect(resumeArgs[1]).toBe("sess-anthropic-2"); // and it was a resume
+  const lines = await settledRunLines("test-spawn-resume-reduction-empty");
+  expect(lines.some((line) =>
+    line.endsWith(" process_outcome orchestrator_reduction_incomplete"),
+  )).toBe(true);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran_empty"))).toBe(false);
+  const logged = readFileSync(log, "utf8").split("\n").filter(Boolean);
+  expect(logged.some((line) =>
+    line.includes(`send test-spawn-resume-reduction-empty ${TEST_COORDINATOR} AGENT COMPLETE`),
+  )).toBe(false);
+});
+
 test("spawn and dispatch force a zero-child director to dispatch two children before reduction", async () => {
   const { spawn } = await import("./support/spawn");
   const { dispatch } = await import("./support/dispatch");

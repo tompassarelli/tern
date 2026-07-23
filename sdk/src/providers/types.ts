@@ -241,7 +241,14 @@ export interface AgentProvider {
     options: Options;
     target?: RoutingTarget;
   }): Promise<void> | void;
-  query(args: { prompt: string | AsyncIterable<any>; options: Options; target?: RoutingTarget }): AgentQuery;
+  /**
+   * `resume` carries a prior provider session id so this construction opens a
+   * fresh turn that continues that conversation instead of racing the previous
+   * turn's closing stream (thread 019f8ec5). Only streaming-input adapters that
+   * tear the session down after a terminal honor it; frame-based adapters
+   * (codex) already re-open a turn per input frame and ignore it.
+   */
+  query(args: { prompt: string | AsyncIterable<any>; options: Options; target?: RoutingTarget; resume?: string }): AgentQuery;
 }
 
 export interface RoutingDecision {

@@ -56,7 +56,7 @@ function replayablePrompt(
  */
 export function routedQueryWithRegistry(
   decision: RoutingDecision,
-  args: { prompt: string | AsyncIterable<any>; options: Options },
+  args: { prompt: string | AsyncIterable<any>; options: Options; resume?: string },
   tier: SemanticTier | undefined,
   providerRegistry: Readonly<Record<ProviderId, AgentProvider>>,
   beforeFallback?: (transition: ProviderFallbackTransition) => Promise<void>,
@@ -171,6 +171,7 @@ export function routedQueryWithRegistry(
             prompt,
             options,
             target: decision.routingTargets[decision.target],
+            resume: args.resume,
           });
           if (closed) {
             await active.close?.();

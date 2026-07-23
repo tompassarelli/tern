@@ -289,6 +289,12 @@ export function createAnthropicQuery(
         abortController: ownedAbort,
         spawnClaudeCodeProcess: lifecycle.spawnClaudeCodeProcess,
         env: providerEnvironmentForTarget("anthropic", args.target, { env: args.options.env }),
+        // Continuation resume (thread 019f8ec5): North opens this turn to
+        // continue a prior session rather than injecting into its closing
+        // stream. `resume` rides the post-seal SDK options only — the sealed
+        // `args.options` the harness composed stays byte-identical, so the
+        // authority seal validated above is untouched.
+        ...(args.resume ? { resume: args.resume } : {}),
       };
       try {
         rawQuery = runtime.query({ prompt: args.prompt, options });

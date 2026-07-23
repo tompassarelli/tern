@@ -478,6 +478,18 @@ async function runSpawn(
   // empty terminal (the continuation raced the Anthropic session's teardown),
   // this drives an explicit blocked outcome instead of a ran_empty masquerade.
   let pendingContinuation: OrchestratorContinuationKind | undefined;
+  // Anthropic streaming input races session teardown after the model's final
+  // result (thread 019f8ec5): a continuation injected into the live channel then
+  // lands on a closing stream. For a streaming-input provider an orchestrator
+  // continuation instead ends the turn and opens a fresh RESUMED turn once a
+  // session id has been observed. Codex (frame-based, liveInput=unsupported)
+  // re-opens a turn per frame already and keeps the injection path untouched.
+  // `sessionId` is the last session id the provider published; `pendingResume`
+  // is the continuation message to carry into the next resumed turn.
+  const resumeContinuations = orchestrator
+    && providerLiveInput(routing.provider) === "streaming";
+  let sessionId: string | undefined;
+  let pendingResume: string | undefined;
   let compactions = 0; // SDK auto-compaction events observed across the run (audit fix 4)
   try {
   // Reserve only at the last pre-provider seam. Earlier routing/admission
@@ -528,9 +540,18 @@ async function runSpawn(
     await liveInputRoute.activate(activeRoute());
   termination.throwIfTerminated();
   providerQueryConstructionStarted = true;
+  turnLoop: while (true) {
+  const resumeMessage = pendingResume;
+  pendingResume = undefined;
+  // Turn 1 (and every non-resumed provider) reads the managed streaming channel
+  // so live steering and background-task continuations keep working unchanged.
+  // A resumed continuation turn reads a fresh single-message channel carrying
+  // the continuation and asks the adapter to resume the observed session.
+  const turnChannel = resumeMessage === undefined ? ch : inputChannel(resumeMessage);
   const activeQuery = queryFn({
-    prompt: ch.stream(),
+    prompt: turnChannel.stream(),
     options: agentOptions,
+    ...(resumeMessage === undefined ? {} : { resume: sessionId }),
   });
   activeExecutionQuery = activeQuery;
   termination.attachQuery(activeQuery);
@@ -539,8 +560,10 @@ async function runSpawn(
     onStall: (mins) => notifyStall(agentId, mins, { coordinator: coordHandle }),
     onAbort: () => { stallAborted = true; },
   });
+  let openResumeTurn = false;
   for await (const message of watched) {
     const msg = message as any;
+    if (typeof msg.session_id === "string") sessionId = msg.session_id;
     renewHarnessPresence(agentOptions);
     // routedQuery mutates the decision before the first fallback-provider event.
     // Refresh from that structured decision before the event is exposed.
@@ -585,7 +608,10 @@ async function runSpawn(
         end("provider_error");
         break;
       }
-      if (ch.pending() === 0) {
+      if (turnChannel.pending() === 0) {
+        // A resumed continuation turn reads its own fresh channel, so gate
+        // turn-end on that turn's channel; for turn 1 turnChannel IS ch, so
+        // non-orchestrator and codex lanes keep byte-identical behavior.
         // Orchestrator continuation race (thread 019f8ec5): a continuation
         // injected at a prior turn-end asks the provider for ANOTHER genuine
         // turn, but the Anthropic session may already be tearing down after its
@@ -616,7 +642,7 @@ async function runSpawn(
           bgContinuations++;
           const live = bgTracker.live();
           console.error(`[harness] @agent:${agentId} refusing turn-end exit — ${live.length} live background task(s): ${live.join(", ")} (continuation ${bgContinuations}/${maxBgContinuations()})`);
-          ch.push(bgContinuationMessage(live));
+          turnChannel.push(bgContinuationMessage(live));
           continue; // do NOT finalize; keep the query loop alive
         }
         if (bgTracker.size() > 0) {
@@ -630,26 +656,42 @@ async function runSpawn(
           );
           childContinuation = decision.state;
           if (decision.action === "continue") {
+            let continuation: string;
             if (decision.reason === "children_live") {
               console.error(
                 `[harness] @agent:${agentId} refusing orchestrator turn-end — ${decision.live.length} live child lane(s): ${decision.live.join(", ")} (no-progress ${decision.attempt}/${decision.cap})`,
               );
-              ch.push(childContinuationMessage(decision.live));
+              continuation = childContinuationMessage(decision.live);
             } else if (decision.reason === "child_dispatch_required") {
               console.error(
                 `[harness] @agent:${agentId} requiring direct-child dispatch — ${decision.children.length}/${decision.required} child lane(s) observed (no-progress ${decision.attempt}/${decision.cap})`,
               );
-              ch.push(childDispatchMessage(decision.children, decision.required));
+              continuation = childDispatchMessage(decision.children, decision.required);
             } else {
               console.error(
                 `[harness] @agent:${agentId} requiring post-settlement reduction — ${decision.children.length} settled child lane(s): ${decision.children.join(", ")}`,
               );
-              ch.push(childReductionMessage(decision.children));
+              continuation = childReductionMessage(decision.children);
             }
             // Remember the outstanding obligation so a degenerate empty terminal
             // on the next turn (a closing-stream race) blocks explicitly rather
             // than falsely discharging the continuation.
             pendingContinuation = decision.reason;
+            if (resumeContinuations && sessionId !== undefined) {
+              // Streaming provider + an observed session: do NOT push into the
+              // closing stream. End this turn and open a fresh resumed turn
+              // carrying the continuation (thread 019f8ec5 prevention). A resume
+              // that still comes back empty is caught by the empty-terminal guard
+              // above / the final child gate — recorded as the obligation-specific
+              // blocked outcome, never a ran_empty masquerade.
+              console.error(
+                `[harness] @agent:${agentId} opening a resumed continuation turn on session ${sessionId} instead of injecting into the closing stream`,
+              );
+              pendingResume = continuation;
+              openResumeTurn = true;
+              break;
+            }
+            ch.push(continuation);
             continue;
           }
           if (decision.action === "block") {
@@ -678,6 +720,14 @@ async function runSpawn(
         break; // MUST end the channel or the query hangs
       }
     }
+  }
+  // Turn complete. A resume-based continuation ended this turn cleanly so no
+  // continuation was pushed into its closing stream; close the finished query
+  // and loop to open the resumed turn. Any other terminal is final for the run.
+  if (turnChannel !== ch) { try { turnChannel.end(); } catch { /* fresh resume channel */ } }
+  if (!openResumeTurn) break turnLoop;
+  try { await activeQuery.close?.(); }
+  catch (error) { queryCloseError = error; }
   }
   if (!resultMsg && outcome === "ran") {
     // A clean iterator close is transport completion, not provider success.

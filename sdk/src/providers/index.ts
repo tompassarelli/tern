@@ -41,7 +41,7 @@ export function providerLiveInput(id: ProviderId): AgentProvider["liveInput"] {
 // errors unchanged because that SDK exposes no such typed signal.
 export function routedQuery(
   decision: RoutingDecision,
-  args: { prompt: string | AsyncIterable<any>; options: Options },
+  args: { prompt: string | AsyncIterable<any>; options: Options; resume?: string },
   tier?: SemanticTier,
   beforeFallback?: (
     transition: import("./types").ProviderFallbackTransition,
