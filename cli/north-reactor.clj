@@ -165,17 +165,24 @@
   [h]
   (try
     (let [response
-          (north.coord/query-page
+          (north.coord/send-op
            port
-           {:find "lane_run_candidate"
-            :rules
-            [{:head {:rel "lane_run_candidate" :args [{:var "e"}]}
-              :body [{:rel "triple"
-                      :args [{:var "e"} "agent" h]}]}]}
-           max-lane-run-candidates nil)
+           {:op :query
+            :query
+            {:find "lane_run_candidate"
+             :rules
+             [{:head {:rel "lane_run_candidate" :args [{:var "e"}]}
+               :body [{:rel "triple"
+                       :args [{:var "e"} "agent" h]}]}]}
+            ;; Ask for one sentinel row beyond the accepted bound. This simple
+            ;; one-literal shape routes through Fram's warm predicate/object
+            ;; index. query-page would rebuild a whole-corpus Datalog fixpoint
+            ;; once per lane before applying its wire-page bound.
+            :query-max-rows (inc max-lane-run-candidates)})
           rows (:ok response)]
-      (if (and (false? (:more response))
+      (if (and (= "index" (:engine response))
                (vector? rows)
+               (<= (count rows) max-lane-run-candidates)
                (every? #(and (vector? %) (= 1 (count %))
                              (string? (first %)))
                        rows))
@@ -186,7 +193,12 @@
               (filter north.terminal-projection/valid-run-entity?)
               distinct
               vec)}
-        {:ok false :reason :run-projection-over-broad}))
+        {:ok false
+         :reason (if (or (= :query-row-limit (:code response))
+                         (and (vector? rows)
+                              (> (count rows) max-lane-run-candidates)))
+                   :run-projection-over-broad
+                   :run-projection-unavailable)}))
     (catch Exception _
       {:ok false :reason :run-projection-unavailable})))
 

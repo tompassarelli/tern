@@ -22,11 +22,12 @@
   (swap! checks conj [label (boolean value) detail]))
 
 (let [source (slurp reactor)]
-  (check "sweep lifecycle lookup is paged, capped, and never scans all subject facts"
-         (and (str/includes? source "north.coord/query-page")
+  (check "sweep lifecycle lookup is indexed, capped, and never scans all subject facts"
+         (and (str/includes? source ":query-max-rows (inc max-lane-run-candidates)")
               (str/includes? source "lane_run_candidate")
-              (str/includes? source "max-lane-run-candidates nil")
+              (str/includes? source "(= \"index\" (:engine response))")
               (str/includes? source "north.coord/many port subject predicate")
+              (not (str/includes? source "north.coord/query-page"))
               (not (str/includes? source ":find \"terminal_fact\"")))))
 
 (defn free-port []
