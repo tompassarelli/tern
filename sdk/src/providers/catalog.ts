@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import type { ProviderId } from "./types";
 import type { ReasoningLevel, RoutingTier } from "../routing-metadata";
+import { projectProviderCatalog, staffingSource } from "../orchestration-graph-source";
 
 export type SemanticTier = RoutingTier;
 type Effort = ReasoningLevel;
@@ -119,15 +120,32 @@ function gafferHome(): string {
   return resolve(process.env.GAFFER_HOME ?? `${process.env.HOME}/code/gaffer`);
 }
 
+function validateProviderCatalog(
+  catalog: ProviderCatalog,
+  provider: ProviderId,
+  where: string,
+): ProviderCatalog {
+  if (catalog.provider !== provider || !catalog.tiers || !catalog.modelAliases
+      || !catalog.models || !catalog.modelDeltas)
+    throw new Error(`invalid Gaffer provider catalog for ${provider} at ${where}`);
+  return catalog;
+}
+
 function providerCatalog(provider: ProviderId): ProviderCatalog {
+  // Dual-read seam (Phase 1): graph mode reconstructs the identical provider
+  // catalog shape from @catalog:current; file mode (default) reads the JSON.
+  if (staffingSource() === "graph") {
+    return validateProviderCatalog(
+      projectProviderCatalog(provider) as ProviderCatalog,
+      provider,
+      `graph @catalog:current provider ${provider}`,
+    );
+  }
   const path = resolve(gafferHome(), "providers", `${provider}.json`);
-  return providerCatalogCache.load(path, (source) => {
-    const catalog = JSON.parse(source) as ProviderCatalog;
-    if (catalog.provider !== provider || !catalog.tiers || !catalog.modelAliases
-        || !catalog.models || !catalog.modelDeltas)
-      throw new Error(`invalid Gaffer provider catalog for ${provider} at ${path}`);
-    return catalog;
-  });
+  return providerCatalogCache.load(
+    path,
+    (source) => validateProviderCatalog(JSON.parse(source) as ProviderCatalog, provider, path),
+  );
 }
 
 /** Resolve a provider-local family alias to the exact catalog model ID. */

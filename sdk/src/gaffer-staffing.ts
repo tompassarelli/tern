@@ -14,6 +14,7 @@ import {
 } from "./gaffer-capabilities";
 import { requireGafferRoleId } from "./gaffer-role-id";
 import { requireProviderNeutralRoute } from "./provider-neutral-route";
+import { projectStaffingCatalog, staffingSource } from "./orchestration-graph-source";
 
 interface StaffingPreset {
   name: string; taskGrade: string; tier: string; deliberation: string;
@@ -78,7 +79,11 @@ function uniqueVocabulary(value: unknown, label: string): string[] {
 export function loadGafferStaffing(
   path = process.env.GAFFER_STAFFING_CATALOG ?? DEFAULT_GAFFER_STAFFING_PATH,
 ): StaffingCatalog {
-  const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
+  // Dual-read seam (Phase 1): graph mode reconstructs the identical catalog
+  // shape from @catalog:current; file mode (default) reads the Gaffer JSON.
+  const value = (staffingSource() === "graph"
+    ? projectStaffingCatalog()
+    : JSON.parse(readFileSync(path, "utf8"))) as Record<string, any>;
   const sourceVersion = value.version;
   if (sourceVersion !== 2) throw new Error("staffing catalog: version must be 2");
   exactKeys(value, TOP_LEVEL_FIELDS, "top level");

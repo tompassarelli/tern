@@ -142,6 +142,12 @@
     ["cli/orchestration-vocab-cli.clj" "put!" "predicate"]
     ["cli/orchestration-vocab-cli.clj" "retract!" "p"]
     ["cli/orchestration-vocab-cli.clj" "retract!" "predicate"]
+    ;; Phase 1 catalog importer: fixed VOCAB predicates written through s1!/
+    ;; smulti! helper loops (the schema-migrate.clj pattern), never a caller-
+    ;; supplied predicate — every emitted predicate is a registered VOCAB row.
+    ["cli/orchestration-import-cli.clj" "append!" "p"]
+    ["cli/orchestration-import-cli.clj" "put!" "p"]
+    ["cli/orchestration-import-cli.clj" "retract!" "p"]
     ["cli/pred-cli.clj" "put!" "p"]
     ["cli/pred-cli.clj" "retract!" "p"]
     ["cli/presence-cli.clj" "retract!" "p"]
