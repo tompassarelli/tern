@@ -201,6 +201,11 @@ export function eligibleForProviderProcessDeathRetry(
 interface RetryContext {
   retryOfRun: string;
   retryAttempt: number;
+  // Bare agent id of the terminal-committed lane this fresh identity follows.
+  // Terminal identities are immutable — the retry mints its OWN agent id
+  // (opts.agentId is overridden by the caller before runSpawn) and links back
+  // to the original via this provenance field rather than reusing its subject.
+  retryOfAgent: string;
 }
 
 // Only the executable bootstrap can classify selectors inherited from a
@@ -356,6 +361,7 @@ async function runSpawn(
     coordinator: opts.coordinator,
     worktree: wt?.path,
     branch: wt?.branch,
+    retryOfAgent: retryContext?.retryOfAgent,
   };
   const initialLiveInput = providerLiveInput(routing.provider);
   const ch = inputChannel(opts.prompt); // streaming input keeps the managed live-steering route open
@@ -1286,6 +1292,13 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
       caveman, admission, injected, termination, worktreeLease,
     );
     let retries = 0;
+    // The lane whose identity is terminal-committed by the attempt that just
+    // finished; a retry mints a FRESH agent id rather than reusing it. Terminal
+    // identities are immutable by design (identity.ts writeAgentTerminal) — a
+    // second publish against the same @agent: subject is durably rejected
+    // (status=not_committed reason=terminal_committed), so reuse is not an
+    // option here, only a fresh mint linked back by provenance.
+    let deadAgentId = agentId;
     while (
       retries < PROVIDER_PROCESS_DEATH_MAX_RETRIES
       && eligibleForProviderProcessDeathRetry(
@@ -1294,16 +1307,19 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     ) {
       retries++;
       const deadRunId = attempt.runId;
+      const retryAgentId = createSpawnAgentId();
       console.error(
-        `[spawn] @agent:${agentId} provider-process death (run @${deadRunId}) is retry-safe `
-        + `(worker + read-only capabilities) — retrying once as a fresh run (attempt ${retries})`,
+        `[spawn] @agent:${deadAgentId} provider-process death (run @${deadRunId}) is retry-safe `
+        + `(worker + read-only capabilities) — retrying once as a fresh run on a fresh `
+        + `@agent:${retryAgentId} (attempt ${retries})`,
       );
       termination.throwIfTerminated();
       attempt = await runSpawn(
-        { ...composed }, judgmentGrade, strugglePolicy,
+        { ...composed, agentId: retryAgentId }, judgmentGrade, strugglePolicy,
         caveman, admission, injected, termination, worktreeLease,
-        { retryOfRun: deadRunId, retryAttempt: retries },
+        { retryOfRun: deadRunId, retryAttempt: retries, retryOfAgent: deadAgentId },
       );
+      deadAgentId = retryAgentId;
     }
     result = attempt.result;
   } catch (error) {

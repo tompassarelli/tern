@@ -136,6 +136,7 @@
    ["current_thread" "single" "literal" "the agent's current thread focus"]
    ["worktree"        "single" "literal" "abspath of a lane's git worktree"]
    ["branch"          "single" "literal" "git branch a lane's worktree is on"]
+   ["retry_of_agent"  "single" "literal" "bounded auto-retry: bare agent id of the prior terminal-committed lane this fresh identity followed"]
    ["worktree_orphaned" "multi" "literal" "a resolved lane's worktree left for manual salvage (dirty/crash)"]
    ["worktree_allocation_version" "single" "literal" "physical worktree allocation record contract version"]
    ["worktree_repository_identity" "single" "literal" "content-free digest identity of the exact git common-dir"]

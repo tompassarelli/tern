@@ -188,8 +188,15 @@ test("worker + read-only capabilities + provider-process death -> exactly one re
   // Retry provenance facts landed on the retried @run.
   expect(logged).toMatch(/tell run:\S+ retry_of_run @run:\S+/);
   expect(logged).toMatch(/tell run:\S+ retry_attempt 1/);
-  // Final agent terminal reflects the recovered retry, not the dead attempt.
-  expect(logged).toContain("tell agent:test-retry-eligible outcome ran");
+  // Terminal identities are immutable: the retry must NOT reuse the original
+  // agent id — it mints a fresh one (identity.ts writeAgentTerminal rejects a
+  // second publish against an already terminal-committed @agent: subject).
+  // The dead original keeps its own honest (died) terminal, never rewritten...
+  expect(logged).toContain("tell agent:test-retry-eligible outcome died");
+  // ...while the fresh retry identity carries retry_of_agent provenance back
+  // to the original (bare id, no @) and its own terminal reflects recovery.
+  expect(logged).toMatch(/tell agent:(?!test-retry-eligible\b)\S+ retry_of_agent test-retry-eligible/);
+  expect(logged).toMatch(/tell agent:(?!test-retry-eligible\b)\S+ outcome ran/);
 });
 
 test("orchestrator topology never retries a provider-process death, even with read-only capabilities", async () => {
@@ -256,8 +263,13 @@ test("a retry that also dies records BOTH runs; the original death is never over
   const runKindWrites = (logged.match(/tell run:\S+ kind run/g) ?? []).length;
   expect(runKindWrites).toBe(2);
   expect(logged).toMatch(/tell run:\S+ retry_of_run @run:\S+/);
-  // Final agent terminal still honestly reports died (both attempts failed).
+  // Original terminal-committed identity keeps its own honest died terminal...
   expect(logged).toContain("tell agent:test-retry-still-dies outcome died");
+  // ...and the retry minted a DISTINCT fresh identity (never reusing the
+  // terminal-committed original) that also honestly reports died, linked back
+  // by retry_of_agent provenance.
+  expect(logged).toMatch(/tell agent:(?!test-retry-still-dies\b)\S+ retry_of_agent test-retry-still-dies/);
+  expect(logged).toMatch(/tell agent:(?!test-retry-still-dies\b)\S+ outcome died/);
 });
 
 test("eligibility gate: only outcome=died (provider-process-level) + worker + read-only capabilities retries", async () => {

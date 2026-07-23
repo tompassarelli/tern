@@ -100,6 +100,11 @@ export interface ObservedAgentIdentity {
   coordinator?: string;
   worktree?: string; // absolute path of this lane's git worktree (opt-in; null-skipped otherwise)
   branch?: string; // the branch `git worktree add` created (lane-<id>)
+  // Bounded auto-retry provenance (thread 019f8f81): set only on a retry lane's
+  // FRESH identity, naming the bare agent id of the terminal-committed lane it
+  // followed. Terminal identities are immutable by design — a retry never
+  // reuses or rewrites the original subject, it mints its own and links back.
+  retryOfAgent?: string;
 }
 
 /** Write-side contract for every North-managed provider lane. */
@@ -444,6 +449,7 @@ export function agentIdentityFacts(
     ["coordinator", f.coordinator],
     ["worktree", f.worktree],
     ["branch", f.branch],
+    ["retry_of_agent", f.retryOfAgent],
     ["spawned_at", spawnedAt],
     ["display_name", renderDisplayName(agentId, f)],
   ];
