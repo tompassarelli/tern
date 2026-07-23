@@ -77,6 +77,7 @@
 (def CORE-ENTITY-KINDS
   (sorted-map
    "agent" "A human-facing or managed execution identity."
+   "client_rate_config" "A per-owner client billing rate configuration read by clock rate lookups; never a session interval."
    "client_session" "One human/client billing-clock interval; never a managed run."
    "concern" "A concurrent implementation footprint and intent declaration."
    "guard_denial" "An admission-guard refusal with its diagnostic evidence."
@@ -128,6 +129,7 @@
 
 (def LEGACY-KIND->ENTITY-KIND
   {"agent" "agent" "lane" "agent" "managed" "agent" "session" "agent"
+   "client_rate_config" "client_rate_config"
    "client_session" "client_session"
    "concern" "concern"
    "guard_denial" "guard_denial"

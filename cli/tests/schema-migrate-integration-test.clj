@@ -239,7 +239,11 @@
                                   ;; Valid explicit policy, including false, is
                                   ;; authoritative and must survive migration.
                                   (op 16 "assert" "@part_of" "acyclic" "false")
-                                  (op 17 "assert" "@depends_on" "acyclic" "true")])
+                                  (op 17 "assert" "@depends_on" "acyclic" "true")
+                                  ;; Legacy kind=client_rate_config classifies via
+                                  ;; LEGACY-KIND->ENTITY-KIND, distinct from
+                                  ;; client_session (never a session interval).
+                                  (op 18 "assert" "@client-rate:acme" "kind" "client_rate_config")])
                        "\n")
               :append true)
       _ (spit telemetry "")
@@ -700,12 +704,18 @@
                       (values facts "@entity-kind:thread" "entity_kind"))
                    (= #{"thread"}
                       (values facts "@entity-kind:thread" "entity_kind_name"))) nil)
+      (check! "client_rate_config entity-kind definition is registered and distinct from client_session"
+              (and (= #{"north/entity_kind_definition"}
+                      (values facts "@entity-kind:client_rate_config" "entity_kind"))
+                   (= #{"client_rate_config"}
+                      (values facts "@entity-kind:client_rate_config" "entity_kind_name"))) nil)
       (let [expected {"@thread-a" "thread"
                       "@topic-schema" "topic"
                       "@concern-schema" "concern"
                       "@msg:schema" "message"
                       "@run-schema" "run"
                       "@client-clock" "client_session"
+                      "@client-rate:acme" "client_rate_config"
                       "@denial:schema" "guard_denial"
                       "@agent:schema" "agent"
                       "@person-schema" "person"
