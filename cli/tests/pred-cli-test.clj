@@ -132,7 +132,12 @@
     ;; lease-cli put-fenced carries a caller-supplied predicate under the fence.
     ["cli/lease-cli.clj" "put-with-fence!" "(required-text \"predicate\" (nth args 4 nil))"]
     ["cli/msg-cli.clj" "put!" "(arg-pred k)"]
-    ["cli/msg-cli.clj" "put!" "target-identity-manifest-predicate"]
+    ;; assert-batch-legacy!'s pre-gen-1023 fallback replays FACTS through put!
+    ;; one-by-one (the exact pre-atomicity behavior); `p` is destructured from
+    ;; each [p r] pair, closing over whatever predicates the send verb batched
+    ;; (from/subject/body/sent_at/to/target_identity_manifest_sha256 — all
+    ;; already fixed literals at their assert-batch! call sites above).
+    ["cli/msg-cli.clj" "put!" "p"]
     ["cli/msg-cli.clj" "retract!" "predicate"]
     ["cli/message-audience.clj" "append!" "rejected-by-predicate"]
     ["cli/message-audience.clj" "append!" "rejection-predicate"]

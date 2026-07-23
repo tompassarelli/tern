@@ -206,6 +206,40 @@
     (put! port wake "target" target)
     wake))
 
+;; assert-batch! — ONE all-or-none publication of every fact in FACTS about TE.
+;; Closes the torn-mail-subject window (thread 019f9063 / incident 019f8958):
+;; the coordinator validates every fact before the first mutation and commits
+;; them in a single tx (do-assert-batch, fram coord_daemon.clj:1237), so a
+;; crash/disconnect between facts leaves the complete subject or nothing.
+;; `to`/`target` are committed+notified LAST by the engine regardless of the
+;; order FACTS is given in, so the pre-atomicity to-last delivery-candidacy
+;; mitigation still holds structurally.
+;;
+;; COMPAT: the running coordinator generation may predate :assert-batch
+;; (gen-1022; the op lands gen-1023). Such a daemon's op dispatch falls to its
+;; default arm and answers {:error "unknown op"} — that specific rejection
+;; falls back to the pre-atomicity sequential per-fact :assert path (loudly
+;; flagged) so mail keeps flowing during the rollout window. Any OTHER
+;; rejection is a genuine failure: the whole batch was refused and there is no
+;; partial subject to clean up — that refusal IS the fix working.
+(defn assert-batch-legacy! [port te facts]
+  (binding [*out* *err*]
+    (println
+     (str "DEPRECATED: coordinator does not yet serve :assert-batch "
+          "(pre-gen-1023) — falling back to per-fact :assert for " te
+          "; upgrade the coordinator to close the torn-subject window")))
+  (doseq [[p r] facts] (put! port te p r))
+  {:ok :legacy-fallback})
+
+(defn assert-batch! [port te facts]
+  (let [response (send-op port
+                          {:op :assert-batch :te te
+                           :facts (mapv (fn [[p r]] {:p p :r (str r)}) facts)})]
+    (cond
+      (:ok response) response
+      (= "unknown op" (:error response)) (assert-batch-legacy! port te facts)
+      :else (reject-message! (str te " publication rejected: " (:reject response))))))
+
 (let [[port verb & args] *command-line-args*
       port (Integer/parseInt port)]
   (case verb
@@ -218,21 +252,29 @@
           steer-admission (when steer?
                             (north.topology-authority/require-coordination! "steer")
                             (require-live-steer! port to))
-          e (str "@msg:" (fresh-id from))]
+          e (str "@msg:" (fresh-id from))
+      ;; Canonicalize the managed control type. Ordinary subjects retain their
+      ;; original spelling; every producer-admitted steer is exactly "steer".
+      ;; All message fields are write-once on a fresh @msg. `to`/`target` land
+      ;; LAST (the listener triggers on it); assert-batch! guarantees that
+      ;; ordering internally now, so no settle race, no sleep, and — for
+      ;; ordinary mail — no torn subject either (thread 019f9063).
+      front-facts
+      (cond-> [["from" from]
+               ["subject" (if steer? "steer" (or subj ""))]
+               ["body" (or body "")]
+               ["sent_at" (str (java.time.Instant/now))]]
+        steer-admission
+        (conj [target-identity-manifest-predicate
+               (:identity-manifest steer-admission)]))]
       ;; `north steer` labels its control message exactly `steer`. Ordinary
       ;; worker -> coordinator completion/death mail remains legal; peer control
       ;; does not become legal merely because the producer bypassed agents-cli.
-      ;; write content facts first, `to` LAST: the listener triggers on `to`, so landing it
-      ;; last means from/subject/body are already visible — no settle race, no sleep.
-      (put! port e "from" from)              ; single — all message fields are write-once on a fresh @msg
-      ;; Canonicalize the managed control type. Ordinary subjects retain their
-      ;; original spelling; every producer-admitted steer is exactly "steer".
-      (put! port e "subject" (if steer? "steer" (or subj "")))
-      (put! port e "body" (or body ""))
-      (put! port e "sent_at" (str (java.time.Instant/now)))
       (when steer-admission
-        (put! port e target-identity-manifest-predicate
-              (:identity-manifest steer-admission)))
+        ;; Steer's `to` lands through its own CAS below (assert-after-read!),
+        ;; not this batch — a route-change validation :assert-batch cannot
+        ;; express. Publish the rest atomically first.
+        (assert-batch! port e front-facts))
       ;; A broadcast's concrete recipients are durable facts, captured before
       ;; `to` lands. Sender exclusion is intentional: broadcast means peers.
       (let [broadcast-audience
@@ -260,7 +302,10 @@
             (when (:reject result)
               (reject-steer!
                "target route changed during message admission")))
-          (put! port e "to" to))
+          ;; Ordinary mail: from/subject/body/sent_at/to publish as ONE
+          ;; all-or-none unit — the torn-mail fix. assert-batch! still lands
+          ;; `to` last inside the batch (delivery-trigger-preds ordering).
+          (assert-batch! port e (conj front-facts ["to" to])))
         (println (str (if steer? "queued for live injection " "sent ") e " -> " to
                       (when broadcast-audience
                         (str " (" (count broadcast-audience)
