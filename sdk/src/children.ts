@@ -601,6 +601,33 @@ export function settleChildren(coordId: string): ChildSettlement {
   return settleChildrenBounded(coordId, { run: productionChildSettlementCommand });
 }
 
+// The three orchestrator continuation shapes North injects at turn-end. A
+// continuation asks the provider for ANOTHER genuine turn; the value doubles as
+// the `decideChildTurnEnd` continue-reason so the harness can remember which
+// obligation is outstanding while the next turn runs.
+export type OrchestratorContinuationKind =
+  | "children_live"
+  | "child_dispatch_required"
+  | "child_reduction_required";
+
+// Orchestrator continuation race (thread 019f8ec5): a continuation can be
+// "answered" by a degenerate empty-success terminal when the Anthropic session
+// tears down after its final message — the injected continuation lands on a
+// closing stream. Such a terminal leaves the obligation UNMET, so map the
+// outstanding continuation to the same explicit blocked outcome the final child
+// gate would record. This keeps the terminal loud and truthful (never a
+// ran_empty masquerade, never a false reduction acknowledgement).
+export function continuationRaceOutcome(kind: OrchestratorContinuationKind): string {
+  switch (kind) {
+    case "children_live":
+      return "orchestrator_children_incomplete";
+    case "child_dispatch_required":
+      return "orchestrator_child_obligation_unmet";
+    case "child_reduction_required":
+      return "orchestrator_reduction_incomplete";
+  }
+}
+
 export function childContinuationMessage(liveIds: string[]): string {
   return [
     `North refuses orchestrator turn-end: ${liveIds.length} child lane(s) remain live (${liveIds.join(", ")}).`,

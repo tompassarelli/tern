@@ -1238,6 +1238,71 @@ test("a spawn orchestrator gets a provider reduction turn after child settlement
   expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(true);
 });
 
+// Orchestrator continuation race (thread 019f8ec5): a reduction continuation is
+// injected at turn-end, but the Anthropic session tears down after its final
+// message — the continuation lands on a closing stream and the provider answers
+// with a degenerate empty-success terminal. Before the fix decideChildTurnEnd
+// read that empty result as a COMPLETED reduction and finalized ran_empty (a
+// 0-byte success masquerade); the child results were never reduced. Assert the
+// lane now records the explicit obligation-specific blocked outcome instead,
+// and NEVER ran_empty / ran.
+test("an orchestrator reduction continuation racing a closing provider stream blocks, never ran_empty", async () => {
+  const { spawn } = await import("./support/spawn");
+  writeFileSync(log, "");
+  const settlement = {
+    kind: "settled" as const,
+    children: ["@agent:child-a", "@agent:child-b"],
+  };
+  const seenInputs: string[] = [];
+  const queryFn: any = ({ prompt }: any) => ({
+    async *[Symbol.asyncIterator]() {
+      const input = prompt[Symbol.asyncIterator]();
+      const initial = await input.next();
+      seenInputs.push(initial.value.message.content);
+      // A genuine first turn — children have settled, so North will require a
+      // post-settlement reduction turn next.
+      yield {
+        type: "result", subtype: "success", result: "children coordinated",
+        duration_ms: 1, num_turns: 1,
+      };
+      // The reduction continuation is consumed, but the session is already
+      // tearing down: it answers on a closing stream with an empty-success
+      // terminal (0-byte result) instead of an actual reduction.
+      const reduction = await input.next();
+      seenInputs.push(reduction.value.message.content);
+      yield {
+        type: "result", subtype: "success", result: "",
+        duration_ms: 2, num_turns: 2,
+      };
+    },
+  });
+
+  await spawn({
+    prompt: "coordinate two children then reduce",
+    agentId: "test-spawn-reduction-race",
+    role: "director",
+    routingMetadata: presetRequest("director"),
+    coordinator: TEST_COORDINATOR,
+    queryFn,
+    childSettlementReader: () => settlement,
+  });
+
+  expect(seenInputs[1]).toContain("post-settlement reduction turn");
+  const lines = await settledRunLines("test-spawn-reduction-race");
+  expect(lines.some((line) =>
+    line.endsWith(" process_outcome orchestrator_reduction_incomplete"),
+  )).toBe(true);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran"))).toBe(false);
+  expect(lines.some((line) => line.endsWith(" process_outcome ran_empty"))).toBe(false);
+  const logged = readFileSync(log, "utf8").split("\n").filter(Boolean);
+  expect(logged.some((line) =>
+    line === "tell agent:test-spawn-reduction-race process_outcome orchestrator_reduction_incomplete",
+  )).toBe(true);
+  expect(logged.some((line) =>
+    line.includes(`send test-spawn-reduction-race ${TEST_COORDINATOR} AGENT COMPLETE`),
+  )).toBe(false);
+});
+
 test("spawn and dispatch force a zero-child director to dispatch two children before reduction", async () => {
   const { spawn } = await import("./support/spawn");
   const { dispatch } = await import("./support/dispatch");

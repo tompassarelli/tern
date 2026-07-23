@@ -22,8 +22,9 @@ import { withStallWatchdog, stallMs, notifyStall, notifyTurnCap } from "./watchd
 import { makeBgTracker, bgContinuationMessage, maxBgContinuations } from "./bgtasks";
 import {
   assessChildFinalization, childContinuationMessage, childDispatchMessage, childReductionMessage,
-  decideChildTurnEnd, initialChildContinuationState, notifyEarlyExitChildren,
-  requiredDirectChildCount, settleChildren, type ChildSettlement,
+  continuationRaceOutcome, decideChildTurnEnd, initialChildContinuationState, notifyEarlyExitChildren,
+  requiredDirectChildCount, settleChildren,
+  type ChildSettlement, type OrchestratorContinuationKind,
 } from "./children";
 import {
   bespokeContractFingerprint, writeAgentFacts, writeAgentTerminal, updateAgentRoute,
@@ -370,6 +371,10 @@ async function runDispatch(
   let childContinuation = initialChildContinuationState(
     requiredDirectChildCount(routingMetadata),
   );
+  // Orchestrator continuation race (thread 019f8ec5): the obligation whose
+  // continuation was injected at the last turn-end and not yet discharged by a
+  // genuine (non-empty) provider result. See the guard in the result loop.
+  let pendingContinuation: OrchestratorContinuationKind | undefined;
   let injectedCompositionEvidence: HarnessCompositionEvidence | undefined;
   let admittedRoute: {
     provider: ProviderAuthoritySurface["provider"];
@@ -507,6 +512,23 @@ async function runDispatch(
           break;
         }
         if (ch.pending() === 0) {
+          // Orchestrator continuation race (thread 019f8ec5): a continuation
+          // injected at a prior turn-end asks the provider for ANOTHER genuine
+          // turn, but the Anthropic session may already be tearing down after
+          // its final message. The continuation then lands on a closing stream
+          // and the provider answers with a degenerate empty-success terminal,
+          // which decideChildTurnEnd would read as a completed continuation and
+          // finalize as ran_empty. An outstanding continuation is discharged
+          // ONLY by a non-empty result; an empty terminal here is the race, so
+          // record the obligation-specific blocked outcome loudly instead.
+          if (orchestrator && pendingContinuation && result.trim() === "") {
+            outcome = continuationRaceOutcome(pendingContinuation);
+            console.error(
+              `[harness] @agent:${agentId} orchestrator ${pendingContinuation} continuation answered by an empty provider terminal — closing-stream race, recording ${outcome} (never ran_empty)`,
+            );
+            break;
+          }
+          pendingContinuation = undefined; // a genuine result discharges the obligation
           // Refuse to exit while background tasks are live (half a) — inject a
           // continuation + keep looping so the SDK auto-continues to task settlement.
           if (bgTracker.size() > 0 && bgContinuations < maxBgContinuations()) {
@@ -543,6 +565,10 @@ async function runDispatch(
                 );
                 ch.push(childReductionMessage(decision.children));
               }
+              // Remember the outstanding obligation so a degenerate empty
+              // terminal on the next turn (a closing-stream race) blocks
+              // explicitly rather than falsely discharging the continuation.
+              pendingContinuation = decision.reason;
               continue;
             }
             if (decision.action === "block") {
