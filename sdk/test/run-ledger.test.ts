@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, connect } from "node:net";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { expect, test } from "bun:test";
 import {
   AGENT_RUN_EVENT_TYPES,
@@ -7,11 +11,13 @@ import {
   AgentRunLedger,
   eventFacts,
   publishRunLifecycleLedger,
+  recordRunEvents,
   type AgentRunEvent,
 } from "../src/run-ledger";
 import { runFacts } from "../src/telemetry";
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+const repo = resolve(import.meta.dir, "../..");
 const identity = {
   run: "@run:lane-ledger-001",
   thread: "@019f89ac-a86a-7399-b915-358d44a1be15",
@@ -223,8 +229,122 @@ const mcpActivity = {
   totalCalls: 2, tools: [{ server: "north", tool: "tell", count: 2 }],
 };
 
+async function unusedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("failed to allocate test port");
+  await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  return address.port;
+}
+
+async function waitForPort(port: number): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const open = await new Promise<boolean>((resolveProbe) => {
+      const socket = connect({ host: "127.0.0.1", port });
+      socket.once("connect", () => {
+        socket.destroy();
+        resolveProbe(true);
+      });
+      socket.once("error", () => resolveProbe(false));
+    });
+    if (open) return;
+    await Bun.sleep(25);
+  }
+  throw new Error("isolated Fram coordinator did not start");
+}
+
+test("one real writer process commits seven ordered events inside the production timeout", async () => {
+  const framCandidates = [resolve(repo, "../fram"), resolve(homedir(), "code/fram")];
+  const fram = framCandidates.find((candidate) =>
+    existsSync(resolve(candidate, "coord_daemon.clj"))
+  );
+  if (!fram) throw new Error("Fram checkout unavailable for run-event writer integration test");
+  const scratch = mkdtempSync(join(tmpdir(), "north-run-event-batch-"));
+  const log = join(scratch, "facts.log");
+  writeFileSync(log, "");
+  const port = await unusedPort();
+  const daemon = Bun.spawn([
+    "bb", "-cp", "out", "coord_daemon.clj", "serve-flat", String(port), log,
+  ], {
+    cwd: fram,
+    env: { ...process.env, FRAM_REQUIRE_LOG_FENCE: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const priorPort = process.env.NORTH_PORT;
+  const priorLog = process.env.FRAM_LOG;
+  try {
+    await waitForPort(port);
+    process.env.NORTH_PORT = String(port);
+    process.env.FRAM_LOG = log;
+    const ledger = new AgentRunLedger({
+      run: "@run:batch-writer-integration",
+      thread: "(ad-hoc)",
+      agent: "batch-writer-integration",
+    });
+    for (let sequence = 0; sequence < 6; sequence += 1) {
+      ledger.append(
+        "tool_activity", { totalCalls: sequence }, "north-sdk-test", "exact",
+        `2026-07-23T00:00:0${sequence}.000Z`,
+      );
+    }
+    ledger.append(
+      "terminal_cleanup", { outcome: "ran", cleanupStatus: "observed" },
+      "north-sdk-test", "exact", "2026-07-23T00:00:06.000Z",
+    );
+    const events = ledger.events();
+    const started = performance.now();
+    expect(await recordRunEvents(events, 4_000)).toBe("recorded");
+    const elapsedMs = performance.now() - started;
+    expect(elapsedMs).toBeLessThan(4_000);
+
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    let predecessorKind = -1;
+    for (const event of events) {
+      const subjectNeedle = `:l "${event.subject}"`;
+      const subjectIndexes = lines
+        .map((line, index) => line.includes(subjectNeedle) ? index : -1)
+        .filter((index) => index >= 0);
+      const digestIndex = lines.findIndex((line) =>
+        line.includes(subjectNeedle)
+        && line.includes(':p "run_event_sha256"')
+        && line.includes(`:r "${event.digest}"`)
+      );
+      const sequenceIndex = lines.findIndex((line) =>
+        line.includes(subjectNeedle)
+        && line.includes(':p "run_event_sequence"')
+        && line.includes(`:r "${event.sequence}"`)
+      );
+      const kindIndex = lines.findIndex((line) =>
+        line.includes(subjectNeedle)
+        && line.includes(':p "kind"')
+        && line.includes(':r "run_event"')
+      );
+      expect(subjectIndexes.length).toBeGreaterThan(0);
+      expect(subjectIndexes[0]).toBeGreaterThan(predecessorKind);
+      expect(sequenceIndex).toBeGreaterThan(predecessorKind);
+      expect(digestIndex).toBeGreaterThan(predecessorKind);
+      expect(kindIndex).toBeGreaterThan(digestIndex);
+      predecessorKind = kindIndex;
+    }
+  } finally {
+    if (priorPort === undefined) delete process.env.NORTH_PORT;
+    else process.env.NORTH_PORT = priorPort;
+    if (priorLog === undefined) delete process.env.FRAM_LOG;
+    else process.env.FRAM_LOG = priorLog;
+    daemon.kill();
+    await daemon.exited;
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("terminal success publishes exact ordered lifecycle evidence and a complete summary", async () => {
   const published: AgentRunEvent[] = [];
+  let writerCalls = 0;
   const summary = await publishRunLifecycleLedger(identity, {
     promptEconomics,
     tokenUsage: {
@@ -235,7 +355,13 @@ test("terminal success publishes exact ordered lifecycle evidence and a complete
     compactions: 0,
     outcome: "ran",
     caveman, mcpActivity,
-  }, 1000, async (event) => { published.push(event); return "recorded"; });
+  }, 1000, async (events, timeoutMs) => {
+    writerCalls += 1;
+    published.push(...events);
+    expect(timeoutMs).toBe(1000);
+    return "recorded";
+  });
+  expect(writerCalls).toBe(1);
   expect(summary?.eventCount).toBe(8);
   expect(published.map(({ type }) => type)).toEqual([
     "caveman_observed", "tool_activity", "tool_activity", "prompt_constructed", "usage_observed", "cache_observed",
@@ -252,13 +378,13 @@ test("a provider failure is a terminal lifecycle but missing usage stays explici
     compactions: 1,
     outcome: "provider_error",
     caveman, mcpActivity,
-  }, 1000, async (event) => { published.push(event); return "recorded"; });
+  }, 1000, async (events) => { published.push(...events); return "recorded"; });
   expect(summary).toBeDefined();
   expect(published.find(({ type }) => type === "usage_observed")?.coverage).toBe("unknown");
   expect(published.at(-1)?.payload.outcome).toBe("provider_error");
 });
 
-test("final run-id rotation never copies partial events or manufactures a summary", async () => {
+test("a mid-batch writer failure never manufactures a complete summary", async () => {
   const finalIdentity = { ...identity, run: "@run:lane-ledger-final" };
   const published: AgentRunEvent[] = [];
   const summary = await publishRunLifecycleLedger(finalIdentity, {
@@ -267,9 +393,9 @@ test("final run-id rotation never copies partial events or manufactures a summar
     compactions: 0,
     outcome: "ran",
     caveman, mcpActivity,
-  }, 1000, async (event) => {
-    published.push(event);
-    return event.type === "cache_observed" ? "unavailable" : "recorded";
+  }, 1000, async (events) => {
+    published.push(...events.slice(0, 5));
+    return "unavailable";
   });
   expect(summary).toBeUndefined();
   expect(published.every(({ run, subject }) =>

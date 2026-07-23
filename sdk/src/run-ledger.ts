@@ -299,6 +299,38 @@ export function recordRunEvent(
   });
 }
 
+export function recordRunEvents(
+  events: ReadonlyArray<AgentRunEvent>,
+  timeoutMs = 10_000,
+): Promise<RunEventPublicationStatus> {
+  let batch: Array<Readonly<{
+    subject: string;
+    facts: Array<[string, string]>;
+  }>>;
+  try {
+    if (events.length === 0) return Promise.resolve("unavailable");
+    batch = events.map((event) => Object.freeze({
+      subject: event.subject,
+      facts: eventFacts(event),
+    }));
+  } catch {
+    return Promise.resolve("unavailable");
+  }
+  return new Promise((resolvePublication) => {
+    try {
+      execFile("bb", [
+        internalWriter,
+        process.env.NORTH_PORT ?? "7977",
+        JSON.stringify(batch),
+      ], { timeout: Math.max(1, Math.floor(timeoutMs)) }, (error) => {
+        resolvePublication(error ? "unavailable" : "recorded");
+      });
+    } catch {
+      resolvePublication("unavailable");
+    }
+  });
+}
+
 export interface RunLifecycleObservations {
   promptEconomics?: PromptEconomicsEvidence;
   tokenUsage: NormalizedTokenUsage;
@@ -317,8 +349,10 @@ export async function publishRunLifecycleLedger(
   identity: RunLedgerIdentity,
   observations: RunLifecycleObservations,
   timeoutMs = 10_000,
-  writer: (event: AgentRunEvent, timeoutMs: number) => Promise<RunEventPublicationStatus>
-    = recordRunEvent,
+  writer: (
+    events: ReadonlyArray<AgentRunEvent>,
+    timeoutMs: number,
+  ) => Promise<RunEventPublicationStatus> = recordRunEvents,
 ): Promise<AgentRunLedgerSummary | undefined> {
   const ledger = new AgentRunLedger(identity);
   const events: AgentRunEvent[] = [];
@@ -422,17 +456,10 @@ export async function publishRunLifecycleLedger(
     cleanupStatus: "observed",
   }, "north-managed-terminal", "exact"));
 
-  const eventTimeout = Math.max(1, Math.floor(timeoutMs / Math.max(1, events.length)));
-  // Event subjects carry immutable sequence slots, so publication may proceed
-  // concurrently without weakening order. This keeps the ledger inside the
-  // shared terminal budget instead of starving existing cleanup writers.
-  let complete = true;
-  for (const event of events) {
-    if (await writer(event, eventTimeout) !== "recorded") {
-      complete = false;
-      break;
-    }
-  }
+  // One writer process receives the full lifecycle budget. Spawning Babashka
+  // once per event consumes most of the terminal timeout in cold starts and can
+  // leave every production run without event evidence.
+  const complete = await writer(Object.freeze([...events]), timeoutMs) === "recorded";
   // A caught transport crash has no provider terminal boundary. Its attempted
   // observations remain useful events, but the @run header must not claim a
   // complete lifecycle ledger.

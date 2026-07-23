@@ -5,7 +5,7 @@
             [clojure.string :as str]))
 
 (def ^:private repo-root
-  (some-> (System/getProperty "babashka.file") io/file .getCanonicalFile
+  (some-> (or *file* (System/getProperty "babashka.file")) io/file .getCanonicalFile
           .getParentFile .getParentFile str))
 (def contract
   (json/parse-string
