@@ -111,6 +111,7 @@ jobs:
           bb cli/tests/reactor-sweep-lifecycle-test.clj  # bounded one-shot, reconnect, and single-flight lock
           bb cli/tests/worktree-allocation-integration-test.clj  # marker-last physical ownership + rollback/quarantine
           bb cli/tests/worktree-janitor-integration-test.clj  # real Git + isolated coordinator, production sweep-once twice
+          bb cli/tests/reactor-sweep-large-corpus-test.clj  # >221k live facts + 48 lanes complete without scan/fixpoint amplification
           # Generate the exact imported corpus and require the lifecycle bar's
           # terminal PASS marker so a missing/wrong log can never skip green.
           ( cd ../fram && bin/fram import )

@@ -146,6 +146,20 @@
                            (repeat north.coord/query-page-cursor-byte-limit
                                    "a")))))))
 
+(with-redefs [north.coord/send-op
+              (fn [_port _request]
+                {:ok [] :error ["corrupt"] :version 1 :engine "index"})]
+  (check! "indexed query rejects a contradictory success/error envelope"
+          (throws-type?
+           :malformed-indexed-query-response
+           #(north.coord/indexed-query
+             7977
+             {:find "row"
+              :rules [{:head {:rel "row" :args [{:var "e"}]}
+                       :body [{:rel "triple"
+                               :args [{:var "e"} "kind" "run"]}]}]}
+             129))))
+
 (let [port (free-port)
       tmp (.toFile
            (java.nio.file.Files/createTempDirectory

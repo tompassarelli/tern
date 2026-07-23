@@ -27,6 +27,7 @@ clojure_bars=(
   cli/tests/peer-command-integration-test.clj
   cli/tests/worktree-allocation-integration-test.clj
   cli/tests/worktree-janitor-integration-test.clj
+  cli/tests/reactor-sweep-large-corpus-test.clj
 )
 
 for entrypoint in "${shell_bars[@]}"; do

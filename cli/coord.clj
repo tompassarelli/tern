@@ -383,6 +383,49 @@
 (defn send-op-for-log [port log op]
   (send-envelope port (log-envelope-for log op)))
 
+(defn indexed-query
+  "Run one simple Fram indexed query with a bounded result set and an exclusive
+   success envelope. A contradictory or malformed response never becomes an
+   empty result: callers may treat the typed row-limit error as over-broad, but
+   every other invalid envelope fails closed."
+  [port query max-rows]
+  (when-not (and (integer? max-rows)
+                 (<= 1 max-rows query-page-row-limit))
+    (throw
+     (ex-info "indexed query row limit is outside the North/Fram contract"
+              {:type :invalid-indexed-query-limit
+               :limit max-rows
+               :max query-page-row-limit})))
+  (let [response
+        (send-op port {:op :query
+                       :query query
+                       :query-max-rows max-rows
+                       :query-max-response-bytes query-page-response-byte-limit})
+        keys* (when (map? response) (set (keys response)))
+        success?
+        (and (= keys* #{:ok :version :engine})
+             (vector? (:ok response))
+             (<= (count (:ok response)) max-rows)
+             (every? #(and (vector? %) (every? string? %)) (:ok response))
+             (integer? (:version response))
+             (not (neg? (:version response)))
+             (= "index" (:engine response)))]
+    (cond
+      success? response
+
+      (and (map? response)
+           (contains? response :error)
+           (= :query-row-limit (:code response)))
+      (throw
+       (ex-info "indexed query exceeded its row bound"
+                {:type :indexed-query-row-limit
+                 :max-rows max-rows}))
+
+      :else
+      (throw
+       (ex-info "coordinator returned a malformed indexed-query response"
+                {:type :malformed-indexed-query-response})))))
+
 (defn query-page
   "Run Fram's internal deterministic query-page verb under its tighter 1 MiB
    client cap. There is no compatibility fallback: managed replay depends on

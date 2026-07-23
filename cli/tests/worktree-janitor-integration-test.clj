@@ -23,7 +23,7 @@
 
 (let [source (slurp reactor)]
   (check "sweep lifecycle lookup is indexed, capped, and never scans all subject facts"
-         (and (str/includes? source ":query-max-rows (inc max-lane-run-candidates)")
+         (and (str/includes? source "north.coord/indexed-query")
               (str/includes? source "lane_run_candidate")
               (str/includes? source "(= \"index\" (:engine response))")
               (str/includes? source "north.coord/many port subject predicate")
