@@ -8,6 +8,7 @@ import { getThreadFacts, type Fact } from "./north-client";
 import {
   trustedGitBranchName, trustedGitExecutable, trustedGitProjectRoot,
 } from "./trusted-runtime";
+import { hasAuthoringCapability } from "./gaffer-capabilities";
 export { trustedGitExecutable } from "./trusted-runtime";
 
 const REPO = resolve(import.meta.dir, "..", "..");
@@ -143,7 +144,7 @@ export function admitBillableClock(
     ? runtime.projectRoot(input.cwd)
     : defaultProjectRoot(input.cwd, gitExecutable());
   const client = clientOwnerForProjectRoot(projectRoot);
-  const required = input.capabilities.includes("filesystem.write")
+  const required = hasAuthoringCapability(input.capabilities)
     && client !== undefined;
   if (!input.threadId) {
     if (required)

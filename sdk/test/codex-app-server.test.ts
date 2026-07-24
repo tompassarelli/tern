@@ -20,6 +20,9 @@ import { codexSupervisorStatusLine } from "../src/providers/codex-supervisor-pro
 import type { OpenAIAuthoritySurface } from "../src/providers/authority";
 import { providerSessionKey, providerTurnKey } from "../src/providers/provider-join";
 import { NORTH_BINARY_PROBE_SCRIPT } from "../src/native-command-activity";
+import {
+  FRAM_MCP_COMMAND, FRAM_MCP_TOOL_NAMES, framMcpEnvironment,
+} from "../src/fram-graph-authoring";
 
 function firstLine(stream: NodeJS.ReadableStream, label: string): Promise<string> {
   return new Promise((resolveLine, reject) => {
@@ -769,6 +772,37 @@ test("launch seals the exact package shell environment policy", () => {
   expect(launch.args).toContain("allow_login_shell=false");
   expect(launch.args).toContain(
     `shell_environment_policy.set={"NORTH_BIN"=${JSON.stringify(options.env.NORTH_BIN)},"PATH"=${JSON.stringify(options.env.PATH)}}`,
+  );
+});
+
+test("launch seals the opt-in Fram MCP server and its exact graph-edit tool set", () => {
+  const { options } = setup();
+  options.surface = {
+    ...options.surface,
+    capabilities: [
+      "filesystem.read", "filesystem.search", "shell.readonly", "graph-authoring.fram",
+    ],
+    sandbox: "read-only",
+  };
+  options.fram = {
+    command: FRAM_MCP_COMMAND,
+    args: [],
+    env: framMcpEnvironment(options.cwd),
+  };
+  const launch = managedCodexAppServerLaunch(options);
+  expect(launch.expectedSessionConfig.mcp_servers).toMatchObject({
+    fram: {
+      command: FRAM_MCP_COMMAND,
+      args: [],
+      env: framMcpEnvironment(options.cwd),
+      enabled: true,
+      required: true,
+      enabled_tools: [...FRAM_MCP_TOOL_NAMES],
+    },
+  });
+  expect(launch.args).toContain("mcp_servers.fram.required=true");
+  expect(launch.args).toContain(
+    `mcp_servers.fram.enabled_tools=${JSON.stringify(FRAM_MCP_TOOL_NAMES)}`,
   );
 });
 

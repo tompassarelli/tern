@@ -57,6 +57,7 @@ import { admitRoutingRequest, routingRequestFromEnv } from "./routing-admission"
 import {
   gafferCapabilities,
 } from "./gaffer-staffing";
+import { hasAuthoringCapability } from "./gaffer-capabilities";
 import { refreshAccountUsages } from "./account-usage";
 import {
   admitResourceEnvelope, completeResourceEnvelope, envelopeContextFromEnv,
@@ -183,7 +184,7 @@ const PROVIDER_PROCESS_DEATH_MAX_RETRIES = 1;
  *    preflight block, stall, cap, or resource-envelope refusal;
  *  - topology is worker — an orchestrator's live child obligations make retry
  *    semantics wrong (a fresh run cannot honestly re-inherit them);
- *  - the lane's capability surface is read-only (no filesystem.write/shell) —
+ *  - the lane's capability surface is read-only (no filesystem.write/shell/Fram graph authoring) —
  *    a writable lane may already have mutated the checkout, so re-running it
  *    is unsafe.
  */
@@ -194,7 +195,7 @@ export function eligibleForProviderProcessDeathRetry(
 ): boolean {
   if (outcome !== PROVIDER_PROCESS_DEATH_OUTCOME) return false;
   if (topology !== "worker") return false;
-  if (capabilities.includes("filesystem.write") || capabilities.includes("shell")) return false;
+  if (hasAuthoringCapability(capabilities)) return false;
   return true;
 }
 
@@ -1202,8 +1203,7 @@ export async function spawn(opts: SpawnOptions): Promise<string> {
     );
   }
   const requestedCapabilities = gafferCapabilities(composed.routingMetadata);
-  const requestsMutation = requestedCapabilities.includes("filesystem.write")
-    || requestedCapabilities.includes("shell");
+  const requestsMutation = hasAuthoringCapability(requestedCapabilities);
   const requestsRegisteredWorkspace = composed.worktree
     ?? process.env.AGENT_WORKTREE === "1";
   if (requestsMutation && !requestsRegisteredWorkspace) {

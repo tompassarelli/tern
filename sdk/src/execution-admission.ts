@@ -2,7 +2,12 @@ import { accessSync, constants } from "node:fs";
 import { spawn as procSpawn } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
 import type { GafferCapability } from "./gaffer-capabilities";
-import { providerCapabilityRejectionCode } from "./gaffer-capabilities";
+import {
+  hasAuthoringCapability, providerCapabilityRejectionCode,
+} from "./gaffer-capabilities";
+import {
+  FRAM_GRAPH_AUTHORING_CAPABILITY, FRAM_MCP_COMMAND, hasCanonicalFramMcpServer,
+} from "./fram-graph-authoring";
 import { preflightReadonlyShell, ReadonlyShellUnavailableError } from "./readonly-shell";
 import {
   PROVIDER_UNSENT_PROOF_VERSION,
@@ -271,6 +276,13 @@ export function validateManagedExecutionEnvelope(
       || !sameStringMap(north.env, expectedNorthEnv)) {
     throw new ExecutionAdmissionError(`${provider}_managed_north_mcp_contract_missing`);
   }
+  const graphAuthoring = capabilities.includes(FRAM_GRAPH_AUTHORING_CAPABILITY);
+  const fram = options?.mcpServers?.fram;
+  if (graphAuthoring
+    ? typeof options?.cwd !== "string" || !hasCanonicalFramMcpServer(fram, options.cwd)
+    : fram !== undefined) {
+    throw new ExecutionAdmissionError(`${provider}_managed_fram_mcp_contract_missing`);
+  }
   const checkpointKeys = [
     "NORTH_CHECKPOINT_ENABLED", "NORTH_CHECKPOINT_EXECUTION_ROOT",
     "NORTH_CHECKPOINT_WORKTREE", "NORTH_CHECKPOINT_REPOSITORY",
@@ -290,7 +302,7 @@ export function validateManagedExecutionEnvelope(
       return typeof value === "string" && value.trim() === value && value.length > 0;
     });
     if (topology !== "worker"
-        || !capabilities.includes("filesystem.write")
+        || !hasAuthoringCapability(capabilities)
         || !allPresent
         || checkpointValues.NORTH_CHECKPOINT_EXECUTION_ROOT !== options.cwd
         || checkpointValues.NORTH_CHECKPOINT_WORKTREE !== options.cwd
@@ -412,6 +424,13 @@ export async function admitExecution(
     accessSync(MCP, constants.X_OK);
   } catch (cause) {
     throw new ExecutionAdmissionError("north_mcp_executable_unavailable", { cause });
+  }
+  if (capabilities.includes(FRAM_GRAPH_AUTHORING_CAPABILITY)) {
+    try {
+      accessSync(FRAM_MCP_COMMAND, constants.X_OK);
+    } catch (cause) {
+      throw new ExecutionAdmissionError("fram_mcp_executable_unavailable", { cause });
+    }
   }
   if (provider === "anthropic" && capabilities.includes("shell.readonly")) {
     try {

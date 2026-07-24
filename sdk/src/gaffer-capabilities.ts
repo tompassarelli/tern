@@ -1,6 +1,6 @@
 import type { ProviderId } from "./providers/types";
 
-export const GAFFER_CAPABILITIES = [
+export const GAFFER_PRESET_CAPABILITIES = [
   "filesystem.read",
   "filesystem.search",
   "filesystem.write",
@@ -9,7 +9,17 @@ export const GAFFER_CAPABILITIES = [
   "web",
   "coordination",
 ] as const;
+export const GAFFER_CAPABILITIES = [
+  ...GAFFER_PRESET_CAPABILITIES,
+  "graph-authoring.fram",
+] as const;
 export type GafferCapability = typeof GAFFER_CAPABILITIES[number];
+
+export function hasAuthoringCapability(capabilities: readonly string[]): boolean {
+  return capabilities.includes("filesystem.write")
+    || capabilities.includes("shell")
+    || capabilities.includes("graph-authoring.fram");
+}
 
 export function requireGafferCapabilities(value: unknown, label = "capabilities"): GafferCapability[] {
   if (!Array.isArray(value) || value.length === 0
@@ -36,6 +46,8 @@ export function validateTopologyCapabilities(
       throw new Error(label + ": orchestrator topology forbids filesystem.write capability");
     if (has("shell"))
       throw new Error(label + ": orchestrator topology forbids unrestricted shell capability");
+    if (has("graph-authoring.fram"))
+      throw new Error(label + ": orchestrator topology forbids graph-authoring.fram capability");
   } else if (has("coordination")) {
     throw new Error(label + ": worker topology forbids coordination capability");
   }

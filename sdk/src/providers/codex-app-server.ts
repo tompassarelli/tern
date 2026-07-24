@@ -16,6 +16,10 @@ import { parseStrictJson, StrictJsonlFrames } from "../strict-json";
 import { trustedGitProjectRoot, trustedManagedCodexExecutable } from "../trusted-runtime";
 import type { TerminalTokenUsage } from "../usage";
 import { McpActivityAccumulator, normalizeCodexMcpIdentity } from "../tool-activity";
+import {
+  FRAM_GRAPH_AUTHORING_CAPABILITY, FRAM_MCP_SERVER, FRAM_MCP_TOOL_NAMES,
+  hasCanonicalFramMcpServer,
+} from "../fram-graph-authoring";
 import type { OpenAIAuthoritySurface } from "./authority";
 import { expectedManagedCodexHooks } from "./codex-managed-hooks";
 import { CODEX_SUPERVISOR_STATUS_PREFIX } from "./codex-supervisor-protocol";
@@ -143,6 +147,7 @@ export interface ManagedCodexAppServerOptions {
   developerInstructions: string;
   surface: OpenAIAuthoritySurface;
   north: ManagedCodexNorthServer;
+  fram?: ManagedCodexNorthServer;
   timeoutMs?: number;
   onActivity?: () => void;
 }
@@ -309,6 +314,29 @@ export function managedCodexAppServerLaunch(
   };
 
   const northEnv = managedNorthMcpEnvironment(options.north.env);
+  const graphAuthoring = options.surface.capabilities.includes(FRAM_GRAPH_AUTHORING_CAPABILITY);
+  if (graphAuthoring
+    ? !options.fram || !hasCanonicalFramMcpServer({
+      type: "stdio",
+      command: options.fram.command,
+      args: options.fram.args,
+      env: options.fram.env,
+    }, options.cwd)
+    : options.fram !== undefined) {
+    throw new ManagedCodexPreThreadError("openai_managed_fram_mcp_contract_missing");
+  }
+  const framConfig = options.fram
+    ? {
+      [FRAM_MCP_SERVER]: {
+        command: options.fram.command,
+        args: options.fram.args,
+        env: options.fram.env,
+        enabled: true,
+        required: true,
+        enabled_tools: [...FRAM_MCP_TOOL_NAMES],
+      },
+    }
+    : {};
   const features = Object.fromEntries([
     ...MANAGED_CODEX_ENABLED_FEATURES.map((name) => [name, true] as const),
     ...MANAGED_CODEX_DISABLED_FEATURES.map((name) => [name, false] as const),
@@ -332,6 +360,7 @@ export function managedCodexAppServerLaunch(
         required: true,
         enabled_tools: options.surface.northEnabledTools,
       },
+      ...framConfig,
     },
     web_search: options.surface.web,
     features,
@@ -351,6 +380,14 @@ export function managedCodexAppServerLaunch(
     "-c", "mcp_servers.north.enabled=true",
     "-c", "mcp_servers.north.required=true",
     "-c", `mcp_servers.north.enabled_tools=${JSON.stringify(options.surface.northEnabledTools)}`,
+    ...(options.fram ? [
+      "-c", `mcp_servers.${FRAM_MCP_SERVER}.command=${JSON.stringify(options.fram.command)}`,
+      "-c", `mcp_servers.${FRAM_MCP_SERVER}.args=${JSON.stringify(options.fram.args)}`,
+      "-c", `mcp_servers.${FRAM_MCP_SERVER}.env=${tomlStringMap(options.fram.env)}`,
+      "-c", `mcp_servers.${FRAM_MCP_SERVER}.enabled=true`,
+      "-c", `mcp_servers.${FRAM_MCP_SERVER}.required=true`,
+      "-c", `mcp_servers.${FRAM_MCP_SERVER}.enabled_tools=${JSON.stringify(FRAM_MCP_TOOL_NAMES)}`,
+    ] : []),
     "-c", `web_search=${JSON.stringify(options.surface.web)}`,
     ...MANAGED_CODEX_ENABLED_FEATURES.flatMap((name) => ["--enable", name]),
     ...MANAGED_CODEX_DISABLED_FEATURES.flatMap((name) => ["--disable", name]),

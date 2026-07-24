@@ -28,7 +28,10 @@ import {
 } from "./routing-metadata";
 import { admitRoutingRequest } from "./routing-admission";
 import { gafferCapabilities } from "./gaffer-staffing";
-import type { GafferCapability } from "./gaffer-capabilities";
+import { hasAuthoringCapability, type GafferCapability } from "./gaffer-capabilities";
+import {
+  FRAM_GRAPH_AUTHORING_CAPABILITY, FRAM_MCP_TOOLS, framMcpServer,
+} from "./fram-graph-authoring";
 import {
   BESPOKE_FINGERPRINT_DOMAIN, BESPOKE_FINGERPRINT_VERSION,
   bespokeContractFingerprint, canonicalGafferCapabilities,
@@ -235,6 +238,7 @@ const CAPABILITY_TOOLS: Record<GafferCapability, string[]> = {
   "shell.readonly": [READONLY_SHELL_TOOL],
   web: ["WebSearch", "WebFetch"],
   coordination: ORCHESTRATION_TOOLS,
+  [FRAM_GRAPH_AUTHORING_CAPABILITY]: [...FRAM_MCP_TOOLS],
 };
 const ALL_CAPABILITY_TOOLS = [...new Set(Object.values(CAPABILITY_TOOLS).flat())];
 
@@ -971,7 +975,7 @@ function capabilityClass(
 ): PromptEconomicsEvidence["capabilityClass"] {
   if (!capabilities) return "unknown";
   if (topology === "orchestrator" && capabilities.includes("coordination")) return "orchestrator";
-  if (capabilities.includes("filesystem.write") || capabilities.includes("shell")) return "authoring";
+  if (hasAuthoringCapability(capabilities)) return "authoring";
   if (capabilities.includes("web")) return "readonly-web";
   return "readonly";
 }
@@ -1606,6 +1610,7 @@ export function harnessOptions(o: HarnessOpts): Options {
     ? undefined
     : o.presenceRenewer ?? (o.presenceRegistrar === undefined ? renewPresence : undefined);
   const readonlyShell = capabilities?.includes("shell.readonly") === true;
+  const graphAuthoring = capabilities?.includes(FRAM_GRAPH_AUTHORING_CAPABILITY) === true;
   const northMcpEnv = Object.freeze(
     managedNorthMcpEnvironment({ ...childEnv, NORTH_BIN: ENGINE }),
   );
@@ -1625,6 +1630,9 @@ export function harnessOptions(o: HarnessOpts): Options {
     // denied native Bash plus North's isolated read-only shell.
     ...(readonlyShell
       ? { [READONLY_SHELL_SERVER]: Object.freeze(readonlyShellServer(cwd, childEnv)) }
+      : {}),
+    ...(graphAuthoring
+      ? { fram: framMcpServer(cwd) }
       : {}),
   });
   const sealedTools = policy

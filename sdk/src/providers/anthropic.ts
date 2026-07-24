@@ -16,6 +16,9 @@ import {
   READONLY_SHELL_SERVER, READONLY_SHELL_TOOL,
 } from "../readonly-shell";
 import {
+  FRAM_GRAPH_AUTHORING_CAPABILITY, FRAM_MCP_SERVER,
+} from "../fram-graph-authoring";
+import {
   canonicalHarnessModelAvailability,
   COORDINATION_TOOLS, hasCanonicalAuthoringHooks, hasCanonicalHarnessAuthority, managedToolPolicy,
   NATIVE_AGENT_TOOLS, ORCHESTRATION_TOOLS,
@@ -177,6 +180,7 @@ function validateAnthropicHarness(options: any): ReturnType<typeof requireGaffer
     "north",
     ...(capabilities.includes("coordination") ? ["north-peer"] : []),
     ...(capabilities.includes("shell.readonly") ? [READONLY_SHELL_SERVER] : []),
+    ...(capabilities.includes(FRAM_GRAPH_AUTHORING_CAPABILITY) ? [FRAM_MCP_SERVER] : []),
   ];
   if (capabilities.includes("coordination")) {
     requireAllowed(ORCHESTRATION_TOOLS, "coordination");

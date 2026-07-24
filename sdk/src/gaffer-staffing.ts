@@ -9,7 +9,8 @@ import {
   parseCompleteRoutingRequest,
 } from "./routing-metadata";
 import {
-  GAFFER_CAPABILITIES, requireGafferCapabilities, validateTopologyCapabilities,
+  GAFFER_CAPABILITIES, GAFFER_PRESET_CAPABILITIES, requireGafferCapabilities,
+  validateTopologyCapabilities,
   type GafferCapability,
 } from "./gaffer-capabilities";
 import { requireGafferRoleId } from "./gaffer-role-id";
@@ -109,7 +110,7 @@ export function loadGafferStaffing(
     deliberations: REASONING_LEVELS,
     topologies: TOPOLOGIES,
     postures: POSTURES,
-    capabilities: GAFFER_CAPABILITIES,
+    capabilities: GAFFER_PRESET_CAPABILITIES,
   })) {
     const actual = [...vocabularyByAxis[axis]].sort();
     if (JSON.stringify(actual) !== JSON.stringify([...expected].sort()))
@@ -131,7 +132,8 @@ export function loadGafferStaffing(
   const vocabulary = requireGafferCapabilities(
     value.vocabulary?.capabilities, "staffing catalog vocabulary.capabilities",
   );
-  if (JSON.stringify([...vocabulary].sort()) !== JSON.stringify([...GAFFER_CAPABILITIES].sort()))
+  if (JSON.stringify([...vocabulary].sort())
+      !== JSON.stringify([...GAFFER_PRESET_CAPABILITIES].sort()))
     throw new Error(`Gaffer capability vocabulary drift at ${path}`);
   const presetNames = new Set<string>();
   for (const preset of presets) {
@@ -142,6 +144,8 @@ export function loadGafferStaffing(
     preset.capabilities = requireGafferCapabilities(
       preset.capabilities, `staffing preset ${preset.name}.capabilities`,
     );
+    if (preset.capabilities.some((capability: GafferCapability) => !vocabulary.includes(capability)))
+      throw new Error(`staffing preset ${preset.name}.capabilities contains a bespoke-only capability`);
     for (const [field, axis] of [
       ["taskGrade", "taskGrades"], ["tier", "semanticTiers"], ["deliberation", "deliberations"],
       ["topology", "topologies"], ["posture", "postures"],
