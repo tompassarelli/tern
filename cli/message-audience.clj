@@ -381,18 +381,48 @@
                        {:type :malformed-pending-steer-page})))
      (assoc response :messages (mapv first (:ok response))))))
 
+(defn- recipient-keyed-ids
+  "Message ids from ONE positive-triple rule, evaluated by the coordinator's warm
+   INCREMENTAL index engine (:op :query, the `simple-query?` fast path) rather than
+   the per-version scan projection. The index buckets recipient-keyed literals
+   (by-pr [pred obj]) directly, so cost is O(matching messages) and — unlike the
+   scan projection, which the coordinator rebuilds O(corpus) on every version bump —
+   it survives swarm write-churn. A single stratified/negated program would fall
+   back to that scan projection and time out at corpus scale, so the pending set is
+   assembled from these simple lookups and one client-side set difference instead."
+  [port body]
+  (let [response
+        (coord/indexed-query
+         port
+         {:find "pending_candidate"
+          :rules [{:head {:rel "pending_candidate" :args [{:var "e"}]}
+                   :body body}]}
+         coord/query-page-row-limit)]
+    (into #{} (map first) (:ok response))))
+
 (defn pending-message-ids
-  "Materialize all pending ids for human/read-only callers via bounded pages.
-   Live replay uses pending-message-page directly and never builds this vector."
+  "All pending ids for human/read-only callers (the `msg inbox` view). Same set as
+   `pending-query`: direct + broadcast-audience candidates, minus durable ack and
+   rejection settlement — but computed from recipient-keyed index lookups so it
+   returns in O(recipient's mail), never the whole-corpus scan that stratified
+   negation forces. Live replay uses pending-message-page directly, not this vector."
   [port recipient direct-addresses]
-  (loop [after nil messages []]
-    (let [page
-          (pending-message-page
-           port recipient direct-addresses coord/query-page-row-limit after)
-          next-messages (into messages (:messages page))]
-      (if (:more page)
-        (recur (:next page) next-messages)
-        next-messages))))
+  (let [recipient (bare-handle recipient)
+        addresses (bounded-direct-addresses recipient direct-addresses)
+        direct (reduce
+                (fn [acc address]
+                  (into acc (recipient-keyed-ids
+                             port [{:rel "triple" :args [{:var "e"} "to" address]}])))
+                #{} addresses)
+        broadcast (recipient-keyed-ids
+                   port [{:rel "triple" :args [{:var "e"} audience-predicate recipient]}
+                         {:rel "triple" :args [{:var "e"} "to" broadcast-address]}])
+        acknowledged (recipient-keyed-ids
+                      port [{:rel "triple" :args [{:var "e"} "acked_by" recipient]}])
+        rejected (recipient-keyed-ids
+                  port [{:rel "triple" :args [{:var "e"} rejected-by-predicate recipient]}])]
+    (vec (sort (set/difference (set/union direct broadcast)
+                               (set/union acknowledged rejected))))))
 
 (defn deliverable?
   "Whether RECIPIENT may consume MESSAGE addressed TO. DIRECT-ADDRESSES contains
