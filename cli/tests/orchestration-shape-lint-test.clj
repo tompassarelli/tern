@@ -46,10 +46,12 @@
 ;; which a readonly corpus lint must not require).
 (def SHAPES (literal-def "cli/orchestration-vocab-cli.clj" 'SHAPES))
 
-(def SHAPE-ALLOWED
-  (into {} (map (fn [[kind {:keys [required extra-allowed]}]]
-                  [kind (set (concat required extra-allowed))])
-                SHAPES)))
+;; The allowed-predicate sets come from the ONE generic interpreter (design
+;; §2.1-2.3, cli/orchestration-shape.clj) — pure + stdlib-only, so this readonly
+;; lint reuses the same allowed-set logic a future coordinator write gate would,
+;; instead of a second copy that can drift.
+(load-file (str (io/file root "cli/orchestration-shape.clj")))
+(def SHAPE-ALLOWED (north.orchestration-shape/allowed-by-kind SHAPES))
 
 (def default-log
   (or (System/getenv "FRAM_LOG") (str (System/getenv "HOME") "/.local/state/north/coordination.log")))

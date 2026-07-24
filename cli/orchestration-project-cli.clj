@@ -11,6 +11,8 @@
 ;; usage:
 ;;   bb orchestration-project-cli.clj <port> staffing            catalog.json projection
 ;;   bb orchestration-project-cli.clj <port> provider <name>     providers/<name>.json projection
+;;   bb orchestration-project-cli.clj <port> policy-pin          §3.2 three-way rule digests
+;;   bb orchestration-project-cli.clj <port> catalog-pin         §3.1(6) receipt graph-digest + tx watermark
 (require '[clojure.java.io :as io]
          '[clojure.string :as str]
          '[cheshire.core :as json])
@@ -178,11 +180,51 @@
      "projectionSha256" (rules-digest graph-rules)
      "validatorSha256" (rules-digest validator-rules)}))
 
+;; ---------------------------------------------------------------------------
+;; §3.1 point 6 — receipt catalog pin. The admission receipt's catalog-FILE
+;; sha256s (staffingCatalogSha256/providerCatalogsSha256 in routing-economics.ts,
+;; computed over Gaffer JSON on disk) are replaced, under NORTH_STAFFING_SOURCE=
+;; graph, by (a) the digest of the canonical JSON projection of the catalog
+;; subgraph and (b) two version watermarks — so the receipt names the EXACT graph
+;; state admission accepted rather than a file the graph may no longer mirror:
+;;   catalogVersion      — the @catalog:current pointer version (which versioned
+;;                         subgraph was projected).
+;;   coordinatorVersion  — the daemon's global tx watermark at projection time
+;;                         (design §3.1's "tell-ack version", e.g. v322995).
+;;   catalogDigestSha256 — sha256 over canonical JSON of {staffing, providers}.
+;; The digest is computed here (one subprocess) over the SAME projections the
+;; loaders read, with sorted-key canonicalization so it is deterministic and
+;; recomputable for audit.
+;; ---------------------------------------------------------------------------
+(defn- canon
+  "Recursively sort map keys so the JSON serialization is order-independent."
+  [x]
+  (cond
+    (map? x)        (into (sorted-map) (map (fn [[k v]] [k (canon v)]) x))
+    (sequential? x) (mapv canon x)
+    :else           x))
+
+(defn- sha256-hex [^String s]
+  (let [md (java.security.MessageDigest/getInstance "SHA-256")
+        bs (.digest md (.getBytes s java.nio.charset.StandardCharsets/UTF_8))]
+    (str/join (map #(format "%02x" (bit-and % 0xff)) bs))))
+
+(defn project-catalog-pin [port]
+  (let [ver (current-version port)
+        coord-ver (:version (send-op port {:op :version}))
+        subgraph {"staffing"  (project-staffing port)
+                  "providers" {"anthropic" (project-provider port "anthropic")
+                               "openai"    (project-provider port "openai")}}]
+    {"catalogVersion"      ver
+     "coordinatorVersion"  coord-ver
+     "catalogDigestSha256" (sha256-hex (json/generate-string (canon subgraph)))}))
+
 (let [[ps verb arg] *command-line-args*
       port (Integer/parseInt (or ps "7977"))]
   (case verb
-    "staffing"   (println (json/generate-string (project-staffing port)))
-    "provider"   (println (json/generate-string (project-provider port arg)))
-    "policy-pin" (println (json/generate-string (project-policy-pin port)))
-    (do (println "usage: orchestration-project-cli.clj <port> {staffing | provider <name> | policy-pin}")
+    "staffing"    (println (json/generate-string (project-staffing port)))
+    "provider"    (println (json/generate-string (project-provider port arg)))
+    "policy-pin"  (println (json/generate-string (project-policy-pin port)))
+    "catalog-pin" (println (json/generate-string (project-catalog-pin port)))
+    (do (println "usage: orchestration-project-cli.clj <port> {staffing | provider <name> | policy-pin | catalog-pin}")
         (System/exit 2))))

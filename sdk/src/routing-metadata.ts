@@ -211,7 +211,8 @@ export function parseCompleteRoutingRequest(
   const missing = ROUTING_REQUEST_FIELDS.filter((field) => normalized[field] === undefined);
   if (missing.length) {
     throw new Error(
-      `${surface} requires the complete eight-field Gaffer request; missing: ${missing.join(", ")}`,
+      `${surface} requires the complete eight-field Gaffer request; missing: ${missing.join(", ")}`
+      + " (recover the valid payload shape: north show @contract:dispatch)",
     );
   }
   return normalized as RoutingRequest;

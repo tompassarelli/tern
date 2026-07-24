@@ -473,9 +473,21 @@ export function runFacts(rec: RunRecord, at = new Date().toISOString()): Array<[
   if (receipt) {
     facts.push(["routing_admission_receipt_version", String(receipt.version)]);
     facts.push(["routing_request_sha256", receipt.routingRequestSha256]);
-    facts.push(["staffing_catalog_sha256", receipt.staffingCatalogSha256]);
-    facts.push(["provider_catalogs_sha256", receipt.providerCatalogsSha256]);
+    // Catalog-FILE digests exist only in file mode (§3.1(6)); graph mode names
+    // the graph state via the catalog pin facts below instead.
+    if (receipt.staffingCatalogSha256)
+      facts.push(["staffing_catalog_sha256", receipt.staffingCatalogSha256]);
+    if (receipt.providerCatalogsSha256)
+      facts.push(["provider_catalogs_sha256", receipt.providerCatalogsSha256]);
     facts.push(["routing_policy_sha256", receipt.routingPolicySha256]);
+    if (receipt.orchestrationPolicyPinSha256)
+      facts.push(["orchestration_policy_pin_sha256", receipt.orchestrationPolicyPinSha256]);
+    if (receipt.orchestrationCatalogDigestSha256)
+      facts.push(["orchestration_catalog_digest_sha256", receipt.orchestrationCatalogDigestSha256]);
+    if (receipt.orchestrationCatalogVersion !== undefined)
+      facts.push(["orchestration_catalog_version", String(receipt.orchestrationCatalogVersion)]);
+    if (receipt.orchestrationCatalogTxVersion !== undefined)
+      facts.push(["orchestration_catalog_tx_version", String(receipt.orchestrationCatalogTxVersion)]);
     facts.push(["routing_assessment_status", assessment ? "recorded" : "unavailable"]);
     if (receipt.routingAssessmentSha256)
       facts.push(["routing_assessment_sha256", receipt.routingAssessmentSha256]);

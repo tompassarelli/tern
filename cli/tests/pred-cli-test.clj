@@ -147,6 +147,13 @@
     ["cli/orchestration-vocab-cli.clj" "put!" "predicate"]
     ["cli/orchestration-vocab-cli.clj" "retract!" "p"]
     ["cli/orchestration-vocab-cli.clj" "retract!" "predicate"]
+    ;; Phase 3 @contract:dispatch publisher: fixed predicates (payload_field/
+    ;; error_code/example_payload/kind/doc, all registered VOCAB rows) written
+    ;; through set-multi!/retract-all! helper loops, never a caller-supplied
+    ;; predicate.
+    ["cli/orchestration-contract-cli.clj" "append!" "predicate"]
+    ["cli/orchestration-contract-cli.clj" "retract!" "p"]
+    ["cli/orchestration-contract-cli.clj" "retract!" "predicate"]
     ;; Phase 1 catalog importer: fixed VOCAB predicates written through s1!/
     ;; smulti! helper loops (the schema-migrate.clj pattern), never a caller-
     ;; supplied predicate — every emitted predicate is a registered VOCAB row.
@@ -230,7 +237,9 @@
     "provider_session_persistence" "thread_provenance" "turn_provenance"
     "routing_admission_receipt_version" "routing_request_sha256"
     "routing_assessment_sha256" "routing_policy_sha256" "provider_catalogs_sha256"
-    "staffing_catalog_sha256" "routing_assessment_status"
+    "staffing_catalog_sha256" "orchestration_policy_pin_sha256"
+    "orchestration_catalog_digest_sha256" "orchestration_catalog_version"
+    "orchestration_catalog_tx_version" "routing_assessment_status"
     "routing_override_evidence_status" "routing_override_exception_code"
     "routing_assessment_policy" "routing_derived_tier" "routing_derived_reasoning"
     "routing_selected_tier" "routing_selected_reasoning" "routing_exception_code"

@@ -116,7 +116,8 @@ export function validatePeerCommandArgs(op: PeerOperation, args: Record<string, 
   if (presentRouting.length !== PEER_ROUTING_FIELDS.length) {
     const missing = PEER_ROUTING_FIELDS.filter((field) => !Object.hasOwn(args, field));
     throw new Error(
-      `${op} requires the complete eight-field Gaffer request; missing: ${missing.join(", ")}`,
+      `${op} requires the complete eight-field Gaffer request; missing: ${missing.join(", ")}`
+      + " (recover the valid payload shape: north show @contract:dispatch)",
     );
   }
   const metadata = Object.fromEntries(

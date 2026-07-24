@@ -61,3 +61,31 @@ export function projectStaffingCatalog(): unknown {
 export function projectProviderCatalog(provider: string): unknown {
   return project(["provider", provider]);
 }
+
+/**
+ * §3.1 point 6 receipt evidence: the catalog subgraph digest plus the two
+ * version watermarks that name the EXACT graph state an admission accepted.
+ * Replaces the catalog-FILE sha256s the receipt carried in file mode, so a
+ * graph-mode receipt never digests a file the graph may no longer mirror.
+ */
+export interface CatalogGraphPin {
+  catalogVersion: number;
+  coordinatorVersion: number;
+  catalogDigestSha256: string;
+}
+
+const HEX64 = /^[0-9a-f]{64}$/;
+
+export function projectCatalogGraphPin(): CatalogGraphPin {
+  const raw = project(["catalog-pin"]) as Record<string, unknown>;
+  const catalogVersion = Number(raw.catalogVersion);
+  const coordinatorVersion = Number(raw.coordinatorVersion);
+  const catalogDigestSha256 = raw.catalogDigestSha256;
+  if (!Number.isInteger(catalogVersion) || catalogVersion < 1)
+    throw new Error("catalog graph pin: catalogVersion must be a positive integer");
+  if (!Number.isInteger(coordinatorVersion) || coordinatorVersion < 0)
+    throw new Error("catalog graph pin: coordinatorVersion must be a non-negative integer");
+  if (typeof catalogDigestSha256 !== "string" || !HEX64.test(catalogDigestSha256))
+    throw new Error("catalog graph pin: catalogDigestSha256 must be a sha256 digest");
+  return { catalogVersion, coordinatorVersion, catalogDigestSha256 };
+}

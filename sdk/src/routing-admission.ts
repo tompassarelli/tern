@@ -28,7 +28,8 @@ export function admitRoutingRequest(
   if (changed.length) {
     throw new Error(
       `${surface} must carry a canonical complete Gaffer request; composer changed: `
-      + changed.join(", "),
+      + changed.join(", ")
+      + " (recover the valid payload shape: north show @contract:dispatch)",
     );
   }
   return deepFreeze(JSON.parse(JSON.stringify(admitted)) as RoutingRequest);

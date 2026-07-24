@@ -683,7 +683,8 @@
       (and (= nm "spawn") (not (non-empty-string? prompt))) "spawn prompt must be a non-empty string"
       missing-routing
       (str "managed " nm " requires the complete eight-field Gaffer request; missing: "
-           (str/join ", " missing-routing))
+           (str/join ", " missing-routing)
+           " (recover the valid payload shape: north show @contract:dispatch)")
       (and (#{"dispatch" "spawn"} nm) (not (non-empty-string? role)))
       (str "managed " nm " requires role selecting a canonical Gaffer preset or a complete bespoke composition")
       (and (some? model) (not (non-empty-string? model))) "model must be a non-empty string"

@@ -55,6 +55,12 @@ test("North freezes the canonical Gaffer assessment and immutable catalog receip
     "routingRequestSha256", "routingAssessmentSha256", "staffingCatalogSha256",
     "providerCatalogsSha256", "routingPolicySha256",
   ] as const) expect(admitted.receipt[field]).toMatch(/^(?:[0-9a-f]{64}|unavailable)$/);
+  // File mode (the hermetic default) keeps the catalog-FILE digests and carries
+  // NEITHER the §3.2 policy pin nor the §3.1(6) catalog graph pin.
+  expect(admitted.receipt.orchestrationPolicyPinSha256).toBeUndefined();
+  expect(admitted.receipt.orchestrationCatalogDigestSha256).toBeUndefined();
+  expect(admitted.receipt.orchestrationCatalogVersion).toBeUndefined();
+  expect(admitted.receipt.orchestrationCatalogTxVersion).toBeUndefined();
   expect(admitted.receipt.overrideEvidence).toEqual({ changedAxes: [], status: "none" });
 });
 

@@ -8,7 +8,7 @@ import type {
 } from "./routing-metadata";
 import { DEFAULT_GAFFER_STAFFING_PATH } from "./gaffer-staffing";
 import { DEFAULT_ROUTING_POLICY_PATH } from "./resource-policy";
-import { staffingSource } from "./orchestration-graph-source";
+import { projectCatalogGraphPin, staffingSource, type CatalogGraphPin } from "./orchestration-graph-source";
 import { verifyPolicyDigestPin } from "./orchestration-policy-pin";
 
 export const ROUTING_ASSESSMENT_POLICY_VERSION = "minimum-sufficient-v1" as const;
@@ -75,8 +75,14 @@ export interface RoutingAdmissionReceipt {
   routingRequestSha256: string;
   routingAssessmentSha256?: string;
   pinEvidenceSha256?: string;
-  staffingCatalogSha256: string;
-  providerCatalogsSha256: string;
+  /**
+   * Catalog-FILE digests over the Gaffer JSON on disk. Present ONLY under
+   * NORTH_STAFFING_SOURCE=file (the retained rollback path). In graph mode
+   * (the Phase 2 default) they are absent — the graph pin below replaces them
+   * so the receipt never digests a file the graph may no longer mirror.
+   */
+  staffingCatalogSha256?: string;
+  providerCatalogsSha256?: string;
   routingPolicySha256: string;
   stockAxes?: {
     taskGrade: string;
@@ -105,6 +111,16 @@ export interface RoutingAdmissionReceipt {
    * admission accepted. Absent under NORTH_STAFFING_SOURCE=file.
    */
   orchestrationPolicyPinSha256?: string;
+  /**
+   * §3.1 point 6 receipt migration: graph-mode replacement for the catalog-FILE
+   * digests. Present only when the staffing source is the graph. Names the exact
+   * graph state admitted against: the sha256 of the canonical JSON projection of
+   * the catalog subgraph, the @catalog:current pointer version, and the daemon's
+   * global tx watermark at projection time. Absent under NORTH_STAFFING_SOURCE=file.
+   */
+  orchestrationCatalogDigestSha256?: string;
+  orchestrationCatalogVersion?: number;
+  orchestrationCatalogTxVersion?: number;
 }
 
 export interface AdmittedRoutingEconomics {
@@ -330,6 +346,15 @@ function graphPolicyPin(surface: string): string {
   return policyPinDigest;
 }
 
+// §3.1 point 6 catalog pin memo: the catalog pointer is atomic, so the subgraph
+// digest + watermarks are identical across every admission in a process. Project
+// once and cache; a transient failure is NOT cached (re-probe next admission).
+let catalogGraphPin: CatalogGraphPin | undefined;
+function graphCatalogPin(): CatalogGraphPin {
+  if (catalogGraphPin === undefined) catalogGraphPin = projectCatalogGraphPin();
+  return catalogGraphPin;
+}
+
 function stockAxes(request: RoutingRequest): RoutingAdmissionReceipt["stockAxes"] {
   if (request.composition.kind !== "preset") return undefined;
   const catalog = JSON.parse(readFileSync(
@@ -380,9 +405,14 @@ export function admitRoutingEconomics(args: {
   // source (Phase 2 default), admission refuses unless the graph policy digest
   // matches the canonical validator's baked table. File mode keeps the packaged
   // rollback path with no pin.
-  const policyPin = staffingSource() === "graph" ? graphPolicyPin(surface) : undefined;
+  const graphMode = staffingSource() === "graph";
+  const policyPin = graphMode ? graphPolicyPin(surface) : undefined;
+  // §3.1 point 6: in graph mode the receipt names the graph state (digest + two
+  // watermarks) instead of digesting catalog FILES; file mode keeps the FILE
+  // digests as the packaged rollback evidence.
+  const catalogPin = graphMode ? graphCatalogPin() : undefined;
   const gafferRoot = resolve(process.env.GAFFER_HOME ?? resolve(homedir(), "code/gaffer"));
-  const providerDigests = {
+  const providerDigests = graphMode ? undefined : {
     anthropic: fileDigest(resolve(gafferRoot, "providers/anthropic.json")),
     openai: fileDigest(resolve(gafferRoot, "providers/openai.json")),
   };
@@ -394,10 +424,12 @@ export function admitRoutingEconomics(args: {
     routingRequestSha256: digest(args.request),
     ...(assessment ? { routingAssessmentSha256: digest(assessment) } : {}),
     ...(pinEvidence ? { pinEvidenceSha256: digest(pinEvidence) } : {}),
-    staffingCatalogSha256: fileDigest(
-      process.env.GAFFER_STAFFING_CATALOG ?? DEFAULT_GAFFER_STAFFING_PATH,
-    ),
-    providerCatalogsSha256: digest(providerDigests),
+    ...(graphMode ? {} : {
+      staffingCatalogSha256: fileDigest(
+        process.env.GAFFER_STAFFING_CATALOG ?? DEFAULT_GAFFER_STAFFING_PATH,
+      ),
+      providerCatalogsSha256: digest(providerDigests),
+    }),
     routingPolicySha256: fileDigest(
       process.env.NORTH_ROUTING_POLICY ?? DEFAULT_ROUTING_POLICY_PATH,
     ),
@@ -415,6 +447,11 @@ export function admitRoutingEconomics(args: {
     pinEvidenceStatus: Object.keys(explicitPins).length === 0
       ? "none" : pinEvidence ? "current" : "legacy-missing",
     ...(policyPin ? { orchestrationPolicyPinSha256: policyPin } : {}),
+    ...(catalogPin ? {
+      orchestrationCatalogDigestSha256: catalogPin.catalogDigestSha256,
+      orchestrationCatalogVersion: catalogPin.catalogVersion,
+      orchestrationCatalogTxVersion: catalogPin.coordinatorVersion,
+    } : {}),
   };
   return deepFreeze({
     ...(assessment ? { assessment } : {}),
