@@ -594,6 +594,26 @@
               (str/includes? (:out steer)
                              "[dry-run] not sent; target capability and liveness were not checked."))))
 
+(let [observed-timeout (atom nil)
+      committed-writes (atom 0)
+      output
+      (with-redefs [run
+                    (fn [_argv & {:keys [timeout]}]
+                      ;; Model independent coordinator writers finishing before
+                      ;; the raw producer reports its successful commit.
+                      (let [writers (doall (repeatedly 32
+                                                       #(future
+                                                          (swap! committed-writes inc))))]
+                        (doseq [writer writers] @writer))
+                      (reset! observed-timeout timeout)
+                      {:ok true :exit 0 :out "queued for live injection @msg:slow"})]
+        (with-out-str (cmd-tell-agent ["live-lane" "commit after contention"])))]
+  (check "steer wrapper keeps a successful live admission through concurrent writes"
+         (and (= steer-admission-timeout-ms @observed-timeout)
+              (= 30000 @observed-timeout)
+              (= 32 @committed-writes)
+              (str/includes? output "queued for live injection @msg:slow"))))
+
 (let [help (proc/shell {:out :string :err :string :continue true
                         :extra-env {"NO_COLOR" "1"}}
                        (str root "/bin/north") "spawn" "--help")]

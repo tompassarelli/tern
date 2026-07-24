@@ -33,6 +33,10 @@
 (def POLICY-BUN (or (System/getenv "NORTH_POLICY_BUN") "bun"))
 (def PROVIDER-CAPABILITY-ADMISSION-SCHEMA
   "north:provider-capability-admission:v1")
+;; A steer subprocess performs the same coordinator admission and atomic
+;; publication as the raw producer.  Give it the coordinator read window: a
+;; four-second wrapper deadline can kill a valid commit while writers contend.
+(def steer-admission-timeout-ms 30000)
 
 (load-file (str NORTH "/cli/spawn-process.clj"))
 (load-file (str NORTH "/cli/coord.clj"))
@@ -1922,7 +1926,7 @@
           (do
             (println (ylw "[dry-run]") "not sent; target capability and liveness were not checked.")
             0)
-          (let [r (run argv :timeout 4000)]
+          (let [r (run argv :timeout steer-admission-timeout-ms)]
             (if (:ok r)
               (do
                 (println (grn (or (known (:out r)) "queued for live injection")))
