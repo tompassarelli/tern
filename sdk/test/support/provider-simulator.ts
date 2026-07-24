@@ -8,6 +8,7 @@ import { ProviderRetrySafeError, type AgentProvider, type AgentQuery, type Provi
 export type OfflineProviderScenario =
   | { kind: "response"; messages: readonly unknown[] }
   | { kind: "sse"; frames: readonly string[] }
+  | { kind: "preaccept_failure"; reason: string }
   | { kind: "http_error"; status: number }
   | { kind: "malformed_stream"; frames: readonly string[] };
 
@@ -31,10 +32,6 @@ export function anthropicTerminal(
 
 export function sseEvent(message: unknown): string {
   return `data: ${JSON.stringify(message)}\n\n`;
-}
-
-function retrySafeStatus(status: number): boolean {
-  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
 }
 
 function parseSse(frames: readonly string[], complete: boolean): unknown[] {
@@ -94,11 +91,17 @@ export class OfflineProviderSimulator {
         return {
           async *[Symbol.asyncIterator]() {
             const scenario = nextScenario();
+            if (scenario.kind === "preaccept_failure") {
+              throw ProviderRetrySafeError.provedUnsent(scenario.reason, {
+                mode: "managed",
+                source: "adapter_preflight",
+                requestBytesPrepared: 0,
+              });
+            }
             const prompt = await capturePrompt(args.prompt);
             simulator.requests.push({ provider: id, target: args.target?.id, prompt, options: args.options });
             if (scenario.kind === "http_error") {
               const error = `offline_provider_http_${scenario.status}`;
-              if (retrySafeStatus(scenario.status)) throw new ProviderRetrySafeError(error);
               throw new Error(error);
             }
             const messages = scenario.kind === "response"

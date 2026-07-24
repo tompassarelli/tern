@@ -200,17 +200,214 @@ export class ProviderEscalationUnsupportedError extends Error {
   }
 }
 
-/**
- * A provider may raise this only when it can prove the request was not accepted
- * and no externally observable tool/model side effect occurred. North never
- * infers retry safety from error text or from an empty output stream.
- */
-export class ProviderRetrySafeError extends Error {
-  readonly retrySafeBeforeAcceptance = true;
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "ProviderRetrySafeError";
+export const PROVIDER_RUNTIME_TELEMETRY_VERSION = "north:provider-runtime:v1" as const;
+export const PROVIDER_UNSENT_PROOF_VERSION = "north:provider-unsent-proof:v1" as const;
+
+export type ProviderRuntimeMode = "native" | "managed";
+export type ProviderDispatchPhase =
+  | "preaccept"
+  | "acceptance_ambiguous"
+  | "accepted"
+  | "terminal";
+export type ProviderReplayDisposition =
+  | "proved_unsent"
+  | "forbidden"
+  | "successor_grant_only"
+  | "not_applicable";
+export type ProviderCheckpointDisposition =
+  | "none"
+  | "exact_successor_required"
+  | "exact_successor_granted";
+export type ProviderPublicationDisposition =
+  | "not_started"
+  | "cas_pending"
+  | "cas_committed"
+  | "unverified";
+export type ProviderRuntimeReason =
+  | "proved_unsent_preaccept"
+  | "retry_proof_missing"
+  | "openai_provider_acceptance_ambiguous"
+  | "openai_provider_failed_after_acceptance"
+  | "exact_checkpoint_successor_granted"
+  | "delivery_reservation_publication_unverified"
+  | "provider_terminal_settled";
+
+export interface ProviderRuntimeTelemetry {
+  version: typeof PROVIDER_RUNTIME_TELEMETRY_VERSION;
+  mode: ProviderRuntimeMode;
+  phase: ProviderDispatchPhase;
+  reason: ProviderRuntimeReason;
+  replay: ProviderReplayDisposition;
+  checkpoint: ProviderCheckpointDisposition;
+  publication: ProviderPublicationDisposition;
+}
+
+const PROVIDER_RUNTIME_REASONS: readonly ProviderRuntimeReason[] = [
+  "proved_unsent_preaccept",
+  "retry_proof_missing",
+  "openai_provider_acceptance_ambiguous",
+  "openai_provider_failed_after_acceptance",
+  "exact_checkpoint_successor_granted",
+  "delivery_reservation_publication_unverified",
+  "provider_terminal_settled",
+];
+
+export function providerRuntimeTelemetryValid(
+  telemetry: ProviderRuntimeTelemetry | undefined,
+): telemetry is ProviderRuntimeTelemetry {
+  if (!telemetry
+      || Object.keys(telemetry).sort().join(",")
+        !== "checkpoint,mode,phase,publication,reason,replay,version"
+      || telemetry.version !== PROVIDER_RUNTIME_TELEMETRY_VERSION
+      || (telemetry.mode !== "native" && telemetry.mode !== "managed")
+      || !PROVIDER_RUNTIME_REASONS.includes(telemetry.reason)
+      || !["not_started", "cas_pending", "cas_committed", "unverified"]
+        .includes(telemetry.publication)) return false;
+  switch (telemetry.reason) {
+    case "proved_unsent_preaccept":
+      return telemetry.phase === "preaccept"
+        && telemetry.replay === "proved_unsent" && telemetry.checkpoint === "none";
+    case "retry_proof_missing":
+    case "openai_provider_acceptance_ambiguous":
+      return telemetry.phase === "acceptance_ambiguous"
+        && telemetry.replay === "forbidden" && telemetry.checkpoint === "none";
+    case "openai_provider_failed_after_acceptance":
+      return telemetry.phase === "accepted"
+        && telemetry.replay === "successor_grant_only"
+        && telemetry.checkpoint === "exact_successor_required";
+    case "exact_checkpoint_successor_granted":
+      return telemetry.phase === "accepted"
+        && telemetry.replay === "successor_grant_only"
+        && telemetry.checkpoint === "exact_successor_granted";
+    case "delivery_reservation_publication_unverified":
+    case "provider_terminal_settled":
+      return telemetry.phase === "terminal"
+        && (telemetry.replay === "forbidden" || telemetry.replay === "not_applicable")
+        && telemetry.checkpoint === "none";
   }
+}
+
+interface ProviderUnsentProofCommon {
+  version: typeof PROVIDER_UNSENT_PROOF_VERSION;
+  durability: "adapter_receipt";
+  requestBytesPrepared: number;
+  requestBytesSent: 0;
+  observableEvents: 0;
+}
+
+export type ProviderUnsentProof = ProviderUnsentProofCommon & (
+  | { mode: "managed"; source: "adapter_preflight" | "managed_pre_thread_receipt" }
+  | { mode: "native"; source: "native_supervisor_unavailable" }
+);
+
+type ProviderUnsentProofInput =
+  | { mode: "managed"; source: "adapter_preflight" | "managed_pre_thread_receipt"; requestBytesPrepared: number }
+  | { mode: "native"; source: "native_supervisor_unavailable"; requestBytesPrepared: number };
+
+function validByteCount(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+export function providerUnsentProofValid(
+  proof: ProviderUnsentProof | undefined,
+): proof is ProviderUnsentProof {
+  return Boolean(proof
+    && Object.keys(proof).sort().join(",")
+      === "durability,mode,observableEvents,requestBytesPrepared,requestBytesSent,source,version"
+    && proof.version === PROVIDER_UNSENT_PROOF_VERSION
+    && ((proof.mode === "managed"
+      && (proof.source === "adapter_preflight" || proof.source === "managed_pre_thread_receipt"))
+      || (proof.mode === "native" && proof.source === "native_supervisor_unavailable"))
+    && proof.durability === "adapter_receipt"
+    && validByteCount(proof.requestBytesPrepared)
+    && proof.requestBytesSent === 0
+    && proof.observableEvents === 0);
+}
+
+/** Typed provider failure. Accepted and ambiguous failures are never replayable. */
+export class ProviderRuntimeError extends Error {
+  constructor(
+    message: string,
+    readonly telemetry: ProviderRuntimeTelemetry,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    if (!providerRuntimeTelemetryValid(telemetry))
+      throw new Error("invalid provider runtime telemetry");
+    this.name = "ProviderRuntimeError";
+    Object.freeze(telemetry);
+  }
+}
+
+/**
+ * Preaccept failures remain non-replayable unless constructed with an exact
+ * adapter receipt proving zero provider-bound bytes and zero observable events.
+ * A bare instance is useful terminal classification, never fallback authority.
+ */
+export class ProviderRetrySafeError extends ProviderRuntimeError {
+  readonly retrySafeBeforeAcceptance: boolean;
+
+  constructor(
+    message: string,
+    options?: ErrorOptions,
+    readonly unsentProof?: ProviderUnsentProof,
+  ) {
+    const proofValid = providerUnsentProofValid(unsentProof);
+    super(message, {
+      version: PROVIDER_RUNTIME_TELEMETRY_VERSION,
+      mode: proofValid ? unsentProof.mode : "managed",
+      phase: proofValid ? "preaccept" : "acceptance_ambiguous",
+      reason: proofValid ? "proved_unsent_preaccept" : "retry_proof_missing",
+      replay: proofValid ? "proved_unsent" : "forbidden",
+      checkpoint: "none",
+      publication: "not_started",
+    }, options);
+    this.name = "ProviderRetrySafeError";
+    this.retrySafeBeforeAcceptance = proofValid;
+    if (unsentProof) Object.freeze(unsentProof);
+  }
+
+  static provedUnsent(
+    message: string,
+    proof: ProviderUnsentProofInput,
+    options?: ErrorOptions,
+  ): ProviderRetrySafeError {
+    if (!validByteCount(proof.requestBytesPrepared)
+        || (proof.mode === "managed"
+          ? proof.source !== "adapter_preflight" && proof.source !== "managed_pre_thread_receipt"
+          : proof.source !== "native_supervisor_unavailable")) {
+      throw new Error("provider unsent proof is invalid");
+    }
+    return new ProviderRetrySafeError(message, options, {
+      version: PROVIDER_UNSENT_PROOF_VERSION,
+      ...proof,
+      durability: "adapter_receipt",
+      requestBytesSent: 0,
+      observableEvents: 0,
+    });
+  }
+}
+
+export function isProvedUnsentPreacceptFailure(
+  error: unknown,
+): error is ProviderRetrySafeError & { unsentProof: ProviderUnsentProof } {
+  return error instanceof ProviderRetrySafeError
+    && error.retrySafeBeforeAcceptance
+    && error.telemetry.phase === "preaccept"
+    && error.telemetry.replay === "proved_unsent"
+    && providerUnsentProofValid(error.unsentProof);
+}
+
+/** Preflight helper for code that runs before prompt transport construction. */
+export function providerPreacceptError(
+  message: string,
+  options?: ErrorOptions,
+): ProviderRetrySafeError {
+  return ProviderRetrySafeError.provedUnsent(message, {
+    mode: "managed",
+    source: "adapter_preflight",
+    requestBytesPrepared: 0,
+  }, options);
 }
 
 export interface RoutingFallbackReason {
@@ -220,6 +417,9 @@ export interface RoutingFallbackReason {
   fromProvider: ProviderId;
   toTarget: string;
   toProvider: ProviderId;
+  phase: "preaccept";
+  replay: "proved_unsent";
+  proof: ProviderUnsentProof;
 }
 
 export interface ProviderFallbackTransition {

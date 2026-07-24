@@ -5,9 +5,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  deliveryRunEnvironment, deliveryWriterInvocation, loadDeliveryRunState,
-  newDeliveryRunContext, recordRunBarEvidence, RUN_RESERVATION_VERSION,
-  runReservationValid,
+  deliveryReservationFailureCause, deliveryRunEnvironment,
+  deliveryWriterInvocation, loadDeliveryRunState, newDeliveryRunContext,
+  recordRunBarEvidence, RUN_RESERVATION_VERSION, runReservationValid,
 } from "../src/delivery-evidence";
 import { MANAGED_NORTH_MCP_ENV_KEYS } from "../src/execution-admission";
 import { harnessOptions } from "../src/harness";
@@ -89,6 +89,19 @@ test("writer failures never echo the live capability in diagnostics", () => {
   } catch (error) {
     expect(String(error)).not.toContain(capability);
   }
+});
+
+test("reservation failure diagnostics expose only bounded semantic causes", () => {
+  const secret = "live-capability-must-not-leak";
+  expect(deliveryReservationFailureCause(new Error(
+    `delivery evidence reserve rejected: delivery evidence publication deadline exceeded ${secret}`,
+  ))).toBe("publication deadline exceeded");
+  expect(deliveryReservationFailureCause(new Error(
+    `delivery evidence reserve rejected: run reservation projection changed before commit ${secret}`,
+  ))).toBe("reservation conflict");
+  expect(deliveryReservationFailureCause(new Error(
+    `unclassified writer failure ${secret}`,
+  ))).toBe("writer rejected reservation");
 });
 
 test("live run capabilities travel on stdin and never enter writer argv", () => {
@@ -183,7 +196,7 @@ test("evidence loading invalidates the entire malformed, cross-scoped, duplicate
     ];
     writeFileSync(
       command,
-      `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(facts))});\n`,
+      `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(1, ${JSON.stringify(JSON.stringify(facts))});\n`,
     );
     chmodSync(command, 0o700);
     try {

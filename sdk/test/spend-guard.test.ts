@@ -155,6 +155,19 @@ test("admitSpendGuard refuses an api-billed target with a distinct, retry-safe o
     code: "blocked_spend_guard",
     processOutcome: "blocked_spend_guard",
     retrySafeBeforeAcceptance: true,
+    telemetry: {
+      mode: "managed",
+      phase: "preaccept",
+      reason: "proved_unsent_preaccept",
+      replay: "proved_unsent",
+    },
+    unsentProof: {
+      durability: "adapter_receipt",
+      source: "adapter_preflight",
+      requestBytesPrepared: 0,
+      requestBytesSent: 0,
+      observableEvents: 0,
+    },
   });
 });
 

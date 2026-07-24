@@ -215,8 +215,8 @@ async function terminateProvider(): Promise<void> {
 
 function shutdown(): Promise<void> {
   shutdownPromise ??= (async () => {
-    stopControl();
-    await terminateProvider();
+    try { await terminateProvider(); }
+    finally { stopControl(); }
   })();
   return shutdownPromise;
 }

@@ -14,7 +14,7 @@ import {
   type ManagedWriteResult,
 } from "./identity";
 import {
-  ProviderRetrySafeError,
+  providerPreacceptError, ProviderRetrySafeError,
   type LiveInputCapability,
   type ProviderFallbackTransition,
 } from "./providers/types";
@@ -260,7 +260,7 @@ export class ManagedLiveInputRoute {
         error instanceof LiveFeedStoppedBeforeReadyError
         || error instanceof LiveFeedStartupTimeoutError
       ) {
-        throw new ProviderRetrySafeError(
+        throw providerPreacceptError(
           "live_input_feed_unavailable_before_acceptance",
           { cause: error },
         );

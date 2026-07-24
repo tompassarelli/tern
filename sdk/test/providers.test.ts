@@ -31,6 +31,12 @@ const MANAGED_ENV = [
   "NORTH_ANTHROPIC_ENTITLEMENT_PRESSURE", "NORTH_OPENAI_ENTITLEMENT_PRESSURE",
 ] as const;
 const saved = Object.fromEntries(MANAGED_ENV.map((key) => [key, process.env[key]])) as Record<typeof MANAGED_ENV[number], string | undefined>;
+const provedUnsent = (message: string, requestBytesPrepared = 0) =>
+  ProviderRetrySafeError.provedUnsent(message, {
+    mode: "managed",
+    source: "adapter_preflight",
+    requestBytesPrepared,
+  });
 const available: ProviderAvailability[] = [
   { provider: "anthropic", available: true, reason: "ready" },
   { provider: "openai", available: true, reason: "ready" },
@@ -810,7 +816,7 @@ async function assertReadonlyCrossProviderFallback(
       return {
         async *[Symbol.asyncIterator]() {
           if (id === initial)
-            throw new ProviderRetrySafeError(`${id}_retry_safe_before_acceptance`);
+            throw provedUnsent(`${id}_retry_safe_before_acceptance`);
           yield { type: "result", result: "ok" };
         },
       };
@@ -1173,7 +1179,7 @@ test("an explicitly retry-safe synthetic Anthropic failure re-resolves the tier 
   const prompt = "preserve this prompt";
   const activated: string[] = [];
   const simulator = new OfflineProviderSimulator({
-    anthropic: { kind: "http_error", status: 429 },
+    anthropic: { kind: "preaccept_failure", reason: "synthetic_unsent_preaccept" },
     openai: { kind: "response", messages: [{ type: "result", result: "ok" }] },
   });
 
@@ -1182,11 +1188,11 @@ test("an explicitly retry-safe synthetic Anthropic failure re-resolves the tier 
   }, "frontier", simulator.registry(), undefined,
   (route) => activated.push(`${route.provider}/${route.resolvedModel}/${route.resolvedEffort}`))))
     .toEqual([{ type: "result", result: "ok" }]);
-  expect(simulator.requests.map((request) => request.provider)).toEqual(["anthropic", "openai"]);
-  expect(simulator.requests[1]!.prompt).toEqual([prompt]);
-  expect((simulator.requests[1]!.options as any).systemPrompt).toBe("keep system");
-  expect((simulator.requests[1]!.options as any).model).toBe("gpt-5.6-sol");
-  expect((simulator.requests[1]!.options as any).effort).toBe("xhigh");
+  expect(simulator.requests.map((request) => request.provider)).toEqual(["openai"]);
+  expect(simulator.requests[0]!.prompt).toEqual([prompt]);
+  expect((simulator.requests[0]!.options as any).systemPrompt).toBe("keep system");
+  expect((simulator.requests[0]!.options as any).model).toBe("gpt-5.6-sol");
+  expect((simulator.requests[0]!.options as any).effort).toBe("xhigh");
   expect(decision.provider).toBe("openai");
   expect(decision.fallbackCount).toBe(1);
   expect(decision.fallbackPath).toEqual(["anthropic", "openai"]);
@@ -1198,15 +1204,16 @@ test("an explicitly retry-safe synthetic Anthropic failure re-resolves the tier 
   expect(initialReason).toContain("mode=preferential");
   expect(initialReason).toContain("pressure=normal");
   expect(initialReason).toContain("order=anthropic -> openai");
-  expect(decision.fallbackReasons).toEqual([{
+  expect(decision.fallbackReasons).toEqual([expect.objectContaining({
     sequence: 1,
     reason: "provider_retry_safe_before_acceptance",
     fromTarget: "anthropic", fromProvider: "anthropic",
     toTarget: "openai", toProvider: "openai",
-  }]);
+    phase: "preaccept", replay: "proved_unsent",
+  })]);
   expect(JSON.stringify(decision.fallbackReasons)).not.toContain("secret-must-not-leak");
-  expect(decision.resolvedModel).toBe((simulator.requests[1]!.options as any).model);
-  expect(decision.resolvedEffort).toBe((simulator.requests[1]!.options as any).effort);
+  expect(decision.resolvedModel).toBe((simulator.requests[0]!.options as any).model);
+  expect(decision.resolvedEffort).toBe((simulator.requests[0]!.options as any).effort);
   expect(activated).toEqual(["anthropic/fable/xhigh", "openai/gpt-5.6-sol/xhigh"]);
   expect(simulator.closes).toEqual(["anthropic"]);
 });
@@ -1236,7 +1243,7 @@ test("provider-pinned retry-safe failure advances to a sibling target only", asy
   const registry = {
     anthropic: fakeProvider("anthropic", () => ({ async *[Symbol.asyncIterator]() {
       calls++;
-      if (calls === 1) throw new ProviderRetrySafeError("account unavailable before acceptance");
+      if (calls === 1) throw provedUnsent("account unavailable before acceptance");
       yield { type: "result", result: "ok" };
     }})),
     openai: fakeProvider("openai", () => { throw new Error("cross-provider fallback must remain filtered"); }),
@@ -1256,7 +1263,7 @@ test("multiple retry-safe fallbacks append redacted structured provenance", asyn
   const selected = decision.selectionReason;
   const registry = {
     anthropic: fakeProvider("anthropic", (args) => ({ async *[Symbol.asyncIterator]() {
-      throw new ProviderRetrySafeError(`private failure for ${args.target?.id}`);
+      throw provedUnsent(`private failure for ${args.target?.id}`);
     }})),
     openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {
       yield { type: "result", result: "ok" };
@@ -1269,12 +1276,14 @@ test("multiple retry-safe fallbacks append redacted structured provenance", asyn
   expect(decision.fallbackTargetPath).toEqual(["claude-personal", "claude-work", "codex-personal"]);
   expect(decision.fallbackPath).toEqual(["anthropic", "anthropic", "openai"]);
   expect(decision.fallbackReasons).toEqual([
-    { sequence: 1, reason: "provider_retry_safe_before_acceptance",
+    expect.objectContaining({ sequence: 1, reason: "provider_retry_safe_before_acceptance",
       fromTarget: "claude-personal", fromProvider: "anthropic",
-      toTarget: "claude-work", toProvider: "anthropic" },
-    { sequence: 2, reason: "provider_retry_safe_before_acceptance",
+      toTarget: "claude-work", toProvider: "anthropic",
+      phase: "preaccept", replay: "proved_unsent" }),
+    expect.objectContaining({ sequence: 2, reason: "provider_retry_safe_before_acceptance",
       fromTarget: "claude-work", fromProvider: "anthropic",
-      toTarget: "codex-personal", toProvider: "openai" },
+      toTarget: "codex-personal", toProvider: "openai",
+      phase: "preaccept", replay: "proved_unsent" }),
   ]);
   expect(JSON.stringify(decision.fallbackReasons)).not.toContain("private failure");
 });
@@ -1285,7 +1294,7 @@ test("retry-safe execution failure on an exact target pin still does not fall ba
   const registry = {
     anthropic: fakeProvider("anthropic", () => ({ async *[Symbol.asyncIterator]() {
       calls++;
-      throw new ProviderRetrySafeError("target unavailable before acceptance");
+      throw provedUnsent("target unavailable before acceptance");
     }})),
     openai: fakeProvider("openai", () => { throw new Error("must not be called"); }),
   };
@@ -1302,7 +1311,7 @@ test("automatic fallback re-resolves the provider while preserving requested rea
   let fallbackArgs: any;
   const registry = {
     openai: fakeProvider("openai", () => ({ async *[Symbol.asyncIterator]() {
-      throw new ProviderRetrySafeError("authentication required before acceptance");
+      throw provedUnsent("authentication required before acceptance");
     }})),
     anthropic: fakeProvider("anthropic", (args) => ({ async *[Symbol.asyncIterator]() {
       fallbackArgs = args;
@@ -1398,7 +1407,7 @@ test("fallback replays a streaming prompt consumed by the failed provider", asyn
   const registry = {
     anthropic: fakeProvider("anthropic", (args) => ({ async *[Symbol.asyncIterator]() {
       await consumeOne("anthropic", args.prompt);
-      throw new ProviderRetrySafeError("capacity unavailable before acceptance");
+      throw provedUnsent("capacity unavailable before acceptance", 12);
     }})),
     openai: fakeProvider("openai", (args) => ({ async *[Symbol.asyncIterator]() {
       await consumeOne("openai", args.prompt);
@@ -1472,7 +1481,7 @@ test("fallback admission runs before the fallback provider has side effects", as
   let fallbackCalls = 0;
   const registry = {
     anthropic: fakeProvider("anthropic", () => ({ async *[Symbol.asyncIterator]() {
-      throw new ProviderRetrySafeError("capacity unavailable before acceptance");
+      throw provedUnsent("capacity unavailable before acceptance");
     }})),
     openai: fakeProvider("openai", () => { fallbackCalls++; return { async *[Symbol.asyncIterator]() {} }; }),
   };

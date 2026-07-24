@@ -83,6 +83,7 @@ test("peer managed spawn fails before msg-cli for both workers and orchestrators
 });
 
 test("authority is ambient only for top-level sessions and otherwise fail-closed", () => {
+  delete process.env.AGENT_TOPOLOGY;
   expect(() => assertCoordinationAuthority("spawn", undefined)).not.toThrow();
   expect(() => assertCoordinationAuthority("spawn", "orchestrator")).not.toThrow();
   for (const topology of ["worker", "unexpected"]) {

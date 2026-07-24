@@ -4,7 +4,12 @@ import { isAbsolute, resolve } from "node:path";
 import type { GafferCapability } from "./gaffer-capabilities";
 import { providerCapabilityRejectionCode } from "./gaffer-capabilities";
 import { preflightReadonlyShell, ReadonlyShellUnavailableError } from "./readonly-shell";
-import { ProviderRetrySafeError, type ProviderId, type RoutingTarget } from "./providers/types";
+import {
+  PROVIDER_UNSENT_PROOF_VERSION,
+  ProviderRetrySafeError,
+  type ProviderId,
+  type RoutingTarget,
+} from "./providers/types";
 import { admitRoutingRequest } from "./routing-admission";
 import { gafferCapabilities } from "./gaffer-staffing";
 import { spendGuardVerdict, reserveSpend } from "./spend-guard";
@@ -26,6 +31,7 @@ const admissionReceipts = new WeakMap<object, Set<ProviderId>>();
  * and attribution/provenance selectors required by the North executable.
  */
 export const MANAGED_NORTH_MCP_ENV_KEYS = [
+  "HOME",
   "NORTH_BIN",
   "AGENT_ID",
   "AGENT_TOPOLOGY",
@@ -34,6 +40,14 @@ export const MANAGED_NORTH_MCP_ENV_KEYS = [
   "NORTH_RUN_ID",
   "NORTH_THREAD_ID",
   "NORTH_RUN_CAPABILITY",
+  "NORTH_CHECKPOINT_ENABLED",
+  "NORTH_CHECKPOINT_EXECUTION_ROOT",
+  "NORTH_CHECKPOINT_WORKTREE",
+  "NORTH_CHECKPOINT_REPOSITORY",
+  "NORTH_CHECKPOINT_BRANCH",
+  "NORTH_CHECKPOINT_BASE",
+  "NORTH_CHECKPOINT_GIT",
+  "NORTH_CHECKPOINT_GITLEAKS",
   "NORTH_HOME",
   "NORTH_STREAM_DIR",
   "NORTH_AGENT_LOGS_DIR",
@@ -42,6 +56,10 @@ export const MANAGED_NORTH_MCP_ENV_KEYS = [
   "NORTH_BG_MAX_CONTINUATIONS",
   "NORTH_MCP_BB",
   "NORTH_MCP_BUN",
+  "NORTH_MCP_MANAGED_CODEX_BIN",
+  "NORTH_MKFIFO_BIN",
+  "NORTH_GIT_BIN",
+  "NORTH_PEER_BB",
   "FRAM_BIN",
   "FRAM_HOME",
   "FRAM_LOG",
@@ -78,10 +96,19 @@ export const MANAGED_NORTH_MCP_ENV_KEYS = [
 export function managedNorthMcpEnvironment(
   source: NodeJS.ProcessEnv | Record<string, unknown>,
 ): Record<string, string> {
-  return Object.fromEntries(MANAGED_NORTH_MCP_ENV_KEYS.flatMap((key) => {
+  const environment = Object.fromEntries(MANAGED_NORTH_MCP_ENV_KEYS.flatMap((key) => {
     const value = source[key];
     return typeof value === "string" ? [[key, value]] : [];
   }));
+  const direct = source.NORTH_MCP_MANAGED_CODEX_BIN;
+  const wrapper = source.NORTH_MANAGED_CODEX_BIN;
+  if (typeof direct === "string" && typeof wrapper === "string" && direct !== wrapper)
+    throw new Error("managed North MCP Codex selector is contradictory");
+  const selector = typeof direct === "string" ? direct
+    : typeof wrapper === "string" ? wrapper
+    : undefined;
+  if (selector) environment.NORTH_MCP_MANAGED_CODEX_BIN = selector;
+  return environment;
 }
 
 function sameStringMap(actual: unknown, expected: Record<string, string>): boolean {
@@ -128,7 +155,15 @@ export class ExecutionAdmissionError extends ProviderRetrySafeError {
   readonly code: string = "blocked_preflight";
   readonly processOutcome: string = "blocked_preflight";
   constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
+    super(message, options, {
+      version: PROVIDER_UNSENT_PROOF_VERSION,
+      mode: "managed",
+      source: "adapter_preflight",
+      durability: "adapter_receipt",
+      requestBytesPrepared: 0,
+      requestBytesSent: 0,
+      observableEvents: 0,
+    });
     this.name = "ExecutionAdmissionError";
   }
 }
@@ -235,6 +270,40 @@ export function validateManagedExecutionEnvelope(
       || !expectedNorthEnv.NORTH_PORT.trim()
       || !sameStringMap(north.env, expectedNorthEnv)) {
     throw new ExecutionAdmissionError(`${provider}_managed_north_mcp_contract_missing`);
+  }
+  const checkpointKeys = [
+    "NORTH_CHECKPOINT_ENABLED", "NORTH_CHECKPOINT_EXECUTION_ROOT",
+    "NORTH_CHECKPOINT_WORKTREE", "NORTH_CHECKPOINT_REPOSITORY",
+    "NORTH_CHECKPOINT_BRANCH", "NORTH_CHECKPOINT_BASE",
+    "NORTH_CHECKPOINT_GIT", "NORTH_CHECKPOINT_GITLEAKS",
+  ] as const;
+  const checkpointValues = Object.fromEntries(
+    checkpointKeys.map((key) => [key, expectedNorthEnv[key]]),
+  ) as Record<(typeof checkpointKeys)[number], string | undefined>;
+  const checkpointEnabled = checkpointValues.NORTH_CHECKPOINT_ENABLED === "1";
+  const checkpointResidue = checkpointKeys.some((key) => expectedNorthEnv[key] !== undefined);
+  if (checkpointResidue && !checkpointEnabled)
+    throw new ExecutionAdmissionError(`${provider}_managed_checkpoint_contract_invalid`);
+  if (checkpointEnabled) {
+    const allPresent = checkpointKeys.every((key) => {
+      const value = checkpointValues[key];
+      return typeof value === "string" && value.trim() === value && value.length > 0;
+    });
+    if (topology !== "worker"
+        || !capabilities.includes("filesystem.write")
+        || !allPresent
+        || checkpointValues.NORTH_CHECKPOINT_EXECUTION_ROOT !== options.cwd
+        || checkpointValues.NORTH_CHECKPOINT_WORKTREE !== options.cwd
+        || !isAbsolute(checkpointValues.NORTH_CHECKPOINT_REPOSITORY!)
+        || !/^lane-[A-Za-z0-9][A-Za-z0-9._-]*$/.test(checkpointValues.NORTH_CHECKPOINT_BRANCH!)
+        || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(checkpointValues.NORTH_CHECKPOINT_BASE!)
+        || !isAbsolute(checkpointValues.NORTH_CHECKPOINT_GIT!)
+        || !isAbsolute(checkpointValues.NORTH_CHECKPOINT_GITLEAKS!)
+        || typeof expectedNorthEnv.NORTH_RUN_ID !== "string"
+        || typeof expectedNorthEnv.NORTH_THREAD_ID !== "string"
+        || typeof expectedNorthEnv.NORTH_RUN_CAPABILITY !== "string") {
+      throw new ExecutionAdmissionError(`${provider}_managed_checkpoint_contract_invalid`);
+    }
   }
 }
 

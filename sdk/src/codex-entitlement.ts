@@ -1,6 +1,11 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  closeSync, constants, fsyncSync, mkdtempSync, openSync, renameSync, rmSync, unlinkSync,
+  writeSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { ProviderUsageObservation, ProviderUsageWindow } from "./providers/types";
 import { writeProviderUsageObservations } from "./provider-observation-store";
 import {
@@ -18,6 +23,8 @@ export const CODEX_USAGE_PROBE_TIMEOUT_MS = 10_000;
 export const CODEX_OBSERVATION_TTL_MS = 5 * 60 * 1000;
 export const CODEX_USAGE_SOURCE = "codex-app-server:account-rate-limits";
 const MAX_LINE_BYTES = 1024 * 1024;
+const SUPERVISOR = resolve(import.meta.dir, "providers/codex-supervisor.ts");
+const SUPERVISOR_FRAME_PREFIX = "NORTH_CODEX_RPC 1 ";
 
 export type CodexUsageUnavailableReason =
   | "codex_usage_command_unavailable"
@@ -97,8 +104,67 @@ function responseError(response: RpcResponse, _method: string): Error {
   return new CodexUsageUnavailableError(reason);
 }
 
+type AppServerWriter = (
+  line: string,
+  callback: (error?: Error | null) => void,
+) => void;
+
+interface SupervisorControl {
+  path: string;
+  writeLine: AppServerWriter;
+  close(): void;
+}
+
+function createSupervisorControl(): SupervisorControl {
+  const directory = mkdtempSync(join(tmpdir(), "north-codex-entitlement-control-"));
+  let sequence = 0;
+  let closed = false;
+  return {
+    path: directory,
+    writeLine(line, callback) {
+      if (closed || Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
+        callback(new Error("Codex entitlement supervisor control is unavailable"));
+        return;
+      }
+      sequence += 1;
+      const stem = String(sequence).padStart(12, "0");
+      const temporary = join(directory, `.${stem}.${process.pid}.tmp`);
+      const requestPath = join(directory, `${stem}.req`);
+      let fd: number | undefined;
+      try {
+        fd = openSync(temporary,
+          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+          0o600);
+        const payload = Buffer.from(line, "utf8");
+        const digest = createHash("sha256").update(payload).digest("hex");
+        const bytes = Buffer.concat([
+          Buffer.from(`${SUPERVISOR_FRAME_PREFIX}${payload.byteLength} ${digest}\n`, "ascii"),
+          payload,
+        ]);
+        let offset = 0;
+        while (offset < bytes.byteLength)
+          offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        renameSync(temporary, requestPath);
+        callback();
+      } catch (error) {
+        try { if (fd !== undefined) closeSync(fd); } catch {}
+        try { unlinkSync(temporary); } catch {}
+        callback(error as Error);
+      }
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      try { rmSync(directory, { recursive: true, force: true }); } catch {}
+    },
+  };
+}
+
 function request(
-  child: ChildProcessWithoutNullStreams,
+  writeLine: AppServerWriter,
   pending: Map<number, { method: string; resolve(value: unknown): void; reject(error: Error): void }>,
   id: number,
   method: string,
@@ -106,7 +172,7 @@ function request(
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     pending.set(id, { method, resolve, reject });
-    child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, (writeError) => {
+    writeLine(`${JSON.stringify({ id, method, params })}\n`, (writeError) => {
       if (!writeError) return;
       pending.delete(id);
       reject(new CodexUsageUnavailableError("codex_usage_transport_failed"));
@@ -154,15 +220,30 @@ export async function readCodexEntitlementObservation(options: AppServerOptions 
     throw new Error(`Codex entitlement target mismatch: ${options.target.id} != ${options.targetId}`);
   const env = providerEnvironmentForTarget("openai", options.target, { env: options.env });
   const command = options.command ?? env.NORTH_CODEX_BIN ?? "codex";
-  const child = (options.spawnProcess ?? spawn)(command, [
+  const commandArguments = [
     ...(options.commandArgs ?? []),
     "app-server",
     ...codexConfigArguments(env),
     "--stdio",
-  ], {
+  ];
+  // Bun's nested child-process pipe can drop provider-bound stdin. The same
+  // framed private spool used by managed Codex keeps every request durable
+  // until the supervisor relays it through its sealed FIFO. Preserve the
+  // direct writer for injected children and platforms without that contract.
+  const supervised = options.spawnProcess === undefined
+    && typeof Bun !== "undefined"
+    && process.platform !== "win32"
+    && typeof env.NORTH_MKFIFO_BIN === "string";
+  const control = supervised ? createSupervisorControl() : undefined;
+  const child = (options.spawnProcess ?? spawn)(supervised ? process.execPath : command, supervised
+    ? [SUPERVISOR, "--duplex", control!.path, command, ...commandArguments]
+    : commandArguments, {
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const writeLine: AppServerWriter = control
+    ? control.writeLine
+    : (line, callback) => { child.stdin.write(line, callback); };
   const pending = new Map<number, { method: string; resolve(value: unknown): void; reject(error: Error): void }>();
   let buffer = "";
   let terminalError: Error | undefined;
@@ -227,15 +308,15 @@ export async function readCodexEntitlementObservation(options: AppServerOptions 
   try {
     if (options.signal?.aborted)
       throw new CodexUsageUnavailableError("codex_usage_probe_failed");
-    await request(child, pending, 1, "initialize", { clientInfo: { name: "north", version: "1" } });
+    await request(writeLine, pending, 1, "initialize", { clientInfo: { name: "north", version: "1" } });
     if (options.signal?.aborted)
       throw new CodexUsageUnavailableError("codex_usage_probe_failed");
-    const account = await request(child, pending, 2, "account/read", {});
+    const account = await request(writeLine, pending, 2, "account/read", {});
     if (options.signal?.aborted)
       throw new CodexUsageUnavailableError("codex_usage_probe_failed");
     if (!record(account) || !record(account.account) || account.account.type !== "chatgpt")
       throw new CodexUsageUnavailableError("codex_usage_subscription_auth_required");
-    const limits = await request(child, pending, 3, "account/rateLimits/read", null);
+    const limits = await request(writeLine, pending, 3, "account/rateLimits/read", null);
     if (options.signal?.aborted)
       throw new CodexUsageUnavailableError("codex_usage_probe_failed");
     const windows = normalizeCodexRateLimits(limits);
@@ -254,6 +335,7 @@ export async function readCodexEntitlementObservation(options: AppServerOptions 
     for (const waiter of pending.values()) waiter.reject(new CodexUsageUnavailableError("codex_usage_transport_failed"));
     pending.clear();
     child.kill("SIGTERM");
+    control?.close();
     const force = setTimeout(() => child.kill("SIGKILL"), 250);
     force.unref?.();
   }

@@ -203,7 +203,7 @@ test("unpinned canonical tier defaults are static, while an explicit pin to the 
   ).provider).toBe("anthropic");
   expect(() => selectProviderFromAvailability(
     { target: anthropic.id }, availability, onlyAnthropic,
-    "frontier", "explicit-default", "xhigh", "claude-opus-4-8",
+    "frontier", "explicit-default", "xhigh", "claude-fable-5",
   )).toThrow("lacks fresh positive exact-model availability evidence");
 });
 

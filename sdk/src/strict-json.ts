@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_MAX_DEPTH = 128;
 const DEFAULT_MAX_NODES = 100_000;
@@ -15,6 +17,10 @@ export interface StrictJsonlLimits {
   maxLineBytes?: number;
   maxTotalBytes?: number;
   maxFrames?: number;
+  /** Refill the byte/frame ceilings over this interval instead of charging them for life. */
+  rollingWindowMs?: number;
+  /** Test-only monotonic clock seam for rolling accounting. */
+  nowMs?: () => number;
 }
 
 export function assertWellFormedUnicode(value: string, label: string): void {
@@ -119,8 +125,9 @@ export function parseStrictJson(
 }
 
 /**
- * Incremental, fatal UTF-8 JSONL framing with independent per-line, cumulative
- * byte, and frame-count bounds. A non-newline-terminated tail is never a frame.
+ * Incremental, fatal UTF-8 JSONL framing with a per-line bound and either
+ * lifetime or token-bucket byte/frame ceilings. A non-newline-terminated tail
+ * is never a frame.
  */
 export class StrictJsonlFrames {
   private fragments: Buffer[] = [];
@@ -132,12 +139,19 @@ export class StrictJsonlFrames {
   private readonly maxLineBytes: number;
   private readonly maxTotalBytes: number;
   private readonly maxFrames: number;
+  private readonly rollingWindowMs?: number;
+  private readonly nowMs: () => number;
+  private rollingByteTokens = 0;
+  private rollingFrameTokens = 0;
+  private rollingUpdatedAt = 0;
 
   constructor(limits: StrictJsonlLimits = {}) {
     this.label = limits.label ?? "Codex app-server";
     this.maxLineBytes = limits.maxLineBytes ?? DEFAULT_MAX_BYTES;
     this.maxTotalBytes = limits.maxTotalBytes ?? DEFAULT_MAX_JSONL_BYTES;
     this.maxFrames = limits.maxFrames ?? DEFAULT_MAX_JSONL_FRAMES;
+    this.rollingWindowMs = limits.rollingWindowMs;
+    this.nowMs = limits.nowMs ?? (() => performance.now());
     for (const [name, value] of [
       ["maxLineBytes", this.maxLineBytes],
       ["maxTotalBytes", this.maxTotalBytes],
@@ -146,13 +160,62 @@ export class StrictJsonlFrames {
       if (!Number.isSafeInteger(value) || value <= 0)
         throw new Error(`${name} must be a positive safe integer`);
     }
+    if (this.rollingWindowMs !== undefined) {
+      if (!Number.isSafeInteger(this.rollingWindowMs) || this.rollingWindowMs <= 0)
+        throw new Error("rollingWindowMs must be a positive safe integer");
+      const now = this.nowMs();
+      if (!Number.isFinite(now)) throw new Error("nowMs must return a finite number");
+      this.rollingByteTokens = this.maxTotalBytes;
+      this.rollingFrameTokens = this.maxFrames;
+      this.rollingUpdatedAt = now;
+    }
+  }
+
+  private refillRolling(): void {
+    if (this.rollingWindowMs === undefined) return;
+    const now = this.nowMs();
+    if (!Number.isFinite(now) || now < this.rollingUpdatedAt)
+      throw new Error(`${this.label} JSONL rolling clock is invalid`);
+    const elapsed = now - this.rollingUpdatedAt;
+    this.rollingUpdatedAt = now;
+    this.rollingByteTokens = Math.min(
+      this.maxTotalBytes,
+      this.rollingByteTokens + (elapsed * this.maxTotalBytes) / this.rollingWindowMs,
+    );
+    this.rollingFrameTokens = Math.min(
+      this.maxFrames,
+      this.rollingFrameTokens + (elapsed * this.maxFrames) / this.rollingWindowMs,
+    );
+  }
+
+  private chargeBytes(bytes: number): void {
+    if (this.rollingWindowMs !== undefined) {
+      if (bytes > this.rollingByteTokens)
+        throw new Error(`${this.label} JSONL output exceeded its rolling byte-rate bound`);
+      this.rollingByteTokens -= bytes;
+      return;
+    }
+    this.totalBytes += bytes;
+    if (!Number.isSafeInteger(this.totalBytes) || this.totalBytes > this.maxTotalBytes)
+      throw new Error(`${this.label} JSONL output exceeded its cumulative byte bound`);
+  }
+
+  private chargeFrame(): void {
+    if (this.rollingWindowMs !== undefined) {
+      if (this.rollingFrameTokens < 1)
+        throw new Error(`${this.label} JSONL output exceeded its rolling frame-rate bound`);
+      this.rollingFrameTokens -= 1;
+      return;
+    }
+    this.frameCount++;
+    if (this.frameCount > this.maxFrames)
+      throw new Error(`${this.label} JSONL output exceeded its frame-count bound`);
   }
 
   push(chunk: Uint8Array): readonly string[] {
     const incoming = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-    this.totalBytes += incoming.byteLength;
-    if (!Number.isSafeInteger(this.totalBytes) || this.totalBytes > this.maxTotalBytes)
-      throw new Error(`${this.label} JSONL output exceeded its cumulative byte bound`);
+    this.refillRolling();
+    this.chargeBytes(incoming.byteLength);
 
     const lines: string[] = [];
     let start = 0;
@@ -179,9 +242,7 @@ export class StrictJsonlFrames {
       try { line = this.decoder.decode(rawLine); }
       catch { throw new Error(`${this.label} emitted invalid UTF-8 JSONL output`); }
       if (!/^[ \t\r]*$/.test(line)) {
-        this.frameCount++;
-        if (this.frameCount > this.maxFrames)
-          throw new Error(`${this.label} JSONL output exceeded its frame-count bound`);
+        this.chargeFrame();
         lines.push(line);
       }
       start = newline + 1;

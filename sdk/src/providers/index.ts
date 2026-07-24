@@ -63,13 +63,16 @@ export function routedQuery(
     onRouteAttempt,
   );
 }
-export { ProviderEscalationUnsupportedError, ProviderRetrySafeError } from "./types";
+export {
+  isProvedUnsentPreacceptFailure, providerPreacceptError, providerRuntimeTelemetryValid,
+  ProviderEscalationUnsupportedError, ProviderRetrySafeError, ProviderRuntimeError,
+} from "./types";
 export {
   compileProviderAuthoritySurface, formatProviderAuthoritySurface,
 } from "./authority";
 export type {
   AgentProvider, AllocationMode, EntitlementPressure, LiveInputCapability, ProviderId, ProviderPreference,
   ProviderFallbackTransition, ResourcePolicy, RoutingDecision, RoutingFallbackReason,
-  RoutingPreference, RoutingRequest,
+  RoutingPreference, RoutingRequest, ProviderRuntimeReason, ProviderRuntimeTelemetry, ProviderUnsentProof,
 } from "./types";
 export type { ProviderAuthoritySurface } from "./authority";

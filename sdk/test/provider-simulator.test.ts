@@ -29,10 +29,16 @@ test("offline provider simulator captures requests and emits nonstream or SSE te
   ]);
 });
 
-test("offline provider simulator distinguishes retryable HTTP failures and bad streams", async () => {
+test("offline provider simulator distinguishes proved preaccept failures, HTTP ambiguity, and bad streams", async () => {
+  const preaccept = new OfflineProviderSimulator({
+    openai: { kind: "preaccept_failure", reason: "offline_provider_unsent" },
+  });
+  await expect(eventsOf(preaccept.provider("openai").query({ prompt: "x", options: {} } as any)))
+    .rejects.toMatchObject({ retrySafeBeforeAcceptance: true, message: "offline_provider_unsent" });
+
   const retry = new OfflineProviderSimulator({ openai: { kind: "http_error", status: 429 } });
   await expect(eventsOf(retry.provider("openai").query({ prompt: "x", options: {} } as any)))
-    .rejects.toMatchObject({ retrySafeBeforeAcceptance: true, message: "offline_provider_http_429" });
+    .rejects.toMatchObject({ message: "offline_provider_http_429" });
 
   const terminal = new OfflineProviderSimulator({ anthropic: { kind: "http_error", status: 400 } });
   await expect(eventsOf(terminal.provider("anthropic").query({ prompt: "x", options: {} } as any)))

@@ -12,7 +12,10 @@ import { MANAGED_NORTH_MCP_ENV_KEYS } from "../../src/execution-admission";
 // The harness always re-sets these from lane identity, so leaving the inherited
 // value in place is harmless — but everything else in the whitelist is pure
 // ambient leakage for a hermetic unit test.
-const HARNESS_OWNED = new Set(["NORTH_BIN", "AGENT_ID", "AGENT_TOPOLOGY", "NORTH_PORT"]);
+const HARNESS_OWNED = new Set([
+  "HOME", "NORTH_BIN", "AGENT_ID", "AGENT_TOPOLOGY", "NORTH_PORT",
+  "NORTH_MKFIFO_BIN", "NORTH_GIT_BIN", "NORTH_PEER_BB",
+]);
 
 export const AMBIENT_GRAPH_POLLUTION: readonly string[] =
   MANAGED_NORTH_MCP_ENV_KEYS.filter((key) => !HARNESS_OWNED.has(key));

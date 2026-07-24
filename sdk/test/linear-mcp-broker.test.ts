@@ -142,6 +142,50 @@ test("strict JSONL framing rejects invalid UTF-8, oversized lines, and partial E
   expect(() => partial.finish()).toThrow("partial JSONL frame");
 });
 
+test("strict JSONL lifetime ceilings remain default while rolling ceilings refill", () => {
+  const lifetimeBytes = new StrictJsonlFrames({
+    maxLineBytes: 16,
+    maxTotalBytes: 6,
+    maxFrames: 10,
+  });
+  expect(lifetimeBytes.push(Buffer.from("{}\n{}\n"))).toHaveLength(2);
+  expect(() => lifetimeBytes.push(Buffer.from("{}\n")))
+    .toThrow("cumulative byte bound");
+
+  const lifetimeFrames = new StrictJsonlFrames({
+    maxLineBytes: 16,
+    maxTotalBytes: 64,
+    maxFrames: 2,
+  });
+  expect(() => lifetimeFrames.push(Buffer.from("{}\n{}\n{}\n")))
+    .toThrow("frame-count bound");
+
+  let now = 0;
+  const rolling = new StrictJsonlFrames({
+    maxLineBytes: 16,
+    maxTotalBytes: 6,
+    maxFrames: 2,
+    rollingWindowMs: 1_000,
+    nowMs: () => now,
+  });
+  expect(rolling.push(Buffer.from("{}\n{}\n"))).toHaveLength(2);
+  expect(() => rolling.push(Buffer.from("{}\n")))
+    .toThrow("rolling byte-rate bound");
+  now = 1_000;
+  expect(rolling.push(Buffer.from("{}\n"))).toEqual(["{}"]);
+  rolling.finish();
+
+  const rollingFrames = new StrictJsonlFrames({
+    maxLineBytes: 16,
+    maxTotalBytes: 64,
+    maxFrames: 2,
+    rollingWindowMs: 1_000,
+    nowMs: () => 0,
+  });
+  expect(() => rollingFrames.push(Buffer.from("{}\n{}\n{}\n")))
+    .toThrow("rolling frame-rate bound");
+});
+
 test("uses stable app-server MCP calls without starting a model turn", async () => {
   const notifications: string[] = [];
   const { broker, log, reaped } = harness({

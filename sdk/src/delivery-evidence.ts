@@ -74,6 +74,8 @@ function invokeWriter(
       encoding: "utf8",
       input: invocation.stdin,
       stdio: ["pipe", "pipe", "pipe"],
+      // Reservation publication owns a 5s monotonic retry window in coord.clj.
+      // Keep subprocess boundary longer so writer can report its semantic cause.
       timeout: 10_000,
     }).trim();
   } catch (error) {
@@ -84,6 +86,31 @@ function invokeWriter(
     const reason = stderr.match(/^Message:\s+(.+)$/m)?.[1]?.trim();
     throw new Error(`delivery evidence ${operation} rejected${reason ? `: ${reason}` : ""}`);
   }
+}
+
+export function deliveryReservationFailureCause(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (message.includes("delivery evidence publication deadline exceeded")) {
+    return "publication deadline exceeded";
+  }
+  if (message.includes("run subject is not fresh")
+    || message.includes("run reservation projection changed before commit")
+    || message.includes("run reservation lost singleton/freshness race")) {
+    return "reservation conflict";
+  }
+  if (message === "delivery evidence reserve returned a malformed acknowledgement") {
+    return "malformed acknowledgement";
+  }
+  if (message === "delivery evidence reserve returned an invalid acknowledgement") {
+    return "invalid acknowledgement";
+  }
+  if (message === "reservation acknowledgement unavailable") {
+    return "acknowledgement unavailable";
+  }
+  if (message.includes("coordinator rejected delivery evidence write")) {
+    return "coordinator rejected write";
+  }
+  return "writer rejected reservation";
 }
 
 /** @internal Pure subprocess boundary used by the writer and its secrecy test. */

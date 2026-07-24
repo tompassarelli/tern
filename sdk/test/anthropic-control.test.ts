@@ -1,9 +1,18 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   readAnthropicControlObservation,
   type StartAnthropicControl,
 } from "../src/providers/anthropic-control";
+
+const temporary: string[] = [];
+afterEach(() => {
+  for (const path of temporary.splice(0))
+    rmSync(path, { recursive: true, force: true });
+});
 
 function usageResponse() {
   return {
@@ -15,6 +24,8 @@ function usageResponse() {
 }
 
 test("usage and supportedModels share one zero-prompt isolated warm Query", async () => {
+  const home = mkdtempSync(join(tmpdir(), "north-anthropic-control-home-"));
+  temporary.push(home);
   let startups = 0;
   let queries = 0;
   let usageCalls = 0;
@@ -48,7 +59,7 @@ test("usage and supportedModels share one zero-prompt isolated warm Query", asyn
   };
   const result = await readAnthropicControlObservation({
     target: { id: "claude-work", provider: "anthropic", authMode: "isolated", profile: "work" },
-    env: { ANTHROPIC_API_KEY: "PRIVATE CANARY", CLAUDE_CODE_OAUTH_TOKEN: "PRIVATE CANARY" },
+    env: { HOME: home, ANTHROPIC_API_KEY: "PRIVATE CANARY", CLAUDE_CODE_OAUTH_TOKEN: "PRIVATE CANARY" },
     usage: true, models: true, start,
   });
   await promptSettled;

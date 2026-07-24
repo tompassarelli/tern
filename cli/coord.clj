@@ -576,23 +576,104 @@
 ;; write makes the marker assert reject; retry therefore re-runs the callback
 ;; over a fresh graph instead of blessing a stale read. This is intentionally
 ;; global-version conservative: unrelated traffic may cause a retry, but can
-;; never create a false successful commit.
+;; never create a false successful commit. Contention retries use a monotonic
+;; deadline plus equal-jitter exponential backoff: a fixed tight attempt count
+;; can starve behind unrelated telemetry, while an unbounded loop can hide a
+;; permanently moving graph. The explicit ATTEMPTS arity remains a smaller
+;; caller-selected cap when needed. Callers publishing prerequisite facts may
+;; create one deadline and pass it through the seven-argument arity so body +
+;; marker share the same finite window.
+(def assert-after-read-deadline-ms 5000)
+(def ^:private assert-after-read-initial-backoff-ms 1)
+(def ^:private assert-after-read-max-backoff-ms 64)
+
+(def ^:dynamic *retry-monotonic-now-ns*
+  "Injectable monotonic clock for deterministic deadline tests."
+  (fn [] (System/nanoTime)))
+
+(def ^:dynamic *retry-sleep-ms!*
+  "Injectable sleeper for deterministic deadline tests."
+  (fn [milliseconds] (Thread/sleep (long milliseconds))))
+
+(def ^:dynamic *retry-jitter-ms*
+  "Injectable inclusive random selection inside the equal-jitter bounds."
+  (fn [floor-ms cap-ms]
+    (.nextLong (java.util.concurrent.ThreadLocalRandom/current)
+               (long floor-ms) (inc (long cap-ms)))))
+
+(defn retry-deadline-ns
+  "Create an absolute monotonic deadline. TIMEOUT-MS exists for bounded tests;
+   production callers use the zero-argument reservation window."
+  ([] (retry-deadline-ns assert-after-read-deadline-ms))
+  ([timeout-ms]
+   (when-not (and (integer? timeout-ms) (pos? timeout-ms))
+     (throw (ex-info "retry deadline requires a positive integer timeout"
+                     {:timeout-ms timeout-ms})))
+   (+ (long (*retry-monotonic-now-ns*))
+      (* (long timeout-ms) 1000000))))
+
+(defn- retry-delay-ms [backoff-ms remaining-ms]
+  (let [cap-ms (long (min backoff-ms remaining-ms))
+        floor-ms (long (max 1 (quot (inc cap-ms) 2)))
+        delay-ms (*retry-jitter-ms* floor-ms cap-ms)]
+    (when-not (and (integer? delay-ms)
+                   (<= floor-ms delay-ms cap-ms))
+      (throw
+       (ex-info "retry jitter must stay inside the requested inclusive bounds"
+                {:floor-ms floor-ms :cap-ms cap-ms :delay-ms delay-ms})))
+    (long delay-ms)))
+
+(defn retry-conflicts-until!
+  "Run OPERATION! while it returns {:reject :conflict}. Retries stop at the
+   absolute monotonic DEADLINE-NS or the optional ATTEMPTS cap. A deadline hit
+   preserves :reject :conflict when one was observed and adds :deadline true."
+  ([deadline-ns operation!]
+   (retry-conflicts-until! deadline-ns Integer/MAX_VALUE operation!))
+  ([deadline-ns attempts operation!]
+   (when-not (integer? deadline-ns)
+     (throw (ex-info "retry deadline must be an absolute integer nanosecond value"
+                     {:deadline-ns deadline-ns})))
+   (when-not (pos? attempts)
+     (throw (ex-info "conflict retry requires at least one attempt"
+                     {:attempts attempts})))
+   (loop [remaining attempts
+          backoff-ms assert-after-read-initial-backoff-ms]
+     (if-not (< (long (*retry-monotonic-now-ns*)) deadline-ns)
+       {:reject :deadline}
+       (let [result (operation!)]
+         (if (and (= :conflict (:reject result)) (> remaining 1))
+           (let [remaining-ns (- deadline-ns
+                                 (long (*retry-monotonic-now-ns*)))
+                 remaining-ms (quot remaining-ns 1000000)]
+             (if (pos? remaining-ms)
+               (do
+                 (*retry-sleep-ms!*
+                  (retry-delay-ms backoff-ms remaining-ms))
+                 (if (< (long (*retry-monotonic-now-ns*)) deadline-ns)
+                   (recur (dec remaining)
+                          (min assert-after-read-max-backoff-ms
+                               (* 2 backoff-ms)))
+                   (assoc result :deadline true)))
+               (assoc result :deadline true)))
+           result))))))
+
 (defn assert-after-read!
-  ([port te p r validate!] (assert-after-read! port te p r validate! 16))
+  ([port te p r validate!]
+   (assert-after-read! port te p r validate! Integer/MAX_VALUE))
   ([port te p r validate! attempts]
+   (assert-after-read! port te p r validate! attempts (retry-deadline-ns)))
+  ([port te p r validate! attempts deadline-ns]
    (when-not (pos? attempts)
      (throw (ex-info "assert-after-read! requires at least one attempt"
                      {:attempts attempts})))
    (let [rv (write-value! te p r)]
-     (loop [remaining attempts]
-       (let [base (cur-ver port)
-             _ (validate!)
-             result
-             (send-op port {:op :assert-at-version
-                            :te te :p p :r rv :base base})]
-         (if (and (= :conflict (:reject result)) (> remaining 1))
-           (recur (dec remaining))
-           result))))))
+     (retry-conflicts-until!
+      deadline-ns attempts
+      (fn []
+        (let [base (cur-ver port)
+              _ (validate!)]
+          (send-op port {:op :assert-at-version
+                         :te te :p p :r rv :base base})))))))
 
 (defn assert-after-read-with-fence!
   "Global read-set CAS plus an atomic lease fence. Every load-bearing read in

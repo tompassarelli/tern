@@ -5,6 +5,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalGlobalAgents } from "../harness";
+import { scrubManagedNonclientReceiptEnvironment } from "./managed-nonclient-receipt";
 
 const MANAGED_HOME_PREFIX = "north-managed-codex-";
 const MAX_AUTH_BYTES = 1024 * 1024;
@@ -89,13 +90,15 @@ export function prepareManagedCodexHome(
     chmodSync(join(home, "sqlite"), 0o700);
     symlinkSync(auth, join(home, "auth.json"));
     symlinkSync(agents.realpath, join(home, "AGENTS.md"));
+    const env = {
+      ...accountEnv,
+      CODEX_HOME: home,
+      CODEX_SQLITE_HOME: join(home, "sqlite"),
+      CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: "1",
+    };
+    scrubManagedNonclientReceiptEnvironment(env);
     return {
-      env: {
-        ...accountEnv,
-        CODEX_HOME: home,
-        CODEX_SQLITE_HOME: join(home, "sqlite"),
-        CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: "1",
-      },
+      env,
       home,
       accountHome,
       dispose,

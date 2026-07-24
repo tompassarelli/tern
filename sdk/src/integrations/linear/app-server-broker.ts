@@ -1,6 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  closeSync, constants, fsyncSync, mkdtempSync, openSync, renameSync, rmSync, unlinkSync,
+  writeSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { codexConfigArguments, providerEnvironmentForTarget } from "../../accounts";
 import type { RoutingTarget } from "../../providers/types";
+import { CODEX_SUPERVISOR_STATUS_PREFIX } from "../../providers/codex-supervisor-protocol";
 import type {
   McpBroker, McpBrokerOpenOptions, McpBrokerSession, McpServerInventory,
   McpToolCall, McpToolDefinition, McpToolResult, ModelFreeBrokerTransportReceipt,
@@ -16,6 +24,9 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_INVENTORY_PAGES = 20;
 const MAX_MCP_SERVERS = 100;
 const MODEL_FREE_PROTOCOL_POLICY = "codex-app-server-linear-v1";
+const SUPERVISOR_CLOSE_GRACE_MS = 1_250;
+const SUPERVISOR = resolve(import.meta.dir, "../../providers/codex-supervisor.ts");
+const SUPERVISOR_FRAME_PREFIX = "NORTH_CODEX_RPC 1 ";
 const SAFE_OUTGOING_METHODS = new Map<string, "request" | "notification">([
   ["initialize", "request"],
   ["initialized", "notification"],
@@ -31,6 +42,64 @@ const SAFE_INCOMING_NOTIFICATIONS = new Set([
 
 type RpcId = number | string;
 type SpawnProcess = typeof spawn;
+type AppServerWriter = (
+  line: string,
+  callback: (error?: Error | null) => void,
+) => void;
+
+interface SupervisorControl {
+  path: string;
+  writeLine: AppServerWriter;
+  close(): void;
+}
+
+function createSupervisorControl(): SupervisorControl {
+  const directory = mkdtempSync(join(tmpdir(), "north-linear-app-server-control-"));
+  let sequence = 0;
+  let closed = false;
+  return {
+    path: directory,
+    writeLine(line, callback) {
+      if (closed || Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
+        callback(new Error("Codex app-server supervisor control is unavailable"));
+        return;
+      }
+      sequence += 1;
+      const stem = String(sequence).padStart(12, "0");
+      const temporary = join(directory, `.${stem}.${process.pid}.tmp`);
+      const requestPath = join(directory, `${stem}.req`);
+      let fd: number | undefined;
+      try {
+        fd = openSync(temporary,
+          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+          0o600);
+        const payload = Buffer.from(line, "utf8");
+        const digest = createHash("sha256").update(payload).digest("hex");
+        const frame = Buffer.concat([
+          Buffer.from(`${SUPERVISOR_FRAME_PREFIX}${payload.byteLength} ${digest}\n`, "ascii"),
+          payload,
+        ]);
+        let offset = 0;
+        while (offset < frame.byteLength)
+          offset += writeSync(fd, frame, offset, frame.byteLength - offset);
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        renameSync(temporary, requestPath);
+        callback();
+      } catch (error) {
+        try { if (fd !== undefined) closeSync(fd); } catch {}
+        try { unlinkSync(temporary); } catch {}
+        callback(error as Error);
+      }
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      try { rmSync(directory, { recursive: true, force: true }); } catch {}
+    },
+  };
+}
 
 export interface AppServerBrokerOptions {
   command?: string;
@@ -109,16 +178,27 @@ class JsonlRpcClient {
   private childExited = false;
   private childClosed = false;
   private stdoutEnded = false;
+  private childExitSignal: NodeJS.Signals | null | undefined;
+  private supervisorStarted = false;
+  private supervisorExitCode?: number;
+  private supervisorStatusFrames?: StrictJsonlFrames;
+  private supervisorStatusComplete?: Promise<void>;
+  private resolveSupervisorStatusComplete?: () => void;
   private childClose: Promise<void>;
   private resolveChildClose!: () => void;
   private outgoingMethods = new Map<string, number>();
   private incomingNotifications = new Map<string, number>();
+  private writeLine: AppServerWriter;
 
   constructor(
     private child: ChildProcessWithoutNullStreams,
     private timeoutMs: number,
     private onNotification?: (method: string, params: unknown) => void,
+    writeLine?: AppServerWriter,
+    private closeControl?: () => void,
+    private supervised = false,
   ) {
+    this.writeLine = writeLine ?? ((line, callback) => { child.stdin.write(line, callback); });
     this.childClose = new Promise((resolve) => { this.resolveChildClose = resolve; });
     child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.stdout.on("end", () => this.onStdoutEnd());
@@ -126,8 +206,27 @@ class JsonlRpcClient {
       if (!this.clientTerminationRequested && !this.closed)
         this.fail(new Error("Codex app-server stdout failed"));
     });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", () => { /* drain only; provider diagnostics may contain secrets */ });
+    if (this.supervised) {
+      this.supervisorStatusComplete = new Promise((resolve) => {
+        this.resolveSupervisorStatusComplete = resolve;
+      });
+      this.supervisorStatusFrames = new StrictJsonlFrames({
+        label: "Codex supervisor status",
+        maxLineBytes: 128,
+        maxTotalBytes: 4 * 1024,
+        maxFrames: 4,
+      });
+      child.stderr.on("data", (chunk: Buffer | string) => this.onSupervisorStatus(
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+      ));
+      child.stderr.on("end", () => {
+        try { this.supervisorStatusFrames?.finish(); }
+        catch { this.fail(new Error("Codex app-server supervisor emitted invalid status")); }
+      });
+    } else {
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", () => { /* drain only; provider diagnostics may contain secrets */ });
+    }
     child.stderr.on("error", () => { /* diagnostics are non-authoritative; prevent an unhandled stream error */ });
     child.stdin.on("error", () => {
       if (!this.clientTerminationRequested && !this.closed)
@@ -135,12 +234,51 @@ class JsonlRpcClient {
     });
     child.on("error", () => this.fail(new Error("could not start Codex app-server")));
     child.on("exit", (code, signal) => this.onChildExit(code, signal));
-    child.on("close", () => {
-      this.childExited = true;
-      if (!this.stdoutEnded) this.onStdoutEnd();
-      this.childClosed = true;
-      this.resolveChildClose();
-    });
+    child.on("close", () => { void this.onChildClose(); });
+  }
+
+  private async onChildClose(): Promise<void> {
+    this.childExited = true;
+    if (!this.stdoutEnded) this.onStdoutEnd();
+    if (this.supervised && this.supervisorExitCode === undefined) {
+      await Promise.race([
+        this.supervisorStatusComplete!,
+        new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_CLOSE_GRACE_MS)),
+      ]);
+    }
+    if (this.supervised) this.classifyChildExit();
+    this.childClosed = true;
+    this.resolveChildClose();
+  }
+
+  private onSupervisorStatus(chunk: Buffer): void {
+    try {
+      for (const line of this.supervisorStatusFrames!.push(chunk)) {
+        const status = line.startsWith(CODEX_SUPERVISOR_STATUS_PREFIX)
+          ? line.slice(CODEX_SUPERVISOR_STATUS_PREFIX.length)
+          : undefined;
+        if (status === "STARTED" && !this.supervisorStarted && this.supervisorExitCode === undefined) {
+          this.supervisorStarted = true;
+          continue;
+        }
+        if (status === "UNAVAILABLE" && !this.supervisorStarted && this.supervisorExitCode === undefined) {
+          this.fail(new Error("could not start Codex app-server"));
+          continue;
+        }
+        const exit = status === undefined ? null : /^EXIT (0|[1-9][0-9]{0,2})$/.exec(status);
+        const code = exit ? Number(exit[1]) : NaN;
+        if (!this.supervisorStarted || this.supervisorExitCode !== undefined
+            || !Number.isInteger(code) || code > 255) {
+          this.fail(new Error("Codex app-server supervisor emitted invalid status"));
+          continue;
+        }
+        this.supervisorExitCode = code;
+        this.resolveSupervisorStatusComplete?.();
+      }
+    } catch {
+      this.fail(new Error("Codex app-server supervisor emitted invalid status"));
+      this.resolveSupervisorStatusComplete?.();
+    }
   }
 
   private fail(error: Error): void {
@@ -153,7 +291,10 @@ class JsonlRpcClient {
     this.pending.clear();
     if (!this.closed && !this.closingByClient
         && this.child.exitCode === null && this.child.signalCode === null) {
-      try { this.child.kill("SIGTERM"); }
+      try {
+        if (this.supervised) this.child.stdin.end();
+        else this.child.kill("SIGTERM");
+      }
       catch { /* the original terminal error remains authoritative */ }
     }
   }
@@ -171,7 +312,7 @@ class JsonlRpcClient {
 
   private rejectServerRequest(id: RpcId, _method: string): void {
     const response = { id, error: { code: -32601, message: "North's model-free MCP broker does not accept server requests" } };
-    this.child.stdin.write(`${JSON.stringify(response)}\n`, () => {});
+    this.writeLine(`${JSON.stringify(response)}\n`, () => {});
     this.fail(new Error("Codex app-server sent an unsupported server request; request rejected"));
   }
 
@@ -254,22 +395,33 @@ class JsonlRpcClient {
       this.fail(error instanceof Error ? error : new Error("Codex app-server closed with a partial JSONL frame"));
       return;
     }
-    if (this.childExited && !this.closingByClient && !this.terminalError)
+    if (this.childExited && !this.supervised && !this.closingByClient && !this.terminalError)
+      this.fail(new Error("Codex app-server transport exited unexpectedly"));
+  }
+
+  private classifyChildExit(): void {
+    const signal = this.childExitSignal;
+    const supervisedSignal = this.supervised && this.clientTerminationRequested
+      ? this.supervisorExitCode === 143 ? "SIGTERM"
+        : this.supervisorExitCode === 137 ? "SIGKILL"
+          : undefined
+      : undefined;
+    if ((signal && this.requestedTerminationSignals.has(signal)) || supervisedSignal)
+      this.closingByClient = true;
+    if (this.stdoutEnded && !this.closingByClient && !this.terminalError)
       this.fail(new Error("Codex app-server transport exited unexpectedly"));
   }
 
   private onChildExit(_code: number | null, signal: NodeJS.Signals | null): void {
     this.childExited = true;
+    this.childExitSignal = signal;
     // A successful kill(2) says only that the signal was accepted; it does not
     // say that signal won a race with a provider's own exit. The observed
     // terminal signal is the shutdown provenance boundary for stdio app-server.
-    if (signal && this.requestedTerminationSignals.has(signal))
-      this.closingByClient = true;
     // Node may emit `exit` before it has drained the child's stdout. Defer the
     // generic death classification so a buffered invalid/partial frame remains
     // the authoritative terminal error when `end` arrives.
-    if (this.stdoutEnded && !this.closingByClient && !this.terminalError)
-      this.fail(new Error("Codex app-server transport exited unexpectedly"));
+    if (!this.supervised) this.classifyChildExit();
   }
 
   private failUndrainedStdout(): void {
@@ -308,7 +460,7 @@ class JsonlRpcClient {
           }, this.timeoutMs);
           timer.unref?.();
           this.pending.set(id, { method, timer, resolve, reject });
-          this.child.stdin.write(line, (error) => {
+          this.writeLine(line, (error) => {
             if (!error) return;
             this.fail(new Error(`Codex app-server ${method} write failed`));
           });
@@ -328,7 +480,7 @@ class JsonlRpcClient {
     const notification = params === undefined ? { method } : { method, params };
     const line = encodeOutgoingJsonl(notification);
     increment(this.outgoingMethods, method);
-    this.child.stdin.write(line, (error) => {
+    this.writeLine(line, (error) => {
       if (error) this.fail(new Error(`Codex app-server ${method} notification failed`));
     });
   }
@@ -352,7 +504,7 @@ class JsonlRpcClient {
   }
 
   close(): Promise<void> {
-    this.closePromise ??= this.closeOnce();
+    this.closePromise ??= this.closeOnce().finally(() => this.closeControl?.());
     return this.closePromise;
   }
 
@@ -367,26 +519,33 @@ class JsonlRpcClient {
     }
     this.pending.clear();
 
-    const waitForClose = async (): Promise<boolean> => {
+    const waitForClose = async (timeoutMs: number): Promise<boolean> => {
       if (this.childClosed) return true;
       return Promise.race([
         this.childClose.then(() => true),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
       ]);
     };
 
     const live = !this.childExited
       && this.child.exitCode === null
       && this.child.signalCode === null;
-    if (!this.terminalError && live) this.requestTermination("SIGTERM");
+    if (!this.terminalError && live) {
+      if (this.supervised) {
+        this.clientTerminationRequested = true;
+        try { this.child.stdin.end(); } catch { /* bounded signal fallback below */ }
+      } else this.requestTermination("SIGTERM");
+    }
 
-    let drained = await waitForClose();
+    // Supervisor may spend 750 ms proving a TERM-resistant provider needs KILL.
+    // Direct children retain the original short close bound.
+    let drained = await waitForClose(this.supervised ? SUPERVISOR_CLOSE_GRACE_MS : 250);
     if (!drained && this.child.exitCode === null && this.child.signalCode === null) {
       // A terminal protocol failure may already have sent SIGTERM from fail().
       // Escalate it too, without relabeling that failure cleanup as a
       // client-initiated successful shutdown.
       this.requestTermination("SIGKILL");
-      drained = await waitForClose();
+      drained = await waitForClose(250);
     }
     if (!drained && !this.terminalError) {
       if (!this.stdoutEnded) this.failUndrainedStdout();
@@ -522,12 +681,38 @@ export class AppServerMcpBroker implements McpBroker {
     });
     const command = this.options.command ?? env.NORTH_CODEX_BIN ?? "codex";
     const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const child = (this.options.spawnProcess ?? spawn)(
-      command,
-      [...(this.options.commandArgs ?? []), ...codexConfigArguments(env), "app-server", "--stdio"],
-      { cwd: options.cwd ?? process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] },
+    const commandArguments = [
+      ...(this.options.commandArgs ?? []), ...codexConfigArguments(env), "app-server", "--stdio",
+    ];
+    // Bun can lose nested provider-bound pipe traffic. Keep requests durable in
+    // the existing bounded private spool; injected and unsupported paths retain
+    // the direct child-process seam.
+    const supervised = this.options.spawnProcess === undefined
+      && typeof Bun !== "undefined"
+      && process.platform !== "win32"
+      && typeof env.NORTH_MKFIFO_BIN === "string";
+    const control = supervised ? createSupervisorControl() : undefined;
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = (this.options.spawnProcess ?? spawn)(
+        supervised ? process.execPath : command,
+        supervised
+          ? [SUPERVISOR, "--duplex", control!.path, command, ...commandArguments]
+          : commandArguments,
+        { cwd: options.cwd ?? process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] },
+      );
+    } catch (error) {
+      control?.close();
+      throw error;
+    }
+    const rpc = new JsonlRpcClient(
+      child,
+      timeoutMs,
+      this.options.onNotification,
+      control?.writeLine,
+      () => control?.close(),
+      supervised,
     );
-    const rpc = new JsonlRpcClient(child, timeoutMs, this.options.onNotification);
     try {
       await awaitSpawn(child, timeoutMs);
       // Deliberately omit experimentalApi and every elicitation capability.

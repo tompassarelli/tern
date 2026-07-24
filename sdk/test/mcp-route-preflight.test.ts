@@ -113,6 +113,7 @@ test("cold exact-model MCP preflight and execution share one Anthropic control Q
     now,
     storePath: usagePath,
     modelStorePath: modelPath,
+    env: { ...process.env, HOME: root },
     startAnthropicControl: async () => {
       counters.startups++;
       return {

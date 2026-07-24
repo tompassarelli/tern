@@ -72,7 +72,8 @@ export type DeliveryAssessment =
         | "delivery_contract_exceeds_evidence_limits"
         | "delivery_contract_changed_during_run"
         | "delivery_bar_evidence_incomplete"
-        | "delivery_bar_evidence_ambiguous";
+        | "delivery_bar_evidence_ambiguous"
+        | "terminal_run_publication_unverified";
     }
   | {
       deliveryOutcome: "reported";

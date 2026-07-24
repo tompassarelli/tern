@@ -1,6 +1,6 @@
 import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
 import {
-  ProviderRetrySafeError, type AgentProvider, type AgentQuery, type ProviderAvailability,
+  providerPreacceptError, type AgentProvider, type AgentQuery, type ProviderAvailability,
   type RoutingTarget,
 } from "./types";
 import { probeAnthropic } from "../provider-routing";
@@ -125,25 +125,25 @@ function validateAnthropicHarness(options: any): ReturnType<typeof requireGaffer
     options.northCapabilities, "northCapabilities",
   );
   if (!hasCanonicalHarnessAuthority(options, "anthropic"))
-    throw new ProviderRetrySafeError("anthropic_harness_authority_seal_missing");
+    throw providerPreacceptError("anthropic_harness_authority_seal_missing");
   validateManagedExecutionEnvelope("anthropic", capabilities, options);
   admitPinnedProvider("anthropic", capabilities);
   const policy = managedToolPolicy(capabilities);
   if (!Array.isArray(options.settingSources) || options.settingSources.length !== 0)
-    throw new ProviderRetrySafeError("anthropic_setting_sources_must_be_isolated");
+    throw providerPreacceptError("anthropic_setting_sources_must_be_isolated");
   if (options.strictMcpConfig !== true)
-    throw new ProviderRetrySafeError("anthropic_strict_mcp_config_required");
+    throw providerPreacceptError("anthropic_strict_mcp_config_required");
   const denied = new Set(options.disallowedTools ?? []);
   const allowed = new Set(options.allowedTools ?? []);
   const requireDenied = (tools: string[], capability: string) => {
     if (tools.some((toolName) => !denied.has(toolName)))
-      throw new ProviderRetrySafeError(
+      throw providerPreacceptError(
         `anthropic_adapter_did_not_enforce_absent_${capability}_capability`,
       );
   };
   const requireAllowed = (tools: string[], capability: string) => {
     if (tools.some((toolName) => !allowed.has(toolName)))
-      throw new ProviderRetrySafeError(
+      throw providerPreacceptError(
         `anthropic_adapter_did_not_apply_${capability}_capability`,
       );
   };
@@ -182,31 +182,31 @@ function validateAnthropicHarness(options: any): ReturnType<typeof requireGaffer
     requireAllowed(ORCHESTRATION_TOOLS, "coordination");
     const peer = options.mcpServers?.["north-peer"];
     if (peer?.type !== "sdk" || peer.name !== "north-peer")
-      throw new ProviderRetrySafeError("anthropic_coordination_server_contract_missing");
+      throw providerPreacceptError("anthropic_coordination_server_contract_missing");
   } else {
     requireDenied(ORCHESTRATION_TOOLS, "coordination");
   }
 
   const permissionMode = capabilities.includes("filesystem.write") ? "acceptEdits" : "default";
   if (options.permissionMode !== permissionMode)
-    throw new ProviderRetrySafeError("anthropic_permission_mode_contract_missing");
+    throw providerPreacceptError("anthropic_permission_mode_contract_missing");
   if (capabilities.includes("shell.readonly")) {
     const readonly = options.mcpServers?.[READONLY_SHELL_SERVER];
     if (readonly?.type !== "sdk" || readonly.name !== READONLY_SHELL_SERVER) {
-      throw new ProviderRetrySafeError("anthropic_readonly_shell_contract_missing");
+      throw providerPreacceptError("anthropic_readonly_shell_contract_missing");
     }
   }
   const actualMcpServers = Object.keys(options.mcpServers ?? {});
   if (!exactStrings(actualMcpServers, expectedMcpServers))
-    throw new ProviderRetrySafeError("anthropic_mcp_server_surface_contract_missing");
+    throw providerPreacceptError("anthropic_mcp_server_surface_contract_missing");
   if (!exactStrings(options.tools, policy.tools))
-    throw new ProviderRetrySafeError("anthropic_builtin_tool_surface_contract_missing");
+    throw providerPreacceptError("anthropic_builtin_tool_surface_contract_missing");
   if (!exactStrings(options.allowedTools, policy.allowedTools))
-    throw new ProviderRetrySafeError("anthropic_auto_approval_contract_missing");
+    throw providerPreacceptError("anthropic_auto_approval_contract_missing");
   if (!exactStrings(options.disallowedTools, policy.disallowedTools))
-    throw new ProviderRetrySafeError("anthropic_denied_tool_contract_missing");
+    throw providerPreacceptError("anthropic_denied_tool_contract_missing");
   if (!hasCanonicalAuthoringHooks(options))
-    throw new ProviderRetrySafeError("anthropic_authoring_guard_contract_missing");
+    throw providerPreacceptError("anthropic_authoring_guard_contract_missing");
   return capabilities;
 }
 
@@ -215,7 +215,7 @@ export async function admitAnthropic(options: any, target?: RoutingTarget): Prom
   if (!capabilities) return;
   const modelAvailability = canonicalHarnessModelAvailability(options, "anthropic");
   if (!modelAvailability)
-    throw new ProviderRetrySafeError("anthropic_model_availability_authority_missing");
+    throw providerPreacceptError("anthropic_model_availability_authority_missing");
   if (modelAvailability.required) {
     if (!target || modelAvailability.targetId !== target.id
         || modelAvailability.model !== options.model
@@ -226,7 +226,7 @@ export async function admitAnthropic(options: any, target?: RoutingTarget): Prom
           options.model,
           modelAvailability.observationPath,
         )) {
-      throw new ProviderRetrySafeError("anthropic_model_availability_unproven");
+      throw providerPreacceptError("anthropic_model_availability_unproven");
     }
   }
   await admitExecution("anthropic", capabilities, resolve(options.cwd ?? process.cwd()), options, target);

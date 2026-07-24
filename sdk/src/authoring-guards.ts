@@ -25,10 +25,13 @@
 //   - other guards remain advisory on unavailable; their explicit denials still win.
 // ============================================================================
 import {
-  spawn, type ChildProcessWithoutNullStreams,
+  spawn, type ChildProcess,
 } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  closeSync, constants, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { parseStrictJson } from "./strict-json";
 
 // Guard scripts default to the portable ~/.agents/hooks, overridable by an exact
@@ -59,7 +62,7 @@ const GUARD_KILL_GRACE_MS = 100;
 const GUARD_POSIX_PROCESS_GROUP = process.platform !== "win32";
 
 function signalGuardProcessTree(
-  child: ChildProcessWithoutNullStreams,
+  child: ChildProcess,
   signal: NodeJS.Signals,
 ): void {
   if (GUARD_POSIX_PROCESS_GROUP && child.pid !== undefined) {
@@ -71,6 +74,35 @@ function signalGuardProcessTree(
     }
   }
   try { child.kill(signal); } catch { /* already gone */ }
+}
+
+function preparedGuardInput(hookInput: unknown): { fd: number; dispose(): void } {
+  const directory = mkdtempSync(join(tmpdir(), "north-guard-input-"));
+  const path = join(directory, "hook.json");
+  let fd: number | undefined;
+  try {
+    const serialized = JSON.stringify(hookInput);
+    writeFileSync(path, serialized === undefined ? "" : serialized, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    return {
+      fd,
+      dispose() {
+        if (fd !== undefined) {
+          try { closeSync(fd); } catch {}
+          fd = undefined;
+        }
+        try { rmSync(directory, { recursive: true, force: true }); } catch {}
+      },
+    };
+  } catch (error) {
+    if (fd !== undefined) try { closeSync(fd); } catch {}
+    try { rmSync(directory, { recursive: true, force: true }); } catch {}
+    throw error;
+  }
 }
 
 export function authoringGuardsOff(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -127,9 +159,11 @@ export function runGuardScript(
   env?: NodeJS.ProcessEnv,
 ): Promise<GuardDecision> {
   return new Promise((resolveP) => {
-    let child: ChildProcessWithoutNullStreams;
+    let child: ChildProcess;
+    let input: ReturnType<typeof preparedGuardInput> | undefined;
     const clockAttestation = scriptPath.endsWith("/north-clock-guard.sh");
     try {
+      input = preparedGuardInput(hookInput);
       // Execute the script directly so its shebang picks the interpreter. Callers
       // may add per-lane topology without mutating shared process.env; otherwise
       // Node inherits the parent environment unchanged.
@@ -137,14 +171,17 @@ export function runGuardScript(
         ? { ...(env ?? process.env), NORTH_CLOCK_GUARD_ATTEST: "1" }
         : env;
       child = spawn(scriptPath, [], {
-        stdio: ["pipe", "pipe", "pipe"],
+        // Bun can lose nested child-pipe stdin. A prewritten private descriptor
+        // makes exact hook bytes available before process construction and EOF
+        // deterministic without exposing them through argv or environment.
+        stdio: [input.fd, "pipe", "pipe"],
         detached: GUARD_POSIX_PROCESS_GROUP,
         ...(childEnv ? { env: childEnv } : {}),
       });
     } catch {
+      input?.dispose();
       return resolveP({ decision: "unavailable", reason: "guard process spawn failed" });
     }
-
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let outputBytes = 0;
@@ -155,6 +192,8 @@ export function runGuardScript(
     const finish = (d: GuardDecision) => {
       if (settled) return;
       settled = true;
+      input?.dispose();
+      input = undefined;
       clearTimeout(timer);
       if (termTimer) clearTimeout(termTimer);
       if (killTimer) clearTimeout(killTimer);
@@ -167,9 +206,9 @@ export function runGuardScript(
       signalGuardProcessTree(child, "SIGTERM");
       termTimer = setTimeout(() => {
         signalGuardProcessTree(child, "SIGKILL");
-        child.stdin.destroy();
-        child.stdout.destroy();
-        child.stderr.destroy();
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.stderr?.destroy();
         killTimer = setTimeout(() => finish(decision), GUARD_KILL_GRACE_MS);
       }, GUARD_TERM_GRACE_MS);
     };
@@ -191,8 +230,8 @@ export function runGuardScript(
       }
       chunks.push(bytes);
     };
-    child.stdout.on("data", capture(stdoutChunks));
-    child.stderr.on("data", capture(stderrChunks));
+    child.stdout!.on("data", capture(stdoutChunks));
+    child.stderr!.on("data", capture(stderrChunks));
     child.on("error", () => {
       if (terminating) return;
       finish({ decision: "unavailable", reason: "guard process unavailable" });
@@ -230,12 +269,6 @@ export function runGuardScript(
         });
       finish(jsonDecision ?? ALLOW);
     });
-
-    try {
-      child.stdin?.end(JSON.stringify(hookInput));
-    } catch {
-      // stdin write failed — the close handler still fires and decides. No-op here.
-    }
   });
 }
 

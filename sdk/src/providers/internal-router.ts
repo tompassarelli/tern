@@ -3,6 +3,7 @@ import type {
   AgentProvider, AgentQuery, ProviderFallbackTransition, ProviderId, RoutingDecision,
 } from "./types";
 import {
+  isProvedUnsentPreacceptFailure,
   ProviderEscalationUnsupportedError, ProviderRetrySafeError,
 } from "./types";
 import { resolveTier, type SemanticTier } from "./catalog";
@@ -148,8 +149,13 @@ export function routedQueryWithRegistry(
           const provider = providerRegistry[decision.provider];
           const managed = (options as any).northCapabilities !== undefined;
           if (managed && !provider.admit)
-            throw new ProviderRetrySafeError(
+            throw ProviderRetrySafeError.provedUnsent(
               "managed_provider_admission_unavailable",
+              {
+                mode: "managed",
+                source: "adapter_preflight",
+                requestBytesPrepared: 0,
+              },
             );
           if (provider.admit) {
             await provider.admit({
@@ -162,8 +168,13 @@ export function routedQueryWithRegistry(
             ? undefined
             : compileProviderAuthoritySurface(decision.provider, options);
           if (authority && authority.provider !== decision.provider)
-            throw new ProviderRetrySafeError(
+            throw ProviderRetrySafeError.provedUnsent(
               "provider_authority_route_mismatch",
+              {
+                mode: "managed",
+                source: "adapter_preflight",
+                requestBytesPrepared: 0,
+              },
             );
           await onRoute?.(decision, route.evidence, authority);
           if (closed) return;
@@ -190,7 +201,7 @@ export function routedQueryWithRegistry(
             && emitted === 0
             && fallbackTarget
             && fallbackProvider
-            && error instanceof ProviderRetrySafeError
+            && isProvedUnsentPreacceptFailure(error)
           ) {
             // Retry safety proves the provider did not accept the turn; it does
             // not imply its preflight process already exited. Reap the failed
@@ -222,6 +233,9 @@ export function routedQueryWithRegistry(
               fromProvider: previousProvider,
               toTarget: fallbackTarget,
               toProvider: fallbackProvider,
+              phase: "preaccept",
+              replay: "proved_unsent",
+              proof: error.unsentProof,
             }));
             continue;
           }

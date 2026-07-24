@@ -17,7 +17,10 @@
 
 (defn checked! [result operation]
   (when (:reject result)
-    (fail! "coordinator rejected delivery evidence write" {:operation operation}))
+    (fail! (if (or (= :deadline (:reject result)) (:deadline result))
+             "delivery evidence publication deadline exceeded"
+             "coordinator rejected delivery evidence write")
+           {:operation operation}))
   result)
 
 (defn parse-request [raw]
@@ -115,10 +118,14 @@
            north.terminal-projection/run-reservation-version
            "run_reserved_at" (str (java.time.Instant/now)))
           marker
-          (north.terminal-projection/run-reservation-manifest-sha256 projection)]
+          (north.terminal-projection/run-reservation-manifest-sha256 projection)
+          deadline-ns (north.coord/retry-deadline-ns)]
       (doseq [[predicate value] projection]
-        (checked! (north.coord/append! port run predicate value)
-                  [:append run predicate value]))
+        (checked!
+         (north.coord/retry-conflicts-until!
+          deadline-ns
+          #(north.coord/append! port run predicate value))
+         [:append run predicate value]))
       (checked!
        (north.coord/assert-after-read!
         port run "run_reservation_manifest_sha256" marker
@@ -144,7 +151,8 @@
                                       projection))
                          stored)
               (fail! "run reservation projection changed before commit"
-                     {:run run :stored stored})))))
+                     {:run run :stored stored}))))
+        Integer/MAX_VALUE deadline-ns)
        [:append-after-read run "run_reservation_manifest_sha256" marker])
       (let [stored (facts-of port run)]
         (when-not (and (north.terminal-projection/run-reservation-valid? stored)

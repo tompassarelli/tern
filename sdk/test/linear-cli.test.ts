@@ -33,6 +33,7 @@ import {
   LinearGatewayError, type LinearGateway, type LinearCallEnvelope,
 } from "../src/integrations/linear/gateway";
 import type { ModelFreeTransportReceipt } from "../src/integrations/linear/mcp-broker";
+import { gatedTest } from "./support/capabilities";
 
 class FakeGraph implements GraphStore {
   rows = new Map<string, GraphFact[]>();
@@ -2789,7 +2790,7 @@ test("binding reservation accepts only exact coordinator envelopes", async () =>
     .rejects.toThrow("invalid reservation response");
 });
 
-test("fenced graph values use bounded private stdin and accept payloads beyond argv limits", async () => {
+gatedTest("loopback-bind", "fenced graph values use bounded private stdin and accept payloads beyond argv limits", async () => {
   const coordinator = await fakeCoordinator();
   const leaseCli = resolve(import.meta.dir, "../../cli/lease-cli.clj");
   const lease: SyncLease = {
@@ -2852,7 +2853,7 @@ test("fenced graph values use bounded private stdin and accept payloads beyond a
   }
 });
 
-test("bootstrap evidence helper bounds scans and validates exact coordinator metadata", async () => {
+gatedTest("loopback-bind", "bootstrap evidence helper bounds scans and validates exact coordinator metadata", async () => {
   const finder = resolve(
     import.meta.dir,
     "../src/integrations/linear/find-bootstrap-links.clj",
@@ -2895,7 +2896,7 @@ test("bootstrap evidence helper bounds scans and validates exact coordinator met
   }
 });
 
-test("lease helper enforces its own byte/UTF-8 boundary before coordinator mutation", async () => {
+gatedTest("loopback-bind", "lease helper enforces its own byte/UTF-8 boundary before coordinator mutation", async () => {
   const coordinator = await fakeCoordinator();
   const leaseCli = resolve(import.meta.dir, "../../cli/lease-cli.clj");
   const args = [

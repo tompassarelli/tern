@@ -6,6 +6,9 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareManagedCodexHome } from "../src/providers/managed-codex-home";
+import {
+  MANAGED_NONCLIENT_RECEIPT_FILE_ENV,
+} from "../src/providers/managed-nonclient-receipt";
 
 const temporary: string[] = [];
 
@@ -34,6 +37,9 @@ function fixture() {
       AGENT_LAWS_PATH: laws,
       CODEX_HOME: accountHome,
       CODEX_SQLITE_HOME: join(accountHome, "sqlite"),
+      [MANAGED_NONCLIENT_RECEIPT_FILE_ENV]: "/tmp/ambient-forged-receipt",
+      NORTH_MANAGED_NONCLIENT_RECEIPT_PATH: "/tmp/ambient-legacy-receipt",
+      NORTH_MANAGED_NONCLIENT_RECEIPT_CAPABILITY: "f".repeat(64),
     },
   };
 }
@@ -53,6 +59,9 @@ test("managed Codex gets one pristine home with only auth, canonical laws, and i
     expect(prepared.home).not.toBe(accountHome);
     expect(prepared.env.CODEX_HOME).toBe(prepared.home);
     expect(prepared.env.CODEX_SQLITE_HOME).toBe(join(prepared.home, "sqlite"));
+    expect(prepared.env).not.toHaveProperty(MANAGED_NONCLIENT_RECEIPT_FILE_ENV);
+    expect(prepared.env).not.toHaveProperty("NORTH_MANAGED_NONCLIENT_RECEIPT_PATH");
+    expect(prepared.env).not.toHaveProperty("NORTH_MANAGED_NONCLIENT_RECEIPT_CAPABILITY");
     expect(readdirSync(prepared.home).sort()).toEqual(["AGENTS.md", "auth.json", "sqlite"]);
     expect(readlinkSync(join(prepared.home, "auth.json")))
       .toBe(resolve(accountHome, "auth.json"));

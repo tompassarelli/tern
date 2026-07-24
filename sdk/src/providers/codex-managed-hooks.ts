@@ -1,6 +1,6 @@
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { ProviderRetrySafeError } from "./types";
+import { providerPreacceptError } from "./types";
 
 export const CODEX_MANAGED_REQUIREMENTS = "/etc/codex/requirements.toml";
 export const CODEX_MANAGED_HOOKS_DIR = "/etc/codex/hooks";
@@ -217,6 +217,6 @@ export function assertInstalledManagedCodexHooks(): void {
       assertNixManagedFile(paths.script);
     }
   } catch (cause) {
-    throw new ProviderRetrySafeError("openai_managed_hooks_contract_unavailable", { cause });
+    throw providerPreacceptError("openai_managed_hooks_contract_unavailable", { cause });
   }
 }
