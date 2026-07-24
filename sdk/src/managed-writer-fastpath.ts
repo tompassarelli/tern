@@ -1,30 +1,40 @@
 // Persistent-connection fast path for the managed-lane identity PUBLISH write
-// (1k-tier cut #1, thread 019f90f5). The admission bottleneck measured in
-// docs/private/admission-benchmark-report.md is a fresh bb/JVM cold-start per
-// admission for cli/agent-fact-internal.clj `publish`. This module removes that
-// JVM on the common path by speaking the coordinator's own EDN wire protocol
-// (cli/coord.clj) directly over TCP from TypeScript, under the SAME per-subject
-// write-lease that agent-fact-internal.clj uses. It is a pure ACCELERATOR:
+// (1k-tier cut #1, thread 019f90f5; atomic op adoption, thread 019f9374). The
+// admission bottleneck measured in docs/private/admission-benchmark-report.md is
+// a fresh bb/JVM cold-start per admission for cli/agent-fact-internal.clj
+// `publish`. This module removes that JVM on the common path by speaking the
+// coordinator's own EDN wire protocol (cli/coord.clj) directly over TCP from
+// TypeScript, under the SAME per-subject write-lease. It is a pure ACCELERATOR:
 //
 //   - It attempts ONLY a fresh publish whose projection validate-publish! would
 //     accept; any other shape returns null so the caller uses the subprocess.
-//   - It reports "committed" ONLY after the coordinator acknowledges the marker
-//     readback, exactly as commit-marker! does. Any deviation, timeout, or
-//     ambiguity releases the lease and returns null → the caller falls back to
-//     cli/agent-fact-internal.clj keyed by the SAME holder + operationId +
-//     desired projection, so recover-identity-write! deterministically
-//     reconciles any killed markerless prefix (recovered_killed_prefix /
-//     exact_replay). The fast path can therefore never double-publish or lose a
-//     write; the proven Clojure recovery stays the correctness authority.
+//   - It reports "committed" ONLY after the coordinator acknowledges the marker,
+//     exactly as commit-marker! does. Any deviation, timeout, or ambiguity
+//     returns null → the caller falls back to cli/agent-fact-internal.clj keyed
+//     by the SAME holder + operationId + desired projection, so
+//     recover-identity-write! deterministically reconciles any killed markerless
+//     prefix (recovered_killed_prefix / exact_replay). The fast path can
+//     therefore never double-publish or lose a write; the proven Clojure
+//     recovery stays the correctness authority.
 //
-// This introduces no new long-lived process (avoiding the runaway-JVM hazard
-// the bench lane observed) and adds no client-side ordering: the coordinator's
-// single writer-lease per subject remains the sole serialization authority. The
-// wire codec + one-shot request/response transport live in ./coord-wire, shared
+// PREFERRED PATH — one atomic wire op (1k-tier lever #2, fram :managed-agent-
+// publish, promoted 2893706). The whole identity publish (assert-batch of every
+// present predicate + manifest marker) is committed server-side in ONE store
+// transaction under the canonical per-subject lease, collapsing ~115 serialized
+// round-trips per admission to one. When the coordinator does not advertise the
+// op ({:error "unknown op"}) the module transparently falls back to the LEGACY
+// per-predicate fenced-wire sequence below, so a rollout window with mixed
+// coordinator generations keeps accelerating. Marker bytes are identical on both
+// paths; a reject on either fails closed to the subprocess.
+//
+// This introduces no new long-lived process (avoiding the runaway-JVM hazard the
+// bench lane observed) and adds no client-side ordering: the coordinator's single
+// writer-lease per subject remains the sole serialization authority. The wire
+// codec + one-shot request/response transport live in ./coord-wire, shared
 // verbatim with the coordinator's own Clojure client (send-envelope).
 import { createHash } from "node:crypto";
 import type { EdnMap, OpPairs } from "./coord-wire";
-import { coordPort, expectedLog, kw, sendOp } from "./coord-wire";
+import { coordPort, expectedLog, kw, sendManagedAgentPublish, sendOp } from "./coord-wire";
 import type { ManagedWriteResult } from "./identity";
 
 // ---------------------------------------------------------------------------
@@ -148,6 +158,54 @@ function rejected(m: EdnMap): boolean {
 
 interface Lease { resource: string; holder: string; epoch: number; }
 
+// Guard predicates for the atomic op's clean-fresh gate. IDENTITY_PREDICATES
+// already feed the manifest (so the server verifies each present/absent), and
+// the projection facts carry display_handle/display_name; these are the terminal
+// bodies + terminal marker whose presence must force publish-conflict, byte-for-
+// byte the clean-fresh gate the legacy path applies below.
+const ATOMIC_GUARD_PREDICATES = [
+  ...PROJECTION_PREDICATES, TERMINAL_MARKER_PREDICATE, ...TERMINAL_PREDICATES,
+];
+
+/**
+ * Attempt the ONE atomic :managed-agent-publish op. Returns:
+ *   - true         → committed (fresh publish or byte-identical idempotent replay)
+ *   - false        → the coordinator refused this shape; fail closed to subprocess
+ *   - "unsupported"→ the coordinator does not advertise the op; use the legacy wire
+ * NEVER throws.
+ */
+async function atomicPublish(
+  entity: string,
+  projection: Record<string, string>,
+  holder: string,
+  port: number,
+  log: string,
+  deadline: number,
+): Promise<boolean | "unsupported"> {
+  const marker = identityMarker(projection);
+  try {
+    const r = await sendManagedAgentPublish(port, log, {
+      entity,
+      facts: Object.entries(projection),
+      identityPreds: IDENTITY_PREDICATES,
+      guardPreds: ATOMIC_GUARD_PREDICATES,
+      marker,
+      holder,
+      ttlMs: 60_000,
+    }, deadline);
+    // A pre-op coordinator generation routes an unknown verb to its default arm.
+    if (r[":error"] === "unknown op") return "unsupported";
+    // Success ONLY on the acknowledged fenced-publish carrying our exact marker
+    // and normalized subject; every reject (:held, :publish-conflict,
+    // :manifest-mismatch, …) and any surprising shape fails closed to the
+    // subprocess so recover-identity-write! owns the reused/partial case.
+    return Boolean(r[":ok"]) && r[":fenced-publish"] === true
+      && r[":te"] === entity && r[":marker"] === marker;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Attempt a fresh managed publish over the wire. Returns a committed result, or
  * null to signal the caller should use the subprocess path. NEVER returns a
@@ -170,6 +228,30 @@ export async function fastPublish(
   const port = coordPort();
   const log = expectedLog();
   const deadline = Date.now() + Math.max(1, Math.floor(timeoutMs));
+
+  // Preferred: one atomic server-side fenced publish. Fall back to the legacy
+  // per-predicate wire sequence only when the coordinator lacks the op.
+  const atomic = await atomicPublish(entity, projection, holder, port, log, deadline);
+  if (atomic === "unsupported") {
+    return legacyWirePublish(entity, projection, holder, operationId, port, log, deadline);
+  }
+  return atomic ? { status: "committed", operationId } : null;
+}
+
+/**
+ * Legacy accelerator: the ~115 sequential per-predicate fenced writes, retained
+ * verbatim for coordinators that predate :managed-agent-publish. Same contract
+ * as fastPublish — committed result or null (fail closed to the subprocess).
+ */
+async function legacyWirePublish(
+  entity: string,
+  projection: Record<string, string>,
+  holder: string,
+  operationId: string,
+  port: number,
+  log: string,
+  deadline: number,
+): Promise<ManagedWriteResult | null> {
   const resource = writeLeaseResource(entity);
   const op = (...pairs: OpPairs): OpPairs => pairs;
   const send = (o: OpPairs) => sendOp(port, log, o, deadline);

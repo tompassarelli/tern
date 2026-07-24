@@ -184,6 +184,45 @@ export function sendOp(port: number, log: string, op: OpPairs, deadline: number)
   });
 }
 
+/** Fields for the coordinator's atomic managed-agent identity publication
+ * (cli/coord_daemon.clj :managed-agent-publish). The North identity vocabulary
+ * (which predicates feed the manifest, which merely guard the clean-fresh gate)
+ * is the CALLER's concern — this codec only frames the one wire op. */
+export interface ManagedAgentPublishFields {
+  entity: string;
+  /** [predicate, value] pairs; encoded as [{:p .. :r ..} ...]. Must omit the marker. */
+  facts: Array<[string, string]>;
+  /** Every predicate participating in the manifest digest. */
+  identityPreds: readonly string[];
+  /** Extra predicates whose absence the clean-fresh gate also verifies. */
+  guardPreds: readonly string[];
+  /** Caller-computed manifest digest; the daemon recomputes and refuses a mismatch. */
+  marker: string;
+  holder: string;
+  ttlMs: number;
+}
+
+/** Send ONE :managed-agent-publish op — the server-side composition that
+ * derives/acquires the per-subject lease, commits the full body + manifest in a
+ * single transaction, verifies exact readback, and releases the lease. Returns
+ * the parsed reply map (fails closed to a rejected Promise on any transport
+ * error, exactly like every other verb here). */
+export function sendManagedAgentPublish(
+  port: number, log: string, f: ManagedAgentPublishFields, deadline: number,
+): Promise<EdnMap> {
+  const factMaps: OpPairs[] = f.facts.map(([p, r]) => [[kw("p"), p], [kw("r"), r]]);
+  return sendOp(port, log, [
+    [kw("op"), kw("managed-agent-publish")],
+    [kw("te"), f.entity],
+    [kw("holder"), f.holder],
+    [kw("ttl-ms"), f.ttlMs],
+    [kw("facts"), factMaps],
+    [kw("identity-preds"), [...f.identityPreds]],
+    [kw("guard-preds"), [...f.guardPreds]],
+    [kw("manifest-sha256"), f.marker],
+  ], deadline);
+}
+
 /** Live values of (te,p), or null on any transport/parse failure. */
 export async function coordResolved(te: string, p: string, timeoutMs: number): Promise<string[] | null> {
   try {

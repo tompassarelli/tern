@@ -1068,6 +1068,51 @@
 (defn optional-payload [raw]
   (when-not (str/blank? raw) (payload raw)))
 
+;; Guard predicates for the atomic op's clean-fresh gate. identity-predicates
+;; already feed the manifest (the server verifies each present/absent), the facts
+;; carry the projection predicates, so these are the terminal bodies + terminal
+;; marker whose presence must force a publish-conflict — byte-for-byte the
+;; fresh?/reuse discriminant the sequential publish! applies.
+(def managed-agent-guard-predicates
+  (vec (distinct (concat projection-predicates
+                         terminal-predicates
+                         [terminal-marker-predicate]))))
+
+(defn atomic-fresh-publish!
+  "Attempt the ONE server-side :managed-agent-publish op (fram, promoted 2893706):
+  the whole identity body + manifest marker committed in a single transaction under
+  the canonical per-subject write lease. Returns a committed result on success, or
+  nil so the caller falls back to the sequential lease-fenced path, which owns every
+  reused, partial, or recovery generation (the atomic op rejects those WITHOUT
+  mutating, so the fallback starts from the exact prior state). A coordinator that
+  does not advertise the op answers {:error \"unknown op\"} and is likewise treated
+  as a fallback. validate-publish! runs FIRST so North's vocabulary/shape rejection
+  reaches the caller before any wire op, exactly as the sequential path would."
+  [port subject facts supplied-holder operation-id]
+  (validate-publish! facts)
+  (let [marker (identity-marker facts)
+        holder (or supplied-holder
+                   (str "managed-agent-writer:" (java.util.UUID/randomUUID)))
+        response (try
+                   (north.coord/send-op
+                    port {:op :managed-agent-publish
+                          :te subject
+                          :holder holder
+                          :ttl-ms write-lease-ttl-ms
+                          :facts (mapv (fn [[predicate value]]
+                                         {:p predicate :r value})
+                                       (sort-by key facts))
+                          :identity-preds (vec identity-predicates)
+                          :guard-preds managed-agent-guard-predicates
+                          :manifest-sha256 marker})
+                   (catch Throwable _ nil))]
+    (when (and (map? response)
+               (:ok response)
+               (:fenced-publish response)
+               (= subject (:te response))
+               (= marker (:marker response)))
+      (committed-result operation-id (when (:idempotent response) "exact_replay")))))
+
 (let [[port-s operation subject raw supplied-holder supplied-operation-id
        desired-raw expected-raw terminal-thread-raw] *command-line-args*
       port (Integer/parseInt (or port-s (or (System/getenv "NORTH_PORT") "7977")))
@@ -1100,7 +1145,24 @@
                        (terminal! port subject (payload raw)))
           (fail! "internal agent fact operation must be publish, route, retask, terminal, or attest"
                  {:operation operation})))
-      result (if (= "attest" operation)
+      ;; Fresh publish preferred path: ONE atomic server-side fenced publish
+      ;; (thread 019f9374), collapsing the ~115 sequential lease-fenced ops. Only
+      ;; a genuinely fresh subject (or a byte-identical idempotent replay) commits
+      ;; through it; every reused/partial/recovery generation returns nil and falls
+      ;; back to with-write-lease below with no atomic mutation to reconcile. Route
+      ;; carries its own overlay semantics and stays on the sequential path. A
+      ;; recovery publish only shortcuts when its delta IS the complete desired
+      ;; projection, the precondition recover-identity-write! enforces anyway.
+      atomic-result
+      (when (and (= "publish" operation)
+                 (or (not managed-recovery?)
+                     (= desired (payload raw))))
+        (atomic-fresh-publish! port subject (payload raw)
+                               supplied-holder operation-id))
+      result (cond
+               (= "attest" operation)
                (attest! port subject (payload raw))
+               atomic-result atomic-result
+               :else
                (with-write-lease port subject operation supplied-holder operation!))]
   (println (json/generate-string {:ok true :result result})))
