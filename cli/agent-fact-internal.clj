@@ -995,26 +995,37 @@
 (def uuid-v4-pattern
   #"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
-(defn acquire-write-lease! [port subject wait-on-held? supplied-holder]
+(defn require-write-lease-policy!
   ;; The SDK's process timeout is the stale-writer boundary. The lease must
   ;; outlive it, otherwise a timed-out writer could wake after expiry and race a
-  ;; successor. Lifecycle updates may wait for an in-flight same-subject writer,
-  ;; but at most half the declared process budget (capped at 5s), leaving a
-  ;; deterministic margin for mutation, rollback, diagnostics, and SDK startup.
+  ;; successor. This holds on EVERY write path — the atomic fenced publish takes
+  ;; the same per-subject lease server-side, and its fallback is the sequential
+  ;; path, so the policy gates both before any wire op.
+  []
   (when-not (and (integer? writer-timeout-bound-ms)
                  (pos? writer-timeout-bound-ms)
                  (integer? write-lease-ttl-ms)
                  (> write-lease-ttl-ms writer-timeout-bound-ms))
     (fail! "managed agent write lease must outlive the writer process timeout"
            {:writer-timeout-ms writer-timeout-bound-ms
-            :lease-ttl-ms write-lease-ttl-ms}))
-  (let [resource (write-lease-resource subject)
-        holder (or supplied-holder
+            :lease-ttl-ms write-lease-ttl-ms})))
+
+(defn validated-writer-holder [supplied-holder]
+  (let [holder (or supplied-holder
                    (str "managed-agent-writer:" (java.util.UUID/randomUUID)))
-        holder-id (str/replace holder #"^managed-agent-writer:" "")
-        _ (when-not (and (str/starts-with? holder "managed-agent-writer:")
-                         (re-matches uuid-v4-pattern holder-id))
-            (fail! "invalid managed agent writer holder" {:holder holder}))
+        holder-id (str/replace holder #"^managed-agent-writer:" "")]
+    (when-not (and (str/starts-with? holder "managed-agent-writer:")
+                   (re-matches uuid-v4-pattern holder-id))
+      (fail! "invalid managed agent writer holder" {:holder holder}))
+    holder))
+
+(defn acquire-write-lease! [port subject wait-on-held? supplied-holder]
+  ;; Lifecycle updates may wait for an in-flight same-subject writer,
+  ;; but at most half the declared process budget (capped at 5s), leaving a
+  ;; deterministic margin for mutation, rollback, diagnostics, and SDK startup.
+  (require-write-lease-policy!)
+  (let [resource (write-lease-resource subject)
+        holder (validated-writer-holder supplied-holder)
         wait-budget-ms
         (if wait-on-held?
           (min max-write-lease-wait-ms (quot writer-timeout-bound-ms 2))
@@ -1090,9 +1101,9 @@
   reaches the caller before any wire op, exactly as the sequential path would."
   [port subject facts supplied-holder operation-id]
   (validate-publish! facts)
+  (require-write-lease-policy!)
   (let [marker (identity-marker facts)
-        holder (or supplied-holder
-                   (str "managed-agent-writer:" (java.util.UUID/randomUUID)))
+        holder (validated-writer-holder supplied-holder)
         response (try
                    (north.coord/send-op
                     port {:op :managed-agent-publish

@@ -116,12 +116,14 @@
   ([target-port inject? injected-response]
    (fault-proxy target-port inject? injected-response {}))
   ([target-port inject? injected-response
-    {:keys [drop-fence-after-injection?]}]
+    {:keys [drop-fence-after-injection? max-injections]
+     :or {max-injections 1}}]
    (let [server (java.net.ServerSocket.
                  0 50 (java.net.InetAddress/getByName "127.0.0.1"))
          requests (atom [])
          envelopes (atom [])
          injected? (atom false)
+         injections (atom 0)
          closed? (atom false)
          worker
          (future
@@ -141,7 +143,10 @@
                        inject-now?
                        (and valid-envelope?
                             (inject? request)
-                            (compare-and-set! injected? false true))
+                            (< @injections max-injections)
+                            (do (swap! injections inc)
+                                (reset! injected? true)
+                                true))
                        drop-response?
                        (and drop-fence-after-injection?
                             @injected?
@@ -162,6 +167,7 @@
      :requests requests
       :envelopes envelopes
       :injected? injected?
+      :injections injections
       :close!
       (fn []
         (reset! closed? true)
@@ -816,22 +822,56 @@
           (finally
             ((:close! proxy))))))
 
+    ;; The atomic fenced publish owns the fresh path, and its rejection falls
+    ;; back to the sequential fenced publish — so proving the ORIGINAL rollback
+    ;; semantics needs two staged faults: one rejecting the atomic op, one
+    ;; failing the fallback's fenced body mid-mutation.
     (let [fresh-subject "@agent:identity-rollback-fresh-publish"
           proxy
           (fault-proxy
            port
-           #(and (= :assert-with-fence (:op %))
-                 (= fresh-subject (:te %))
-                 (= "model" (:p %))))]
+           #(or (and (= :managed-agent-publish (:op %))
+                     (= fresh-subject (:te %)))
+                (and (= :assert-with-fence (:op %))
+                     (= fresh-subject (:te %))
+                     (= "model" (:p %))))
+           (constantly {:reject :test-injected})
+           {:max-injections 2})]
       (try
         (let [result
               (run-writer (:port proxy) "publish" fresh-subject
                           (json/generate-string preset))]
           (check "fresh publish failure reaches a partial fenced body"
-                 (and @(:injected? proxy)
+                 (and (= 2 @(:injections proxy))
                       (not (zero? (:exit result)))))
           (check "fresh publish failure withdraws its entire managed projection"
                  (empty? (entity-facts port fresh-subject))))
+        (finally
+          ((:close! proxy)))))
+
+    ;; Atomic-op rejection alone is NOT a publish failure: the sequential
+    ;; fallback must complete the identical projection under its own fence.
+    (let [fallback-subject "@agent:identity-atomic-fallback-fresh-publish"
+          proxy
+          (fault-proxy
+           port
+           #(and (= :managed-agent-publish (:op %))
+                 (= fallback-subject (:te %))))]
+      (try
+        (let [result
+              (run-writer (:port proxy) "publish" fallback-subject
+                          (json/generate-string
+                           (assoc preset
+                                  "goal" "atomic fallback fresh publish"
+                                  "display_handle" "atomic-fallback-fresh-publish"
+                                  "display_name" "atomic fallback fresh publish")))
+              stored (scalar-facts (entity-facts port fallback-subject))]
+          (check "atomic publish rejection falls back to the sequential fenced path"
+                 (and @(:injected? proxy)
+                      (zero? (:exit result))
+                      (north.agent-provenance/managed-valid? stored)
+                      (= (get stored "identity_manifest_sha256")
+                         (north.agent-provenance/manifest-sha256 stored)))))
         (finally
           ((:close! proxy)))))
 
