@@ -20,6 +20,7 @@ import type { ExecutionTerminal } from "./execution-outcome";
 import { classifyExecutionTerminal } from "./execution-outcome";
 import type { LiveInputCapability, ProviderId } from "./providers/types";
 import { canonicalWriteModel } from "./providers/catalog";
+import { fastPublish } from "./managed-writer-fastpath";
 export { bespokeContractFingerprint } from "./bespoke-contract";
 
 export type LiveInputState = "pending" | "armed" | "frozen";
@@ -455,14 +456,30 @@ export function agentIdentityFacts(
   ];
 }
 
-export function writeAgentFacts(agentId: string, f: ManagedLaneIdentity): void {
+export async function writeAgentFacts(agentId: string, f: ManagedLaneIdentity): Promise<void> {
   const subject = `agent:${agentId}`; // north tell @-prefixes bare ids
   const facts = agentIdentityFacts(agentId, f);
   const projection = Object.fromEntries(facts.filter((fact): fact is [string, string] => fact[1] !== undefined && fact[1] !== ""));
   const session = managedWriterSession(agentId);
+  const operationId = randomUUID();
+  // Persistent-connection fast path: only a genuinely fresh publish (no prior
+  // in-process identity to reconcile) is eligible. On any deviation it returns
+  // null and we fall through to the subprocess with the SAME holder/operationId,
+  // so recover-identity-write! reconciles any killed markerless prefix. The
+  // fast path never double-publishes and never reports uncommitted as durable.
+  if (!session.identity) {
+    const fast = await fastPublish(
+      subject, projection, session.holder, operationId, INTERNAL_WRITER_TIMEOUT_MS,
+    );
+    if (fast) {
+      session.identity = projection;
+      session.terminalCommitted = false;
+      return;
+    }
+  }
   writeHarnessAgentOperation("publish", subject, JSON.stringify(projection), {
     holder: session.holder,
-    operationId: randomUUID(),
+    operationId,
     desiredIdentity: projection,
     expectedIdentity: session.identity,
   });

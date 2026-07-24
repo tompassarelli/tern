@@ -323,7 +323,7 @@ async function runDispatch(
     (message) => ch.push(message),
     feedSubscriber,
   );
-  writeAgentFacts(agentId, { ...identityBase, model: resolved.model,
+  await writeAgentFacts(agentId, { ...identityBase, model: resolved.model,
     provider: routing.provider, providerTarget: routing.target,
     liveInput: initialLiveInput, ...liveInputRoute.initialProjection(),
     effort: resolved.effort });

@@ -14,7 +14,7 @@ afterEach(() => {
   if (directory) rmSync(directory, { recursive: true, force: true });
 });
 
-test("sequential lane-id reuse retracts the prior outcome before publishing identity", () => {
+test("sequential lane-id reuse retracts the prior outcome before publishing identity", async () => {
   directory = mkdtempSync(join(tmpdir(), "north-identity-reuse-"));
   const log = join(directory, "commands.log");
   const fake = join(directory, "north");
@@ -29,7 +29,7 @@ printf '%s\\n' "$*" >> "${log}"
   process.env.NORTH_BIN = fake;
   process.env.NORTH_IDENTITY_TEST_REDIRECT = "1";
 
-  writeAgentFacts("stable-id", {
+  await writeAgentFacts("stable-id", {
     kind: "lane", role: "migration-cartographer",
     liveInput: "unsupported",
     liveInputState: "frozen",

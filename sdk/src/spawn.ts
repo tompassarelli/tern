@@ -379,7 +379,7 @@ async function runSpawn(
     (message) => ch.push(message),
     injected.feedSubscriber ?? subscribeFeed,
   );
-  writeAgentFacts(agentId, {
+  await writeAgentFacts(agentId, {
     ...identityBase,
     model: opts.model,
     provider: routing.provider,
