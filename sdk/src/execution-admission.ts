@@ -6,7 +6,7 @@ import {
   hasAuthoringCapability, providerCapabilityRejectionCode,
 } from "./gaffer-capabilities";
 import {
-  FRAM_GRAPH_AUTHORING_CAPABILITY, FRAM_MCP_COMMAND, hasCanonicalFramMcpServer,
+  FRAM_GRAPH_AUTHORING_CAPABILITY, framMcpCommand, hasCanonicalFramMcpServer,
 } from "./fram-graph-authoring";
 import { preflightReadonlyShell, ReadonlyShellUnavailableError } from "./readonly-shell";
 import {
@@ -427,7 +427,7 @@ export async function admitExecution(
   }
   if (capabilities.includes(FRAM_GRAPH_AUTHORING_CAPABILITY)) {
     try {
-      accessSync(FRAM_MCP_COMMAND, constants.X_OK);
+      accessSync(framMcpCommand(), constants.X_OK);
     } catch (cause) {
       throw new ExecutionAdmissionError("fram_mcp_executable_unavailable", { cause });
     }

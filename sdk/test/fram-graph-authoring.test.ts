@@ -1,5 +1,7 @@
-import { afterEach, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { afterAll, afterEach, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   GAFFER_CAPABILITIES, hasAuthoringCapability,
 } from "../src/gaffer-capabilities";
@@ -14,7 +16,7 @@ import {
   validateManagedExecutionEnvelope,
 } from "../src/execution-admission";
 import {
-  FRAM_MCP_COMMAND, FRAM_MCP_TOOL_NAMES, FRAM_MCP_TOOLS, framMcpEnvironment,
+  FRAM_MCP_TOOL_NAMES, FRAM_MCP_TOOLS, framMcpCommand, framMcpEnvironment,
 } from "../src/fram-graph-authoring";
 import {
   compileProviderAuthoritySurface,
@@ -24,9 +26,35 @@ import { eligibleForProviderProcessDeathRetry } from "../src/spawn";
 const north = resolve(import.meta.dir, "../..");
 const originalAgentLaws = process.env.AGENT_LAWS;
 
+// Roots are deployment facts supplied by the dispatcher; tests provide
+// hermetic stand-ins (with an executable fram-mcp stub so the admission
+// X_OK preflight passes) instead of depending on host checkouts.
+const framHome = mkdtempSync(join(tmpdir(), "fram-home-"));
+const beagleHome = mkdtempSync(join(tmpdir(), "beagle-home-"));
+mkdirSync(join(framHome, "bin"), { recursive: true });
+writeFileSync(join(framHome, "bin", "fram-mcp"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+process.env.NORTH_FRAM_HOME = framHome;
+process.env.NORTH_BEAGLE_HOME = beagleHome;
+
 afterEach(() => {
   if (originalAgentLaws === undefined) delete process.env.AGENT_LAWS;
   else process.env.AGENT_LAWS = originalAgentLaws;
+  process.env.NORTH_FRAM_HOME = framHome;
+  process.env.NORTH_BEAGLE_HOME = beagleHome;
+});
+
+afterAll(() => {
+  rmSync(framHome, { recursive: true, force: true });
+  rmSync(beagleHome, { recursive: true, force: true });
+});
+
+test("composing the capability without deployment roots fails closed by name", () => {
+  delete process.env.NORTH_FRAM_HOME;
+  delete process.env.NORTH_BEAGLE_HOME;
+  expect(() => framMcpCommand()).toThrow(/graph_authoring_fram_roots_unset/);
+  expect(() => framMcpCommand()).toThrow(/NORTH_FRAM_HOME, NORTH_BEAGLE_HOME/);
+  process.env.NORTH_FRAM_HOME = framHome;
+  expect(() => framMcpCommand()).toThrow(/NORTH_BEAGLE_HOME/);
 });
 
 const graphAuthoringRequest: RoutingRequest = {
@@ -88,7 +116,7 @@ test("managed providers compile the exact sealed Fram MCP only when explicitly r
     ]);
     expect(options.mcpServers.fram).toEqual({
       type: "stdio",
-      command: FRAM_MCP_COMMAND,
+      command: framMcpCommand(),
       args: [],
       env: framMcpEnvironment(north),
     });

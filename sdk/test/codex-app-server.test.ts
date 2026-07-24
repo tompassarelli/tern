@@ -21,7 +21,7 @@ import type { OpenAIAuthoritySurface } from "../src/providers/authority";
 import { providerSessionKey, providerTurnKey } from "../src/providers/provider-join";
 import { NORTH_BINARY_PROBE_SCRIPT } from "../src/native-command-activity";
 import {
-  FRAM_MCP_COMMAND, FRAM_MCP_TOOL_NAMES, framMcpEnvironment,
+  FRAM_MCP_TOOL_NAMES, framMcpCommand, framMcpEnvironment,
 } from "../src/fram-graph-authoring";
 
 function firstLine(stream: NodeJS.ReadableStream, label: string): Promise<string> {
@@ -776,6 +776,8 @@ test("launch seals the exact package shell environment policy", () => {
 });
 
 test("launch seals the opt-in Fram MCP server and its exact graph-edit tool set", () => {
+  process.env.NORTH_FRAM_HOME ??= "/tmp/fram-home-codex-test";
+  process.env.NORTH_BEAGLE_HOME ??= "/tmp/beagle-home-codex-test";
   const { options } = setup();
   options.surface = {
     ...options.surface,
@@ -785,14 +787,14 @@ test("launch seals the opt-in Fram MCP server and its exact graph-edit tool set"
     sandbox: "read-only",
   };
   options.fram = {
-    command: FRAM_MCP_COMMAND,
+    command: framMcpCommand(),
     args: [],
     env: framMcpEnvironment(options.cwd),
   };
   const launch = managedCodexAppServerLaunch(options);
   expect(launch.expectedSessionConfig.mcp_servers).toMatchObject({
     fram: {
-      command: FRAM_MCP_COMMAND,
+      command: framMcpCommand(),
       args: [],
       env: framMcpEnvironment(options.cwd),
       enabled: true,
