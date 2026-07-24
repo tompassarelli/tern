@@ -782,11 +782,17 @@ PY
                 package-hook-mail 'ambient-PATH-free delivery' \
                 > "$smoke/hook-send.out"
             grep -q 'sent @msg:' "$smoke/hook-send.out"
-            printf '%s' "$hook_input" | ${pkgs.coreutils}/bin/env -i \
+            if ! printf '%s' "$hook_input" | ${pkgs.coreutils}/bin/env -i \
               HOME="$smoke/home" PATH= XDG_RUNTIME_DIR="$hook_runtime" \
               NORTH_AGENT_ID="$hook_actor" NORTH_PORT="$coord_port" \
               FRAM_LOG="$coord_log" AGENT_PROVIDER=openai \
-              $out/bin/north-on-tooluse > "$smoke/hook-tooluse.out"
+              $out/bin/north-on-tooluse > "$smoke/hook-tooluse.out" \
+              2> "$smoke/hook-tooluse.err"; then
+              echo "north package smoke: north-on-tooluse failed; stderr follows" >&2
+              cat "$smoke/hook-tooluse.err" >&2
+              sed -n '1,40p' "$smoke/hook-tooluse.out" >&2
+              exit 1
+            fi
             ${pkgs.python3}/bin/python3 - \
               "$smoke/hook-tooluse.out" <<'PY'
 import json
@@ -807,11 +813,16 @@ PY
               $out/bin/north doctor > "$smoke/doctor.out" || doctor_rc=$?
             # The hermetic smoke deliberately has no reactor. Doctor must render
             # every section and report that critical absence through exit 1.
-            test "$doctor_rc" -eq 1
-            grep -Fq '[ERR]  reactor heartbeat MISSING' "$smoke/doctor.out"
-            grep -Fq 'guard hooks' "$smoke/doctor.out"
-            grep -Fq 'north  package rev ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")}' "$smoke/doctor.out"
-            grep -Fq 'fram  package rev ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}' "$smoke/doctor.out"
+            doctor_block_fail() {
+              echo "north package smoke: doctor block failed at: $1 (doctor_rc=$doctor_rc)" >&2
+              sed -n '1,120p' "$smoke/doctor.out" >&2
+              exit 1
+            }
+            test "$doctor_rc" -eq 1 || doctor_block_fail rc
+            grep -Fq '[ERR]  reactor heartbeat MISSING' "$smoke/doctor.out" || doctor_block_fail reactor
+            grep -Fq 'guard hooks' "$smoke/doctor.out" || doctor_block_fail guard-hooks
+            grep -Fq 'north  package rev ${builtins.substring 0 12 (self.rev or self.dirtyRev or "dirty")}' "$smoke/doctor.out" || doctor_block_fail north-rev
+            grep -Fq 'fram  package rev ${builtins.substring 0 12 (fram.rev or fram.dirtyRev or "local")}' "$smoke/doctor.out" || doctor_block_fail fram-rev
             if grep -q forged "$smoke/doctor.out"; then
               echo "north package smoke: ambient provenance overrode the package pins" >&2
               exit 1
@@ -1063,13 +1074,15 @@ PY
             printf '{"policyVersion":"north-routing-pin-v1","issuedAt":"%s","expiresAt":"%s","reasonCode":"capability-requirement","detail":"package smoke validates the exact OpenAI route","pins":[{"kind":"provider","value":"openai"}]}\n' \
               "$now" "$reset" > "$smoke/openai-pin-evidence.json"
             HOME="$smoke/home" NORTH_CLAUDE_BIN="$smoke/bin/claude" NORTH_CODEX_BIN="$smoke/bin/codex" \
+              NORTH_STAFFING_SOURCE=file \
               NORTH_PROVIDER_OBSERVATIONS="$smoke/observations.json" $out/bin/north providers --json > "$smoke/providers.json"
             ${pkgs.jq}/bin/jq -e \
               '([.providers[].targets[] | select(.id == "anthropic")][0] | .installed and .authenticated) and
                ([.providers[].targets[] | select(.id == "openai")][0] |
                  .installed and .authenticated and .headroom == "plenty")' \
               "$smoke/providers.json" > /dev/null
-            HOME="$smoke/home" NO_COLOR=1 $out/bin/north spawn implementer probe \
+            HOME="$smoke/home" NO_COLOR=1 NORTH_STAFFING_SOURCE=file \
+              $out/bin/north spawn implementer probe \
               --provider openai --pin-evidence "@$smoke/openai-pin-evidence.json" \
               --dry-run > "$smoke/spawn.out"
             grep -q 'grade=mid tier=standard' "$smoke/spawn.out"
@@ -1086,6 +1099,7 @@ PY
             printf '%s\n' '{"version":"minimum-sufficient-v1","signals":{"decisionOwnership":"none","seamScope":"none","errorExposure":"contained-reversible","oracleStrength":"judgment-only","foundationalImpact":"none","dependencyShape":"atomic-cohesive","reasoningShape":"multi-hypothesis"},"derived":{"minimumTier":"senior","minimumReasoning":"high","ruleCodes":["oracle-strength:judgment-only","reasoning-shape:multi-hypothesis"]},"selected":{"tier":"senior","reasoning":"high"}}' \
               > "$smoke/verifier-assessment.json"
             GAFFER_HOME=${gafferContract} HOME="$smoke/home" NO_COLOR=1 \
+              NORTH_STAFFING_SOURCE=file \
               $out/bin/north spawn verifier probe \
               --assessment "@$smoke/verifier-assessment.json" --dry-run \
               > "$smoke/assessed-spawn.out"
@@ -1097,6 +1111,7 @@ PY
             printf '%s\n' '{"version":"minimum-sufficient-v1","signals":{"decisionOwnership":"none","seamScope":"none","errorExposure":"contained-reversible","oracleStrength":"judgment-only","foundationalImpact":"none","dependencyShape":"atomic-cohesive","reasoningShape":"multi-hypothesis"},"derived":{"minimumTier":"senior","minimumReasoning":"high","ruleCodes":["forged"]},"selected":{"tier":"senior","reasoning":"high"}}' \
               > "$smoke/verifier-assessment-forged.json"
             if GAFFER_HOME=${gafferContract} HOME="$smoke/home" NO_COLOR=1 \
+                 NORTH_STAFFING_SOURCE=file \
                  $out/bin/north spawn verifier probe \
                  --assessment "@$smoke/verifier-assessment-forged.json" --dry-run \
                  > "$smoke/assessed-forged.out" 2>&1; then
@@ -1107,7 +1122,10 @@ PY
             grep -q 'canonical Gaffer validation' "$smoke/assessed-forged.out"
             # Runtime Gaffer reads must be hermetic: exercise exact provider/model
             # resolution against the packaged contract, with no sibling checkout.
-            GAFFER_HOME=${gafferContract} HOME="$smoke/home" ${pkgs.bun}/bin/bun -e \
+            # File staffing source: the graph default needs a live coordinator,
+            # which a sandboxed build never has.
+            GAFFER_HOME=${gafferContract} HOME="$smoke/home" \
+              NORTH_STAFFING_SOURCE=file ${pkgs.bun}/bin/bun -e \
               'import { readFileSync } from "node:fs";
                import { resolveModelAlias, resolveModelDelta, resolveTier } from "'$out'/sdk/src/providers/catalog.ts";
                const route = resolveTier("openai", "frontier");

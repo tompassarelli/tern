@@ -90,11 +90,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1784682955,
-        "narHash": "sha256-wFRee1CjRgpgShNAdYbKWCVW3RTlLmEyfaYrePxt2kA=",
-        "owner": "TomPassarelli",
+        "lastModified": 1784841340,
+        "narHash": "sha256-xtrahnSvREOEe5U5F0sfqyc6gRk03rAe2rg1wJTBNxg=",
+        "owner": "tompassarelli",
         "repo": "fram",
-        "rev": "88fb1955b98cabccd234c9d20c96b93eacbe6d8f",
+        "rev": "a1c8672eff3f9b0d572bc816ef75f9ac5d4fad92",
         "type": "github"
       },
       "original": {
